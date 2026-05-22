@@ -1,5 +1,6 @@
 import base64
 import email.message
+import io
 import json
 
 import pytest
@@ -470,7 +471,8 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["filename"] == "data.csv"
-    assert fake_web_client.last_kwargs["content"] == b"a,b\n1,2\n"
+    assert isinstance(fake_web_client.last_kwargs["file"], io.BytesIO)
+    assert fake_web_client.last_kwargs["file"].getvalue() == b"a,b\n1,2\n"
     assert result["preview"] == {
         "size_bytes": 8,
         "mime_type": "text/csv",

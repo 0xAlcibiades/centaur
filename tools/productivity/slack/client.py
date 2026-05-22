@@ -1,6 +1,7 @@
 """Slack API client with bot operations plus optional user-token access paths."""
 
 import base64
+import io
 import json
 import mimetypes
 import os
@@ -1741,7 +1742,9 @@ class SlackClient:
                 raise ValueError(
                     "One of content_base64, attachment_id, or attachment_url is required"
                 )
-            kwargs["content"] = upload_bytes
+            # Slack SDK ``content`` is for editable text snippets; binary files
+            # such as videos need the file upload path to produce a shared file object.
+            kwargs["file"] = io.BytesIO(upload_bytes)
             kwargs["filename"] = effective_filename
             if title:
                 kwargs["title"] = title
