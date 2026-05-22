@@ -118,6 +118,7 @@ const FINAL_PLAN_TITLE_CHARS = slackReplyLimits.finalPlan.taskTitleChars
 const FINAL_PLAN_DETAILS_LINES = slackReplyLimits.finalPlan.taskDetailsCodeBlockLines
 const FINAL_PLAN_OUTPUT_LINES = slackReplyLimits.finalPlan.taskOutputCodeBlockLines
 const MAX_LIVE_TEXT_CHARS = slackReplyLimits.stream.maxLiveTextChars
+const DURABLE_STREAMED_ANSWER_TASK_THRESHOLD = 10
 
 export class AgentSessionRenderer {
   constructor(private readonly client: WebClient) {}
@@ -150,11 +151,7 @@ export class AgentSessionRenderer {
     return await this.queueText(state, segment, markdown)
   }
 
-  async textDelta(
-    sessionId: string,
-    markdownDelta: string,
-    opts: TextOptions = {}
-  ): Promise<number> {
+  async textDelta(sessionId: string, markdownDelta: string, opts: TextOptions = {}): Promise<number> {
     if (!markdownDelta) return 0
     const state = requireSession(sessionId)
     const segment = currentSegment(state)
@@ -303,71 +300,39 @@ export class AgentSessionRenderer {
     const commentaryMarkdown = state.finalCommentaryMarkdown?.trim() ?? ''
     const answerSource =
       state.finalAnswerMarkdown?.trim() || segment.streamedText.trim() || segment.textParts.join('')
-    const answerMarkdown = finalMarkdownForBlocks(answerSource)
+    const answerMarkdown = finalMarkdownForFinalBlocks(answerSource, segment, {
+      includeStreamedText: originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
+    })
     const streamedTextLive =
       Boolean(segment.streamedText.trim()) && segment.streamedText.length < MAX_LIVE_TEXT_CHARS
     const showThinking =
       !streamedTextLive && shouldShowThinkingBlock(commentaryMarkdown, answerMarkdown)
     const thinkingBlock = showThinking ? thinkingContextBlock(commentaryMarkdown) : null
+    // Slack accumulates appendStream chunks; stopStream blocks are the composed final layout.
+    // Only add blocks for content that was not streamed live; live task_update chunks carry
+    // fenced details/output, and the header has already been streamed as the first chunk.
     const blocks = sanitizeFinalMessagePayload([
-      ...(tasks.length
+      ...(tasks.length && !segment.planStarted
         ? [planBlock(planTitle(state.title, originalTasks), tasks, EXECUTION_PLAN_ID)]
         : []),
       ...(thinkingBlock ? [thinkingBlock] : []),
-      ...(answerMarkdown ? renderMarkdownBlocks(answerMarkdown) : [])
+      ...(!streamedTextLive && answerMarkdown ? renderMarkdownBlocks(answerMarkdown) : [])
     ] as AnyBlock[])
     const fallbackText = buildFinalFallbackText({
       title: state.title,
       commentaryMarkdown: showThinking ? commentaryMarkdown : '',
       answerMarkdown
     })
-    const replaceLiveStreamWithFinalBlocks =
-      blocks.length > 0 && (Boolean(segment.streamedText.trim()) || segment.planStarted)
+    const chunks =
+      blocks.length || streamedTextLive ? undefined : markdownToStreamChunks(fallbackText)
     const stopResponse = await this.client.chat.stopStream({
       channel: state.channel,
       ts: segment.streamTs,
-      chunks: markdownToStreamChunks(
-        blocks.length || streamedTextLive || replaceLiveStreamWithFinalBlocks ? ' ' : fallbackText
-      ),
-      ...(!replaceLiveStreamWithFinalBlocks && blocks.length ? { blocks } : {})
+      ...(chunks ? { chunks } : {}),
+      ...(blocks.length ? { blocks } : {})
     })
     if (!stopResponse.ok) throw new Error(stopResponse.error ?? 'chat.stopStream failed')
-    if (replaceLiveStreamWithFinalBlocks) {
-      await this.replaceFinalStreamMessage(state, segment, blocks, fallbackText)
-    }
     segment.closed = true
-  }
-
-  private async replaceFinalStreamMessage(
-    state: AgentSessionState,
-    segment: Segment,
-    blocks: AnyBlock[],
-    fallbackText: string
-  ): Promise<void> {
-    if (!segment.streamTs) return
-    try {
-      const response = await this.client.chat.update({
-        channel: state.channel,
-        ts: segment.streamTs,
-        text: fallbackText || state.title,
-        blocks
-      })
-      if (!response.ok) {
-        logWarn('slack_final_stream_update_failed', {
-          channel: state.channel,
-          thread_ts: state.parentTs,
-          stream_ts: segment.streamTs,
-          error: response.error ?? 'unknown_error'
-        })
-      }
-    } catch (error) {
-      logWarn('slack_final_stream_update_failed', {
-        channel: state.channel,
-        thread_ts: state.parentTs,
-        stream_ts: segment.streamTs,
-        error: error instanceof Error ? error.message : String(error)
-      })
-    }
   }
 
   private async streamChunks(
@@ -685,8 +650,19 @@ function compactTaskBody(body: StreamTask['details'], maxLines: number): StreamT
   return richText([preformatted(clipLines(text, maxLines), language)])
 }
 
-function finalMarkdownForBlocks(markdown: string): string {
-  return clipText(markdown, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+function finalMarkdownForFinalBlocks(
+  markdown: string,
+  segment: Segment,
+  opts: { includeStreamedText?: boolean } = {}
+): string {
+  const trimmed = markdown.trim()
+  if (!trimmed) return ''
+  if (opts.includeStreamedText || !segment.streamedText.trim()) {
+    return clipText(trimmed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+  }
+  const unstreamed = markdown.slice(segment.streamedTextSourceChars).trim()
+  if (!unstreamed) return ''
+  return clipText(unstreamed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
 }
 
 function clipText(value: string, maxChars: number): string {

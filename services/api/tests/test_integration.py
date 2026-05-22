@@ -14,6 +14,8 @@ Pure-function tests run without any infrastructure.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -557,6 +559,129 @@ class TestBuildSessionContext:
 
         ctx = _build_session_context("test:1")
         assert "Date/Time" in ctx
+
+    def test_requester_identity_with_github_handle(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context(
+            "test:1",
+            platform="slack",
+            user_id="U123",
+            requester_identity={
+                "slack_user_id": "U123",
+                "slack_mention": "<@U123>",
+                "github_handle": "@alice",
+                "github_handle_source": 'Slack profile custom field "GitHub"',
+                "github_handle_verified": True,
+            },
+        )
+
+        assert "Requester Identity" in ctx
+        assert "GitHub handle from Slack profile: @alice" in ctx
+        assert "GitHub handle verified: yes" in ctx
+
+    def test_requester_identity_without_github_handle(self):
+        from api.agent import _build_session_context
+
+        ctx = _build_session_context(
+            "test:1",
+            platform="slack",
+            user_id="U123",
+            requester_identity={
+                "slack_user_id": "U123",
+                "slack_mention": "<@U123>",
+                "github_handle_verified": False,
+                "github_handle_unavailable_reason": (
+                    "no GitHub custom field found on Slack profile"
+                ),
+            },
+        )
+
+        assert "GitHub handle from Slack profile: unavailable" in ctx
+        assert "no GitHub custom field found on Slack profile" in ctx
+        assert "GitHub handle verified: no" in ctx
+
+    def test_extract_github_handle_from_slack_profile(self):
+        from api.agent import _extract_github_handle_from_slack_profile
+
+        handle, source, reason = _extract_github_handle_from_slack_profile(
+            {"custom_fields": {"Affiliations": "GitHub: test-user"}}
+        )
+
+        assert handle == "@test-user"
+        assert source == 'Slack profile custom field "Affiliations"'
+        assert reason == ""
+
+    def test_extract_github_handle_unavailable_reason(self):
+        from api.agent import _extract_github_handle_from_slack_profile
+
+        handle, source, reason = _extract_github_handle_from_slack_profile(
+            {"custom_fields": {"Telegram": "@alice"}}
+        )
+
+        assert handle is None
+        assert source is None
+        assert reason == "no GitHub custom field found on Slack profile"
+
+    @pytest.mark.asyncio
+    async def test_latest_thread_user_id_reads_message_metadata(self, db_pool):
+        from api.agent import _get_latest_thread_user_id
+
+        thread_key = "test:requester-fallback"
+        await db_pool.execute(
+            "INSERT INTO chat_messages (id, thread_key, role, parts, metadata) "
+            "VALUES ($1, $2, 'user', '[]'::jsonb, $3::jsonb)",
+            "msg-requester-fallback",
+            thread_key,
+            '{"user_id": "U123"}',
+        )
+
+        assert await _get_latest_thread_user_id(thread_key) == "U123"
+
+    @pytest.mark.asyncio
+    async def test_insert_system_message_uses_thread_user_id_fallback(
+        self, db_pool, monkeypatch
+    ):
+        from api import agent
+
+        thread_key = "test:requester-context-fallback"
+        await db_pool.execute(
+            "INSERT INTO chat_messages (id, thread_key, role, parts, user_id, metadata) "
+            "VALUES ($1, $2, 'user', '[]'::jsonb, 'U123', '{}'::jsonb)",
+            "msg-requester-context-fallback",
+            thread_key,
+        )
+
+        async def fake_resolve_requester_identity(*, platform, user_id):
+            assert platform == "slack"
+            assert user_id == "U123"
+            return {
+                "slack_user_id": user_id,
+                "slack_mention": f"<@{user_id}>",
+                "github_handle": "@alice",
+                "github_handle_source": 'Slack profile custom field "GitHub"',
+                "github_handle_verified": True,
+            }
+
+        monkeypatch.setattr(
+            agent,
+            "_resolve_requester_identity",
+            fake_resolve_requester_identity,
+        )
+
+        await agent._insert_system_message(thread_key, "slack")
+
+        row = await db_pool.fetchrow(
+            "SELECT parts FROM chat_messages WHERE id = $1",
+            f"system-{thread_key}-slack",
+        )
+        parts = row["parts"]
+        if isinstance(parts, str):
+            parts = json.loads(parts)
+        text = parts[0]["text"]
+        assert "Requester Identity" in text
+        assert "Slack user ID: U123" in text
+        assert "GitHub handle from Slack profile: @alice" in text
 
 
 # ── Test 7: Status endpoint ──────────────────────────────────────────────────
