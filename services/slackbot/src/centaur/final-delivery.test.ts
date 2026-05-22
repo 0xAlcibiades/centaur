@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import {
+  isRuntimeFailureText,
   pollFinalDeliveriesOnce,
   shouldAlertFinalDeliveryPollFailure,
 } from "./final-delivery";
@@ -23,6 +24,22 @@ const config: AppConfig = {
 
 afterEach(() => {
   mock.restore();
+});
+
+describe("runtime failure alert classification", () => {
+  it("alerts only for direct runtime startup failures", () => {
+    expect(
+      isRuntimeFailureText(
+        "Failed to start the codex runtime: sandbox pod exited before ready",
+      ),
+    ).toBe(true);
+
+    expect(
+      isRuntimeFailureText(
+        "The failures are because the Publish Images workflow still publishes to ghcr.io/paradigmxyz/centaur-*.",
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("final delivery polling", () => {

@@ -140,15 +140,22 @@ async function maybeAlertRuntimeFailure(
   })
 }
 
-function isRuntimeFailureText(text: string): boolean {
-  return (
-    /\bFailed to start\b/i.test(text) ||
-    /\bsandbox readiness timed out\b/i.test(text) ||
-    /\bsandbox pod exited before ready\b/i.test(text) ||
-    /\bnode capacity\b/i.test(text) ||
-    /\biron-proxy\b/i.test(text) ||
-    /\b1Password\b/i.test(text)
-  )
+const RUNTIME_FAILURE_LINE_PATTERNS = [
+  /^Failed to start\b/i,
+  /^sandbox readiness timed out\b/i,
+  /^sandbox pod exited before ready\b/i,
+  /^node capacity\b/i,
+  /^iron-proxy\b.*\b(?:failed|error|unavailable|timeout|timed out)\b/i,
+  /^1Password\b.*\b(?:failed|error|unavailable|timeout|timed out)\b/i
+]
+
+export function isRuntimeFailureText(text: string): boolean {
+  const firstMeaningfulLine =
+    text
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(Boolean) ?? ""
+  return RUNTIME_FAILURE_LINE_PATTERNS.some(pattern => pattern.test(firstMeaningfulLine))
 }
 
 async function postRuntimeAlert(
