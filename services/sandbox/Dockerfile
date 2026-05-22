@@ -166,6 +166,9 @@ USER root
 RUN rm -f /etc/sudoers.d/agent
 COPY --link --chmod=755 services/sandbox/call.sh /usr/local/bin/call
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
+COPY --link --chmod=755 services/sandbox/github-link.sh /usr/local/bin/github-link
+COPY --link --chmod=755 services/sandbox/github-gist.sh /usr/local/bin/github-gist
+COPY --link --chmod=755 services/sandbox/share-artifact.sh /usr/local/bin/share-artifact
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/sandbox/amp-wrapper.py /usr/local/bin/amp-wrapper
 COPY --link --chmod=755 services/sandbox/codex-app-wrapper.py /usr/local/bin/codex-app-wrapper
