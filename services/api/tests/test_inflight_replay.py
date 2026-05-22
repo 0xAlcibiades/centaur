@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
 from pathlib import Path
@@ -214,6 +215,104 @@ async def test_flush_pending_skips_assistant_messages(db_pool) -> None:
         rows = await _flush_pending(thread_key, user_one)
 
     assert [row["id"] for row in rows] == [assistant_history, user_two]
+
+
+@pytest.mark.asyncio
+async def test_system_context_refresh_does_not_hide_later_user_messages() -> None:
+    thread_key = "test:thread-system-cursor"
+    system_id = f"system-{thread_key}-slack"
+    user_two = "msg-after-system"
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.rows = {
+                "msg-before-system": {
+                    "id": "msg-before-system",
+                    "thread_key": thread_key,
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "first"}],
+                    "metadata": {},
+                    "created_at": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                }
+            }
+            self.now = dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.timezone.utc)
+
+        async def execute(self, sql: str, *args):
+            if sql.startswith("INSERT INTO chat_messages"):
+                msg_id, row_thread_key, parts_json = args[:3]
+                if msg_id in self.rows:
+                    self.rows[msg_id]["parts"] = json.loads(parts_json)
+                    return
+                self.rows[msg_id] = {
+                    "id": msg_id,
+                    "thread_key": row_thread_key,
+                    "role": "system",
+                    "parts": json.loads(parts_json),
+                    "metadata": {},
+                    "created_at": self.now,
+                }
+                return
+            raise AssertionError(sql)
+
+        async def fetch(self, sql: str, *args):
+            row_thread_key = args[0]
+            last_delivered_id = args[1] if len(args) > 1 else None
+            cutoff = None
+            if last_delivered_id is not None:
+                cutoff = self.rows[last_delivered_id]["created_at"]
+            rows = []
+            for row in self.rows.values():
+                if row["thread_key"] != row_thread_key:
+                    continue
+                if (
+                    row["role"] == "assistant"
+                    and row["metadata"].get("history_backfill") is not True
+                ):
+                    continue
+                if cutoff is not None and row["created_at"] <= cutoff:
+                    continue
+                rows.append(row)
+            return sorted(rows, key=lambda row: row["created_at"])
+
+    pool = FakePool()
+
+    with (
+        patch("api.agent._get_pool", return_value=pool),
+        patch(
+            "api.agent._resolve_requester_identity",
+            new_callable=AsyncMock,
+            return_value={
+                "slack_user_id": "U123",
+                "slack_mention": "<@U123>",
+                "github_handle_verified": True,
+                "github_handle": "@seabert",
+                "github_handle_source": "test",
+            },
+        ),
+    ):
+        from api.agent import _flush_pending, _insert_system_message
+
+        await _insert_system_message(thread_key, "slack", user_id="U123")
+        assert pool.rows[system_id]["created_at"] == dt.datetime(
+            2026, 1, 1, 0, 0, 1, tzinfo=dt.timezone.utc
+        )
+        pool.rows[user_two] = {
+            "id": user_two,
+            "thread_key": thread_key,
+            "role": "user",
+            "parts": [{"type": "text", "text": "second"}],
+            "metadata": {},
+            "created_at": dt.datetime(2026, 1, 1, 0, 0, 2, tzinfo=dt.timezone.utc),
+        }
+        pool.now = dt.datetime(2026, 1, 1, 0, 0, 3, tzinfo=dt.timezone.utc)
+
+        await _insert_system_message(thread_key, "slack", user_id="U123")
+        rows = await _flush_pending(thread_key, system_id)
+
+    assert pool.rows[system_id]["created_at"] == dt.datetime(
+        2026, 1, 1, 0, 0, 1, tzinfo=dt.timezone.utc
+    )
+    assert [row["id"] for row in rows] == [user_two]
 
 
 def test_flushed_history_backfill_marks_imported_assistant_context() -> None:
