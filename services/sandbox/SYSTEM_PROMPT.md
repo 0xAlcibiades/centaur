@@ -268,7 +268,7 @@
 |Never leave bare code references like `SportsbookTable.tsx:275` in Slack-visible prose; convert them to a GitHub URL first.
 |Use `github-link path/to/file.ts:123` from inside the repo and paste the returned GitHub URL. If you only know a unique basename, `github-link SportsbookTable.tsx:275` will resolve it; if it is ambiguous, rerun with a fuller path.
 |If a GitHub URL cannot be produced, use a plain code path without markdown link styling and say it could not be linked.
-|For PR work, push the branch before claiming branch-specific GitHub links are valid; otherwise use the default-branch link only for code that already exists upstream.
+|For PR work, push the branch before claiming branch-specific GitHub links are valid. Use `github-link --ref branch-name path/to/file.ts:123` when you need a specific pushed branch. Without `--ref`, `github-link` uses the pushed current branch when available, otherwise the current HEAD commit SHA, so links should still point at the commit cache rather than an unrelated `main`.
 
 [Slack responses]
 |Only use the slack tool to respond to a user unless explicitly asked. Centaur already sends responses through the preferred user <> chat interface

@@ -114,3 +114,30 @@ def test_github_link_rejects_ambiguous_basename(tmp_path: Path) -> None:
     assert "ambiguous path suffix" in result.stderr
     assert "apps/web/SportsbookTable.tsx" in result.stderr
     assert "packages/ui/SportsbookTable.tsx" in result.stderr
+
+
+def test_github_link_uses_head_sha_when_current_branch_is_unpushed(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, "git@github.com:leanxyz/livermore.git")
+    _git(repo, "checkout", "-q", "-b", "local-only")
+    head = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+
+    result = _run(["bash", str(GITHUB_LINK_SH), "src/file.ts:1"], repo)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == (
+        f"https://github.com/leanxyz/livermore/blob/{head}/src/file.ts#L1"
+    )
+
+
+def test_github_link_ref_override_can_target_specific_branch(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, "git@github.com:leanxyz/livermore.git")
+
+    result = _run(
+        ["bash", str(GITHUB_LINK_SH), "src/file.ts:1", "--ref", "review-branch"],
+        repo,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == (
+        "https://github.com/leanxyz/livermore/blob/review-branch/src/file.ts#L1"
+    )

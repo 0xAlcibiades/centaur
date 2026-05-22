@@ -113,10 +113,11 @@ else
   DEFAULT_REF="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
   if [ -n "$BRANCH" ] && git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
     REF="$BRANCH"
-  elif [ -n "$DEFAULT_REF" ]; then
-    REF="$DEFAULT_REF"
   else
-    REF="main"
+    REF="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$REF" ]; then
+      REF="${DEFAULT_REF:-main}"
+    fi
   fi
 fi
 
