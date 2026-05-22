@@ -63,6 +63,17 @@ if [ -z "$REPO_ROOT" ]; then
 fi
 
 REL_PATH="$(git -C "$REPO_ROOT" ls-files --full-name -- "$ABS_PATH" 2>/dev/null | head -n 1)"
+if [ -z "$REL_PATH" ] && [[ "$PATH_PART" != /* ]]; then
+  SUFFIX_MATCHES="$(git -C "$REPO_ROOT" ls-files -- "$PATH_PART" "*/$PATH_PART" 2>/dev/null | sort -u)"
+  SUFFIX_MATCH_COUNT="$(printf '%s\n' "$SUFFIX_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$SUFFIX_MATCH_COUNT" = "1" ]; then
+    REL_PATH="$(printf '%s\n' "$SUFFIX_MATCHES" | sed '/^$/d')"
+  elif [ "$SUFFIX_MATCH_COUNT" -gt 1 ]; then
+    echo "github-link: ambiguous path suffix: $PATH_PART" >&2
+    printf '%s\n' "$SUFFIX_MATCHES" >&2
+    exit 1
+  fi
+fi
 if [ -z "$REL_PATH" ]; then
   REL_PATH="$(realpath --relative-to="$REPO_ROOT" "$ABS_PATH" 2>/dev/null || true)"
 fi

@@ -265,7 +265,9 @@
 |Use `slack-upload <file> "optional comment"` directly when the user specifically wants an inline Slack file/image. It prints the Slack permalink; include that link in your final answer.
 |Use `github-gist <file> "description"` only when the user explicitly asks for a gist, pastebin-style link, or public/shareable text outside Slack. Prefer secret gists by default; use `--public` only if the user explicitly asks for public.
 |When linking to code files, never put local sandbox paths like `/home/agent/workspace/...` or `/home/agent/branches/...` inside Markdown links. Slack users cannot open those paths.
-|Use `github-link path/to/file.ts:123` from inside the repo and paste the returned GitHub URL, or use a plain code path if a GitHub URL cannot be produced.
+|Never leave bare code references like `SportsbookTable.tsx:275` in Slack-visible prose; convert them to a GitHub URL first.
+|Use `github-link path/to/file.ts:123` from inside the repo and paste the returned GitHub URL. If you only know a unique basename, `github-link SportsbookTable.tsx:275` will resolve it; if it is ambiguous, rerun with a fuller path.
+|If a GitHub URL cannot be produced, use a plain code path without markdown link styling and say it could not be linked.
 |For PR work, push the branch before claiming branch-specific GitHub links are valid; otherwise use the default-branch link only for code that already exists upstream.
 
 [Slack responses]

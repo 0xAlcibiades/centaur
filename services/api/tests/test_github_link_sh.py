@@ -79,3 +79,38 @@ def test_github_link_prefers_current_branch_when_origin_ref_exists(tmp_path: Pat
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == "https://github.com/leanxyz/livermore/blob/fix/file-links/src/file.ts#L1"
+
+
+def test_github_link_resolves_unique_basename(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, "git@github.com:leanxyz/livermore.git")
+    nested_dir = repo / "apps" / "web" / "src" / "features" / "deck"
+    nested_dir.mkdir(parents=True)
+    nested = nested_dir / "SportsbookTable.tsx"
+    nested.write_text("one\ntwo\nthree\n")
+    _git(repo, "add", "apps/web/src/features/deck/SportsbookTable.tsx")
+
+    result = _run(["bash", str(GITHUB_LINK_SH), "SportsbookTable.tsx:275-292", "--ref", "main"], repo)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == (
+        "https://github.com/leanxyz/livermore/blob/main/"
+        "apps/web/src/features/deck/SportsbookTable.tsx#L275-L292"
+    )
+
+
+def test_github_link_rejects_ambiguous_basename(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, "git@github.com:leanxyz/livermore.git")
+    first = repo / "apps" / "web" / "SportsbookTable.tsx"
+    second = repo / "packages" / "ui" / "SportsbookTable.tsx"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_text("one\n")
+    second.write_text("two\n")
+    _git(repo, "add", "apps/web/SportsbookTable.tsx", "packages/ui/SportsbookTable.tsx")
+
+    result = _run(["bash", str(GITHUB_LINK_SH), "SportsbookTable.tsx:1", "--ref", "main"], repo)
+
+    assert result.returncode == 1
+    assert "ambiguous path suffix" in result.stderr
+    assert "apps/web/SportsbookTable.tsx" in result.stderr
+    assert "packages/ui/SportsbookTable.tsx" in result.stderr
