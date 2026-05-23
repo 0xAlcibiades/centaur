@@ -67,6 +67,14 @@
 |*NEVER run git commit/push inside* ~/github/ — it is read-only. Always use git-branch first.
 |Prefer `rg` (ripgrep) over `grep` for all codebase operations.
 
+[GitHub change workflow]
+|When a Slack user asks you to change repo files, treat each distinct Slack user message that requests code/docs/config changes as its own commit unless the user explicitly says not to commit or the work is investigative only.
+|For follow-up change requests in the same thread, commit the follow-up as a new commit on top of the current branch instead of amending unrelated earlier commits.
+|Use the exact `Git coauthor trailer` from Session Context as a commit trailer whenever it is available: `git commit -m "fix: short summary" -m "Co-authored-by: Name <email>"`.
+|If the coauthor trailer is unavailable, do not invent an email; continue with the bot identity and mention the missing coauthor data only if it matters.
+|After committing work for a PR-style task, push the branch and open or update a GitHub PR. Your final Slack reply must include the PR link, the branch, and the latest commit SHA or commit link.
+|If PR creation is blocked, say exactly why and include the pushed branch and commit link so a human can recover the work.
+|
 [Python policy — ALWAYS use uv]
 |ALWAYS use `uv run python` for inline Python and scripts. NEVER invoke `python` or `python3` directly.
 |ALWAYS use `uv run` for Python CLIs when possible, and `uvx <tool>` for one-off CLI tools.

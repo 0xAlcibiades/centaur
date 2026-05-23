@@ -620,6 +620,59 @@ def _extract_github_handle_from_slack_profile(
     return None, None, "no GitHub custom field found on Slack profile"
 
 
+def _slack_profile_field(profile: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    nested = profile.get("profile")
+    sources = [nested, profile] if isinstance(nested, dict) else [profile]
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _sanitize_git_coauthor_name(value: str) -> str | None:
+    name = re.sub(r"[\r\n<>]+", " ", value).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name or None
+
+
+def _valid_git_coauthor_email(value: str | None) -> str | None:
+    if not value:
+        return None
+    email = value.strip()
+    if any(char in email for char in "\r\n<>") or "@" not in email:
+        return None
+    return email
+
+
+def _extract_slack_profile_identity(
+    profile: dict[str, Any],
+) -> dict[str, str]:
+    identity: dict[str, str] = {}
+    display_name = _slack_profile_field(
+        profile,
+        ("display_name_normalized", "display_name"),
+    )
+    real_name = _slack_profile_field(
+        profile,
+        ("real_name_normalized", "real_name", "name"),
+    )
+    email = _valid_git_coauthor_email(_slack_profile_field(profile, ("email",)))
+
+    if display_name:
+        identity["slack_display_name"] = display_name
+    if real_name:
+        identity["slack_real_name"] = real_name
+    if email:
+        identity["slack_email"] = email
+
+    coauthor_name = _sanitize_git_coauthor_name(real_name or display_name or "")
+    if coauthor_name and email:
+        identity["git_coauthor_trailer"] = f"Co-authored-by: {coauthor_name} <{email}>"
+    return identity
+
+
 async def _resolve_requester_identity(
     *,
     platform: str | None,
@@ -669,6 +722,7 @@ async def _resolve_requester_identity(
         )
         return identity
 
+    identity.update(_extract_slack_profile_identity(profile))
     handle, source, reason = _extract_github_handle_from_slack_profile(profile)
     if handle:
         identity.update(
@@ -749,9 +803,7 @@ def _resolve_harness_profile(
     if normalized_harness and normalized_harness not in _ENGINE_HARNESSES:
         raise ValueError(f"Unknown harness: {normalized_harness}")
 
-    persona_info = (
-        get_tool_manager().get_persona(persona) if persona else None
-    )
+    persona_info = get_tool_manager().get_persona(persona) if persona else None
     if persona and persona_info is None:
         raise ValueError(f"Unknown persona: {persona}")
 
@@ -958,6 +1010,20 @@ def _build_session_context(
                 f"- Slack mention: {requester_identity['slack_mention']}",
             ]
         )
+        if requester_identity.get("slack_display_name"):
+            lines.append(
+                f"- Slack display name: {requester_identity['slack_display_name']}"
+            )
+        if requester_identity.get("slack_real_name"):
+            lines.append(f"- Slack real name: {requester_identity['slack_real_name']}")
+        if requester_identity.get("slack_email"):
+            lines.append(f"- Slack email: {requester_identity['slack_email']}")
+        if requester_identity.get("git_coauthor_trailer"):
+            lines.append(
+                f"- Git coauthor trailer: {requester_identity['git_coauthor_trailer']}"
+            )
+        else:
+            lines.append("- Git coauthor trailer: unavailable")
         if requester_identity.get("github_handle_verified"):
             lines.extend(
                 [

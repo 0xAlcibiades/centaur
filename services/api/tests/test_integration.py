@@ -250,7 +250,11 @@ class TestFlushedToMessages:
         from api.agent import _flushed_to_messages
 
         rows = [
-            {"role": "user", "parts": [{"type": "text", "text": "hi"}], "user_id": "U123"},
+            {
+                "role": "user",
+                "parts": [{"type": "text", "text": "hi"}],
+                "user_id": "U123",
+            },
         ]
         msgs = _flushed_to_messages(rows)
         assert len(msgs) == 1
@@ -263,7 +267,11 @@ class TestFlushedToMessages:
         from api.agent import _flushed_to_messages
 
         rows = [
-            {"role": "user", "parts": '[{"type": "text", "text": "world"}]', "user_id": None},
+            {
+                "role": "user",
+                "parts": '[{"type": "text", "text": "world"}]',
+                "user_id": None,
+            },
         ]
         msgs = _flushed_to_messages(rows)
         assert msgs[0]["parts"] == [{"type": "text", "text": "world"}]
@@ -274,8 +282,16 @@ class TestFlushedToMessages:
         from api.agent import _flushed_to_messages
 
         rows = [
-            {"role": "user", "parts": [{"type": "text", "text": "hi"}], "user_id": "U123"},
-            {"role": "user", "parts": '[{"type": "text", "text": "world"}]', "user_id": None},
+            {
+                "role": "user",
+                "parts": [{"type": "text", "text": "hi"}],
+                "user_id": "U123",
+            },
+            {
+                "role": "user",
+                "parts": '[{"type": "text", "text": "world"}]',
+                "user_id": None,
+            },
         ]
         msgs = _flushed_to_messages(rows)
         assert len(msgs) == 2
@@ -290,19 +306,21 @@ class TestMessagesToContentBlocksWithAttachmentRef:
         """DB message with attachment_ref → download instruction."""
         from api.sandbox.harness_protocol import messages_to_content_blocks
 
-        msgs = [{
-            "role": "user",
-            "parts": [
-                {"type": "text", "text": "check this"},
-                {
-                    "type": "attachment_ref",
-                    "id": "att-1",
-                    "name": "doc.pdf",
-                    "mime_type": "application/pdf",
-                },
-            ],
-            "user_id": "U999",
-        }]
+        msgs = [
+            {
+                "role": "user",
+                "parts": [
+                    {"type": "text", "text": "check this"},
+                    {
+                        "type": "attachment_ref",
+                        "id": "att-1",
+                        "name": "doc.pdf",
+                        "mime_type": "application/pdf",
+                    },
+                ],
+                "user_id": "U999",
+            }
+        ]
         blocks = messages_to_content_blocks(msgs)
         assert len(blocks) == 2
         assert blocks[0]["text"] == "<@U999>: check this"
@@ -467,7 +485,10 @@ class TestResolveHarnessProfile:
 
         # Rule 1: engine_override always wins.
         assert resolve("amp", persona="invest", engine_override="codex")[0] == "codex"
-        assert resolve(None, persona="invest", engine_override="claude-code")[0] == "claude-code"
+        assert (
+            resolve(None, persona="invest", engine_override="claude-code")[0]
+            == "claude-code"
+        )
         assert resolve("codex", persona=None, engine_override="amp")[0] == "amp"
 
         # Rule 2: explicit harness arg DIFFERENT from persona's engine wins
@@ -573,12 +594,22 @@ class TestBuildSessionContext:
                 "github_handle": "@alice",
                 "github_handle_source": 'Slack profile custom field "GitHub"',
                 "github_handle_verified": True,
+                "slack_display_name": "alice",
+                "slack_real_name": "Alice Example",
+                "slack_email": "alice@lean.xyz",
+                "git_coauthor_trailer": "Co-authored-by: Alice Example <alice@lean.xyz>",
             },
         )
 
         assert "Requester Identity" in ctx
         assert "GitHub handle from Slack profile: @alice" in ctx
         assert "GitHub handle verified: yes" in ctx
+        assert "Slack real name: Alice Example" in ctx
+        assert "Slack email: alice@lean.xyz" in ctx
+        assert (
+            "Git coauthor trailer: Co-authored-by: Alice Example <alice@lean.xyz>"
+            in ctx
+        )
 
     def test_requester_identity_without_github_handle(self):
         from api.agent import _build_session_context
@@ -611,6 +642,27 @@ class TestBuildSessionContext:
         assert handle == "@test-user"
         assert source == 'Slack profile custom field "Affiliations"'
         assert reason == ""
+
+    def test_extract_slack_profile_identity_builds_coauthor_trailer(self):
+        from api.agent import _extract_slack_profile_identity
+
+        identity = _extract_slack_profile_identity(
+            {
+                "profile": {
+                    "display_name": "alice",
+                    "real_name": "Alice Example",
+                    "email": "alice@lean.xyz",
+                }
+            }
+        )
+
+        assert identity["slack_display_name"] == "alice"
+        assert identity["slack_real_name"] == "Alice Example"
+        assert identity["slack_email"] == "alice@lean.xyz"
+        assert (
+            identity["git_coauthor_trailer"]
+            == "Co-authored-by: Alice Example <alice@lean.xyz>"
+        )
 
     def test_extract_github_handle_unavailable_reason(self):
         from api.agent import _extract_github_handle_from_slack_profile
