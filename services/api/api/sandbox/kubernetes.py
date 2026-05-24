@@ -42,7 +42,14 @@ from api.sandbox.config import (
     sandbox_env_value,
 )
 from api.sandbox.prompt_assembly import assemble_prompt
-from api.tool_manager import OAuthFieldSource, OAuthTokenSecret, PgDsnSecret, SecretDef
+from api.tool_manager import (
+    HttpSecret,
+    OAuthFieldSource,
+    OAuthTokenSecret,
+    PgDsnSecret,
+    SecretDef,
+    SecretMode,
+)
 
 log = structlog.get_logger()
 
@@ -81,10 +88,27 @@ def _claude_oauth_scopes() -> tuple[str, ...]:
     return tuple(scope for scope in raw.split() if scope)
 
 
+def _claude_oauth_token_secret_ref() -> str:
+    return sandbox_env_value("CLAUDE_CODE_OAUTH_TOKEN_SECRET_REF")
+
+
 def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
     if not _harness_uses_proxy_auth(engine):
         return []
     if engine == "claude-code":
+        token_secret_ref = _claude_oauth_token_secret_ref()
+        if token_secret_ref:
+            return [
+                HttpSecret(
+                    name="CLAUDE_CODE_OAUTH_TOKEN",
+                    secret_ref=token_secret_ref,
+                    mode=SecretMode.INJECT,
+                    hosts=("api.anthropic.com",),
+                    inject_header="Authorization",
+                    inject_formatter="Bearer {{ .Value }}",
+                    source_kind="env",
+                )
+            ]
         return [
             OAuthTokenSecret(
                 name="CLAUDE_CODE_OAUTH",
@@ -115,7 +139,11 @@ def _harness_proxy_auth_env_keys(engine: str) -> tuple[str, ...]:
     if not _harness_uses_proxy_auth(engine):
         return ()
     if engine == "claude-code":
-        return ("CLAUDE_CODE_OAUTH_CLIENT_ID", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+        keys = ["CLAUDE_CODE_OAUTH_CLIENT_ID", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN"]
+        token_secret_ref = _claude_oauth_token_secret_ref()
+        if token_secret_ref:
+            keys.append(token_secret_ref)
+        return tuple(dict.fromkeys(keys))
     return ()
 
 

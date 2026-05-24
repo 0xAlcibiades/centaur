@@ -16,7 +16,7 @@ from api.sandbox.kubernetes import (
     STDOUT_CHANNEL,
 )
 from api.sandbox.registry import auto_configure
-from api.tool_manager import OAuthFieldSource
+from api.tool_manager import HttpSecret, OAuthFieldSource, OAuthTokenSecret, SecretMode
 
 
 class FakeCoreApi:
@@ -280,6 +280,7 @@ def test_container_env_filters_raw_local_auth_from_extra_env(
         "CLAUDE_CODE_OAUTH_CLIENT_ID": "claude-client-id",
         "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "claude-refresh-token",
         "CLAUDE_CODE_OAUTH_SCOPES": "user:inference user:profile",
+        "CLAUDE_CODE_OAUTH_TOKEN_SECRET_REF": "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
         "ANTHROPIC_AUTH_TOKEN": "anthropic-token",
     }
     monkeypatch.setenv(
@@ -325,6 +326,7 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
     assert _harness_codex_auth_json_secret_ref("codex") == "CODEX_AUTH_JSON"
     assert len(claude) == 1
     secret = claude[0]
+    assert isinstance(secret, OAuthTokenSecret)
     assert secret.name == "CLAUDE_CODE_OAUTH"
     assert secret.grant == "refresh_token"
     assert secret.hosts == ("api.anthropic.com",)
@@ -337,6 +339,46 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
         ),
     }
     assert _harness_proxy_auth_secrets("amp") == []
+
+
+def test_harness_proxy_auth_secrets_can_use_static_claude_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import (
+        _harness_proxy_auth_env_keys,
+        _harness_proxy_auth_secrets,
+    )
+
+    monkeypatch.setenv("CLAUDE_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv(
+        "KUBERNETES_SANDBOX_EXTRA_ENV",
+        json.dumps(
+            [
+                {
+                    "name": "CLAUDE_CODE_OAUTH_TOKEN_SECRET_REF",
+                    "value": "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+                }
+            ]
+        ),
+    )
+
+    secrets = _harness_proxy_auth_secrets("claude-code")
+
+    assert _harness_proxy_auth_env_keys("claude-code") == (
+        "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "CLAUDE_CODE_OAUTH_ACCESS_TOKEN",
+    )
+    assert len(secrets) == 1
+    secret = secrets[0]
+    assert isinstance(secret, HttpSecret)
+    assert secret.name == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert secret.secret_ref == "CLAUDE_CODE_OAUTH_ACCESS_TOKEN"
+    assert secret.mode is SecretMode.INJECT
+    assert secret.hosts == ("api.anthropic.com",)
+    assert secret.inject_header == "Authorization"
+    assert secret.inject_formatter == "Bearer {{ .Value }}"
+    assert secret.source_kind == "env"
 
 
 def test_proxy_pod_spec_can_receive_harness_auth_keys(
