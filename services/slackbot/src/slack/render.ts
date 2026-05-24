@@ -5,6 +5,10 @@ const MAX_BLOCKS = slackReplyLimits.message.maxBlocks
 const MAX_MARKDOWN_CHARS = slackReplyLimits.stream.markdownChunkChars
 const MAX_FALLBACK_CHARS = slackReplyLimits.text.maxFallbackChars
 const MAX_STREAM_CHUNK_CHARS = slackReplyLimits.stream.markdownChunkChars
+const FILE_REF_PATTERN =
+  /(?<![\w./-])((?:\/home\/agent\/(?:workspace|(?:github|branches)\/[^/\s`]+\/[^/\s`]+)\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|md|mdx|json|toml|ya?ml|css|scss|sql|sh)(?::\d+(?:-\d+)?)?)/g
+const INLINE_CODE_PATTERN = /`([^`\n]+)`/g
+const FENCE_PATTERN = /```[\s\S]*?```/g
 
 export type StatusMetadata = {
   title?: string
@@ -46,7 +50,7 @@ export function thinkingContextBlock(
 }
 
 export function renderMarkdownBlocks(markdown: string): MarkdownBlock[] {
-  const normalized = markdown.trim() || ' '
+  const normalized = linkifyGithubFileRefs(markdown).trim() || ' '
   const blocks: MarkdownBlock[] = []
   let used = 0
 
@@ -109,10 +113,83 @@ export function fallbackText(input: {
 }
 
 export function markdownToStreamChunks(markdown: string): AnyChunk[] {
-  return splitText(markdown || ' ', MAX_STREAM_CHUNK_CHARS).map(text => ({
+  return splitText(linkifyGithubFileRefs(markdown || ' '), MAX_STREAM_CHUNK_CHARS).map(text => ({
     type: 'markdown_text',
     text
   }))
+}
+
+export function linkifyGithubFileRefs(markdown: string): string {
+  const baseUrl = githubFileLinkBaseUrl()
+  if (!baseUrl || !markdown) return markdown
+  const fenced: string[] = []
+  const inline: string[] = []
+  const withoutFences = markdown.replace(FENCE_PATTERN, match => {
+    const index = fenced.push(match) - 1
+    return `@@CENTAUR_FENCE_${index}@@`
+  })
+  const withoutInline = withoutFences.replace(INLINE_CODE_PATTERN, (match, code: string) => {
+    const url = githubUrlForFileRef(baseUrl, code.trim())
+    const replacement = url ? `[${escapeMarkdownLinkText(code)}](${url})` : match
+    const index = inline.push(replacement) - 1
+    return `@@CENTAUR_INLINE_${index}@@`
+  })
+  const linked = withoutInline.replace(FILE_REF_PATTERN, (match: string) => {
+    if (match.includes('://')) return match
+    const url = githubUrlForFileRef(baseUrl, match)
+    return url ? `[${escapeMarkdownLinkText(match)}](${url})` : match
+  })
+  return linked
+    .replace(/@@CENTAUR_INLINE_(\d+)@@/g, (_match, index: string) => inline[Number(index)] ?? '')
+    .replace(/@@CENTAUR_FENCE_(\d+)@@/g, (_match, index: string) => fenced[Number(index)] ?? '')
+}
+
+function githubFileLinkBaseUrl(): string {
+  return (process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL ?? '').trim().replace(/\/+$/, '')
+}
+
+function githubUrlForFileRef(baseUrl: string, rawRef: string): string | null {
+  const parsed = parseFileRef(rawRef)
+  if (!parsed) return null
+  const path = parsed.path
+    .split('/')
+    .filter(Boolean)
+    .map(part => encodeURIComponent(part))
+    .join('/')
+  const url = `${baseUrl}/${path}`
+  if (!parsed.lineStart) return url
+  return `${url}#L${parsed.lineStart}${parsed.lineEnd ? `-L${parsed.lineEnd}` : ''}`
+}
+
+function parseFileRef(
+  rawRef: string
+): { path: string; lineStart?: string; lineEnd?: string } | null {
+  const trimmed = rawRef.trim()
+  const match = /^(.+?)(?::(\d+)(?:-(\d+))?)?$/.exec(trimmed)
+  if (!match) return null
+  const rawPath = match[1]
+  if (!rawPath) return null
+  const path = normalizeRepoPath(rawPath)
+  if (!path || !isLinkableFileRef(path)) return null
+  return { path, lineStart: match[2], lineEnd: match[3] }
+}
+
+function normalizeRepoPath(path: string): string | null {
+  let normalized = path.replace(/^\.\/+/, '').replace(/^\/home\/agent\/workspace\/+/, '')
+  normalized = normalized.replace(/^\/home\/agent\/(?:github|branches)\/[^/]+\/[^/]+\/+/, '')
+  if (normalized.startsWith('/') || normalized.startsWith('../')) return null
+  return normalized
+}
+
+function isLinkableFileRef(path: string): boolean {
+  FILE_REF_PATTERN.lastIndex = 0
+  const matched = FILE_REF_PATTERN.test(path)
+  FILE_REF_PATTERN.lastIndex = 0
+  return matched
+}
+
+function escapeMarkdownLinkText(text: string): string {
+  return text.replace(/([\\[\]])/g, '\\$1')
 }
 
 function splitText(input: string, maxChars: number): string[] {
