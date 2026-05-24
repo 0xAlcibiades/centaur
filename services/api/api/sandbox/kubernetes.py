@@ -38,9 +38,10 @@ from api.sandbox.config import (
     container_env,
     image,
     runtime_for_session,
+    sandbox_env_flag,
 )
 from api.sandbox.prompt_assembly import assemble_prompt
-from api.tool_manager import PgDsnSecret, SecretDef
+from api.tool_manager import OAuthFieldSource, OAuthTokenSecret, PgDsnSecret, SecretDef
 
 log = structlog.get_logger()
 
@@ -53,6 +54,68 @@ _SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
 _PROXY_LABEL = "centaur.ai/iron-proxy"
 _API_PROXY_POD_NAME = "centaur-api-proxy"
 _API_PROXY_SANDBOX_ID = "api"
+_CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+
+
+def _harness_auth_secret_name() -> str:
+    value = (os.getenv("KUBERNETES_HARNESS_AUTH_SECRET_NAME") or "").strip()
+    return value or "centaur-harness-auth"
+
+
+def _harness_uses_proxy_auth(engine: str) -> bool:
+    if engine == "codex":
+        return sandbox_env_flag("CODEX_USE_LOCAL_AUTH")
+    if engine == "claude-code":
+        return sandbox_env_flag("CLAUDE_USE_LOCAL_AUTH")
+    return False
+
+
+def _codex_auth_json_secret_ref() -> str:
+    return (os.getenv("CODEX_AUTH_JSON_SECRET_REF") or "CODEX_AUTH_JSON").strip()
+
+
+def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
+    if not _harness_uses_proxy_auth(engine):
+        return []
+    if engine == "claude-code":
+        return [
+            OAuthTokenSecret(
+                name="CLAUDE_CODE_OAUTH",
+                grant="refresh_token",
+                hosts=("api.anthropic.com",),
+                fields=(
+                    (
+                        "client_id",
+                        OAuthFieldSource(
+                            "CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"
+                        ),
+                    ),
+                    (
+                        "refresh_token",
+                        OAuthFieldSource(
+                            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", source_kind="env"
+                        ),
+                    ),
+                ),
+                token_endpoint=_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT,
+            )
+        ]
+    return []
+
+
+def _harness_proxy_auth_env_keys(engine: str) -> tuple[str, ...]:
+    if not _harness_uses_proxy_auth(engine):
+        return ()
+    if engine == "claude-code":
+        return ("CLAUDE_CODE_OAUTH_CLIENT_ID", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+    return ()
+
+
+def _harness_codex_auth_json_secret_ref(engine: str) -> str | None:
+    if engine == "codex" and _harness_uses_proxy_auth(engine):
+        return _codex_auth_json_secret_ref()
+    return None
 
 
 def _get_rt(session: SandboxSession):
@@ -122,6 +185,21 @@ def _proxy_health_port() -> int:
     return _env_int("KUBERNETES_IRON_PROXY_HEALTH_PORT", 9090)
 
 
+def _op_connect_app_name() -> str:
+    return os.getenv("KUBERNETES_OP_CONNECT_APP_NAME", "onepassword-connect").strip()
+
+
+def _op_connect_port() -> int:
+    return _env_int("KUBERNETES_OP_CONNECT_PORT", 8080)
+
+
+def _uses_op_connect_secret_source() -> bool:
+    return (
+        os.getenv("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+        == "onepassword-connect"
+    )
+
+
 def _proxy_image() -> str:
     return os.getenv("KUBERNETES_IRON_PROXY_IMAGE", "centaur-iron-proxy:latest")
 
@@ -169,10 +247,7 @@ def _proxy_iron_env(
             },
         }
     ]
-    if (
-        os.getenv("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
-        == "onepassword-connect"
-    ):
+    if _uses_op_connect_secret_source():
         connect_host = os.getenv("KUBERNETES_OP_CONNECT_HOST", "").strip()
         if connect_host:
             env.append({"name": "OP_CONNECT_HOST", "value": connect_host})
@@ -547,10 +622,13 @@ class KubernetesExecutorBackend(SandboxBackend):
             if pod_name:
                 await self._delete_pod(pod_name)
 
-    def _collect_secrets(self) -> list[SecretDef]:
+    def _collect_secrets(self, engine: str | None = None) -> list[SecretDef]:
         from api.app import get_tool_manager
 
-        return get_tool_manager().collect_secrets()
+        secrets = get_tool_manager().collect_secrets()
+        if engine:
+            secrets = [*secrets, *_harness_proxy_auth_secrets(engine)]
+        return secrets
 
     def _resolved_pg_secrets(
         self, secrets: list[SecretDef]
@@ -575,9 +653,14 @@ class KubernetesExecutorBackend(SandboxBackend):
         sandbox_id: str,
         secrets: list[SecretDef],
         pg_listen_ports: dict[str, int],
+        *,
+        codex_auth_json_secret_ref: str | None = None,
     ) -> None:
         rendered = render_proxy_yaml(
-            secrets, base_config=None, pg_listen_ports=pg_listen_ports
+            secrets,
+            base_config=None,
+            pg_listen_ports=pg_listen_ports,
+            codex_auth_json_secret_ref=codex_auth_json_secret_ref,
         )
         name = _proxy_configmap_name(sandbox_id)
         await self._delete_configmap(name)
@@ -673,6 +756,32 @@ class KubernetesExecutorBackend(SandboxBackend):
         for _, port in sorted(pg_listen_ports.items(), key=lambda item: item[1]):
             sandbox_to_proxy_ports.append({"protocol": "TCP", "port": port})
 
+        proxy_egress = [
+            {
+                "to": [{"podSelector": {"matchLabels": _api_pod_match_labels()}}],
+                "ports": [{"protocol": "TCP", "port": 8000}],
+            },
+            {
+                "ports": [{"protocol": "TCP", "port": 443}],
+            },
+            {
+                "ports": [{"protocol": "TCP", "port": 5432}],
+            },
+        ]
+        if _uses_op_connect_secret_source():
+            proxy_egress.append(
+                {
+                    "to": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {"app": _op_connect_app_name()}
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": _op_connect_port()}],
+                }
+            )
+
         await self._networking_api().create_namespaced_network_policy(
             _namespace(),
             {
@@ -754,24 +863,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                             "ports": sandbox_to_proxy_ports,
                         }
                     ],
-                    "egress": [
-                        {
-                            "to": [
-                                {
-                                    "podSelector": {
-                                        "matchLabels": _api_pod_match_labels()
-                                    }
-                                }
-                            ],
-                            "ports": [{"protocol": "TCP", "port": 8000}],
-                        },
-                        {
-                            "ports": [{"protocol": "TCP", "port": 443}],
-                        },
-                        {
-                            "ports": [{"protocol": "TCP", "port": 5432}],
-                        },
-                    ],
+                    "egress": proxy_egress,
                 },
             },
         )
@@ -783,6 +875,7 @@ class KubernetesExecutorBackend(SandboxBackend):
         pg_listen_ports: dict[str, int],
         *,
         restart_policy: str,
+        harness_auth_env_keys: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Return the pod.spec dict shared by the sandbox bare Pod and the api-self Deployment."""
         configmap_name = _proxy_configmap_name(sandbox_id)
@@ -795,6 +888,20 @@ class KubernetesExecutorBackend(SandboxBackend):
             and bootstrap_secret_name
         ):
             env_from.append({"secretRef": {"name": bootstrap_secret_name}})
+        env = _proxy_iron_env(secret_name, pg_secrets)
+        for key in harness_auth_env_keys:
+            env.append(
+                {
+                    "name": key,
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": _harness_auth_secret_name(),
+                            "key": key,
+                            "optional": True,
+                        }
+                    },
+                }
+            )
         proxy_ports: list[dict[str, Any]] = [
             {"containerPort": _proxy_port(), "name": "proxy"},
             {"containerPort": _proxy_management_port(), "name": "management"},
@@ -816,7 +923,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                     "name": "iron-proxy",
                     "image": _proxy_image(),
                     "imagePullPolicy": _proxy_image_pull_policy(),
-                    "env": _proxy_iron_env(secret_name, pg_secrets),
+                    "env": env,
                     "envFrom": env_from,
                     "ports": proxy_ports,
                     "readinessProbe": {
@@ -884,10 +991,16 @@ class KubernetesExecutorBackend(SandboxBackend):
         sandbox_id: str,
         pg_secrets: list[tuple[PgDsnSecret, str]],
         pg_listen_ports: dict[str, int],
+        *,
+        harness_auth_env_keys: tuple[str, ...] = (),
     ) -> str:
         proxy_pod_name = _new_proxy_pod_name(sandbox_id)
         spec = self._build_proxy_pod_spec(
-            sandbox_id, pg_secrets, pg_listen_ports, restart_policy="Never"
+            sandbox_id,
+            pg_secrets,
+            pg_listen_ports,
+            harness_auth_env_keys=harness_auth_env_keys,
+            restart_policy="Never",
         )
         await self._core_api().create_namespaced_pod(
             _namespace(),
@@ -1035,7 +1148,7 @@ class KubernetesExecutorBackend(SandboxBackend):
         secret_name = _prompt_secret_name(pod_name)
         firewall_host = _proxy_service_name(pod_name)
 
-        secrets = self._collect_secrets()
+        secrets = self._collect_secrets(engine)
         pg_listen_ports = assign_pg_listen_ports(secrets)
         pg_secrets = self._resolved_pg_secrets(secrets)
         sandbox_pg_dsns = {
@@ -1052,6 +1165,7 @@ class KubernetesExecutorBackend(SandboxBackend):
             thread_key,
             pod_name,
             firewall_host,
+            engine=engine,
             trace_id=trace_id,
             resume_thread_id=resume_thread_id,
             pg_dsns=sandbox_pg_dsns,
@@ -1271,11 +1385,19 @@ class KubernetesExecutorBackend(SandboxBackend):
         await self._delete_proxy_resources(pod_name)
         try:
             await self._create_prompt_secret(secret_name, persona)
-            await self._create_proxy_configmap(pod_name, secrets, pg_listen_ports)
+            await self._create_proxy_configmap(
+                pod_name,
+                secrets,
+                pg_listen_ports,
+                codex_auth_json_secret_ref=_harness_codex_auth_json_secret_ref(engine),
+            )
             await self._create_proxy_service(pod_name, pg_listen_ports)
             await self._create_proxy_network_policies(pod_name, pg_listen_ports)
             proxy_pod_name = await self._create_proxy_pod(
-                pod_name, pg_secrets, pg_listen_ports
+                pod_name,
+                pg_secrets,
+                pg_listen_ports,
+                harness_auth_env_keys=_harness_proxy_auth_env_keys(engine),
             )
             await self._wait_pod_ready(proxy_pod_name)
             await self._core_api().create_namespaced_pod(_namespace(), pod_spec)

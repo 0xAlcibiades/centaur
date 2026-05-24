@@ -16,6 +16,7 @@ from api.sandbox.kubernetes import (
     STDOUT_CHANNEL,
 )
 from api.sandbox.registry import auto_configure
+from api.tool_manager import OAuthFieldSource
 
 
 class FakeCoreApi:
@@ -153,8 +154,21 @@ class FakeWsApiClient:
 def _default_per_sandbox_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME", "firewall-ca-key")
     monkeypatch.setenv("KUBERNETES_SECRET_ENV_NAME", "centaur-infra-env")
+    monkeypatch.delenv("KUBERNETES_HARNESS_AUTH_SECRET_NAME", raising=False)
     monkeypatch.delenv("KUBERNETES_BOOTSTRAP_SECRET_NAME", raising=False)
     monkeypatch.delenv("KUBERNETES_SANDBOX_CACHE_HOST_PATH", raising=False)
+    for key in (
+        "CODEX_USE_LOCAL_AUTH",
+        "CODEX_AUTH_JSON",
+        "CODEX_ACCESS_TOKEN",
+        "CLAUDE_USE_LOCAL_AUTH",
+        "CLAUDE_CREDENTIALS_JSON",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_pod_resources_uses_default_limits_when_unset(
@@ -195,7 +209,9 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
         "thread-key",
         "sandbox-id",
         "firewall.internal",
+        engine="codex",
         trace_id="00000000-0000-0000-0000-000000000123",
+        resume_thread_id="T-legacy",
     )
     env_map = dict(item.split("=", 1) for item in env)
 
@@ -207,6 +223,149 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
     assert env_map["CENTAUR_TRACE_ID"] == "00000000-0000-0000-0000-000000000123"
     assert env_map["NO_PROXY"] == "localhost,127.0.0.1,firewall.internal,api.internal"
     assert env_map["no_proxy"] == env_map["NO_PROXY"]
+    assert env_map["AMP_CONTINUE_THREAD_ID"] == "T-legacy"
+    assert "CODEX_CONTINUE_THREAD_ID" not in env_map
+
+
+def test_container_env_passes_proxy_local_auth_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv("CLAUDE_USE_LOCAL_AUTH", "true")
+
+    codex_env = dict(
+        item.split("=", 1)
+        for item in sandbox_container_env(
+            "thread-key", "sandbox-id", "firewall.internal", engine="codex"
+        )
+    )
+    claude_env = dict(
+        item.split("=", 1)
+        for item in sandbox_container_env(
+            "thread-key", "sandbox-id", "firewall.internal", engine="claude-code"
+        )
+    )
+    amp_env = dict(
+        item.split("=", 1)
+        for item in sandbox_container_env(
+            "thread-key", "sandbox-id", "firewall.internal", engine="amp"
+        )
+    )
+
+    assert codex_env["CODEX_USE_LOCAL_AUTH"] == "true"
+    assert codex_env["OPENAI_API_KEY"] == ""
+    assert codex_env["CODEX_API_KEY"] == ""
+    assert "CODEX_AUTH_JSON_FILE" not in codex_env
+    assert "CLAUDE_USE_LOCAL_AUTH" not in codex_env
+    assert "CODEX_USE_LOCAL_AUTH" not in claude_env
+    assert claude_env["CLAUDE_USE_LOCAL_AUTH"] == "true"
+    assert claude_env["ANTHROPIC_AUTH_TOKEN"] == "ANTHROPIC_AUTH_TOKEN"
+    assert claude_env["ANTHROPIC_API_KEY"] == ""
+    assert "CLAUDE_CREDENTIALS_JSON_FILE" not in claude_env
+    assert claude_env["CLAUDE_CONFIG_DIR"] == "/tmp/claude"
+    assert "CODEX_USE_LOCAL_AUTH" not in amp_env
+    assert "CLAUDE_USE_LOCAL_AUTH" not in amp_env
+
+
+def test_container_env_filters_raw_local_auth_from_extra_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_auth_env = {
+        "CODEX_USE_LOCAL_AUTH": "true",
+        "CODEX_AUTH_JSON": "codex-secret",
+        "CODEX_AUTH_JSON_SECRET_REF": "op://vault/item/field",
+        "CODEX_ACCESS_TOKEN": "codex-token",
+        "CLAUDE_USE_LOCAL_AUTH": "true",
+        "CLAUDE_CREDENTIALS_JSON": "claude-secret",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID": "claude-client-id",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "claude-refresh-token",
+        "ANTHROPIC_AUTH_TOKEN": "anthropic-token",
+    }
+    monkeypatch.setenv(
+        "KUBERNETES_SANDBOX_EXTRA_ENV",
+        json.dumps(
+            [{"name": name, "value": value} for name, value in local_auth_env.items()]
+        ),
+    )
+
+    env = sandbox_container_env(
+        "thread-key", "sandbox-id", "firewall.internal", engine="amp"
+    )
+    env_map = dict(item.split("=", 1) for item in env)
+
+    assert not (set(local_auth_env) & set(env_map))
+
+
+def test_harness_proxy_auth_secrets_are_engine_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import (
+        _harness_codex_auth_json_secret_ref,
+        _harness_proxy_auth_secrets,
+    )
+
+    monkeypatch.setenv("CODEX_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv("CLAUDE_USE_LOCAL_AUTH", "true")
+
+    claude = _harness_proxy_auth_secrets("claude-code")
+
+    assert _harness_proxy_auth_secrets("codex") == []
+    assert _harness_codex_auth_json_secret_ref("codex") == "CODEX_AUTH_JSON"
+    assert len(claude) == 1
+    secret = claude[0]
+    assert secret.name == "CLAUDE_CODE_OAUTH"
+    assert secret.grant == "refresh_token"
+    assert secret.hosts == ("api.anthropic.com",)
+    assert secret.token_endpoint == "https://platform.claude.com/v1/oauth/token"
+    assert dict(secret.fields) == {
+        "client_id": OAuthFieldSource("CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"),
+        "refresh_token": OAuthFieldSource(
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", source_kind="env"
+        ),
+    }
+    assert _harness_proxy_auth_secrets("amp") == []
+
+
+def test_proxy_pod_spec_can_receive_harness_auth_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERNETES_HARNESS_AUTH_SECRET_NAME", "custom-harness-auth")
+
+    backend = KubernetesExecutorBackend()
+    spec = backend._build_proxy_pod_spec(
+        "sandbox-id",
+        [],
+        {},
+        restart_policy="Never",
+        harness_auth_env_keys=(
+            "CLAUDE_CODE_OAUTH_CLIENT_ID",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        ),
+    )
+
+    assert spec["containers"][0]["envFrom"] == [
+        {"secretRef": {"name": "centaur-infra-env"}},
+    ]
+    assert {
+        "name": "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "custom-harness-auth",
+                "key": "CLAUDE_CODE_OAUTH_CLIENT_ID",
+                "optional": True,
+            }
+        },
+    } in spec["containers"][0]["env"]
+    assert {
+        "name": "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "custom-harness-auth",
+                "key": "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+                "optional": True,
+            }
+        },
+    } in spec["containers"][0]["env"]
 
 
 def test_container_env_can_pass_direct_github_token(
@@ -505,6 +664,8 @@ async def test_create_builds_pod_and_prompt_secret(
     monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE", "ghcr.io/tempoxyz/centaur-tempo:latest")
     monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE_PULL_POLICY", "Always")
     monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH", "/overlay")
+    monkeypatch.setenv("CODEX_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv("CLAUDE_USE_LOCAL_AUTH", "true")
     monkeypatch.setattr(
         "api.sandbox.kubernetes._prompt_bundle",
         lambda persona: f"prompt:{persona}",
@@ -585,6 +746,12 @@ async def test_create_builds_pod_and_prompt_secret(
     } in pod_body["spec"]["volumes"]
     assert any(
         volume["name"] == "overlay-root" for volume in pod_body["spec"]["volumes"]
+    )
+    assert not any(
+        volume["name"] == "harness-auth" for volume in pod_body["spec"]["volumes"]
+    )
+    assert not any(
+        mount["name"] == "harness-auth" for mount in container["volumeMounts"]
     )
     assert pod_body["spec"]["initContainers"] == [
         {
@@ -789,6 +956,14 @@ async def test_create_builds_per_sandbox_proxy_resources(
         "centaur.ai/iron-proxy": "true",
         "centaur.ai/sandbox-id": session.sandbox_id,
     }
+    assert not any(
+        egress.get("to", [{}])[0]
+        .get("podSelector", {})
+        .get("matchLabels", {})
+        .get("app")
+        == "onepassword-connect"
+        for egress in fake_networking.created_network_policies[1][1]["spec"]["egress"]
+    )
 
     replacement = await backend.create("slack:C123:123.456", "amp", "amp")
     assert replacement.sandbox_id != session.sandbox_id
@@ -819,6 +994,37 @@ async def test_per_sandbox_proxy_uses_bootstrap_secret_for_onepassword(
         {"secretRef": {"name": "centaur-infra-env"}},
         {"secretRef": {"name": "centaur-bootstrap"}},
     ]
+
+
+@pytest.mark.asyncio
+async def test_per_sandbox_proxy_allows_onepassword_connect_egress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_networking = FakeNetworkingApi()
+    backend._networking = fake_networking
+    monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
+    monkeypatch.setenv(
+        "KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE", "onepassword-connect"
+    )
+    monkeypatch.setenv("KUBERNETES_OP_CONNECT_APP_NAME", "custom-connect")
+    monkeypatch.setenv("KUBERNETES_OP_CONNECT_PORT", "8181")
+
+    await backend._create_proxy_network_policies("sandbox-pod", {})
+
+    proxy_policy = fake_networking.created_network_policies[1][1]
+    assert {
+        "to": [
+            {
+                "podSelector": {
+                    "matchLabels": {
+                        "app": "custom-connect",
+                    }
+                }
+            }
+        ],
+        "ports": [{"protocol": "TCP", "port": 8181}],
+    } in proxy_policy["spec"]["egress"]
 
 
 @pytest.mark.asyncio

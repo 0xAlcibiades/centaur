@@ -86,6 +86,16 @@ is_placeholder_secret() {
     esac
 }
 
+truthy_env() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "${value,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
@@ -274,19 +284,28 @@ if [ -x "$HARNESS_ADAPTER" ]; then
     "$HARNESS_ADAPTER" "${1:-}" "$TARGET_PROMPT"
 fi
 
+CODEX_LOCAL_AUTH_LOADED=0
+if truthy_env "${CODEX_USE_LOCAL_AUTH:-}"; then
+    mkdir -p "$HOME_DIR/.codex"
+    cat > "$HOME_DIR/.codex/auth.json" <<'JSON'
+{"auth_mode":"chatgpt","last_refresh":"1970-01-01T00:00:00Z","tokens":{"access_token":"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImVtYWlsIjoiaXJvbi1wcm94eS1jb2RleC1zdHViQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vcHJvZmlsZSI6eyJlbWFpbCI6Imlyb24tcHJveHktY29kZXgtc3R1YkBleGFtcGxlLmludmFsaWQifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7InVzZXJfaWQiOiJpcm9uLXByb3h5LWNvZGV4LXN0dWItdXNlciIsImNoYXRncHRfdXNlcl9pZCI6Imlyb24tcHJveHktY29kZXgtc3R1Yi11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiaXJvbi1wcm94eS1jb2RleC1zdHViLWFjY291bnQiLCJjaGF0Z3B0X2FjY291bnRfaXNfZmVkcmFtcCI6ZmFsc2V9fQ.stub-signature","refresh_token":"iron-proxy-codex-stub-refresh-token","id_token":"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImVtYWlsIjoiaXJvbi1wcm94eS1jb2RleC1zdHViQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vcHJvZmlsZSI6eyJlbWFpbCI6Imlyb24tcHJveHktY29kZXgtc3R1YkBleGFtcGxlLmludmFsaWQifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7InVzZXJfaWQiOiJpcm9uLXByb3h5LWNvZGV4LXN0dWItdXNlciIsImNoYXRncHRfdXNlcl9pZCI6Imlyb24tcHJveHktY29kZXgtc3R1Yi11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiaXJvbi1wcm94eS1jb2RleC1zdHViLWFjY291bnQiLCJjaGF0Z3B0X2FjY291bnRfaXNfZmVkcmFtcCI6ZmFsc2V9fQ.stub-signature","account_id":"iron-proxy-codex-stub-account"}}
+JSON
+    chmod 600 "$HOME_DIR/.codex/auth.json"
+    CODEX_LOCAL_AUTH_LOADED=1
+    unset CODEX_API_KEY OPENAI_API_KEY
+fi
+unset CODEX_AUTH_JSON CODEX_AUTH_JSON_FILE CODEX_ACCESS_TOKEN CODEX_PROXY_AUTH
+
 # Codex reads its auth file when the app server starts. Complete this before
 # signaling readiness, otherwise warm pods can be claimed with no auth loaded.
-if [ -n "${CODEX_AUTH_JSON:-}" ]; then
-    printf '%s' "$CODEX_AUTH_JSON" > "$HOME_DIR/.codex/auth.json"
-    chmod 600 "$HOME_DIR/.codex/auth.json"
+if [ "$CODEX_LOCAL_AUTH_LOADED" != "1" ]; then
+    CODEX_KEY="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
+    if ! is_placeholder_secret "$CODEX_KEY"; then
+        echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true
+    fi
 fi
-CODEX_KEY="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
-if [ "$CODEX_KEY" = "CODEX_API_KEY" ] || [ "$CODEX_KEY" = "OPENAI_API_KEY" ]; then
-    CODEX_KEY=""
-fi
-if [ -n "$CODEX_KEY" ]; then
-    echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true
-fi
+
+unset CLAUDE_CREDENTIALS_JSON CLAUDE_CREDENTIALS_JSON_FILE
 
 # Signal readiness
 touch "$HOME_DIR/.ready"

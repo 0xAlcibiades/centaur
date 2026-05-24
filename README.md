@@ -138,6 +138,29 @@ What they are for:
 - `SLACK_SIGNING_SECRET`: verifies incoming Slack requests
 - `SLACKBOT_API_KEY`: API key the Slackbot uses to call Centaur
 
+Application-level model and tool secrets, such as `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `AMP_API_KEY`, and `GITHUB_TOKEN`, should live in
+1Password or the configured [iron-proxy](https://docs.iron.sh) secret source.
+Sandboxes receive placeholder values and [iron-proxy](https://docs.iron.sh)
+injects the real credentials only on approved outbound requests.
+
+Codex and Claude Code can also use local CLI OAuth/subscription auth, but that
+path is explicit opt-in. Codex reconstructs its login file inside matching
+sandboxes; Claude Code uses its refresh token through iron-proxy by default.
+To import local auth payloads into `.env.local`, run:
+
+```bash
+bun run auth:bootstrap
+```
+
+If a login is missing, run the printed command yourself or use
+`bun run auth:bootstrap -- --login` to stream the Codex device flow or Claude
+Code login flow. Then `source .env.local` before `just bootstrap-secrets` and
+`just bootstrap-secrets` will create or patch a separate
+`centaur-harness-auth` Secret for those payloads. Enable the matching sandbox
+flags, such as `CODEX_USE_LOCAL_AUTH=true` or `CLAUDE_USE_LOCAL_AUTH=true`,
+only for deployments that need local auth.
+
 Then create local Kubernetes Secrets from those environment variables and boot the stack:
 
 ```bash

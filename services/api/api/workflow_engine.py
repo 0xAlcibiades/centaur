@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from api.agent import _insert_system_message
 from api import slackbot_client
 from api.runtime_control import (
     ControlPlaneError,
@@ -972,6 +973,44 @@ async def _compute_agent_session_header(
     )
 
 
+def _history_has_assistant_message(history_messages: Any) -> bool:
+    if not isinstance(history_messages, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("role") or "").strip().lower() == "assistant"
+        for item in history_messages
+    )
+
+
+async def _thread_has_prior_slack_agent_reply(pool, thread_key: str) -> bool:
+    if await pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM agent_execution_requests "
+        "WHERE thread_key = $1 AND COALESCE(delivery->>'platform', '') = 'slack' "
+        "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '')",
+        thread_key,
+    ):
+        return True
+    return bool(
+        await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM agent_message_requests "
+            "WHERE thread_key = $1 AND event_json->>'type' = 'assistant')",
+            thread_key,
+        )
+    )
+
+
+async def _should_show_agent_session_header(
+    pool,
+    *,
+    thread_key: str,
+    history_messages: Any,
+) -> bool:
+    if _history_has_assistant_message(history_messages):
+        return False
+    return not await _thread_has_prior_slack_agent_reply(pool, thread_key)
+
+
 def _assignment_display_engine(active: dict[str, Any]) -> str | None:
     engine = _nonempty(active.get("engine"))
     if engine:
@@ -1181,8 +1220,18 @@ async def do_agent_turn(
         session_title = await _compute_agent_session_title(
             ctx._pool, effective_thread_key, selector,
         )
-        session_header = await _compute_agent_session_header(
-            ctx._pool, effective_thread_key, selector,
+        session_header = (
+            await _compute_agent_session_header(
+                ctx._pool,
+                effective_thread_key,
+                selector,
+            )
+            if await _should_show_agent_session_header(
+                ctx._pool,
+                thread_key=effective_thread_key,
+                history_messages=effective_history,
+            )
+            else None
         )
         slackbot_session_id = await slackbot_client.open_agent_session(
             delivery=effective_delivery,
@@ -1194,6 +1243,23 @@ async def do_agent_turn(
         if slackbot_session_id:
             effective_metadata["slackbot_agent_session_id"] = slackbot_session_id
             effective_metadata["slackbot_live_delivery"] = True
+
+        effective_platform = str(effective_delivery.get("platform") or "").strip().lower()
+        if effective_platform == "slack" or effective_thread_key.startswith("slack:"):
+            requester_user_id = (
+                str(
+                    effective_delivery.get("recipient_user_id")
+                    or effective_delivery.get("user_id")
+                    or effective_metadata.get("user_id")
+                    or "",
+                ).strip()
+                or None
+            )
+            await _insert_system_message(
+                effective_thread_key,
+                effective_platform or "slack",
+                user_id=requester_user_id,
+            )
 
         if isinstance(effective_history, list):
             backfilled = 0

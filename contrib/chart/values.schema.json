@@ -47,6 +47,12 @@
         "bootstrapSecretName": { "type": "string" }
       }
     },
+    "harnessAuth": {
+      "type": "object",
+      "properties": {
+        "existingSecretName": { "type": "string" }
+      }
+    },
     "api": {
       "type": "object",
       "properties": {
@@ -130,6 +136,17 @@
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "subPath": { "type": "string" }
+          }
+        }
       }
     },
     "runnerAccess": {

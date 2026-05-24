@@ -49,6 +49,23 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 ARG CLAUDE_CODE_VERSION=2.1.143
 ARG CODEX_VERSION=0.130.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
+ARG NUSHELL_VERSION=0.112.2
+
+# ── Nushell ─────────────────────────────────────────────────────────────────
+RUN set -eux; \
+    nu_arch="$(case "$(dpkg --print-architecture)" in \
+      amd64) echo x86_64 ;; \
+      arm64) echo aarch64 ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac)"; \
+    curl -fsSL \
+      "https://github.com/nushell/nushell/releases/download/${NUSHELL_VERSION}/nu-${NUSHELL_VERSION}-${nu_arch}-unknown-linux-gnu.tar.gz" \
+      -o /tmp/nu.tar.gz; \
+    mkdir -p /tmp/nu; \
+    tar -xzf /tmp/nu.tar.gz -C /tmp/nu --strip-components=1; \
+    install -m 0755 /tmp/nu/nu /usr/local/bin/nu; \
+    rm -rf /tmp/nu /tmp/nu.tar.gz; \
+    nu --version | grep -F "${NUSHELL_VERSION}"
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
 RUN npm install -g --prefer-online --force \

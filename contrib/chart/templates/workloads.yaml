@@ -75,6 +75,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+              {{- with .Values.postgres.persistence.subPath }}
+              subPath: {{ . | quote }}
+              {{- end }}
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
@@ -292,6 +295,8 @@ spec:
               value: {{ include "centaur.secretEnvName" . | quote }}
             - name: KUBERNETES_SECRET_ENV_PREFIX
               value: {{ .Values.secretManager.envPrefix | quote }}
+            - name: KUBERNETES_HARNESS_AUTH_SECRET_NAME
+              value: {{ .Values.harnessAuth.existingSecretName | quote }}
 {{- if .Values.secrets.bootstrapSecretName }}
             - name: KUBERNETES_BOOTSTRAP_SECRET_NAME
               value: {{ .Values.secrets.bootstrapSecretName | quote }}

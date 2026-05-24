@@ -17,6 +17,10 @@ set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
                                creates Secret centaur-onepassword-connect-credentials
   OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
+  CLAUDE_CODE_OAUTH_CLIENT_ID
+                               Claude Code public OAuth client id; added to centaur-harness-auth
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+                               Claude Code OAuth refresh token; added to centaur-harness-auth
 EOF
 }
 
@@ -80,28 +84,36 @@ require_env SLACK_BOT_TOKEN
 require_env SLACK_SIGNING_SECRET
 require_env SLACKBOT_API_KEY
 
+optional_secret_env_names=(
+  LMNR_PROJECT_API_KEY
+  LMNR_BASE_URL
+  OP_CONNECT_TOKEN
+)
+
+harness_auth_env_names=(
+  CLAUDE_CODE_OAUTH_CLIENT_ID
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+)
+
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 delete_if_forced centaur-infra-env
 delete_if_forced centaur-firewall-ca
 delete_if_forced centaur-firewall-ca-key
 delete_if_forced centaur-onepassword-connect-credentials
+delete_if_forced centaur-harness-auth
 
 if secret_exists centaur-infra-env; then
   patch_data=()
-  if [[ -n "${LMNR_PROJECT_API_KEY:-}" ]]; then
-    patch_data+=("\"LMNR_PROJECT_API_KEY\":\"$(printf '%s' "$LMNR_PROJECT_API_KEY" | base64 | tr -d '\n')\"")
-  fi
-  if [[ -n "${LMNR_BASE_URL:-}" ]]; then
-    patch_data+=("\"LMNR_BASE_URL\":\"$(printf '%s' "$LMNR_BASE_URL" | base64 | tr -d '\n')\"")
-  fi
-  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
-    patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
-  fi
+  for name in "${optional_secret_env_names[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
+    fi
+  done
   if [[ "${#patch_data[@]}" -gt 0 ]]; then
     patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
-    echo "Updated optional Laminar keys in Secret centaur-infra-env in namespace $NAMESPACE"
+    echo "Updated optional keys in Secret centaur-infra-env in namespace $NAMESPACE"
   fi
   echo "Secret centaur-infra-env already exists in namespace $NAMESPACE; leaving unchanged"
 else
@@ -119,17 +131,36 @@ else
     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
     --from-literal=DATABASE_URL="$DATABASE_URL"
   )
-  if [[ -n "${LMNR_PROJECT_API_KEY:-}" ]]; then
-    secret_args+=(--from-literal=LMNR_PROJECT_API_KEY="$LMNR_PROJECT_API_KEY")
-  fi
-  if [[ -n "${LMNR_BASE_URL:-}" ]]; then
-    secret_args+=(--from-literal=LMNR_BASE_URL="$LMNR_BASE_URL")
-  fi
-  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
-    secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
-  fi
+  for name in "${optional_secret_env_names[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      secret_args+=(--from-literal="$name=${!name}")
+    fi
+  done
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
+fi
+
+harness_auth_args=()
+for name in "${harness_auth_env_names[@]}"; do
+  if [[ -n "${!name:-}" ]]; then
+    harness_auth_args+=(--from-literal="$name=${!name}")
+  fi
+done
+if [[ "${#harness_auth_args[@]}" -gt 0 ]]; then
+  if secret_exists centaur-harness-auth; then
+    patch_data=()
+    for name in "${harness_auth_env_names[@]}"; do
+      if [[ -n "${!name:-}" ]]; then
+        patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
+      fi
+    done
+    patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
+    kubectl -n "$NAMESPACE" patch secret centaur-harness-auth --type merge -p "$patch_json" >/dev/null
+    echo "Updated local auth payload keys in Secret centaur-harness-auth in namespace $NAMESPACE"
+  else
+    kubectl -n "$NAMESPACE" create secret generic centaur-harness-auth "${harness_auth_args[@]}" >/dev/null
+    echo "Created Secret centaur-harness-auth in namespace $NAMESPACE"
+  fi
 fi
 
 if secret_exists centaur-firewall-ca && secret_exists centaur-firewall-ca-key; then

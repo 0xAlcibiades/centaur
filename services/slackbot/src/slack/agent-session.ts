@@ -660,9 +660,30 @@ function finalMarkdownForFinalBlocks(
   if (opts.includeStreamedText || !segment.streamedText.trim()) {
     return clipText(trimmed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
   }
+  const streamedPrefix = unstreamedMarkdownAfterLivePrefix(markdown, segment.streamedText)
+  if (streamedPrefix !== null) {
+    return clipText(streamedPrefix, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+  }
   const unstreamed = markdown.slice(segment.streamedTextSourceChars).trim()
   if (!unstreamed) return ''
   return clipText(unstreamed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+}
+
+function unstreamedMarkdownAfterLivePrefix(markdown: string, streamedText: string): string | null {
+  if (!streamedText.trim()) return null
+  if (markdown.startsWith(streamedText)) return markdown.slice(streamedText.length).trim()
+
+  const normalizedMarkdown = normalizeFinalMarkdownPrefix(markdown)
+  const normalizedStreamed = normalizeFinalMarkdownPrefix(streamedText)
+  if (!normalizedMarkdown.startsWith(normalizedStreamed)) return null
+  return normalizedMarkdown.slice(normalizedStreamed.length).trim()
+}
+
+function normalizeFinalMarkdownPrefix(markdown: string): string {
+  return markdown
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .trim()
 }
 
 function clipText(value: string, maxChars: number): string {

@@ -44,6 +44,18 @@ _CLAUDE_HARDENING_ENV = (
     ("DISABLE_UPDATES", "1"),
 )
 
+_LOCAL_AUTH_EXTRA_ENV_KEYS = {
+    "CODEX_USE_LOCAL_AUTH",
+    "CODEX_AUTH_JSON",
+    "CODEX_AUTH_JSON_SECRET_REF",
+    "CODEX_ACCESS_TOKEN",
+    "CLAUDE_USE_LOCAL_AUTH",
+    "CLAUDE_CREDENTIALS_JSON",
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+}
+
 
 def _set_env(env: list[str], name: str, value: str) -> None:
     prefix = f"{name}="
@@ -57,6 +69,15 @@ def _set_env(env: list[str], name: str, value: str) -> None:
 
 def _env_flag(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sandbox_env_flag(name: str, extra_env: list[tuple[str, str]] | None = None) -> bool:
+    if extra_env is None:
+        extra_env = _sandbox_extra_env()
+    for key, value in reversed(extra_env):
+        if key == name:
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+    return _env_flag(name)
 
 
 def _sandbox_direct_github_token() -> str | None:
@@ -131,6 +152,7 @@ def container_env(
     container_name: str,
     firewall_host: str,
     *,
+    engine: str | None = None,
     trace_id: str | None = None,
     resume_thread_id: str | None = None,
     pg_dsns: dict[str, str] | None = None,
@@ -144,6 +166,7 @@ def container_env(
     """
     api_key = mint_sandbox_token(thread_key, container_name)
     api_url = os.getenv("AGENT_API_URL", "http://api:8000")
+    extra_env = _sandbox_extra_env()
 
     env = [
         f"CENTAUR_API_URL={api_url}",
@@ -177,6 +200,17 @@ def container_env(
         value = (os.getenv(key) or "").strip()
         if value:
             env.append(f"{key}={value}")
+    if engine == "codex" and sandbox_env_flag("CODEX_USE_LOCAL_AUTH", extra_env):
+        env.append("CODEX_USE_LOCAL_AUTH=true")
+        _set_env(env, "OPENAI_API_KEY", "")
+        _set_env(env, "CODEX_API_KEY", "")
+    if engine == "claude-code" and sandbox_env_flag(
+        "CLAUDE_USE_LOCAL_AUTH", extra_env
+    ):
+        env.append("CLAUDE_USE_LOCAL_AUTH=true")
+        _set_env(env, "ANTHROPIC_API_KEY", "")
+        env.append("ANTHROPIC_AUTH_TOKEN=ANTHROPIC_AUTH_TOKEN")
+        env.append("CLAUDE_CONFIG_DIR=/tmp/claude")
     for key, value in _CLAUDE_HARDENING_ENV:
         env.append(f"{key}={value}")
     env.extend(
@@ -199,7 +233,9 @@ def container_env(
         for name, dsn in pg_dsns.items():
             env.append(f"{name}={dsn}")
 
-    for name, value in _sandbox_extra_env():
+    for name, value in extra_env:
+        if name in _LOCAL_AUTH_EXTRA_ENV_KEYS:
+            continue
         _set_env(env, name, value)
 
     return env

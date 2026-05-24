@@ -109,6 +109,30 @@ def test_configure_trace_context_ignores_invalid_trace_id(monkeypatch) -> None:
     assert "TRACEPARENT" not in wrapper.os.environ
 
 
+def test_resume_uses_amp_var(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.delenv("CODEX_CONTINUE_THREAD_ID", raising=False)
+    monkeypatch.setenv("AMP_CONTINUE_THREAD_ID", "legacy-thread")
+    monkeypatch.setattr(wrapper.os, "getcwd", lambda: "/workspace")
+    calls = []
+
+    def fake_request(method, params=None, timeout=30.0):
+        calls.append((method, params, timeout))
+        return {"thread": {"id": params["threadId"]}}
+
+    monkeypatch.setattr(wrapper, "request", fake_request)
+    wrapper.THREAD_ID = None
+
+    assert wrapper.start_or_resume_thread() == "legacy-thread"
+    assert calls == [
+        (
+            "thread/resume",
+            {"threadId": "legacy-thread", "cwd": "/workspace"},
+            60,
+        )
+    ]
+
+
 def test_request_attaches_traceparent(monkeypatch) -> None:
     wrapper = _load_wrapper()
     sent: list[dict] = []

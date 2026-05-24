@@ -1032,6 +1032,38 @@ def test_render_oauth_token_field_omits_json_key_for_whole_secret(
     assert tokens[0]["client_id"] == {"type": "env", "var": "OAUTH_CLIENT_ID"}
 
 
+def test_render_oauth_token_field_can_force_env_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+    secrets = [
+        OAuthTokenSecret(
+            name="OAUTH_APP",
+            grant="client_credentials",
+            hosts=("api.example.com",),
+            fields=(
+                (
+                    "client_id",
+                    OAuthFieldSource("OAUTH_CLIENT_ID", source_kind="env"),
+                ),
+                (
+                    "client_secret",
+                    OAuthFieldSource("OAUTH_CLIENT_SECRET", source_kind="env"),
+                ),
+            ),
+        )
+    ]
+    cfg = yaml.safe_load(render_proxy_yaml(secrets))
+    tokens = next(
+        t for t in cfg["transforms"] if t["name"] == "oauth_token"
+    )["config"]["tokens"]
+    assert tokens[0]["client_id"] == {"type": "env", "var": "OAUTH_CLIENT_ID"}
+    assert tokens[0]["client_secret"] == {
+        "type": "env",
+        "var": "OAUTH_CLIENT_SECRET",
+    }
+
+
 def test_render_oauth_token_merges_entries_by_token_identity() -> None:
     secrets = [
         OAuthTokenSecret(
@@ -1211,6 +1243,38 @@ def test_render_oauth_token_emits_token_endpoint_when_set() -> None:
         t for t in cfg["transforms"] if t["name"] == "oauth_token"
     )["config"]["tokens"]
     assert tokens[0]["token_endpoint"] == "https://login.example.com/oauth2/token"
+
+
+def test_render_codex_login_transform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+    monkeypatch.setenv("OP_VAULT", "ai-agents")
+    cfg = yaml.safe_load(
+        render_proxy_yaml([], codex_auth_json_secret_ref="CODEX_AUTH_JSON")
+    )
+
+    transform = next(t for t in cfg["transforms"] if t["name"] == "codex_login")
+    auth_json = transform["config"]["auth_json"]
+    assert auth_json["source"] == {
+        "type": "1password",
+        "secret_ref": "op://ai-agents/CODEX_AUTH_JSON/credential",
+        "ttl": "10m",
+    }
+    assert auth_json["writeback"] == {
+        "type": "1password",
+        "secret_ref": "op://ai-agents/CODEX_AUTH_JSON/credential",
+    }
+    assert transform["config"]["rules"] == [
+        {"host": "chatgpt.com", "paths": ["/backend-api/codex/*"]}
+    ]
+
+
+def test_render_codex_login_rejects_env_secret_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "env")
+
+    with pytest.raises(ValueError, match="codex_login requires"):
+        render_proxy_yaml([], codex_auth_json_secret_ref="CODEX_AUTH_JSON")
 
 
 _RENDER_JWT_BEARER_FIELDS = (
@@ -1441,7 +1505,10 @@ def test_render_emits_postgres_listeners_with_env_refs(
     ]
     cfg = yaml.safe_load(render_proxy_yaml(secrets))
     listeners = cfg["postgres"]
-    assert [l["name"] for l in listeners] == ["analytics_pg", "database_url"]
+    assert [listener["name"] for listener in listeners] == [
+        "analytics_pg",
+        "database_url",
+    ]
     assert listeners[0]["listen"] == "0.0.0.0:5432"
     assert listeners[1]["listen"] == "0.0.0.0:5433"
     # upstream.dsn uses the secret_ref directly so iron-proxy can resolve it

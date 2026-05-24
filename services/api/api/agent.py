@@ -544,15 +544,33 @@ async def _get_last_delivered_id(thread_key: str) -> str | None:
 
 
 async def _get_latest_thread_user_id(thread_key: str) -> str | None:
-    """Return the most recent user id recorded for this thread."""
+    """Return the most recent user id recorded for this thread.
+
+    Slack turns can surface the requester in several durable rows depending on
+    where execution is when prompt context is assembled. Prefer the newest row
+    across those sources so the session context does not depend on one caller
+    preserving one specific delivery field.
+    """
     pool = _get_pool()
     row = await pool.fetchrow(
-        "SELECT COALESCE(user_id, metadata->>'user_id') AS user_id "
-        "FROM chat_messages "
-        "WHERE thread_key = $1 "
-        "AND role = 'user' "
-        "AND COALESCE(user_id, metadata->>'user_id') IS NOT NULL "
-        "ORDER BY created_at DESC "
+        "WITH candidates AS ("
+        "  SELECT COALESCE(user_id, metadata->>'user_id') AS user_id, created_at, 1 AS source_rank "
+        "  FROM chat_messages "
+        "  WHERE thread_key = $1 AND role = 'user' "
+        "  UNION ALL "
+        "  SELECT COALESCE(metadata->>'user_id', delivery->>'recipient_user_id', delivery->>'user_id') "
+        "    AS user_id, created_at, 2 AS source_rank "
+        "  FROM agent_execution_requests "
+        "  WHERE thread_key = $1 "
+        "  UNION ALL "
+        "  SELECT COALESCE(input_json->>'user_id', input_json#>>'{delivery,recipient_user_id}', "
+        "    input_json#>>'{delivery,user_id}') AS user_id, created_at, 3 AS source_rank "
+        "  FROM workflow_runs "
+        "  WHERE thread_key = $1 AND workflow_name = 'slack_thread_turn' "
+        ") "
+        "SELECT user_id FROM candidates "
+        "WHERE user_id IS NOT NULL AND btrim(user_id) <> '' "
+        "ORDER BY created_at DESC, source_rank ASC "
         "LIMIT 1",
         thread_key,
     )
@@ -744,23 +762,35 @@ async def _resolve_requester_identity(
 
 async def _insert_system_message(
     thread_key: str,
-    platform: str,
+    platform: str | None,
     *,
     user_id: str | None = None,
 ) -> None:
     """Insert a static system message with platform formatting rules (idempotent)."""
     pool = _get_pool()
-    msg_id = f"system-{thread_key}-{platform}"
+    effective_platform = platform or ("slack" if thread_key.startswith("slack:") else None)
+    msg_id = f"system-{thread_key}-{effective_platform or 'generic'}"
     effective_user_id = user_id or await _get_latest_thread_user_id(thread_key)
     requester_identity = await _resolve_requester_identity(
-        platform=platform,
+        platform=effective_platform,
         user_id=effective_user_id,
     )
     context = _build_session_context(
         thread_key,
-        platform=platform,
+        platform=effective_platform,
         user_id=effective_user_id,
         requester_identity=requester_identity,
+    )
+    log.info(
+        "session_context_prepared",
+        thread_key=thread_key,
+        platform=effective_platform,
+        explicit_user_id=bool(user_id),
+        effective_user_id=bool(effective_user_id),
+        requester_identity=bool(requester_identity),
+        github_handle_verified=bool(
+            requester_identity and requester_identity.get("github_handle_verified")
+        ),
     )
     await pool.execute(
         "INSERT INTO chat_messages (id, thread_key, role, parts, metadata) "
@@ -1025,13 +1055,23 @@ def _build_session_context(
         else:
             lines.append("- Git coauthor trailer: unavailable")
         if requester_identity.get("github_handle_verified"):
+            github_handle = requester_identity["github_handle"]
+            github_login = github_handle.removeprefix("@")
             lines.extend(
                 [
                     "- GitHub handle from Slack profile: "
-                    f"{requester_identity['github_handle']}",
+                    f"{github_handle}",
                     "- GitHub handle source: "
                     f"{requester_identity['github_handle_source']}",
                     "- GitHub handle verified: yes",
+                    "",
+                    "## GitHub PR Attribution",
+                    "",
+                    "- If you create a GitHub PR for this Slack request, "
+                    f"the PR body MUST contain this standalone line: `Prompted by: {github_handle}`",
+                    "- This is a GitHub PR body requirement, not a Slack response mention rule.",
+                    "- Assign the PR to the requester when possible: "
+                    f"`{github_login}`",
                 ]
             )
         else:
@@ -1041,6 +1081,12 @@ def _build_session_context(
                     "- GitHub handle unavailable reason: "
                     f"{requester_identity['github_handle_unavailable_reason']}",
                     "- GitHub handle verified: no",
+                    "",
+                    "## GitHub PR Attribution",
+                    "",
+                    "- If you create a GitHub PR for this Slack request, do not infer a GitHub "
+                    "username from Slack display name, real name, or email.",
+                    "- Omit the `Prompted by` line unless a verified GitHub handle is present.",
                 ]
             )
 
@@ -1057,11 +1103,14 @@ def _build_session_context(
                 "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
                 "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
                 "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+                "- For links to Slack threads or messages, always use the canonical `https://slack.com/archives/{CHANNEL_ID}/p{TS_WITHOUT_DOT}` form. Slack redirects this to the correct workspace. Do not invent or hardcode a `<workspace>.slack.com` subdomain.",
             ]
         )
         if user_id:
             lines.append(
-                f"- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"
+                "- For Slack replies after completing a long task, tag the requester with "
+                f"their real Slack mention: <@{user_id}>. This Slack reply rule does not "
+                "replace GitHub PR attribution requirements."
             )
 
     lines.extend(["", "---", ""])
@@ -1306,8 +1355,13 @@ async def stream_connect(
     """
     rt = _get_runtime(session.sandbox_id)
 
-    if platform:
-        await _insert_system_message(session.thread_key, platform, user_id=user_id)
+    effective_platform = platform or ("slack" if session.thread_key.startswith("slack:") else None)
+    if effective_platform:
+        await _insert_system_message(
+            session.thread_key,
+            effective_platform,
+            user_id=user_id,
+        )
 
     backend = get_backend()
     await backend.attach(session)
@@ -1394,8 +1448,13 @@ async def inject_stdin(
     """
     rt = _get_runtime(session.sandbox_id)
 
-    if platform:
-        await _insert_system_message(session.thread_key, platform, user_id=user_id)
+    effective_platform = platform or ("slack" if session.thread_key.startswith("slack:") else None)
+    if effective_platform:
+        await _insert_system_message(
+            session.thread_key,
+            effective_platform,
+            user_id=user_id,
+        )
 
     last_delivered_id = await _get_last_delivered_id(session.thread_key)
     flushed = await _flush_pending(session.thread_key, last_delivered_id)

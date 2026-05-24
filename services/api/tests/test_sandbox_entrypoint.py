@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
 
 ENTRYPOINT_SH = Path(__file__).resolve().parents[2] / "sandbox" / "entrypoint.sh"
+CODEX_STUB_ACCOUNT_ID = "iron-proxy-codex-stub-account"
 
 
 def _write_codex_harness_config(home: Path) -> Path:
@@ -54,6 +57,18 @@ def _write_codex_harness_config(home: Path) -> Path:
         )
     )
     return harness_dir
+
+
+def _assert_codex_stub_jwt(token: str) -> None:
+    parts = token.split(".")
+    assert len(parts) == 3
+    assert all(parts)
+    payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+    assert payload["exp"] > int(time.time()) + 86400
+    assert (
+        payload["https://api.openai.com/auth"]["chatgpt_account_id"]
+        == CODEX_STUB_ACCOUNT_ID
+    )
 
 
 def test_sandbox_entrypoint_bootstraps_mock_google_adc(tmp_path: Path) -> None:
@@ -136,6 +151,136 @@ def test_sandbox_entrypoint_installs_codex_harness_config(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout == (harness_dir / "codex" / "config.toml").read_text()
+
+
+def test_sandbox_entrypoint_writes_codex_proxy_auth_stub(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            'printf "%s/%s\\n" "${OPENAI_API_KEY-unset}" '
+            '"${CODEX_API_KEY-unset}"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+            "CODEX_USE_LOCAL_AUTH": "true",
+            "OPENAI_API_KEY": "OPENAI_API_KEY",
+            "CODEX_API_KEY": "CODEX_API_KEY",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    auth = json.loads((home / ".codex" / "auth.json").read_text())
+    assert auth["auth_mode"] == "chatgpt"
+    _assert_codex_stub_jwt(auth["tokens"]["access_token"])
+    _assert_codex_stub_jwt(auth["tokens"]["id_token"])
+    assert auth["tokens"]["refresh_token"] == "iron-proxy-codex-stub-refresh-token"
+    assert auth["tokens"]["account_id"] == CODEX_STUB_ACCOUNT_ID
+    assert result.stdout.splitlines()[-1] == "unset/unset"
+
+
+def test_sandbox_entrypoint_keeps_claude_api_key_without_credentials(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            'printf "%s\\n" "$ANTHROPIC_API_KEY"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+            "CLAUDE_USE_LOCAL_AUTH": "true",
+            "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "ANTHROPIC_API_KEY"
+
+
+def test_sandbox_entrypoint_codex_local_auth_does_not_fallback_to_api_keys(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            'printf "%s/%s/%s\\n" "${OPENAI_API_KEY-unset}" '
+            '"${CODEX_API_KEY-unset}" "$ANTHROPIC_API_KEY"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+            "CODEX_USE_LOCAL_AUTH": "true",
+            "OPENAI_API_KEY": "OPENAI_API_KEY",
+            "CODEX_API_KEY": "CODEX_API_KEY",
+            "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "unset/unset/ANTHROPIC_API_KEY"
+
+
+def test_sandbox_entrypoint_keeps_claude_proxy_local_auth_placeholder(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            'printf "%s/%s\\n" "$ANTHROPIC_AUTH_TOKEN" "${ANTHROPIC_API_KEY-unset}"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+            "CLAUDE_USE_LOCAL_AUTH": "true",
+            "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "ANTHROPIC_AUTH_TOKEN/"
 
 
 def test_sandbox_entrypoint_appends_codex_laminar_otel_config(tmp_path: Path) -> None:
@@ -305,7 +450,7 @@ def test_sandbox_entrypoint_imports_claude_skills_before_linking(tmp_path: Path)
     (agents_skills / "verify-pr-review").symlink_to(
         "../../.claude/skills/verify-pr-review"
     )
-    subprocess.run(["git", "add", ".claude", ".agents"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-f", ".claude", ".agents"], cwd=repo, check=True)
     subprocess.run(
         [
             "git",

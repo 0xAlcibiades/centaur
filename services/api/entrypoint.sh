@@ -12,27 +12,29 @@ set -euo pipefail
 # Install dependencies from bind-mounted overlay tool directories.
 # These aren't baked into the image — install at startup so tool loading doesn't fail.
 if [[ -n "${TOOL_DIRS:-}" ]]; then
-  IFS=':' read -ra _dirs <<< "$TOOL_DIRS"
-  _extra_deps=""
-  for _d in "${_dirs[@]}"; do
-    [[ "$_d" == "/app/tools" ]] && continue  # already in image
-    [[ -d "$_d" ]] || continue
-    _extra_deps+=$(python3 -c "
-import tomllib, pathlib
+  _extra_deps_file="$(mktemp)"
+  python3 - "$TOOL_DIRS" "$_extra_deps_file" <<'PYEOF' 2>/dev/null || true
+import pathlib
+import sys
+import tomllib
+
+tool_dirs, output_path = sys.argv[1], pathlib.Path(sys.argv[2])
 deps = set()
-for p in pathlib.Path('$_d').glob('**/pyproject.toml'):
-    deps.update(tomllib.load(open(p,'rb')).get('project',{}).get('dependencies',[]))
-print('\n'.join(sorted(deps)))
-" 2>/dev/null || true)
-    _extra_deps+=$'\n'
-  done
-  if [[ -n "${_extra_deps}" ]]; then
-    printf '%s\n' "$_extra_deps" | sort -u | grep -v '^$' > /tmp/_extra_deps.txt || true
-    if [[ -s /tmp/_extra_deps.txt ]]; then
-      uv pip install -r /tmp/_extra_deps.txt --quiet 2>/dev/null || true
-    fi
-    rm -f /tmp/_extra_deps.txt
+for raw_dir in tool_dirs.split(":"):
+    if raw_dir == "/app/tools":
+        continue
+    root = pathlib.Path(raw_dir)
+    if not root.is_dir():
+        continue
+    for pyproject in root.glob("**/pyproject.toml"):
+        project = tomllib.loads(pyproject.read_text()).get("project", {})
+        deps.update(dep for dep in project.get("dependencies", []) if dep)
+output_path.write_text("\n".join(sorted(deps)) + ("\n" if deps else ""))
+PYEOF
+  if [[ -s "$_extra_deps_file" ]]; then
+    uv pip install -r "$_extra_deps_file" --quiet 2>/dev/null || true
   fi
+  rm -f "$_extra_deps_file"
 fi
 
 # Bootstrap optional gcloud credentials for deployments that use gcloud-backed SSH tunneling.

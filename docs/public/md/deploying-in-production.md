@@ -98,6 +98,62 @@ so any thread can use any configured credential. Per-user and per-channel
 scoping is on the roadmap; until then, scope tool and harness access
 accordingly. See [Security](/security) for the full threat model.
 
+### Optional local OAuth/subscription auth
+
+Codex and Claude Code can use local CLI auth state instead of the API-key
+path. This is meant for deployments that need Codex subscriptions or Claude
+Code subscription/card auth. It is not automatic. Codex reconstructs its local
+auth file inside matching sandboxes; Claude Code uses a refresh token through
+[iron-proxy](https://docs.iron.sh) by default.
+
+For local development, run:
+
+```bash
+bun run auth:bootstrap
+source .env.local
+just bootstrap-secrets
+```
+
+If local auth is missing, `auth:bootstrap` prints the exact login command. To
+stream the device/browser setup flow from the bootstrap command itself, run:
+
+```bash
+bun run auth:bootstrap -- --login
+```
+
+For production, deliver these keys through the same infra Secret transport you
+use for other chart secrets, but put them in a separate Secret. The chart
+defaults to:
+
+```yaml
+harnessAuth:
+  existingSecretName: centaur-harness-auth
+```
+
+| Secret | Used for |
+|--------|----------|
+| `CODEX_AUTH_JSON` | Store this value in the configured 1Password field for iron-proxy writeback. |
+| `CLAUDE_CODE_OAUTH_CLIENT_ID` | Claude Code public OAuth client id for iron-proxy. |
+| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Claude Code OAuth refresh token for iron-proxy. |
+
+Then enable only the providers you intend to use:
+
+```yaml
+sandbox:
+  extraEnv:
+    CODEX_USE_LOCAL_AUTH: "true"
+    CLAUDE_USE_LOCAL_AUTH: "true"
+```
+
+The Kubernetes sandbox backend scopes auth payloads by engine: Codex auth stays
+in iron-proxy, Claude proxy pods receive only Claude OAuth material, and Amp
+receives none. Do not put these payloads in `centaur-infra-env`; the API pod
+imports that Secret with `envFrom`.
+
+Claude Code subscription credentials contain a rotating refresh token, so they
+are best treated as a narrow opt-in path rather than fleet auth. Prefer Console
+API keys, `ANTHROPIC_AUTH_TOKEN`, or an auth helper/gateway for concurrent pods.
+
 ## 4. Configure Slack
 
 Create the Slackbot app at [api.slack.com/apps](https://api.slack.com/apps).
@@ -186,12 +242,16 @@ kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
   curl -fsS http://localhost:8000/health/tools | jq
 ```
 
-If you need to call operator routes from outside the cluster, create an admin
-API key from inside the API deployment and save the returned plaintext key:
+If you need to call operator routes from outside the cluster, use a configured
+admin key such as `LOCAL_DEV_API_KEY` to create a narrower operator key and
+save the returned plaintext key:
 
 ```bash
+ADMIN_KEY=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- printenv LOCAL_DEV_API_KEY)
+
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
   curl -fsS -X POST http://localhost:8000/admin/api-keys \
+    -H "Authorization: Bearer ${ADMIN_KEY}" \
     -H "Content-Type: application/json" \
     -d '{"name":"operator","scopes":["admin"],"created_by":"ops"}' | jq
 ```
@@ -207,22 +267,27 @@ Run one agent turn from inside the API deployment:
 
 ```bash
 THREAD_KEY=production-smoke-codex
+API_KEY=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- printenv SLACKBOT_API_KEY)
 
 SPAWN=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/spawn \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d "{\"thread_key\":\"${THREAD_KEY}\"}")
 ASSIGNMENT_GENERATION=$(printf '%s' "$SPAWN" | jq -r '.assignment_generation')
 
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/message \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}"
 
 EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/execute \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"delivery\":{\"platform\":\"dev\"}}")
 EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
+  -H "Authorization: Bearer ${API_KEY}" \
   "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
 ```
 
@@ -246,6 +311,7 @@ execution before retrying:
 
 ```bash
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
+  -H "Authorization: Bearer ${API_KEY}" \
   "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
 
 kubectl logs -n centaur-system deploy/centaur-centaur-api --tail=200

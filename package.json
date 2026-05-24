@@ -3,6 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.28.1",
   "scripts": {
+    "auth:bootstrap": "bun run scripts/auth-bootstrap.js",
     "slackbot:delivery-regression": "pnpm --filter slackbot test"
   }
 }
