@@ -8,7 +8,7 @@ const MAX_STREAM_CHUNK_CHARS = slackReplyLimits.stream.markdownChunkChars
 const FILE_REF_PATTERN =
   /(?<![\w./-])((?:\/home\/agent\/(?:workspace|(?:github|branches)\/[^/\s`]+\/[^/\s`]+)\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|md|mdx|json|toml|ya?ml|css|scss|sql|sh)(?::\d+(?:-\d+)?)?)/g
 const INLINE_CODE_PATTERN = /`([^`\n]+)`/g
-const FENCE_PATTERN = /```[\s\S]*?```/g
+const FENCE_PATTERN = /```([A-Za-z0-9_-]*)?\n?([\s\S]*?)```/g
 
 export type StatusMetadata = {
   title?: string
@@ -124,7 +124,10 @@ export function linkifyGithubFileRefs(markdown: string): string {
   if (!baseUrl || !markdown) return markdown
   const fenced: string[] = []
   const inline: string[] = []
-  const withoutFences = markdown.replace(FENCE_PATTERN, match => {
+  const withoutFences = markdown.replace(FENCE_PATTERN, (match, language: string, body: string) => {
+    if (shouldUnwrapFileListFence(language, body)) {
+      return linkifyPlainFileRefs(baseUrl, body.trimEnd())
+    }
     const index = fenced.push(match) - 1
     return `@@CENTAUR_FENCE_${index}@@`
   })
@@ -134,11 +137,7 @@ export function linkifyGithubFileRefs(markdown: string): string {
     const index = inline.push(replacement) - 1
     return `@@CENTAUR_INLINE_${index}@@`
   })
-  const linked = withoutInline.replace(FILE_REF_PATTERN, (match: string) => {
-    if (match.includes('://')) return match
-    const url = githubUrlForFileRef(baseUrl, match)
-    return url ? `[${escapeMarkdownLinkText(match)}](${url})` : match
-  })
+  const linked = linkifyPlainFileRefs(baseUrl, withoutInline)
   return linked
     .replace(/@@CENTAUR_INLINE_(\d+)@@/g, (_match, index: string) => inline[Number(index)] ?? '')
     .replace(/@@CENTAUR_FENCE_(\d+)@@/g, (_match, index: string) => fenced[Number(index)] ?? '')
@@ -146,6 +145,22 @@ export function linkifyGithubFileRefs(markdown: string): string {
 
 function githubFileLinkBaseUrl(): string {
   return (process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL ?? '').trim().replace(/\/+$/, '')
+}
+
+function shouldUnwrapFileListFence(language: string | undefined, body: string): boolean {
+  const normalizedLanguage = (language ?? '').trim().toLowerCase()
+  if (normalizedLanguage && normalizedLanguage !== 'text' && normalizedLanguage !== 'plain')
+    return false
+  const refs = body.match(FILE_REF_PATTERN) ?? []
+  return refs.length >= 2
+}
+
+function linkifyPlainFileRefs(baseUrl: string, text: string): string {
+  return text.replace(FILE_REF_PATTERN, (match: string) => {
+    if (match.includes('://')) return match
+    const url = githubUrlForFileRef(baseUrl, match)
+    return url ? `[${escapeMarkdownLinkText(match)}](${url})` : match
+  })
 }
 
 function githubUrlForFileRef(baseUrl: string, rawRef: string): string | null {

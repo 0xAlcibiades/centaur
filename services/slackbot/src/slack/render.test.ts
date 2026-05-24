@@ -47,6 +47,27 @@ describe('linkifyGithubFileRefs', () => {
     expect(linked).not.toContain(']([apps/web')
   })
 
+  it('unwraps text fences that are file lists so Slack can click links', () => {
+    process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL = 'https://github.com/leanxyz/livermore/blob/main'
+
+    const linked = linkifyGithubFileRefs(
+      [
+        '```text',
+        '1  12152  apps/web/src/lib/enrichment/teams.ts',
+        '2  4290   rust/ws/crates/ws-sports/src/bridge.rs',
+        '```'
+      ].join('\n')
+    )
+
+    expect(linked).not.toContain('```')
+    expect(linked).toContain(
+      '[apps/web/src/lib/enrichment/teams.ts](https://github.com/leanxyz/livermore/blob/main/apps/web/src/lib/enrichment/teams.ts)'
+    )
+    expect(linked).toContain(
+      '[rust/ws/crates/ws-sports/src/bridge.rs](https://github.com/leanxyz/livermore/blob/main/rust/ws/crates/ws-sports/src/bridge.rs)'
+    )
+  })
+
   it('leaves markdown unchanged when no base url is configured', () => {
     delete process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL
 
