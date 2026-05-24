@@ -39,6 +39,7 @@ from api.sandbox.config import (
     image,
     runtime_for_session,
     sandbox_env_flag,
+    sandbox_env_value,
 )
 from api.sandbox.prompt_assembly import assemble_prompt
 from api.tool_manager import OAuthFieldSource, OAuthTokenSecret, PgDsnSecret, SecretDef
@@ -75,6 +76,11 @@ def _codex_auth_json_secret_ref() -> str:
     return (os.getenv("CODEX_AUTH_JSON_SECRET_REF") or "CODEX_AUTH_JSON").strip()
 
 
+def _claude_oauth_scopes() -> tuple[str, ...]:
+    raw = sandbox_env_value("CLAUDE_CODE_OAUTH_SCOPES")
+    return tuple(scope for scope in raw.split() if scope)
+
+
 def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
     if not _harness_uses_proxy_auth(engine):
         return []
@@ -98,6 +104,7 @@ def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
                         ),
                     ),
                 ),
+                scopes=_claude_oauth_scopes(),
                 token_endpoint=_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT,
             )
         ]

@@ -279,6 +279,7 @@ def test_container_env_filters_raw_local_auth_from_extra_env(
         "CLAUDE_CREDENTIALS_JSON": "claude-secret",
         "CLAUDE_CODE_OAUTH_CLIENT_ID": "claude-client-id",
         "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "claude-refresh-token",
+        "CLAUDE_CODE_OAUTH_SCOPES": "user:inference user:profile",
         "ANTHROPIC_AUTH_TOKEN": "anthropic-token",
     }
     monkeypatch.setenv(
@@ -306,6 +307,17 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
 
     monkeypatch.setenv("CODEX_USE_LOCAL_AUTH", "true")
     monkeypatch.setenv("CLAUDE_USE_LOCAL_AUTH", "true")
+    monkeypatch.setenv(
+        "KUBERNETES_SANDBOX_EXTRA_ENV",
+        json.dumps(
+            [
+                {
+                    "name": "CLAUDE_CODE_OAUTH_SCOPES",
+                    "value": "user:inference user:profile",
+                }
+            ]
+        ),
+    )
 
     claude = _harness_proxy_auth_secrets("claude-code")
 
@@ -316,6 +328,7 @@ def test_harness_proxy_auth_secrets_are_engine_scoped(
     assert secret.name == "CLAUDE_CODE_OAUTH"
     assert secret.grant == "refresh_token"
     assert secret.hosts == ("api.anthropic.com",)
+    assert secret.scopes == ("user:inference", "user:profile")
     assert secret.token_endpoint == "https://platform.claude.com/v1/oauth/token"
     assert dict(secret.fields) == {
         "client_id": OAuthFieldSource("CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"),

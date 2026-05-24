@@ -53,6 +53,7 @@ _LOCAL_AUTH_EXTRA_ENV_KEYS = {
     "CLAUDE_CREDENTIALS_JSON",
     "CLAUDE_CODE_OAUTH_CLIENT_ID",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
     "ANTHROPIC_AUTH_TOKEN",
 }
 
@@ -78,6 +79,15 @@ def sandbox_env_flag(name: str, extra_env: list[tuple[str, str]] | None = None) 
         if key == name:
             return value.strip().lower() in {"1", "true", "yes", "on"}
     return _env_flag(name)
+
+
+def sandbox_env_value(name: str, extra_env: list[tuple[str, str]] | None = None) -> str:
+    if extra_env is None:
+        extra_env = _sandbox_extra_env()
+    for key, value in reversed(extra_env):
+        if key == name:
+            return value.strip()
+    return (os.getenv(name) or "").strip()
 
 
 def _sandbox_direct_github_token() -> str | None:
