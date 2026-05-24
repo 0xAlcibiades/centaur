@@ -18,7 +18,7 @@ describe('linkifyGithubFileRefs', () => {
     const linked = linkifyGithubFileRefs('See `apps/web/src/foo.ts:12-14` for details.')
 
     expect(linked).toBe(
-      'See [apps/web/src/foo.ts:12-14](https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts#L12-L14) for details.'
+      'See <https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts#L12-L14|apps/web/src/foo.ts:12-14> for details.'
     )
   })
 
@@ -29,7 +29,7 @@ describe('linkifyGithubFileRefs', () => {
     const linked = linkifyGithubFileRefs('Edited `/home/agent/workspace/apps/web/src/foo.tsx:7`.')
 
     expect(linked).toContain(
-      '[/home/agent/workspace/apps/web/src/foo.tsx:7](https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.tsx#L7)'
+      '<https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.tsx#L7|/home/agent/workspace/apps/web/src/foo.tsx:7>'
     )
   })
 
@@ -41,7 +41,7 @@ describe('linkifyGithubFileRefs', () => {
     )
 
     expect(linked).toContain(
-      '[apps/web/src/foo.ts](https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts)'
+      '<https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts|apps/web/src/foo.ts>'
     )
     expect(linked).toContain('```\napps/web/src/bar.ts\n```')
     expect(linked).not.toContain(']([apps/web')
@@ -61,10 +61,10 @@ describe('linkifyGithubFileRefs', () => {
 
     expect(linked).not.toContain('```')
     expect(linked).toContain(
-      '[apps/web/src/lib/enrichment/teams.ts](https://github.com/leanxyz/livermore/blob/main/apps/web/src/lib/enrichment/teams.ts)'
+      '<https://github.com/leanxyz/livermore/blob/main/apps/web/src/lib/enrichment/teams.ts|apps/web/src/lib/enrichment/teams.ts>'
     )
     expect(linked).toContain(
-      '[rust/ws/crates/ws-sports/src/bridge.rs](https://github.com/leanxyz/livermore/blob/main/rust/ws/crates/ws-sports/src/bridge.rs)'
+      '<https://github.com/leanxyz/livermore/blob/main/rust/ws/crates/ws-sports/src/bridge.rs|rust/ws/crates/ws-sports/src/bridge.rs>'
     )
   })
 
@@ -76,7 +76,19 @@ describe('linkifyGithubFileRefs', () => {
     })
 
     expect(linked).toBe(
-      'See [apps/web/src/foo.ts:12](https://github.com/leanxyz/livermore/blob/feature-branch/apps/web/src/foo.ts#L12).'
+      'See <https://github.com/leanxyz/livermore/blob/feature-branch/apps/web/src/foo.ts#L12|apps/web/src/foo.ts:12>.'
+    )
+  })
+
+  it('converts existing markdown links to Slack native links', () => {
+    process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL = 'https://github.com/leanxyz/livermore/blob/main'
+
+    const linked = linkifyGithubFileRefs(
+      '[apps/web/src/foo.ts](https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts)'
+    )
+
+    expect(linked).toBe(
+      '<https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts|apps/web/src/foo.ts>'
     )
   })
 
@@ -96,7 +108,7 @@ describe('renderMarkdownBlocks', () => {
     const blocks = renderMarkdownBlocks('1. `apps/web/src/foo.ts` — 10 lines')
 
     expect(blocks[0]?.text).toContain(
-      '[apps/web/src/foo.ts](https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts)'
+      '<https://github.com/leanxyz/livermore/blob/main/apps/web/src/foo.ts|apps/web/src/foo.ts>'
     )
   })
 })

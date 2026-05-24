@@ -8,6 +8,7 @@ const MAX_STREAM_CHUNK_CHARS = slackReplyLimits.stream.markdownChunkChars
 const FILE_REF_PATTERN =
   /(?<![\w./-])((?:\/home\/agent\/(?:workspace|(?:github|branches)\/[^/\s`]+\/[^/\s`]+)\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|md|mdx|json|toml|ya?ml|css|scss|sql|sh)(?::\d+(?:-\d+)?)?)/g
 const INLINE_CODE_PATTERN = /`([^`\n]+)`/g
+const MARKDOWN_LINK_PATTERN = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g
 const FENCE_PATTERN = /```([A-Za-z0-9_-]*)?\n?([\s\S]*?)```/g
 
 export type StatusMetadata = {
@@ -136,6 +137,7 @@ export function linkifyGithubFileRefs(markdown: string, opts: GithubFileLinkOpti
   if (!baseUrl || !markdown) return markdown
   const fenced: string[] = []
   const inline: string[] = []
+  const markdownLinks: string[] = []
   const withoutFences = markdown.replace(FENCE_PATTERN, (match, language: string, body: string) => {
     if (shouldUnwrapFileListFence(language, body)) {
       return linkifyPlainFileRefs(baseUrl, body.trimEnd())
@@ -143,14 +145,25 @@ export function linkifyGithubFileRefs(markdown: string, opts: GithubFileLinkOpti
     const index = fenced.push(match) - 1
     return `@@CENTAUR_FENCE_${index}@@`
   })
-  const withoutInline = withoutFences.replace(INLINE_CODE_PATTERN, (match, code: string) => {
+  const withoutMarkdownLinks = withoutFences.replace(
+    MARKDOWN_LINK_PATTERN,
+    (match, label: string, url: string) => {
+      const index = markdownLinks.push(slackLink(url, label)) - 1
+      return `@@CENTAUR_MARKDOWN_LINK_${index}@@`
+    }
+  )
+  const withoutInline = withoutMarkdownLinks.replace(INLINE_CODE_PATTERN, (match, code: string) => {
     const url = githubUrlForFileRef(baseUrl, code.trim())
-    const replacement = url ? `[${escapeMarkdownLinkText(code)}](${url})` : match
+    const replacement = url ? slackLink(url, code) : match
     const index = inline.push(replacement) - 1
     return `@@CENTAUR_INLINE_${index}@@`
   })
   const linked = linkifyPlainFileRefs(baseUrl, withoutInline)
   return linked
+    .replace(
+      /@@CENTAUR_MARKDOWN_LINK_(\d+)@@/g,
+      (_match, index: string) => markdownLinks[Number(index)] ?? ''
+    )
     .replace(/@@CENTAUR_INLINE_(\d+)@@/g, (_match, index: string) => inline[Number(index)] ?? '')
     .replace(/@@CENTAUR_FENCE_(\d+)@@/g, (_match, index: string) => fenced[Number(index)] ?? '')
 }
@@ -173,8 +186,20 @@ function linkifyPlainFileRefs(baseUrl: string, text: string): string {
   return text.replace(FILE_REF_PATTERN, (match: string) => {
     if (match.includes('://')) return match
     const url = githubUrlForFileRef(baseUrl, match)
-    return url ? `[${escapeMarkdownLinkText(match)}](${url})` : match
+    return url ? slackLink(url, match) : match
   })
+}
+
+function slackLink(url: string, label: string): string {
+  return `<${url}|${escapeSlackLinkText(label)}>`
+}
+
+function escapeSlackLinkText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\|/g, '\u2223')
 }
 
 function githubUrlForFileRef(baseUrl: string, rawRef: string): string | null {
@@ -215,10 +240,6 @@ function isLinkableFileRef(path: string): boolean {
   const matched = FILE_REF_PATTERN.test(path)
   FILE_REF_PATTERN.lastIndex = 0
   return matched
-}
-
-function escapeMarkdownLinkText(text: string): string {
-  return text.replace(/([\\[\]])/g, '\\$1')
 }
 
 function splitText(input: string, maxChars: number): string[] {
