@@ -297,6 +297,7 @@ app.post('/api/slack/agent-sessions', apiKeyMiddleware, async c => {
     recipient_user_id: string
     title?: string
     header?: string
+    github_file_link_base_url?: string
   }>()
   const { client } = await resolver.resolve({})
   try {
@@ -306,7 +307,8 @@ app.post('/api/slack/agent-sessions', apiKeyMiddleware, async c => {
       recipientTeamId: body.recipient_team_id,
       recipientUserId: body.recipient_user_id,
       title: body.title,
-      header: body.header
+      header: body.header,
+      githubFileLinkBaseUrl: body.github_file_link_base_url
     })
     return c.json({ ok: true, session_id: result.sessionId })
   } catch (error) {
@@ -315,12 +317,14 @@ app.post('/api/slack/agent-sessions', apiKeyMiddleware, async c => {
 })
 
 app.post('/api/slack/agent-sessions/:session_id/text', apiKeyMiddleware, async c => {
-  const body = await c.req.json<{ markdown: string }>()
+  const body = await c.req.json<{ markdown: string; github_file_link_base_url?: string }>()
   const { client } = await resolver.resolve({})
   try {
     const sessionId = c.req.param('session_id')
     await withAgentSessionLock(sessionId, () =>
-      new AgentSessionRenderer(client).text(sessionId, body.markdown)
+      new AgentSessionRenderer(client).text(sessionId, body.markdown, {
+        githubFileLinkBaseUrl: body.github_file_link_base_url
+      })
     )
     return c.json({ ok: true })
   } catch (error) {
@@ -349,15 +353,19 @@ app.post('/api/slack/agent-sessions/:session_id/step', apiKeyMiddleware, async c
 })
 
 app.post('/api/slack/agent-sessions/:session_id/done', apiKeyMiddleware, async c => {
-  const body = await c.req.json<{ thread_id?: string }>()
+  const body = await c.req.json<{ thread_id?: string; github_file_link_base_url?: string }>()
   const { client } = await resolver.resolve({})
   try {
     const sessionId = c.req.param('session_id')
     await withAgentSessionLock(sessionId, async () => {
       if (hasActiveCodexSession(sessionId)) {
-        await new CodexSessionRenderer(client).done(sessionId, body.thread_id)
+        await new CodexSessionRenderer(client).done(sessionId, body.thread_id, {
+          githubFileLinkBaseUrl: body.github_file_link_base_url
+        })
       } else {
-        await new AgentSessionRenderer(client).done(sessionId)
+        await new AgentSessionRenderer(client).done(sessionId, {
+          githubFileLinkBaseUrl: body.github_file_link_base_url
+        })
       }
     })
     return c.json({ ok: true })

@@ -50,6 +50,7 @@ type AgentSessionState = {
   recipientUserId: string
   title: string
   header?: string
+  githubFileLinkBaseUrl?: string
   finalCommentaryMarkdown?: string
   finalAnswerMarkdown?: string
   done: boolean
@@ -69,6 +70,7 @@ export type OpenAgentSessionInput = {
    * claude-opus-4-7", "legal · codex-gpt-5").
    */
   header?: string
+  githubFileLinkBaseUrl?: string
 }
 
 export type StepInput = {
@@ -85,6 +87,7 @@ export type StepOptions = {
 
 export type TextOptions = {
   flush?: boolean
+  githubFileLinkBaseUrl?: string
   /** When true, stream pending assistant text immediately instead of waiting for heuristics. */
   force?: boolean
   /** When false, stream this text without creating the plan/task surface first. */
@@ -93,16 +96,23 @@ export type TextOptions = {
 
 export type DoneOptions = {
   streamFinalUpdates?: boolean
+  githubFileLinkBaseUrl?: string
   commentaryMarkdown?: string
   answerMarkdown?: string
 }
 
-function headerMarkdown(header: string): string {
-  return `_${header.trim()}_`
+function cleanGithubFileLinkBaseUrl(value: string | undefined): string | undefined {
+  const cleaned = value?.trim().replace(/\/+$/, '')
+  return cleaned || undefined
 }
 
-function headerBlock(header: string): AnyBlock {
-  return { type: 'markdown', text: headerMarkdown(header) }
+function applyGithubFileLinkBaseUrl(state: AgentSessionState, value: string | undefined): void {
+  const cleaned = cleanGithubFileLinkBaseUrl(value)
+  if (cleaned) state.githubFileLinkBaseUrl = cleaned
+}
+
+function headerMarkdown(header: string): string {
+  return `_${header.trim()}_`
 }
 
 const sessions = new Map<string, AgentSessionState>()
@@ -134,6 +144,7 @@ export class AgentSessionRenderer {
       recipientUserId: input.recipientUserId,
       title: input.title ?? 'Execution steps',
       header,
+      githubFileLinkBaseUrl: cleanGithubFileLinkBaseUrl(input.githubFileLinkBaseUrl),
       segments: [newSegment()],
       done: false,
       statusCleared: false,
@@ -143,17 +154,23 @@ export class AgentSessionRenderer {
     return { sessionId: id }
   }
 
-  async text(sessionId: string, markdown: string): Promise<number> {
+  async text(sessionId: string, markdown: string, opts: TextOptions = {}): Promise<number> {
     const state = requireSession(sessionId)
+    applyGithubFileLinkBaseUrl(state, opts.githubFileLinkBaseUrl)
     const segment = currentSegment(state)
 
     segment.textParts.push(markdown)
     return await this.queueText(state, segment, markdown)
   }
 
-  async textDelta(sessionId: string, markdownDelta: string, opts: TextOptions = {}): Promise<number> {
+  async textDelta(
+    sessionId: string,
+    markdownDelta: string,
+    opts: TextOptions = {}
+  ): Promise<number> {
     if (!markdownDelta) return 0
     const state = requireSession(sessionId)
+    applyGithubFileLinkBaseUrl(state, opts.githubFileLinkBaseUrl)
     const segment = currentSegment(state)
 
     const lastIndex = segment.textParts.length - 1
@@ -216,6 +233,7 @@ export class AgentSessionRenderer {
   async done(sessionId: string, opts: DoneOptions = {}): Promise<{ streamedTextChars: number }> {
     const state = requireSession(sessionId)
     state.done = true
+    applyGithubFileLinkBaseUrl(state, opts.githubFileLinkBaseUrl)
     state.finalCommentaryMarkdown = opts.commentaryMarkdown
     state.finalAnswerMarkdown = opts.answerMarkdown
     const streamFinalUpdates = opts.streamFinalUpdates ?? true
@@ -316,7 +334,11 @@ export class AgentSessionRenderer {
         ? [planBlock(planTitle(state.title, originalTasks), tasks, EXECUTION_PLAN_ID)]
         : []),
       ...(thinkingBlock ? [thinkingBlock] : []),
-      ...(!streamedTextLive && answerMarkdown ? renderMarkdownBlocks(answerMarkdown) : [])
+      ...(!streamedTextLive && answerMarkdown
+        ? renderMarkdownBlocks(answerMarkdown, {
+            githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
+          })
+        : [])
     ] as AnyBlock[])
     const fallbackText = buildFinalFallbackText({
       title: state.title,
@@ -324,7 +346,11 @@ export class AgentSessionRenderer {
       answerMarkdown
     })
     const chunks =
-      blocks.length || streamedTextLive ? undefined : markdownToStreamChunks(fallbackText)
+      blocks.length || streamedTextLive
+        ? undefined
+        : markdownToStreamChunks(fallbackText, {
+            githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
+          })
     const stopResponse = await this.client.chat.stopStream({
       channel: state.channel,
       ts: segment.streamTs,
@@ -453,7 +479,7 @@ export class AgentSessionRenderer {
     segment.pendingTextSourceChars = 0
     await this.streamChunks(state, segment, [
       ...(segment.pendingTextPlanPrefix ? this.planPrefix(state, segment) : []),
-      ...markdownToStreamChunks(markdown)
+      ...markdownToStreamChunks(markdown, { githubFileLinkBaseUrl: state.githubFileLinkBaseUrl })
     ])
     segment.streamedText += markdown
     segment.streamedTextSourceChars += pendingSourceChars

@@ -154,7 +154,7 @@ export function isRuntimeFailureText(text: string): boolean {
     text
       .split(/\r?\n/)
       .map(line => line.trim())
-      .find(Boolean) ?? ""
+      .find(Boolean) ?? ''
   return RUNTIME_FAILURE_LINE_PATTERNS.some(pattern => pattern.test(firstMeaningfulLine))
 }
 
@@ -206,7 +206,8 @@ async function deliver(client: WebClient, delivery: any): Promise<void> {
     channel,
     threadTs,
     executionId(delivery),
-    splitFinalDeliveryText(textToPost)
+    splitFinalDeliveryText(textToPost),
+    githubFileLinkBaseUrl(payload)
   )
 }
 
@@ -214,12 +215,45 @@ function executionId(delivery: any): string {
   return String(delivery?.execution_id ?? '')
 }
 
+function githubFileLinkBaseUrl(payload: any): string | undefined {
+  const direct = cleanGithubFileLinkBaseUrl(payload?.github_file_link_base_url)
+  if (direct) return direct
+  const repoContext = payload?.repo_context
+  if (!repoContext || typeof repoContext !== 'object') return undefined
+  const owner = cleanPathPart(repoContext.repo_owner)
+  const repo = cleanPathPart(repoContext.repo_name)
+  const ref = cleanGithubRef(
+    repoContext.github_ref ?? repoContext.git_ref ?? repoContext.git_commit
+  )
+  if (!owner || !repo || !ref) return undefined
+  return `https://github.com/${owner}/${repo}/blob/${ref}`
+}
+
+function cleanGithubFileLinkBaseUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.trim().replace(/\/+$/, '')
+  return cleaned || undefined
+}
+
+function cleanPathPart(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.trim()
+  return cleaned && !cleaned.includes('/') ? encodeURIComponent(cleaned) : undefined
+}
+
+function cleanGithubRef(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.trim()
+  return cleaned ? cleaned.split('/').map(encodeURIComponent).join('/') : undefined
+}
+
 async function postFollowups(
   client: WebClient,
   channel: string,
   threadTs: string,
   executionId: string,
-  chunks: string[]
+  chunks: string[],
+  githubFileLinkBaseUrl?: string
 ): Promise<void> {
   const posted = await postedChunkIndexes(client, channel, threadTs, executionId)
   for (const [index, chunk] of chunks.entries()) {
@@ -228,7 +262,7 @@ async function postFollowups(
       channel,
       thread_ts: threadTs,
       text: chunk,
-      blocks: renderMarkdownBlocks(chunk),
+      blocks: renderMarkdownBlocks(chunk, { githubFileLinkBaseUrl }),
       unfurl_links: false,
       unfurl_media: false,
       metadata: chunkMetadata(executionId, index, chunks.length)
@@ -298,8 +332,16 @@ function extractText(payload: any): string {
 
 function firstNonEmpty(...values: unknown[]): string {
   for (const value of values) {
-    const text = value === undefined || value === null ? '' : String(value).trim()
+    const text = primitiveText(value).trim()
     if (text) return text
+  }
+  return ''
+}
+
+function primitiveText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value)
   }
   return ''
 }
@@ -367,11 +409,11 @@ function slackDeliveryErrorFingerprint(error: unknown): string {
   const parts = [slackDeliveryErrorMessage(error)]
   const data = (error as { data?: unknown })?.data
   if (data && typeof data === 'object') {
-    const slackError = (data as { error?: unknown }).error
-    if (slackError) parts.push(String(slackError))
+    const slackError = primitiveText((data as { error?: unknown }).error)
+    if (slackError) parts.push(slackError)
   }
-  const code = (error as { code?: unknown })?.code
-  if (code) parts.push(String(code))
+  const code = primitiveText((error as { code?: unknown })?.code)
+  if (code) parts.push(code)
   return parts.join(' ')
 }
 

@@ -85,9 +85,9 @@ def test_codex_live_delivery_keeps_semantic_events():
     assert _slackbot_live_events("codex", thinking_completed, [thinking_completed]) == [
         thinking_completed
     ]
-    assert _slackbot_live_events("codex", {"type": "turn.done"}, [{"type": "turn.done"}]) == [
-        {"type": "turn.done"}
-    ]
+    assert _slackbot_live_events(
+        "codex", {"type": "turn.done"}, [{"type": "turn.done"}]
+    ) == [{"type": "turn.done"}]
 
 
 def test_non_codex_live_delivery_keeps_existing_behavior():
@@ -954,7 +954,9 @@ async def test_mark_execution_terminal_delays_outbox_claimability(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(db_pool):
+async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(
+    db_pool,
+):
     from api.runtime_control import _mark_execution_terminal
 
     execution_id = f"exe-{uuid.uuid4().hex[:10]}"
@@ -3967,3 +3969,28 @@ async def test_bootstrap_service_api_keys_includes_local_dev_key(db_pool, monkey
     assert list(row["scopes"]) == ["admin", "agent", "threads", "tools:*"]
     assert row["revoked_at"] is None
     assert row["created_by"] == "service-bootstrap"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_github_file_link_context_uses_backend_exec(monkeypatch):
+    from api import runtime_control
+
+    class Backend:
+        async def exec_run(self, sandbox_id, cmd, *, environment=None, user=""):
+            assert sandbox_id == "sandbox-1"
+            assert cmd[:2] == ["python3", "-c"]
+            assert user == "agent"
+            return (
+                0,
+                b'{"github_file_link_base_url":"https://github.com/leanxyz/livermore/blob/abc123","repo_context":{"repo_owner":"leanxyz","repo_name":"livermore","github_ref":"abc123","git_commit":"abc123"}}',
+            )
+
+    monkeypatch.setattr(runtime_control, "get_backend", lambda: Backend())
+
+    context = await runtime_control._sandbox_github_file_link_context("sandbox-1")
+
+    assert (
+        context["github_file_link_base_url"]
+        == "https://github.com/leanxyz/livermore/blob/abc123"
+    )
+    assert context["repo_context"]["github_ref"] == "abc123"

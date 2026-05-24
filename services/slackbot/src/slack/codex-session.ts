@@ -37,6 +37,7 @@ type CodexSessionState = {
   streamedCommentaryText: string
   streamedAnswerText: string
   deliveredAnswerChars: number
+  githubFileLinkBaseUrl?: string
   agentMessagePhase: AgentMessagePhase | null
   agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
@@ -83,6 +84,8 @@ export class CodexSessionRenderer {
     const state = getState(agentSessionId)
     if (event?.session_id) state.threadId = String(event.session_id)
     if (event?.thread_id) state.threadId = String(event.thread_id)
+    const githubFileLinkBaseUrl = githubFileLinkBaseUrlFromEvent(event)
+    if (githubFileLinkBaseUrl) state.githubFileLinkBaseUrl = githubFileLinkBaseUrl
 
     trackAgentMessageLifecycle(event, state)
     ensureCommentarySegmentBreak(event, state)
@@ -243,10 +246,15 @@ export class CodexSessionRenderer {
     }
   }
 
-  async done(agentSessionId: string, threadId?: string): Promise<void> {
+  async done(
+    agentSessionId: string,
+    threadId?: string,
+    opts: { githubFileLinkBaseUrl?: string } = {}
+  ): Promise<void> {
     const state = getState(agentSessionId)
     if (state.done) return
     if (threadId) state.threadId = threadId
+    if (opts.githubFileLinkBaseUrl) state.githubFileLinkBaseUrl = opts.githubFileLinkBaseUrl
     state.done = true
     completeThinkingTasks(state)
     completeOpenTasks(state)
@@ -255,7 +263,8 @@ export class CodexSessionRenderer {
     const { streamedTextChars } = await this.renderer.done(agentSessionId, {
       streamFinalUpdates: true,
       commentaryMarkdown: state.commentaryText,
-      answerMarkdown: state.answerText
+      answerMarkdown: state.answerText,
+      githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
     })
     state.deliveredAnswerChars = streamedTextChars
     state.done = true
@@ -315,7 +324,8 @@ export class CodexSessionRenderer {
     if (!delta) return
     const acceptedChars = await this.renderer.textDelta(agentSessionId, delta, {
       force: opts.force ?? false,
-      planPrefix: hasPlan
+      planPrefix: hasPlan,
+      githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
     })
     if (acceptedChars > 0) {
       state.streamedAnswerText += delta.slice(0, acceptedChars)
@@ -562,6 +572,13 @@ function logSuspiciousAnswerDelta(
 
 function textHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 16)
+}
+
+function githubFileLinkBaseUrlFromEvent(event: any): string | undefined {
+  const value = event?.github_file_link_base_url ?? event?.githubFileLinkBaseUrl
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.trim().replace(/\/+$/, '')
+  return cleaned || undefined
 }
 
 function reasoningText(event: any): string {

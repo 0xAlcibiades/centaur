@@ -126,6 +126,7 @@ async def open_agent_session(
     thread_key: str,
     title: str = "Centaur execution",
     header: str | None = None,
+    github_file_link_base_url: str | None = None,
 ) -> str | None:
     if not enabled() or not is_slack_delivery(delivery):
         return None
@@ -143,18 +144,32 @@ async def open_agent_session(
     header_text = (header or "").strip()
     if header_text:
         body["header"] = header_text
+    if github_file_link_base_url:
+        body["github_file_link_base_url"] = github_file_link_base_url
     result = await post("/api/slack/agent-sessions", body)
     session_id = str((result or {}).get("session_id") or "").strip()
     return session_id or None
 
 
-async def session_text(session_id: str | None, markdown: str) -> bool:
+async def session_text(
+    session_id: str | None,
+    markdown: str,
+    *,
+    github_file_link_base_url: str | None = None,
+) -> bool:
     sanitized = sanitize_for_slack(markdown)
     if not session_id or not sanitized.strip():
         return True
     result = await post(
         f"/api/slack/agent-sessions/{session_id}/text",
-        {"markdown": sanitized},
+        {
+            "markdown": sanitized,
+            **(
+                {"github_file_link_base_url": github_file_link_base_url}
+                if github_file_link_base_url
+                else {}
+            ),
+        },
     )
     return result is not None
 
@@ -182,12 +197,19 @@ async def session_step(
     await post(f"/api/slack/agent-sessions/{session_id}/step", body)
 
 
-async def session_done(session_id: str | None, thread_id: str | None = None) -> bool:
+async def session_done(
+    session_id: str | None,
+    thread_id: str | None = None,
+    *,
+    github_file_link_base_url: str | None = None,
+) -> bool:
     if not session_id:
         return True
     body: dict[str, Any] = {}
     if thread_id:
         body["thread_id"] = thread_id
+    if github_file_link_base_url:
+        body["github_file_link_base_url"] = github_file_link_base_url
     result = await post(f"/api/slack/agent-sessions/{session_id}/done", body)
     return result is not None
 

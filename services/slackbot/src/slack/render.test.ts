@@ -68,6 +68,18 @@ describe('linkifyGithubFileRefs', () => {
     )
   })
 
+  it('prefers explicit per-message base url over the environment fallback', () => {
+    process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL = 'https://github.com/leanxyz/livermore/blob/main'
+
+    const linked = linkifyGithubFileRefs('See `apps/web/src/foo.ts:12`.', {
+      githubFileLinkBaseUrl: 'https://github.com/leanxyz/livermore/blob/feature-branch'
+    })
+
+    expect(linked).toBe(
+      'See [apps/web/src/foo.ts:12](https://github.com/leanxyz/livermore/blob/feature-branch/apps/web/src/foo.ts#L12).'
+    )
+  })
+
   it('leaves markdown unchanged when no base url is configured', () => {
     delete process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL
 

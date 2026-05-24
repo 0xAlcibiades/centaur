@@ -49,8 +49,15 @@ export function thinkingContextBlock(
   }
 }
 
-export function renderMarkdownBlocks(markdown: string): MarkdownBlock[] {
-  const normalized = linkifyGithubFileRefs(markdown).trim() || ' '
+export type GithubFileLinkOptions = {
+  githubFileLinkBaseUrl?: string
+}
+
+export function renderMarkdownBlocks(
+  markdown: string,
+  opts: GithubFileLinkOptions = {}
+): MarkdownBlock[] {
+  const normalized = linkifyGithubFileRefs(markdown, opts).trim() || ' '
   const blocks: MarkdownBlock[] = []
   let used = 0
 
@@ -112,15 +119,20 @@ export function fallbackText(input: {
   return text.length > MAX_FALLBACK_CHARS ? `${text.slice(0, MAX_FALLBACK_CHARS - 1)}…` : text
 }
 
-export function markdownToStreamChunks(markdown: string): AnyChunk[] {
-  return splitText(linkifyGithubFileRefs(markdown || ' '), MAX_STREAM_CHUNK_CHARS).map(text => ({
-    type: 'markdown_text',
-    text
-  }))
+export function markdownToStreamChunks(
+  markdown: string,
+  opts: GithubFileLinkOptions = {}
+): AnyChunk[] {
+  return splitText(linkifyGithubFileRefs(markdown || ' ', opts), MAX_STREAM_CHUNK_CHARS).map(
+    text => ({
+      type: 'markdown_text',
+      text
+    })
+  )
 }
 
-export function linkifyGithubFileRefs(markdown: string): string {
-  const baseUrl = githubFileLinkBaseUrl()
+export function linkifyGithubFileRefs(markdown: string, opts: GithubFileLinkOptions = {}): string {
+  const baseUrl = githubFileLinkBaseUrl(opts)
   if (!baseUrl || !markdown) return markdown
   const fenced: string[] = []
   const inline: string[] = []
@@ -143,8 +155,10 @@ export function linkifyGithubFileRefs(markdown: string): string {
     .replace(/@@CENTAUR_FENCE_(\d+)@@/g, (_match, index: string) => fenced[Number(index)] ?? '')
 }
 
-function githubFileLinkBaseUrl(): string {
-  return (process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL ?? '').trim().replace(/\/+$/, '')
+function githubFileLinkBaseUrl(opts: GithubFileLinkOptions): string {
+  return (opts.githubFileLinkBaseUrl ?? process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL ?? '')
+    .trim()
+    .replace(/\/+$/, '')
 }
 
 function shouldUnwrapFileListFence(language: string | undefined, body: string): boolean {

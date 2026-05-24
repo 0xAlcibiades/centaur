@@ -115,6 +115,99 @@ _RAW_HARNESS_AUTH_SAFE_FAILURE_MESSAGE = (
     "Please retry in a moment."
 )
 
+_GITHUB_FILE_LINK_CONTEXT_SCRIPT = r"""
+import glob
+import json
+import os
+import re
+import subprocess
+import urllib.parse
+
+
+def git(args, cwd):
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=cwd,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def add_candidate(candidates, value):
+    if not value:
+        return
+    path = os.path.abspath(os.path.expanduser(value))
+    if path not in candidates:
+        candidates.append(path)
+
+
+def candidate_dirs():
+    candidates = []
+    add_candidate(candidates, os.getcwd())
+    add_candidate(candidates, "/home/agent/workspace")
+    repo = os.environ.get("AGENT_REPO", "").strip()
+    if "/" in repo:
+        add_candidate(candidates, os.path.join("/home/agent/github", repo))
+        add_candidate(candidates, os.path.join("/home/agent/branches", repo))
+    for pattern in ("/home/agent/github/*/*", "/home/agent/branches/*/*"):
+        for path in sorted(glob.glob(pattern)):
+            add_candidate(candidates, path)
+    return candidates
+
+
+def repo_identity(cwd):
+    remote = git(["remote", "get-url", "origin"], cwd)
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote)
+    if not match:
+        repo = os.environ.get("AGENT_REPO", "").strip()
+        if "/" in repo:
+            owner, name = repo.split("/", 1)
+            return owner, name.removesuffix(".git")
+        return "", ""
+    return match.group(1), match.group(2)
+
+
+def main():
+    for cwd in candidate_dirs():
+        if not os.path.isdir(cwd):
+            continue
+        repo_root = git(["rev-parse", "--show-toplevel"], cwd)
+        if not repo_root:
+            continue
+        commit = git(["rev-parse", "HEAD"], repo_root)
+        if not commit:
+            continue
+        owner, repo = repo_identity(repo_root)
+        if not owner or not repo:
+            continue
+        branch = git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+        upstream_commit = ""
+        if branch and branch != "HEAD":
+            upstream_commit = git(["rev-parse", "@{u}"], repo_root)
+        github_ref = branch if branch and branch != "HEAD" and upstream_commit == commit else commit
+        encoded_ref = "/".join(urllib.parse.quote(part, safe="") for part in github_ref.split("/"))
+        print(json.dumps({
+            "github_file_link_base_url": f"https://github.com/{owner}/{repo}/blob/{encoded_ref}",
+            "repo_context": {
+                "cwd": repo_root,
+                "repo_owner": owner,
+                "repo_name": repo,
+                "github_ref": github_ref,
+                "git_commit": commit,
+                **({"git_ref": branch} if branch and branch != "HEAD" else {}),
+            },
+        }, separators=(",", ":")))
+        return
+    print("{}")
+
+
+main()
+"""
+
 
 class ControlPlaneError(RuntimeError):
     def __init__(self, code: str, message: str, status_code: int = 409):
@@ -324,7 +417,14 @@ def _progress_silence_timeout_s(
 def _extract_repo_context(source: Any) -> dict[str, str]:
     payload = source if isinstance(source, dict) else {}
     repo_context: dict[str, str] = {}
-    for key in ("cwd", "repo_owner", "repo_name", "git_ref", "git_commit"):
+    for key in (
+        "cwd",
+        "repo_owner",
+        "repo_name",
+        "git_ref",
+        "git_commit",
+        "github_ref",
+    ):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             repo_context[key] = value.strip()
@@ -344,6 +444,59 @@ async def _merge_execution_repo_context(
         canonical_json({"repo_context": repo_context}),
         execution_id,
     )
+
+
+async def _sandbox_github_file_link_context(sandbox_id: str) -> dict[str, Any]:
+    if not sandbox_id:
+        return {}
+    try:
+        exit_code, output = await get_backend().exec_run(
+            sandbox_id,
+            ["python3", "-c", _GITHUB_FILE_LINK_CONTEXT_SCRIPT],
+            user="agent",
+        )
+    except NotImplementedError:
+        return {}
+    except Exception:
+        log.warning(
+            "github_file_link_context_collect_failed",
+            sandbox_id=sandbox_id,
+            exc_info=True,
+        )
+        return {}
+    if exit_code != 0:
+        log.info(
+            "github_file_link_context_collect_nonzero",
+            sandbox_id=sandbox_id,
+            exit_code=exit_code,
+            output=output.decode("utf-8", "replace")[:500],
+        )
+        return {}
+    payload = decode_jsonb(output.decode("utf-8", "replace"), {})
+    if not isinstance(payload, dict):
+        return {}
+    base_url = str(payload.get("github_file_link_base_url") or "").strip().rstrip("/")
+    repo_context = _extract_repo_context(payload.get("repo_context"))
+    github_ref = ""
+    if isinstance(payload.get("repo_context"), dict):
+        raw_github_ref = payload["repo_context"].get("github_ref")
+        if isinstance(raw_github_ref, str) and raw_github_ref.strip():
+            github_ref = raw_github_ref.strip()
+    if not base_url:
+        return {}
+    return {
+        "github_file_link_base_url": base_url,
+        **(
+            {
+                "repo_context": {
+                    **repo_context,
+                    **({"github_ref": github_ref} if github_ref else {}),
+                }
+            }
+            if repo_context or github_ref
+            else {}
+        ),
+    }
 
 
 async def _merge_execution_metadata(
@@ -1883,6 +2036,7 @@ async def _mark_execution_terminal(
     prompt_ref = None
     prompt_sha = None
     repo_context: dict[str, str] = {}
+    github_file_link_base_url = ""
     slackbot_streamed_answer_chars = 0
     suppress_final_delivery = False
     suppress_legacy_delivery = False
@@ -1901,6 +2055,11 @@ async def _mark_execution_terminal(
             repo_context = _extract_repo_context(
                 decode_jsonb(metadata.get("repo_context"), {})
             )
+            raw_github_file_link_base_url = metadata.get("github_file_link_base_url")
+            if isinstance(raw_github_file_link_base_url, str):
+                github_file_link_base_url = (
+                    raw_github_file_link_base_url.strip().rstrip("/")
+                )
             steer_replacement = decode_jsonb(metadata.get("steer_replacement"), {})
             suppress_final_delivery = bool(
                 isinstance(steer_replacement, dict)
@@ -1983,6 +2142,11 @@ async def _mark_execution_terminal(
             **({"agent_thread_id": agent_thread_id} if agent_thread_id else {}),
             **({"repo_context": repo_context} if repo_context else {}),
             **(
+                {"github_file_link_base_url": github_file_link_base_url}
+                if github_file_link_base_url
+                else {}
+            ),
+            **(
                 {"suppress_final_delivery": True}
                 if suppress_final_delivery_payload
                 else {}
@@ -1995,7 +2159,11 @@ async def _mark_execution_terminal(
     if delivery_platform == "dev" or suppress_legacy_delivery:
         slackbot_agent_session_id = str(metadata.get("slackbot_agent_session_id") or "")
         result_size = payload_size_bytes(result_text)
-        if suppress_legacy_delivery and result_size > 0 and slackbot_streamed_answer_chars <= 0:
+        if (
+            suppress_legacy_delivery
+            and result_size > 0
+            and slackbot_streamed_answer_chars <= 0
+        ):
             log.warning(
                 "final_delivery_skipped_without_live_answer",
                 execution_id=execution_id,
@@ -2078,6 +2246,11 @@ async def _mark_execution_terminal(
                 **({"agent_thread_id": agent_thread_id} if agent_thread_id else {}),
                 **({"repo_context": repo_context} if repo_context else {}),
                 **(
+                    {"github_file_link_base_url": github_file_link_base_url}
+                    if github_file_link_base_url
+                    else {}
+                ),
+                **(
                     {"suppress_final_delivery": True}
                     if suppress_final_delivery_payload
                     else {}
@@ -2107,6 +2280,11 @@ async def _mark_execution_terminal(
             "result_text": result_text,
             **({"error_text": error_text} if error_text else {}),
             **({"repo_context": repo_context} if repo_context else {}),
+            **(
+                {"github_file_link_base_url": github_file_link_base_url}
+                if github_file_link_base_url
+                else {}
+            ),
             **(
                 {"suppress_final_delivery": True}
                 if suppress_final_delivery_payload
@@ -2553,7 +2731,9 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     else:
         requester_user_id = None
         if isinstance(delivery, dict):
-            requester_user_id = delivery.get("recipient_user_id") or delivery.get("user_id")
+            requester_user_id = delivery.get("recipient_user_id") or delivery.get(
+                "user_id"
+            )
         requester_user_id = requester_user_id or execution_metadata.get("user_id")
         inject_result = await inject_stdin(
             session,
@@ -2614,6 +2794,21 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     # to the outbox path; the streak resets on the next success.
     slackbot_live_failure_streak = 0
     slackbot_live_failure_limit = 5
+    github_file_link_context: dict[str, Any] = {}
+
+    async def _ensure_github_file_link_context() -> dict[str, Any]:
+        nonlocal github_file_link_context, execution_metadata
+        if github_file_link_context:
+            return github_file_link_context
+        github_file_link_context = await _sandbox_github_file_link_context(
+            session.sandbox_id
+        )
+        if github_file_link_context:
+            execution_metadata = {**execution_metadata, **github_file_link_context}
+            await _merge_execution_metadata(
+                pool, execution_id, github_file_link_context
+            )
+        return github_file_link_context
 
     async def _finalize_execution(
         *,
@@ -2622,6 +2817,10 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         result_text: str,
         error_text: str | None,
     ) -> None:
+        github_context = await _ensure_github_file_link_context()
+        github_file_link_base_url = str(
+            github_context.get("github_file_link_base_url") or ""
+        ).strip()
         current_status = await pool.fetchval(
             "SELECT status FROM agent_execution_requests WHERE execution_id = $1",
             execution_id,
@@ -2686,6 +2885,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                     live_finalize_ok = await slackbot_client.session_text(
                         finalize_session_id,
                         result_text,
+                        github_file_link_base_url=github_file_link_base_url or None,
                     )
                     terminal_result_sent_to_slackbot = live_finalize_ok
                     slackbot_text_sent = slackbot_text_sent or live_finalize_ok
@@ -2693,6 +2893,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                     live_finalize_ok = await slackbot_client.session_done(
                         finalize_session_id,
                         harness_thread_id or None,
+                        github_file_link_base_url=github_file_link_base_url or None,
                     )
                 if live_finalize_ok:
                     slackbot_done = True
@@ -2888,6 +3089,23 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                         slack_event.setdefault(
                             "centaur_assignment_generation", assignment_generation
                         )
+                        if slack_event.get("type") in {
+                            "result",
+                            "turn.done",
+                            "turn.completed",
+                        }:
+                            github_context = await _ensure_github_file_link_context()
+                            github_file_link_base_url = str(
+                                github_context.get("github_file_link_base_url") or ""
+                            ).strip()
+                            if github_file_link_base_url:
+                                slack_event.setdefault(
+                                    "github_file_link_base_url",
+                                    github_file_link_base_url,
+                                )
+                            repo_context = github_context.get("repo_context")
+                            if isinstance(repo_context, dict) and repo_context:
+                                slack_event.setdefault("repo_context", repo_context)
                     harness_result = await slackbot_client.harness_event(
                         slackbot_session_id, slack_event
                     )
