@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import time
-import tomllib
 from pathlib import Path
 
 
@@ -281,53 +280,6 @@ def test_sandbox_entrypoint_keeps_claude_proxy_local_auth_placeholder(
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == "ANTHROPIC_AUTH_TOKEN/"
-
-
-def test_sandbox_entrypoint_appends_codex_laminar_otel_config(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    harness_dir = _write_codex_harness_config(home)
-
-    result = subprocess.run(
-        [
-            "bash",
-            str(ENTRYPOINT_SH),
-            "sh",
-            "-lc",
-            'cat "$HOME/.codex/config.toml"',
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env={
-            "HOME": str(home),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
-            "CENTAUR_THREAD_KEY": "slack:C123:1700000000.000100",
-            "CENTAUR_TRACE_ID": "00000000-0000-0000-0000-000000000123",
-            "CODEX_OTEL_ENVIRONMENT": "staging",
-            "LMNR_BASE_URL": "http://stg-laminar-app-server.stg-laminar.svc.cluster.local:8000",
-            "LMNR_PROJECT_API_KEY": "lmnr-key",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr or result.stdout
-    assert result.stdout.startswith((harness_dir / "codex" / "config.toml").read_text())
-    parsed = tomllib.loads(result.stdout)
-    assert "exporter" not in parsed["otel"]
-    assert (
-        parsed["otel"]["trace_exporter"]["otlp-http"]["endpoint"]
-        == "http://stg-laminar-app-server.stg-laminar.svc.cluster.local:8000/v1/traces"
-    )
-    assert "\nexporter = { otlp-http = {" not in result.stdout
-    assert "trace_exporter = { otlp-http = {" in result.stdout
-    assert (
-        'endpoint = "http://stg-laminar-app-server.stg-laminar.svc.cluster.local:8000/v1/traces"'
-        in result.stdout
-    )
-    assert '"x-trace-id" = "00000000-0000-0000-0000-000000000123"' in result.stdout
-    assert '"x-centaur-thread-key" = "slack:C123:1700000000.000100"' in result.stdout
-    assert '"authorization" = "Bearer lmnr-key"' in result.stdout
-    assert 'environment = "staging"' in result.stdout
 
 
 def test_sandbox_entrypoint_ignores_github_placeholder_token(tmp_path: Path) -> None:

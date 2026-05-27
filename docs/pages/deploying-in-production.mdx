@@ -101,10 +101,9 @@ accordingly. See [Security](/security) for the full threat model.
 ### Optional local OAuth/subscription auth
 
 Codex and Claude Code can use local CLI auth state instead of the API-key
-path. This is meant for deployments that need Codex subscriptions or Claude
-Code subscription/card auth. It is not automatic. Codex reconstructs its local
-auth file inside matching sandboxes; Claude Code uses a refresh token through
-[iron-proxy](https://docs.iron.sh) by default.
+path. This is opt-in for deployments that need Codex subscriptions or Claude
+Code subscription/card auth. In normal API-key mode, keep using the harness
+credential table above.
 
 For local development, run:
 
@@ -130,9 +129,45 @@ harnessAuth:
   existingSecretName: centaur-harness-auth
 ```
 
+### Codex Auth Modes
+
+Codex supports two authentication modes, selected per deployment with the
+`CODEX_AUTH_MODE` env var on the sandbox (set it via `sandbox.extraEnv`):
+
+| Mode | Upstream | Secrets required |
+|------|----------|------------------|
+| `api_key` (default) | `api.openai.com` | `OPENAI_API_KEY` |
+| `access_token` | `chatgpt.com` | `OPENAI_CODEX_CLIENT_ID`, `OPENAI_CODEX_BLOB`, `OPENAI_CODEX_ACCOUNT_ID` |
+
+`access_token` mode routes Codex through a ChatGPT account rather than a raw
+API key. [iron-token-broker](https://docs.iron.sh) holds the refresh token
+and mints short-lived access tokens, which iron-proxy injects on outbound
+requests so the sandbox never sees them.
+
+Store these three items in your secrets backend (1Password vault, Kubernetes
+Secret, etc.) when running in `access_token` mode:
+
+- `OPENAI_CODEX_CLIENT_ID`: the Codex CLI's OAuth client id. This is a
+  fixed, publicly known constant: `app_EMoamEEZ73f0CkXaXp7hrann`. It is
+  the same for every Codex install and never rotates, but the broker
+  still resolves it through your secrets backend, so store the literal
+  value as-is.
+- `OPENAI_CODEX_BLOB`: a JSON document `{"refresh_token": "..."}`. The
+  broker rotates this in place on every refresh, so the backing item must
+  be writable.
+- `OPENAI_CODEX_ACCOUNT_ID`: the ChatGPT account UUID the credential is
+  bound to. It is static, but iron-proxy injects it as the
+  `chatgpt-account-id` header so the backend can route to the right
+  workspace. Store it alongside the other two, not in code.
+
+To bootstrap, run `codex login` locally, then copy the refresh token and
+account id from `~/.codex/auth.json` into the matching secret items. Use
+the constant above for `OPENAI_CODEX_CLIENT_ID`.
+
+Claude Code local auth uses these optional keys in `centaur-harness-auth`:
+
 | Secret | Used for |
 |--------|----------|
-| `CODEX_AUTH_JSON` | Store this value in the configured 1Password field for iron-proxy writeback. |
 | `CLAUDE_CODE_OAUTH_CLIENT_ID` | Claude Code public OAuth client id for iron-proxy. |
 | `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Claude Code OAuth refresh token for iron-proxy. |
 
@@ -141,18 +176,18 @@ Then enable only the providers you intend to use:
 ```yaml
 sandbox:
   extraEnv:
-    CODEX_USE_LOCAL_AUTH: "true"
+    CODEX_AUTH_MODE: "access_token"
     CLAUDE_USE_LOCAL_AUTH: "true"
 ```
 
-The Kubernetes sandbox backend scopes auth payloads by engine: Codex auth stays
-in iron-proxy, Claude proxy pods receive only Claude OAuth material, and Amp
-receives none. Do not put these payloads in `centaur-infra-env`; the API pod
-imports that Secret with `envFrom`.
+The Kubernetes sandbox backend scopes auth payloads by engine. Do not put
+these payloads in `centaur-infra-env`; the API pod imports that Secret with
+`envFrom`.
 
 Claude Code subscription credentials contain a rotating refresh token, so they
 are best treated as a narrow opt-in path rather than fleet auth. Prefer Console
 API keys, `ANTHROPIC_AUTH_TOKEN`, or an auth helper/gateway for concurrent pods.
+
 
 ## 4. Configure Slack
 

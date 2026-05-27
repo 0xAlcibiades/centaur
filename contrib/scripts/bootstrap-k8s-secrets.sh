@@ -21,6 +21,11 @@ set to onepassword-connect in the Helm values):
                                Claude Code public OAuth client id; added to centaur-harness-auth
   CLAUDE_CODE_OAUTH_REFRESH_TOKEN
                                Claude Code OAuth refresh token; added to centaur-harness-auth
+
+Optional local-dev admin key:
+  LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
+                               (envFrom centaur-infra-env). Re-run with --force
+                               or kubectl patch to rotate.
 EOF
 }
 
@@ -88,6 +93,7 @@ optional_secret_env_names=(
   LMNR_PROJECT_API_KEY
   LMNR_BASE_URL
   OP_CONNECT_TOKEN
+  LOCAL_DEV_API_KEY
 )
 
 harness_auth_env_names=(
@@ -103,6 +109,14 @@ delete_if_forced centaur-firewall-ca-key
 delete_if_forced centaur-onepassword-connect-credentials
 delete_if_forced centaur-harness-auth
 
+secret_key_present() {
+  local key="$1"
+  local value
+  value="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env \
+    -o "jsonpath={.data.${key}}" 2>/dev/null || true)"
+  [[ -n "$value" ]]
+}
+
 if secret_exists centaur-infra-env; then
   patch_data=()
   for name in "${optional_secret_env_names[@]}"; do
@@ -110,6 +124,12 @@ if secret_exists centaur-infra-env; then
       patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
     fi
   done
+  # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
+  # support landed. Only generated when absent so we don't rotate it out from
+  # under cached iron-proxy access tokens on every script run.
+  if ! secret_key_present IRON_BROKER_TOKEN; then
+    patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
   if [[ "${#patch_data[@]}" -gt 0 ]]; then
     patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
@@ -122,6 +142,7 @@ else
   secret_args=(
     -n "$NAMESPACE" create secret generic centaur-infra-env
     --from-literal=IRON_MANAGEMENT_API_KEY="$(rand_hex)"
+    --from-literal=IRON_BROKER_TOKEN="$(rand_hex)"
     --from-literal=SANDBOX_SIGNING_KEY="$(rand_hex)"
     --from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
     --from-literal=OP_VAULT="$OP_VAULT"

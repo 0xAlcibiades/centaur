@@ -22,12 +22,15 @@ _HARNESS_STUB_KEYS = (
 )
 
 _SANDBOX_PASSTHROUGH_ENV_KEYS = (
-    "CODEX_AUTH_JSON",
     "CODEX_OTEL_ENVIRONMENT",
     "CODEX_OTEL_LAMINAR_ENDPOINT",
     "CODEX_OTEL_LAMINAR_BASE_URL",
     "LMNR_BASE_URL",
     "LMNR_PROJECT_API_KEY",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_RESOURCE_ATTRIBUTES",
     "WORKSPACE_ENV_LOCAL_B64",
 )
 
@@ -138,6 +141,20 @@ def _sandbox_no_proxy_extra_hosts() -> list[str]:
     return hosts
 
 
+def _sandbox_otel_endpoint_hosts(extra_env: list[tuple[str, str]]) -> list[str]:
+    extra = dict(extra_env)
+    hosts: list[str] = []
+    for key in (
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ):
+        value = (os.getenv(key) or extra.get(key) or "").strip()
+        host = urlsplit(value).hostname
+        if host:
+            hosts.append(host)
+    return hosts
+
+
 def amp_mode() -> str:
     return (os.getenv("AMP_MODE") or "deep").strip() or "deep"
 
@@ -197,6 +214,7 @@ def container_env(
     if api_host:
         no_proxy_hosts.append(api_host)
     no_proxy_hosts.extend(_sandbox_no_proxy_extra_hosts())
+    no_proxy_hosts.extend(_sandbox_otel_endpoint_hosts(extra_env))
     no_proxy = ",".join(dict.fromkeys(no_proxy_hosts))
     # Placeholder values for harness infra secrets. iron-proxy MITMs the
     # outbound TLS connection and rewrites these strings in auth headers
