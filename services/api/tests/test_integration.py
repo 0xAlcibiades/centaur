@@ -561,7 +561,8 @@ class TestBuildSessionContext:
 
         ctx = _build_session_context("test:1", platform="slack", user_id="U123")
         assert "Slack Formatting Rules" in ctx
-        assert "<@U123>" in ctx
+        assert "<@U123>" not in ctx
+        assert "Do not @-mention or tag the requester" in ctx
         assert "test:1" in ctx
 
     def test_no_platform(self):
@@ -576,7 +577,8 @@ class TestBuildSessionContext:
 
         ctx = _build_session_context("test:1", platform="slack")
         assert "Slack Formatting Rules" in ctx
-        assert "tag the requester" not in ctx
+        assert "their real Slack mention" not in ctx
+        assert "Do not @-mention or tag the requester" in ctx
 
     def test_slack_bot_user_id_not_mentioned(self):
         from api.agent import _build_session_context
@@ -584,7 +586,7 @@ class TestBuildSessionContext:
         ctx = _build_session_context("test:1", platform="slack", user_id="B123")
         assert "Slack Formatting Rules" in ctx
         assert "<@B123>" not in ctx
-        assert "tag the requester" not in ctx
+        assert "Do not @-mention or tag the requester" in ctx
 
     def test_contains_timestamp(self):
         from api.agent import _build_session_context
@@ -623,6 +625,7 @@ class TestBuildSessionContext:
         )
         assert "GitHub PR Attribution" in ctx
         assert "Prompted by: @alice" in ctx
+        assert "not the Slack thread OP/root author" in ctx
         assert "Assign the PR to the requester when possible: `alice`" in ctx
         assert "not a Slack response mention rule" in ctx
 
@@ -707,6 +710,25 @@ class TestBuildSessionContext:
         )
 
         assert await _get_latest_thread_user_id(thread_key) == "U123"
+
+    @pytest.mark.asyncio
+    async def test_latest_thread_user_id_prefers_newest_requester_over_thread_op(
+        self, db_pool
+    ):
+        from api.agent import _get_latest_thread_user_id
+
+        thread_key = "test:requester-not-thread-op"
+        await db_pool.execute(
+            "INSERT INTO chat_messages (id, thread_key, role, parts, user_id, metadata, created_at) "
+            "VALUES "
+            "($1, $2, 'user', '[]'::jsonb, 'U_THREAD_OP', '{}'::jsonb, NOW() - INTERVAL '5 minutes'), "
+            "($3, $2, 'user', '[]'::jsonb, 'U_PROMPTER', '{}'::jsonb, NOW())",
+            "msg-thread-op",
+            thread_key,
+            "msg-current-prompter",
+        )
+
+        assert await _get_latest_thread_user_id(thread_key) == "U_PROMPTER"
 
     @pytest.mark.asyncio
     async def test_latest_thread_user_id_reads_execution_delivery(self, db_pool):

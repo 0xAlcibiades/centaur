@@ -1,18 +1,8 @@
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import { describe, expect, it } from 'bun:test'
-import { shouldShowThinkingBlock } from './render'
 import { AgentSessionRenderer } from './agent-session'
 import { CodexSessionRenderer } from './codex-session'
-
-describe('assistant message sections', () => {
-  it('skips Thinking when commentary is duplicated in the answer', () => {
-    const prose = 'I will call five tools and report results.'
-    expect(shouldShowThinkingBlock(prose, prose)).toBe(false)
-    expect(shouldShowThinkingBlock(prose, `${prose}\n\nTool results follow.`)).toBe(false)
-    expect(shouldShowThinkingBlock('Planning only.', 'Final answer only.')).toBe(true)
-  })
-})
 
 describe('CodexSessionRenderer', () => {
   it('streams canonical terminal result text before closing the session', async () => {
@@ -669,7 +659,7 @@ describe('CodexSessionRenderer', () => {
     expect(toolTask?.title).not.toContain('failed')
   })
 
-  it('streams small Thinking context before the answer after the first plan task', async () => {
+  it('does not stream Thinking context before the answer after the first plan task', async () => {
     const calls: Array<{ method: string; params: any }> = []
     const client = {
       assistant: {
@@ -745,7 +735,7 @@ describe('CodexSessionRenderer', () => {
 
     const chunks = calls.flatMap(call => call.params.chunks ?? [])
     const firstTaskIndex = chunks.findIndex(chunk => chunk.type === 'task_update')
-    const thinkingIndex = chunks.findIndex(
+    const contextBlockIndex = chunks.findIndex(
       chunk =>
         chunk.type === 'blocks' &&
         chunk.blocks?.some((block: any) =>
@@ -756,7 +746,7 @@ describe('CodexSessionRenderer', () => {
       chunk => chunk.type === 'markdown_text' && String(chunk.text).includes('Done.')
     )
     expect(firstTaskIndex).toBeGreaterThanOrEqual(0)
-    expect(thinkingIndex).toBe(-1)
+    expect(contextBlockIndex).toBe(-1)
     expect(firstTextIndex).toBeGreaterThan(firstTaskIndex)
     expect(thinkingBlockText(calls)).toBe('')
 
@@ -1523,6 +1513,49 @@ describe('CodexSessionRenderer', () => {
     const visible = visibleMarkdown(calls)
     expect(countOccurrences(visible, 'Hello. World.')).toBe(1)
     expect(countOccurrences(visible, 'Hello.')).toBe(1)
+  })
+
+  it('streams claude-code delta assistant text and ignores the canonical duplicate', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = makeFakeSlackClient(calls)
+    const { sessionId } = await new AgentSessionRenderer(client as any).open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    const renderer = new CodexSessionRenderer(client as any)
+    const finalText = "I'm centaur, Tempo's AI assistant. I help with engineering and ops."
+
+    await renderer.event(sessionId, {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: "I'm" }] }
+    })
+    await renderer.event(sessionId, {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: " centaur, Tempo's AI assistant." }] }
+    })
+    await renderer.event(sessionId, {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: ' I help with engineering and ops.' }] }
+    })
+    await renderer.event(sessionId, {
+      type: 'assistant',
+      uuid: 'msg-uuid',
+      request_id: 'req-123',
+      session_id: 'claude-session',
+      message: {
+        id: 'msg_123',
+        model: 'claude-opus-4-8',
+        content: [{ type: 'text', text: finalText }]
+      }
+    })
+    await renderer.event(sessionId, { type: 'result', result: finalText })
+
+    const visible = visibleMarkdown(calls)
+    expect(countOccurrences(visible, finalText)).toBe(1)
+    expect(visible).not.toContain("I'm\n centaur")
   })
 
   it('does not log a canonical correction for plain delta streams without item.completed', async () => {

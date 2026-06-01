@@ -11,10 +11,10 @@ import re
 import secrets as _secrets
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import WSMsgType
 from kubernetes_asyncio import client, config
@@ -29,28 +29,23 @@ from kubernetes_asyncio.stream.ws_client import (
 import structlog
 
 from api.broker_config import render_broker_yaml
+from api.deps import mint_sandbox_token
 from api.proxy_config import (
     assign_pg_listen_ports,
+    core_pg_listen_port,
     render_proxy_yaml,
 )
 from api.sandbox.base import SandboxBackend, SandboxSession
 from api.sandbox.config import (
+    OBSERVABILITY_NO_PROXY_HOSTS,
     build_harness_cmd,
     container_env,
     image,
     runtime_for_session,
-    sandbox_env_flag,
-    sandbox_env_value,
+    sandbox_extra_env_map,
 )
 from api.sandbox.prompt_assembly import assemble_prompt
-from api.tool_manager import (
-    HttpSecret,
-    OAuthFieldSource,
-    OAuthTokenSecret,
-    PgDsnSecret,
-    SecretDef,
-    SecretMode,
-)
+from api.tool_manager import PgDsnSecret, SecretDef
 
 log = structlog.get_logger()
 
@@ -60,105 +55,20 @@ _CONTAINER_NAME = "sandbox"
 _AGENT_UID = 1001
 _SANDBOX_OVERLAY_ROOT = "/home/agent/overlay"
 _SANDBOX_OVERLAY_DIR = f"{_SANDBOX_OVERLAY_ROOT}/org"
+# Writable dir the tool-server sidecar installs overlay tool deps into. The
+# sidecar runs as a non-root user and cannot write the root-owned /app/.venv,
+# so install-tool-deps.sh installs here with `uv pip install --target` and the
+# sidecar puts it on PYTHONPATH. /tmp is writable regardless of the run-as user.
+_OVERLAY_TOOL_DEPS_DIR = "/tmp/overlay-tool-deps"
 _PROXY_LABEL = "centaur.ai/iron-proxy"
 _API_PROXY_POD_NAME = "centaur-api-proxy"
 _API_PROXY_SANDBOX_ID = "api"
-_CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 # iron-token-broker resource names. The chart provisions the matching Service
 # + NetworkPolicies under the same name; ensure_token_broker() applies the
 # Deployment + ConfigMap so the broker config can be regenerated without a
 # Helm upgrade. The label keeps the chart-side NetworkPolicy selector
 # wired up.
 _TOKEN_BROKER_LABEL = "centaur.ai/iron-token-broker"
-
-
-def _harness_auth_secret_name() -> str:
-    value = (os.getenv("KUBERNETES_HARNESS_AUTH_SECRET_NAME") or "").strip()
-    return value or "centaur-harness-auth"
-
-
-def _harness_uses_proxy_auth(engine: str) -> bool:
-    if engine == "codex":
-        return sandbox_env_flag("CODEX_USE_LOCAL_AUTH")
-    if engine == "claude-code":
-        return sandbox_env_flag("CLAUDE_USE_LOCAL_AUTH")
-    return False
-
-
-def _codex_auth_json_secret_ref() -> str:
-    return (os.getenv("CODEX_AUTH_JSON_SECRET_REF") or "CODEX_AUTH_JSON").strip()
-
-
-def _claude_oauth_scopes() -> tuple[str, ...]:
-    raw = sandbox_env_value("CLAUDE_CODE_OAUTH_SCOPES")
-    return tuple(scope for scope in raw.split() if scope)
-
-
-def _claude_oauth_token_secret_ref() -> str:
-    return sandbox_env_value("CLAUDE_CODE_OAUTH_TOKEN_SECRET_REF")
-
-
-def _harness_proxy_auth_secrets(engine: str) -> list[SecretDef]:
-    if not _harness_uses_proxy_auth(engine):
-        return []
-    if engine == "claude-code":
-        token_secret_ref = _claude_oauth_token_secret_ref()
-        if token_secret_ref:
-            return [
-                HttpSecret(
-                    name="CLAUDE_CODE_OAUTH_TOKEN",
-                    secret_ref=token_secret_ref,
-                    mode=SecretMode.INJECT,
-                    hosts=("api.anthropic.com",),
-                    inject_header="Authorization",
-                    inject_formatter="Bearer {{ .Value }}",
-                    source_kind="env",
-                )
-            ]
-        return [
-            OAuthTokenSecret(
-                name="CLAUDE_CODE_OAUTH",
-                grant="refresh_token",
-                hosts=("api.anthropic.com",),
-                fields=(
-                    (
-                        "client_id",
-                        OAuthFieldSource(
-                            "CLAUDE_CODE_OAUTH_CLIENT_ID", source_kind="env"
-                        ),
-                    ),
-                    (
-                        "refresh_token",
-                        OAuthFieldSource(
-                            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", source_kind="env"
-                        ),
-                    ),
-                ),
-                scopes=_claude_oauth_scopes(),
-                token_endpoint=_CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT,
-            )
-        ]
-    return []
-
-
-def _harness_proxy_auth_env_keys(engine: str) -> tuple[str, ...]:
-    if not _harness_uses_proxy_auth(engine):
-        return ()
-    if engine == "claude-code":
-        keys = ["CLAUDE_CODE_OAUTH_CLIENT_ID", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN"]
-        token_secret_ref = _claude_oauth_token_secret_ref()
-        if token_secret_ref:
-            keys.append(token_secret_ref)
-        return tuple(dict.fromkeys(keys))
-    return ()
-
-
-def _harness_codex_auth_json_secret_ref(engine: str) -> str | None:
-    if engine == "codex" and _harness_uses_proxy_auth(engine):
-        return _codex_auth_json_secret_ref()
-    return None
-
 def _get_rt(session: SandboxSession):
     return runtime_for_session(session)
 
@@ -204,11 +114,6 @@ def _service_account_name() -> str | None:
     return value or None
 
 
-def _cache_host_path() -> str | None:
-    value = (os.getenv("KUBERNETES_SANDBOX_CACHE_HOST_PATH") or "").strip()
-    return value or None
-
-
 def _state_volume_enabled() -> bool:
     value = (os.getenv("KUBERNETES_SANDBOX_STATE_VOLUME_ENABLED") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -248,6 +153,65 @@ def _uses_op_connect_secret_source() -> bool:
 
 def _proxy_image() -> str:
     return os.getenv("KUBERNETES_IRON_PROXY_IMAGE", "centaur-iron-proxy:latest")
+
+
+def _tool_server_image() -> str | None:
+    """Tool-server sidecar image.
+
+    When set, sandbox Pods get a ``tool-server`` sidecar that exposes
+    ``/tools/*`` on loopback. Sandboxes call ``http://localhost:<port>``
+    instead of routing tool calls back to the API.
+    """
+    value = (os.getenv("KUBERNETES_TOOL_SERVER_IMAGE") or "").strip()
+    return value or None
+
+
+def _tool_server_image_pull_policy() -> str:
+    return (
+        os.getenv("KUBERNETES_TOOL_SERVER_IMAGE_PULL_POLICY") or _image_pull_policy()
+    ).strip()
+
+
+def _tool_server_port() -> int:
+    return _env_int("KUBERNETES_TOOL_SERVER_PORT", 8001)
+
+
+def _workflow_run_image() -> str:
+    """Image used for per-run workflow execution pods.
+
+    Defaults to ``KUBERNETES_WORKFLOW_RUN_IMAGE`` (Helm injects the api image
+    by default) and falls back to ``centaur-api:latest`` for local runs.
+    """
+    return os.getenv("KUBERNETES_WORKFLOW_RUN_IMAGE", "centaur-api:latest")
+
+
+def _workflow_run_image_pull_policy() -> str:
+    return (
+        os.getenv("KUBERNETES_WORKFLOW_RUN_IMAGE_PULL_POLICY") or _image_pull_policy()
+    ).strip()
+
+
+def _workflow_run_pod_name(run_id: str) -> str:
+    return _resource_name("centaur-centaur-workflow-run", run_id)
+
+
+def _tool_server_tool_dirs() -> str:
+    """TOOL_DIRS the sidecar uses.
+
+    The API fully controls both of the sidecar's mounts, so it constructs the
+    path directly rather than inheriting (and rewriting) its own ``TOOL_DIRS``.
+    Base tools live at ``/app/tools`` in the shared image. The overlay, when
+    present, is mounted at ``_SANDBOX_OVERLAY_DIR`` — not the API's overlay
+    mount — so its tools are at ``<_SANDBOX_OVERLAY_DIR>/tools``. An explicit
+    ``KUBERNETES_TOOL_SERVER_TOOL_DIRS`` still wins as an escape hatch.
+    """
+    value = (os.getenv("KUBERNETES_TOOL_SERVER_TOOL_DIRS") or "").strip()
+    if value:
+        return value
+    dirs = ["/app/tools"]
+    if _overlay_image():
+        dirs.append(f"{_SANDBOX_OVERLAY_DIR}/tools")
+    return ":".join(dirs)
 
 
 def _token_broker_name() -> str:
@@ -299,6 +263,7 @@ def _secret_env_key(name: str) -> str:
 def _proxy_iron_env(
     secret_name: str,
     pg_secrets: list[tuple[PgDsnSecret, str]],
+    core: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Env block for the iron-proxy container.
 
@@ -354,6 +319,8 @@ def _proxy_iron_env(
         env.append(
             {"name": f"PG_PROXY_PASSWORD_{secret.name}", "value": proxy_password}
         )
+    if core is not None:
+        env.append({"name": core["password_env"], "value": core["password"]})
     return env
 
 
@@ -366,6 +333,42 @@ def _build_proxied_pg_url(host: str, port: int, password: str, database: str) ->
     """
     netloc = f"app_user:{password}@{host}:{port}"
     return urlunsplit(("postgresql", netloc, f"/{database}", "", ""))
+
+
+_CORE_PG_PASSWORD_ENV = "PG_PROXY_PASSWORD_CENTAUR_CORE"
+
+
+def _core_db_name() -> str:
+    """Database name of the core Centaur DB, parsed from the API's own DSN.
+
+    iron-proxy forwards the client's startup-packet database to the upstream,
+    so the sidecar's proxied DSN must declare the same dbname.
+    """
+    from api.config import settings
+
+    return urlsplit(settings.database_url).path.lstrip("/") or "centaur"
+
+
+def _build_core_pg(
+    firewall_host: str, pg_listen_ports: dict[str, int]
+) -> dict[str, Any]:
+    """Wiring for the per-sandbox proxy's core-DB listener (sidecar use only).
+
+    The tool-server sidecar reaches the core DB through the proxy because the
+    sandbox is denied direct Postgres egress. Returns the fields needed to
+    render the listener, inject the proxy-side password, open the sidecar's
+    pool, and allow egress to the listener port. Never injected into the agent
+    container, so no DB credential lives in the sandbox.
+    """
+    port = core_pg_listen_port(pg_listen_ports)
+    password = _secrets.token_urlsafe(24)
+    return {
+        "port": port,
+        "password": password,
+        "password_env": _CORE_PG_PASSWORD_ENV,
+        "dsn_env_var": _secret_env_key("DATABASE_URL"),
+        "dsn": _build_proxied_pg_url(firewall_host, port, password, _core_db_name()),
+    }
 
 
 def _api_pod_match_labels() -> dict[str, str]:
@@ -434,6 +437,190 @@ def _firewall_ca_key_secret_name() -> str:
             "KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME is required for per-sandbox proxy"
         )
     return value
+
+
+def _build_tool_server_container(
+    *,
+    thread_key: str,
+    container_name: str,
+    firewall_host: str,
+    api_url: str,
+    overlay_mount: str | None,
+    database_url: str,
+    pg_dsns: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the tool-server sidecar container spec.
+
+    The sidecar listens on loopback inside the sandbox Pod and routes its own
+    HTTP egress through the per-sandbox iron-proxy. ``database_url`` points at
+    the proxy's core-DB listener (not the raw DSN) so the pool respects the
+    sandbox's NetworkPolicy; the real credentials stay in the proxy pod.
+    Caller is responsible for only invoking this when ``_tool_server_image()``
+    is set.
+
+    ``pg_dsns`` maps each ``PgDsnSecret`` name to the local proxied DSN the
+    sandbox should see (same dict wired into the agent container). Tool code
+    runs in this sidecar, so a ``pg_dsn`` secret must reach it as an env var:
+    ``_resolve_secrets`` returns nothing for ``PgDsnSecret`` (it is delivered
+    via the environment, not ``ToolContext``), and the SDK's ``secret()`` reads
+    it from ``os.environ``. Without these, ``secret("<PG_DSN_NAME>")`` falls
+    through to the placeholder. The agent container alone having them is why a
+    tool like ``paradigmdb`` got the stub DSN.
+
+    The sidecar runs tool code that calls back into the API (e.g. the slack
+    tool offloading a downloaded file to ``/agent/attachments/upload``), so it
+    needs its own ``CENTAUR_API_KEY``. Mint a sandbox token scoped to this
+    thread, mirroring the agent container; without it the callback is
+    unauthenticated and the API rejects it with 401.
+    """
+    image_ref = _tool_server_image()
+    if not image_ref:
+        raise RuntimeError("_build_tool_server_container called without an image")
+
+    secret_name = _secret_env_name()
+    proxy_url = f"http://{firewall_host}:{_proxy_port()}"
+    api_host = urlsplit(api_url).hostname or ""
+    no_proxy_hosts = [
+        "localhost",
+        "127.0.0.1",
+        firewall_host,
+        *OBSERVABILITY_NO_PROXY_HOSTS,
+    ]
+    if api_host:
+        no_proxy_hosts.append(api_host)
+    no_proxy = ",".join(dict.fromkeys(no_proxy_hosts))
+
+    env: list[dict[str, Any]] = [
+        {"name": "DATABASE_URL", "value": database_url},
+        {
+            "name": "SANDBOX_SIGNING_KEY",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_name,
+                    "key": _secret_env_key("SANDBOX_SIGNING_KEY"),
+                }
+            },
+        },
+        {"name": "HTTPS_PROXY", "value": proxy_url},
+        {"name": "HTTP_PROXY", "value": proxy_url},
+        {"name": "https_proxy", "value": proxy_url},
+        {"name": "http_proxy", "value": proxy_url},
+        {"name": "NO_PROXY", "value": no_proxy},
+        {"name": "no_proxy", "value": no_proxy},
+        {"name": "REQUESTS_CA_BUNDLE", "value": "/firewall-certs/ca-cert.pem"},
+        {"name": "SSL_CERT_FILE", "value": "/firewall-certs/ca-cert.pem"},
+        {"name": "NODE_EXTRA_CA_CERTS", "value": "/firewall-certs/ca-cert.pem"},
+        {"name": "CENTAUR_API_URL", "value": api_url},
+        {"name": "CENTAUR_API_KEY", "value": mint_sandbox_token(thread_key, container_name)},
+        {"name": "TOOL_DIRS", "value": _tool_server_tool_dirs()},
+        {"name": "PLUGIN_WATCHER_ENABLED", "value": "0"},
+    ]
+    # pg_dsn secrets reach tool code as env vars (see docstring). Add them
+    # before operator extra-env so an operator override still wins, matching
+    # the agent container's ordering in ``container_env``.
+    for name, dsn in (pg_dsns or {}).items():
+        env.append({"name": name, "value": dsn})
+    _apply_tool_server_extra_env(env, no_proxy)
+
+    volume_mounts: list[dict[str, Any]] = [
+        {
+            "name": "firewall-ca",
+            "mountPath": "/firewall-certs",
+            "readOnly": True,
+        },
+    ]
+    if overlay_mount:
+        volume_mounts.append(
+            {
+                "name": "overlay-root",
+                "mountPath": overlay_mount,
+                "readOnly": True,
+            }
+        )
+
+    port = _tool_server_port()
+    # Bind the listener on 0.0.0.0 inside the pod's network namespace. The
+    # sandbox container reaches it via 127.0.0.1 (shared loopback within the
+    # pod); kubelet probes reach it via the pod IP. Listening only on
+    # 127.0.0.1 would block liveness probes — the kubelet runs on the node
+    # and can't see the container's loopback interface — and the resulting
+    # probe failures would kill the sidecar.
+    return {
+        "name": "tool-server",
+        "image": image_ref,
+        "imagePullPolicy": _tool_server_image_pull_policy(),
+        # Same image as the API, but the sidecar overrides the image ENTRYPOINT,
+        # so the overlay tool-dep install the API gets via entrypoint.sh would be
+        # skipped. tool-server-startup.sh installs overlay deps into the writable
+        # _OVERLAY_TOOL_DEPS_DIR (passed as an arg) since this container is
+        # non-root and cannot write the venv, puts it on PYTHONPATH, then execs
+        # uvicorn.
+        "command": ["/app/tool-server-startup.sh"],
+        "args": [str(port), _OVERLAY_TOOL_DEPS_DIR],
+        "env": env,
+        "ports": [{"containerPort": port, "name": "tools"}],
+        "readinessProbe": {
+            "httpGet": {"path": "/healthz", "port": port},
+            "periodSeconds": 5,
+            "failureThreshold": 30,
+        },
+        "livenessProbe": {
+            "httpGet": {"path": "/healthz", "port": port},
+            "periodSeconds": 30,
+            "failureThreshold": 5,
+        },
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+            "runAsGroup": _AGENT_UID,
+            "runAsNonRoot": True,
+            "runAsUser": _AGENT_UID,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "volumeMounts": volume_mounts,
+    }
+
+
+def _apply_tool_server_extra_env(env: list[dict[str, Any]], computed_no_proxy: str) -> None:
+    """Let the sidecar see operator sandbox env without breaking its wiring."""
+    pinned = {
+        "DATABASE_URL",
+        "SANDBOX_SIGNING_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "CENTAUR_API_URL",
+        "CENTAUR_API_KEY",
+        "TOOL_DIRS",
+        "PLUGIN_WATCHER_ENABLED",
+    }
+    no_proxy_keys = {"NO_PROXY", "no_proxy"}
+    for name, value in sandbox_extra_env_map().items():
+        if name in pinned:
+            log.warning("tool_server_extra_env_ignored_pinned_var", key=name)
+            continue
+        if name in no_proxy_keys:
+            value = _merge_csv_env(computed_no_proxy, value)
+        _upsert_env_value(env, name, value)
+
+
+def _upsert_env_value(env: list[dict[str, Any]], name: str, value: str) -> None:
+    for item in env:
+        if item.get("name") == name:
+            item["value"] = value
+            item.pop("valueFrom", None)
+            return
+    env.append({"name": name, "value": value})
+
+
+def _merge_csv_env(base: str, extra: str) -> str:
+    values = [item.strip() for item in base.split(",") if item.strip()]
+    values.extend(item.strip() for item in extra.split(",") if item.strip())
+    return ",".join(dict.fromkeys(values))
 
 
 def _resource_name(prefix: str, raw: str, *, max_length: int = 63) -> str:
@@ -730,13 +917,17 @@ class KubernetesExecutorBackend(SandboxBackend):
     async def _cleanup_workload_after_create_error(self, pod_name: str) -> None:
         await self._delete_pod(pod_name)
 
-    def _collect_secrets(self, engine: str | None = None) -> list[SecretDef]:
+    def _collect_secrets(self) -> list[SecretDef]:
         from api.app import get_tool_manager
 
-        secrets = get_tool_manager().collect_secrets()
-        if engine:
-            secrets = [*secrets, *_harness_proxy_auth_secrets(engine)]
-        return secrets
+        return get_tool_manager().collect_secrets()
+
+    def _secrets_for_sandbox(
+        self, engine: str, auth_modes: Mapping[str, str]
+    ) -> list[SecretDef]:
+        from api.app import get_tool_manager
+
+        return get_tool_manager().secrets_for_sandbox(engine, auth_modes)
 
     def _resolved_pg_secrets(
         self, secrets: list[SecretDef]
@@ -761,14 +952,18 @@ class KubernetesExecutorBackend(SandboxBackend):
         sandbox_id: str,
         secrets: list[SecretDef],
         pg_listen_ports: dict[str, int],
-        *,
-        codex_auth_json_secret_ref: str | None = None,
+        core: dict[str, Any] | None = None,
     ) -> None:
+        core_pg = (
+            {k: core[k] for k in ("port", "dsn_env_var", "password_env")}
+            if core is not None
+            else None
+        )
         rendered = render_proxy_yaml(
             secrets,
             base_config=None,
             pg_listen_ports=pg_listen_ports,
-            codex_auth_json_secret_ref=codex_auth_json_secret_ref,
+            core_pg=core_pg,
         )
         name = _proxy_configmap_name(sandbox_id)
         await self._delete_configmap(name)
@@ -811,7 +1006,10 @@ class KubernetesExecutorBackend(SandboxBackend):
         )
 
     async def _create_proxy_service(
-        self, sandbox_id: str, pg_listen_ports: dict[str, int]
+        self,
+        sandbox_id: str,
+        pg_listen_ports: dict[str, int],
+        core: dict[str, Any] | None = None,
     ) -> None:
         service_name = _proxy_service_name(sandbox_id)
         await self._delete_service(service_name)
@@ -829,6 +1027,15 @@ class KubernetesExecutorBackend(SandboxBackend):
                     "name": f"pg-{name[:11].lower().replace('_', '-')}",
                     "port": port,
                     "targetPort": port,
+                    "protocol": "TCP",
+                }
+            )
+        if core is not None:
+            ports.append(
+                {
+                    "name": "pg-core",
+                    "port": core["port"],
+                    "targetPort": core["port"],
                     "protocol": "TCP",
                 }
             )
@@ -855,7 +1062,10 @@ class KubernetesExecutorBackend(SandboxBackend):
         )
 
     async def _create_proxy_network_policies(
-        self, sandbox_id: str, pg_listen_ports: dict[str, int]
+        self,
+        sandbox_id: str,
+        pg_listen_ports: dict[str, int],
+        core_port: int | None = None,
     ) -> None:
         await self._delete_network_policy(_sandbox_egress_policy_name(sandbox_id))
         await self._delete_network_policy(_proxy_policy_name(sandbox_id))
@@ -863,6 +1073,9 @@ class KubernetesExecutorBackend(SandboxBackend):
         sandbox_to_proxy_ports = [{"protocol": "TCP", "port": _proxy_port()}]
         for _, port in sorted(pg_listen_ports.items(), key=lambda item: item[1]):
             sandbox_to_proxy_ports.append({"protocol": "TCP", "port": port})
+        if core_port is not None:
+            # Lets the tool-server sidecar reach the proxy's core-DB listener.
+            sandbox_to_proxy_ports.append({"protocol": "TCP", "port": core_port})
 
         proxy_egress = [
             {
@@ -983,7 +1196,7 @@ class KubernetesExecutorBackend(SandboxBackend):
         pg_listen_ports: dict[str, int],
         *,
         restart_policy: str,
-        harness_auth_env_keys: tuple[str, ...] = (),
+        core: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return the pod.spec dict shared by the sandbox bare Pod and the api-self Deployment."""
         configmap_name = _proxy_configmap_name(sandbox_id)
@@ -996,20 +1209,6 @@ class KubernetesExecutorBackend(SandboxBackend):
             and bootstrap_secret_name
         ):
             env_from.append({"secretRef": {"name": bootstrap_secret_name}})
-        env = _proxy_iron_env(secret_name, pg_secrets)
-        for key in harness_auth_env_keys:
-            env.append(
-                {
-                    "name": key,
-                    "valueFrom": {
-                        "secretKeyRef": {
-                            "name": _harness_auth_secret_name(),
-                            "key": key,
-                            "optional": True,
-                        }
-                    },
-                }
-            )
         proxy_ports: list[dict[str, Any]] = [
             {"containerPort": _proxy_port(), "name": "proxy"},
             {"containerPort": _proxy_management_port(), "name": "management"},
@@ -1022,6 +1221,8 @@ class KubernetesExecutorBackend(SandboxBackend):
                     "name": f"pg-{name[:11].lower().replace('_', '-')}",
                 }
             )
+        if core is not None:
+            proxy_ports.append({"containerPort": core["port"], "name": "pg-core"})
         return {
             "automountServiceAccountToken": False,
             "restartPolicy": restart_policy,
@@ -1031,7 +1232,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                     "name": "iron-proxy",
                     "image": _proxy_image(),
                     "imagePullPolicy": _proxy_image_pull_policy(),
-                    "env": env,
+                    "env": _proxy_iron_env(secret_name, pg_secrets, core=core),
                     "envFrom": env_from,
                     "ports": proxy_ports,
                     "readinessProbe": {
@@ -1099,16 +1300,11 @@ class KubernetesExecutorBackend(SandboxBackend):
         sandbox_id: str,
         pg_secrets: list[tuple[PgDsnSecret, str]],
         pg_listen_ports: dict[str, int],
-        *,
-        harness_auth_env_keys: tuple[str, ...] = (),
+        core: dict[str, Any] | None = None,
     ) -> str:
         proxy_pod_name = _new_proxy_pod_name(sandbox_id)
         spec = self._build_proxy_pod_spec(
-            sandbox_id,
-            pg_secrets,
-            pg_listen_ports,
-            harness_auth_env_keys=harness_auth_env_keys,
-            restart_policy="Never",
+            sandbox_id, pg_secrets, pg_listen_ports, restart_policy="Never", core=core
         )
         await self._core_api().create_namespaced_pod(
             _namespace(),
@@ -1268,7 +1464,7 @@ class KubernetesExecutorBackend(SandboxBackend):
         secret_name = _prompt_secret_name(pod_name)
         firewall_host = _proxy_service_name(pod_name)
 
-        secrets = self._collect_secrets(engine)
+        secrets = self._secrets_for_sandbox(engine, sandbox_extra_env_map())
         pg_listen_ports = assign_pg_listen_ports(secrets)
         pg_secrets = self._resolved_pg_secrets(secrets)
         sandbox_pg_dsns = {
@@ -1280,12 +1476,18 @@ class KubernetesExecutorBackend(SandboxBackend):
             )
             for secret, proxy_password in pg_secrets
         }
+        # Core-DB listener for the tool-server sidecar (sidecar-only; never put
+        # into sandbox_pg_dsns / the agent env). None when no sidecar runs.
+        core_pg = (
+            _build_core_pg(firewall_host, pg_listen_ports)
+            if _tool_server_image()
+            else None
+        )
 
         env = container_env(
             thread_key,
             pod_name,
             firewall_host,
-            engine=engine,
             trace_id=trace_id,
             resume_thread_id=resume_thread_id,
             pg_dsns=sandbox_pg_dsns,
@@ -1335,47 +1537,6 @@ class KubernetesExecutorBackend(SandboxBackend):
             },
         ]
         init_containers: list[dict[str, Any]] = []
-
-        cache_host_path = _cache_host_path()
-        if cache_host_path:
-            volume_mounts.append(
-                {
-                    "name": "sandbox-sccache",
-                    "mountPath": "/home/agent/.cache/sccache",
-                }
-            )
-            volumes.append(
-                {
-                    "name": "sandbox-sccache",
-                    "hostPath": {
-                        "path": cache_host_path,
-                        "type": "DirectoryOrCreate",
-                    },
-                }
-            )
-            init_containers.append(
-                {
-                    "name": "sandbox-sccache-permissions",
-                    "image": image(),
-                    "imagePullPolicy": _image_pull_policy(),
-                    "command": [
-                        "/bin/sh",
-                        "-ec",
-                        "mkdir -p /cache && chown 1001:1001 /cache",
-                    ],
-                    "volumeMounts": [
-                        {
-                            "name": "sandbox-sccache",
-                            "mountPath": "/cache",
-                        }
-                    ],
-                    "securityContext": {
-                        "allowPrivilegeEscalation": False,
-                        "runAsGroup": 0,
-                        "runAsUser": 0,
-                    },
-                }
-            )
 
         if overlay_image:
             volume_mounts.append(
@@ -1445,6 +1606,50 @@ class KubernetesExecutorBackend(SandboxBackend):
 
         cmd = build_harness_cmd(engine, model)
 
+        containers: list[dict[str, Any]] = [
+            {
+                "name": _CONTAINER_NAME,
+                "image": image(),
+                "imagePullPolicy": _image_pull_policy(),
+                "args": cmd,
+                "stdin": True,
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "runAsGroup": _AGENT_UID,
+                    "runAsNonRoot": True,
+                    "runAsUser": _AGENT_UID,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "tty": False,
+                "workingDir": "/home/agent",
+                "env": [
+                    {
+                        "name": item.split("=", 1)[0],
+                        "value": item.split("=", 1)[1],
+                    }
+                    for item in env
+                ],
+                "resources": _pod_resources(),
+                "volumeMounts": volume_mounts,
+            }
+        ]
+        if _tool_server_image():
+            assert core_pg is not None  # set under the same guard above
+            containers.append(
+                _build_tool_server_container(
+                    thread_key=thread_key,
+                    container_name=pod_name,
+                    firewall_host=firewall_host,
+                    api_url=os.getenv("AGENT_API_URL", "http://api:8000"),
+                    overlay_mount=(
+                        _SANDBOX_OVERLAY_ROOT if overlay_image else None
+                    ),
+                    database_url=core_pg["dsn"],
+                    pg_dsns=sandbox_pg_dsns,
+                )
+            )
+
         pod_spec: dict[str, Any] = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -1461,34 +1666,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                 "automountServiceAccountToken": False,
                 "restartPolicy": "Never",
                 "initContainers": init_containers,
-                "containers": [
-                    {
-                        "name": _CONTAINER_NAME,
-                        "image": image(),
-                        "imagePullPolicy": _image_pull_policy(),
-                        "args": cmd,
-                        "stdin": True,
-                        "securityContext": {
-                            "allowPrivilegeEscalation": False,
-                            "capabilities": {"drop": ["ALL"]},
-                            "runAsGroup": _AGENT_UID,
-                            "runAsNonRoot": True,
-                            "runAsUser": _AGENT_UID,
-                            "seccompProfile": {"type": "RuntimeDefault"},
-                        },
-                        "tty": False,
-                        "workingDir": "/home/agent",
-                        "env": [
-                            {
-                                "name": item.split("=", 1)[0],
-                                "value": item.split("=", 1)[1],
-                            }
-                            for item in env
-                        ],
-                        "resources": _pod_resources(),
-                        "volumeMounts": volume_mounts,
-                    }
-                ],
+                "containers": containers,
                 "volumes": volumes,
             },
         }
@@ -1508,18 +1686,16 @@ class KubernetesExecutorBackend(SandboxBackend):
         try:
             await self._create_prompt_secret(secret_name, persona)
             await self._create_proxy_configmap(
-                pod_name,
-                secrets,
-                pg_listen_ports,
-                codex_auth_json_secret_ref=_harness_codex_auth_json_secret_ref(engine),
+                pod_name, secrets, pg_listen_ports, core=core_pg
             )
-            await self._create_proxy_service(pod_name, pg_listen_ports)
-            await self._create_proxy_network_policies(pod_name, pg_listen_ports)
-            proxy_pod_name = await self._create_proxy_pod(
+            await self._create_proxy_service(pod_name, pg_listen_ports, core=core_pg)
+            await self._create_proxy_network_policies(
                 pod_name,
-                pg_secrets,
                 pg_listen_ports,
-                harness_auth_env_keys=_harness_proxy_auth_env_keys(engine),
+                core_port=core_pg["port"] if core_pg else None,
+            )
+            proxy_pod_name = await self._create_proxy_pod(
+                pod_name, pg_secrets, pg_listen_ports, core=core_pg
             )
             await self._wait_pod_ready(proxy_pod_name)
             await self._create_workload(pod_spec)
@@ -1859,6 +2035,198 @@ class KubernetesExecutorBackend(SandboxBackend):
         raise TimeoutError(
             f"deployment readiness timed out after {_READY_TIMEOUT_S}s: {name}"
         )
+
+    # ── Workflow-run pods (one-shot, trusted code) ─────────────────────
+
+    async def _load_api_container_template(self) -> dict[str, Any]:
+        """Snapshot env / envFrom / volumes from a running API pod.
+
+        Workflows are trusted code (not arbitrary agent harnesses), so they
+        don't need their own iron-proxy. They run in a one-shot pod that
+        clones the API container's runtime config — same secrets, same
+        ``HTTPS_PROXY`` pointing at the shared API iron-proxy, same CA mount.
+        """
+        selector = ",".join(
+            f"{k}={v}" for k, v in _api_pod_match_labels().items()
+        )
+        pods = await self._core_api().list_namespaced_pod(
+            _namespace(), label_selector=selector
+        )
+        items = list(getattr(pods, "items", []) or [])
+        if not items:
+            raise RuntimeError(
+                f"no api pod matches selector {selector!r}; "
+                "cannot derive workflow-run pod env"
+            )
+        chosen = next(
+            (
+                p
+                for p in items
+                if (getattr(getattr(p, "status", None), "phase", "") or "").lower()
+                == "running"
+            ),
+            items[0],
+        )
+        sanitize = self._core_api().api_client.sanitize_for_serialization
+        spec = sanitize(chosen.spec) or {}
+        api_container: dict[str, Any] | None = None
+        for c in spec.get("containers") or []:
+            if c.get("name") == "api":
+                api_container = c
+                break
+        if api_container is None:
+            raise RuntimeError("api container not found in api pod spec")
+        return {
+            "env": list(api_container.get("env") or []),
+            "envFrom": list(api_container.get("envFrom") or []),
+            "volumeMounts": list(api_container.get("volumeMounts") or []),
+            "volumes": list(spec.get("volumes") or []),
+            "imagePullSecrets": list(spec.get("imagePullSecrets") or []),
+            "serviceAccountName": spec.get("serviceAccountName"),
+        }
+
+    def _build_workflow_run_pod_spec(
+        self, run_id: str, *, api_template: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Pod spec for a single workflow execution.
+
+        The pod runs ``python -m api.workflow_executor --run-id <run_id>``
+        against the API image, inheriting the API container's env (so it
+        shares the API's view of secrets and proxy config), and exits when
+        the handler returns. Lifecycle is one-shot: ``restartPolicy: Never``.
+        """
+        pod_name = _workflow_run_pod_name(run_id)
+
+        # Override entries that should differ from the API container's env.
+        # The executor's __main__ does not start background loops, but
+        # disabling them defensively makes the env unambiguous if a handler
+        # imports module-level code that reads these.
+        overrides: dict[str, dict[str, Any]] = {
+            "EXECUTION_WORKER_ENABLED": {"name": "EXECUTION_WORKER_ENABLED", "value": "0"},
+            "WORKFLOW_WORKER_ENABLED": {"name": "WORKFLOW_WORKER_ENABLED", "value": "0"},
+            "WARM_POOL_ENABLED": {"name": "WARM_POOL_ENABLED", "value": "0"},
+            "PLUGIN_WATCHER_ENABLED": {"name": "PLUGIN_WATCHER_ENABLED", "value": "0"},
+            # Already running inside the per-run pod; never recurse.
+            "WORKFLOW_RUN_SANDBOX_ENABLED": {
+                "name": "WORKFLOW_RUN_SANDBOX_ENABLED",
+                "value": "0",
+            },
+            "CENTAUR_WORKFLOW_RUN_ID": {
+                "name": "CENTAUR_WORKFLOW_RUN_ID",
+                "value": run_id,
+            },
+        }
+        env_list: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in api_template["env"]:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str):
+                continue
+            if name in overrides:
+                env_list.append(overrides.pop(name))
+            else:
+                env_list.append(entry)
+            seen.add(name)
+        for name, entry in overrides.items():
+            if name not in seen:
+                env_list.append(entry)
+
+        container: dict[str, Any] = {
+            "name": "workflow-executor",
+            "image": _workflow_run_image(),
+            "imagePullPolicy": _workflow_run_image_pull_policy(),
+            "command": ["/app/.venv/bin/python"],
+            "args": ["-m", "api.workflow_executor", "--run-id", run_id],
+            "env": env_list,
+            "envFrom": api_template["envFrom"],
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "resources": _pod_resources(),
+            "volumeMounts": api_template["volumeMounts"],
+        }
+
+        spec: dict[str, Any] = {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "imagePullSecrets": (
+                api_template["imagePullSecrets"] or _image_pull_secrets()
+            ),
+            "containers": [container],
+            "volumes": api_template["volumes"],
+        }
+        service_account = api_template.get("serviceAccountName") or _service_account_name()
+        if service_account:
+            spec["serviceAccountName"] = service_account
+
+        return {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "labels": {
+                    "centaur.ai/managed": "true",
+                    "centaur.ai/component": "workflow-run",
+                    "centaur.ai/workflow-run-id": run_id,
+                },
+                "annotations": {
+                    "centaur.ai/workflow-run-id": run_id,
+                },
+            },
+            "spec": spec,
+        }
+
+    async def spawn_workflow_run(self, run_id: str) -> str:
+        """Provision a one-shot workflow executor pod.
+
+        Workflows are trusted code, so this skips the per-run iron-proxy
+        bring-up: the pod just clones the API container's env (which already
+        routes through the shared API iron-proxy) and runs the executor.
+        """
+        await self._ensure_clients()
+        pod_name = _workflow_run_pod_name(run_id)
+        api_template = await self._load_api_container_template()
+        pod_spec = self._build_workflow_run_pod_spec(
+            run_id, api_template=api_template
+        )
+
+        # If a previous attempt for this run_id left a pod behind, clear it.
+        await self._delete_pod(pod_name)
+        try:
+            await self._core_api().create_namespaced_pod(_namespace(), pod_spec)
+        except Exception as exc:
+            # Idempotent: an existing pod for the same run_id is fine.
+            if getattr(exc, "status", None) != 409:
+                with contextlib.suppress(Exception):
+                    await self._delete_pod(pod_name)
+                raise
+        return pod_name
+
+    async def wait_workflow_run_terminal(self, pod_name: str) -> str:
+        """Block until the workflow-run pod terminates; return its phase."""
+        await self._ensure_clients()
+        backoff = 0.5
+        while True:
+            try:
+                pod = await self._core_api().read_namespaced_pod(
+                    pod_name, _namespace()
+                )
+            except Exception as exc:
+                if self._is_not_found(exc):
+                    return "gone"
+                raise
+            phase = (pod.status.phase or "").lower()
+            if phase in {"succeeded", "failed"}:
+                return phase
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 5.0)
+
+    async def cleanup_workflow_run_pod(self, pod_name: str) -> None:
+        """Delete a workflow-run pod (idempotent). No per-run proxy to clean up."""
+        await self._ensure_clients()
+        await self._delete_pod(pod_name)
 
     async def ensure_api_proxy_pod(self) -> None:
         """Create or update the API server's iron-proxy Deployment.

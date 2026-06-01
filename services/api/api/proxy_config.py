@@ -10,7 +10,6 @@ tool_manager (injection map). The API server owns iron-proxy's full config:
   ``oauth_token``; kept until tools migrate off the ``gcp_auth`` secret type.
 - ``oauth_token`` transform — one ``tokens`` entry per ``OAuthTokenSecret``,
   minting OAuth2 access tokens for the declared grant.
-- ``codex_login`` transform — optional Codex ChatGPT-login auth transport.
 - ``hmac_sign`` transforms — one per unique ``HmacSignSecret`` signing scheme,
   HMAC-signing each request and injecting the configured headers.
 - top-level ``postgres:`` — one listener per ``PgDsnSecret`` on sequential ports
@@ -53,7 +52,7 @@ GCP_AUTH_HOSTS: tuple[str, ...] = ("*.googleapis.com",)
 PG_LISTEN_PORT_BASE = 5432
 
 _MANAGED_TRANSFORMS: frozenset[str] = frozenset(
-    {"secrets", "gcp_auth", "oauth_token", "codex_login", "hmac_sign"}
+    {"secrets", "gcp_auth", "oauth_token", "hmac_sign"}
 )
 
 # Iron-proxy ``source`` schema for resolving secret values. ``env`` reads the
@@ -89,11 +88,8 @@ def _op_vault() -> str:
     return os.environ.get("OP_VAULT", "ai-agents").strip()
 
 
-def _build_source(secret_ref: str, source_kind: str | None = None) -> dict[str, str]:
-    kind = (source_kind or "").strip().lower() or _secret_source_kind()
-    if kind == "env":
-        return {"type": "env", "var": secret_ref}
-    iron_proxy_type = _OP_REF_SOURCES.get(kind)
+def _build_source(secret_ref: str) -> dict[str, str]:
+    iron_proxy_type = _OP_REF_SOURCES.get(_secret_source_kind())
     if iron_proxy_type is not None:
         return {
             "type": iron_proxy_type,
@@ -103,48 +99,27 @@ def _build_source(secret_ref: str, source_kind: str | None = None) -> dict[str, 
     return {"type": "env", "var": secret_ref}
 
 
-def _build_codex_login_transform(
-    auth_json_secret_ref: str, source_kind: str | None = None
-) -> dict[str, Any]:
-    """Render iron-proxy's Codex ChatGPT-login auth transport.
+# Per-sandbox listener that lets a co-located tool-server sidecar reach the
+# core Centaur DB through the proxy (sandboxes are denied direct Postgres
+# egress). Unlike tool ``pg_dsn`` listeners, its upstream is always resolved
+# from an env var: the proxy already has the core DSN via ``envFrom`` the infra
+# secret, so this is robust regardless of the configured secret source.
+CENTAUR_CORE_PG_LISTENER = "centaur_core"
 
-    The transform owns the real Codex auth.json and writes it back after
-    refresh-token rotation, so it must use a writable 1Password field source.
-    """
-    kind = (source_kind or "").strip().lower() or _secret_source_kind()
-    iron_proxy_type = _OP_REF_SOURCES.get(kind)
-    if iron_proxy_type is None:
-        raise ValueError(
-            "codex_login requires FIREWALL_MANAGER_SECRET_SOURCE to be "
-            "'onepassword' or 'onepassword-connect'"
-        )
-    secret_ref = auth_json_secret_ref.strip()
-    if not secret_ref:
-        raise ValueError("codex_login requires a non-empty auth_json_secret_ref")
-    if not secret_ref.startswith("op://"):
-        secret_ref = f"op://{_op_vault()}/{secret_ref}/credential"
-    source = {
-        "type": iron_proxy_type,
-        "secret_ref": secret_ref,
-        "ttl": _secret_ttl(),
-    }
+
+def core_pg_listen_port(pg_listen_ports: dict[str, int]) -> int:
+    """Port for the core-DB listener: just past the tool ``pg_dsn`` listeners."""
+    return PG_LISTEN_PORT_BASE + len(pg_listen_ports)
+
+
+def _build_core_pg_listener(
+    *, port: int, dsn_env_var: str, password_env: str
+) -> dict[str, Any]:
     return {
-        "name": "codex_login",
-        "config": {
-            "auth_json": {
-                "source": source,
-                "writeback": {
-                    "type": iron_proxy_type,
-                    "secret_ref": secret_ref,
-                },
-            },
-            "rules": [
-                {
-                    "host": "chatgpt.com",
-                    "paths": ["/backend-api/codex/*"],
-                }
-            ],
-        },
+        "name": CENTAUR_CORE_PG_LISTENER,
+        "listen": f"0.0.0.0:{port}",
+        "upstream": {"dsn": {"type": "env", "var": dsn_env_var}},
+        "client": {"user": "app_user", "password_env": password_env},
     }
 
 
@@ -210,7 +185,7 @@ def _build_secret_transform(
         action, block = _secret_action_block(secret)
         entries.append(
             {
-                "source": _build_source(secret.secret_ref, secret.source_kind),
+                "source": _build_source(secret.secret_ref),
                 action: block,
                 "rules": [{"host": h} for h in sorted(host_set)],
             }
@@ -303,7 +278,7 @@ def _build_field_source(field: OAuthFieldSource) -> dict[str, Any]:
     Resolves the secret like any other source, then appends ``json_key`` when
     the field is pulled out of a JSON-encoded secret.
     """
-    source = _build_source(field.secret_ref, field.source_kind)
+    source = _build_source(field.secret_ref)
     if field.json_key is not None:
         source["json_key"] = field.json_key
     return source
@@ -498,7 +473,7 @@ def render_proxy_yaml(
     base_config: str | None = None,
     *,
     pg_listen_ports: dict[str, int] | None = None,
-    codex_auth_json_secret_ref: str | None = None,
+    core_pg: dict[str, Any] | None = None,
 ) -> str:
     """Splice managed transforms + postgres listeners into ``base_config`` YAML.
 
@@ -524,10 +499,6 @@ def render_proxy_yaml(
     oauth_token = _build_oauth_token_transform(secrets)
     if oauth_token is not None:
         new_transforms.append(oauth_token)
-    if codex_auth_json_secret_ref is not None:
-        new_transforms.append(
-            _build_codex_login_transform(codex_auth_json_secret_ref)
-        )
     new_transforms.extend(_build_hmac_sign_transforms(secrets))
     if new_transforms:
         for index, transform in enumerate(transforms):
@@ -539,6 +510,8 @@ def render_proxy_yaml(
     cfg["transforms"] = transforms
 
     listeners = _build_postgres_listeners(secrets, pg_listen_ports)
+    if core_pg is not None:
+        listeners.append(_build_core_pg_listener(**core_pg))
     if listeners:
         cfg["postgres"] = listeners
     else:

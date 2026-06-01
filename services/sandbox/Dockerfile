@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.143
+ARG CLAUDE_CODE_VERSION=2.1.154
 ARG CODEX_VERSION=0.130.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
@@ -201,6 +201,7 @@ RUN rm -f /etc/sudoers.d/agent
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
 RUN install -d -m 0755 /etc/centaur
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
+COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/call.sh /usr/local/bin/call
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/github-link.sh /usr/local/bin/github-link

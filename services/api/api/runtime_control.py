@@ -30,8 +30,10 @@ from api.otel import (
     add_span_event,
     context_from_serialized,
     current_traceparent,
+    laminar_trace_metadata_attributes,
     mark_error,
     record_exception,
+    set_laminar_trace_metadata,
     set_span_attributes,
     span_context_to_dict,
     start_span,
@@ -64,7 +66,6 @@ log = structlog.get_logger()
 
 _SLACKBOT_LIVE_DELIVERY_METADATA_KEY = "slackbot_live_delivery"
 _LEGACY_SLACKBOT_LIVE_DELIVERY_METADATA_KEY = "slackbot" + "_v" + "2_live_delivery"
-_STALE_LEASE_RECOVERY_METADATA_KEY = "recovered_from_stale_lease"
 
 EXECUTION_SILENCE_TIMEOUT_S = int(os.getenv("EXECUTION_SILENCE_TIMEOUT_S", "600"))
 EXECUTION_TOOL_SILENCE_TIMEOUT_S = int(
@@ -130,99 +131,6 @@ _RAW_HARNESS_AUTH_SAFE_FAILURE_MESSAGE = (
 )
 _OTEL_METADATA_KEY = "_otel"
 _OTEL_EXECUTION_SPAN_CONTEXT_KEY = "execution_span_context"
-
-_GITHUB_FILE_LINK_CONTEXT_SCRIPT = r"""
-import glob
-import json
-import os
-import re
-import subprocess
-import urllib.parse
-
-
-def git(args, cwd):
-    try:
-        return subprocess.check_output(
-            ["git", *args],
-            cwd=cwd,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        ).strip()
-    except Exception:
-        return ""
-
-
-def add_candidate(candidates, value):
-    if not value:
-        return
-    path = os.path.abspath(os.path.expanduser(value))
-    if path not in candidates:
-        candidates.append(path)
-
-
-def candidate_dirs():
-    candidates = []
-    add_candidate(candidates, os.getcwd())
-    add_candidate(candidates, "/home/agent/workspace")
-    repo = os.environ.get("AGENT_REPO", "").strip()
-    if "/" in repo:
-        add_candidate(candidates, os.path.join("/home/agent/github", repo))
-        add_candidate(candidates, os.path.join("/home/agent/branches", repo))
-    for pattern in ("/home/agent/github/*/*", "/home/agent/branches/*/*"):
-        for path in sorted(glob.glob(pattern)):
-            add_candidate(candidates, path)
-    return candidates
-
-
-def repo_identity(cwd):
-    remote = git(["remote", "get-url", "origin"], cwd)
-    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote)
-    if not match:
-        repo = os.environ.get("AGENT_REPO", "").strip()
-        if "/" in repo:
-            owner, name = repo.split("/", 1)
-            return owner, name.removesuffix(".git")
-        return "", ""
-    return match.group(1), match.group(2)
-
-
-def main():
-    for cwd in candidate_dirs():
-        if not os.path.isdir(cwd):
-            continue
-        repo_root = git(["rev-parse", "--show-toplevel"], cwd)
-        if not repo_root:
-            continue
-        commit = git(["rev-parse", "HEAD"], repo_root)
-        if not commit:
-            continue
-        owner, repo = repo_identity(repo_root)
-        if not owner or not repo:
-            continue
-        branch = git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
-        upstream_commit = ""
-        if branch and branch != "HEAD":
-            upstream_commit = git(["rev-parse", "@{u}"], repo_root)
-        github_ref = branch if branch and branch != "HEAD" and upstream_commit == commit else commit
-        encoded_ref = "/".join(urllib.parse.quote(part, safe="") for part in github_ref.split("/"))
-        print(json.dumps({
-            "github_file_link_base_url": f"https://github.com/{owner}/{repo}/blob/{encoded_ref}",
-            "repo_context": {
-                "cwd": repo_root,
-                "repo_owner": owner,
-                "repo_name": repo,
-                "github_ref": github_ref,
-                "git_commit": commit,
-                **({"git_ref": branch} if branch and branch != "HEAD" else {}),
-            },
-        }, separators=(",", ":")))
-        return
-    print("{}")
-
-
-main()
-"""
 
 
 class ControlPlaneError(RuntimeError):
@@ -308,8 +216,10 @@ def _agent_session_title(
 
 # ── Per-message header (rendered italic at the top of every assistant message) ──
 
+_DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
+
 _CLAUDE_MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-7",
+    "opus": _DEFAULT_CLAUDE_MODEL,
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
@@ -319,7 +229,7 @@ def _resolve_claude_model_label(model: str | None) -> str:
     raw = (model or os.getenv("CLAUDE_MODEL") or "opus").strip().lower()
     if raw.startswith("claude-"):
         return raw
-    return _CLAUDE_MODEL_ALIASES.get(raw, raw or "claude-opus-4-7")
+    return _CLAUDE_MODEL_ALIASES.get(raw, raw or _DEFAULT_CLAUDE_MODEL)
 
 
 def _resolve_codex_model_label(model: str | None) -> str:
@@ -433,14 +343,7 @@ def _progress_silence_timeout_s(
 def _extract_repo_context(source: Any) -> dict[str, str]:
     payload = source if isinstance(source, dict) else {}
     repo_context: dict[str, str] = {}
-    for key in (
-        "cwd",
-        "repo_owner",
-        "repo_name",
-        "git_ref",
-        "git_commit",
-        "github_ref",
-    ):
+    for key in ("cwd", "repo_owner", "repo_name", "git_ref", "git_commit"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             repo_context[key] = value.strip()
@@ -460,59 +363,6 @@ async def _merge_execution_repo_context(
         canonical_json({"repo_context": repo_context}),
         execution_id,
     )
-
-
-async def _sandbox_github_file_link_context(sandbox_id: str) -> dict[str, Any]:
-    if not sandbox_id:
-        return {}
-    try:
-        exit_code, output = await get_backend().exec_run(
-            sandbox_id,
-            ["python3", "-c", _GITHUB_FILE_LINK_CONTEXT_SCRIPT],
-            user="agent",
-        )
-    except NotImplementedError:
-        return {}
-    except Exception:
-        log.warning(
-            "github_file_link_context_collect_failed",
-            sandbox_id=sandbox_id,
-            exc_info=True,
-        )
-        return {}
-    if exit_code != 0:
-        log.info(
-            "github_file_link_context_collect_nonzero",
-            sandbox_id=sandbox_id,
-            exit_code=exit_code,
-            output=output.decode("utf-8", "replace")[:500],
-        )
-        return {}
-    payload = decode_jsonb(output.decode("utf-8", "replace"), {})
-    if not isinstance(payload, dict):
-        return {}
-    base_url = str(payload.get("github_file_link_base_url") or "").strip().rstrip("/")
-    repo_context = _extract_repo_context(payload.get("repo_context"))
-    github_ref = ""
-    if isinstance(payload.get("repo_context"), dict):
-        raw_github_ref = payload["repo_context"].get("github_ref")
-        if isinstance(raw_github_ref, str) and raw_github_ref.strip():
-            github_ref = raw_github_ref.strip()
-    if not base_url:
-        return {}
-    return {
-        "github_file_link_base_url": base_url,
-        **(
-            {
-                "repo_context": {
-                    **repo_context,
-                    **({"github_ref": github_ref} if github_ref else {}),
-                }
-            }
-            if repo_context or github_ref
-            else {}
-        ),
-    }
 
 
 async def _merge_execution_metadata(
@@ -550,6 +400,84 @@ def _metadata_platform(metadata: dict[str, Any]) -> str | None:
 def _delivery_platform(delivery: dict[str, Any]) -> str | None:
     platform = delivery.get("platform") if isinstance(delivery, dict) else None
     return platform if isinstance(platform, str) and platform else None
+
+
+def _deployment_environment() -> str:
+    return (
+        os.getenv("CENTAUR_ENVIRONMENT")
+        or os.getenv("DEPLOY_ENV")
+        or os.getenv("ENVIRONMENT")
+        or "local"
+    ).strip() or "local"
+
+
+def _slack_thread_metadata(thread_key: str) -> dict[str, str]:
+    # Slack thread keys are slack:<team>:<channel>:<thread_ts>; the older
+    # slack:<channel>:<thread_ts> form is still accepted for compatibility.
+    parts = thread_key.split(":")
+    if parts[0] != "slack":
+        return {}
+    if len(parts) == 4:
+        return {
+            "slack_team_id": parts[1],
+            "slack_channel_id": parts[2],
+            "slack_thread_ts": parts[3],
+        }
+    if len(parts) == 3:
+        return {
+            "slack_channel_id": parts[1],
+            "slack_thread_ts": parts[2],
+        }
+    return {}
+
+
+def _execution_laminar_metadata(
+    *,
+    thread_key: str,
+    execution_id: str,
+    execute_id: Any = None,
+    assignment_generation: int | None = None,
+    delivery: dict[str, Any] | None = None,
+    execution_metadata: dict[str, Any] | None = None,
+    harness: Any = None,
+    engine: Any = None,
+    persona_id: Any = None,
+    prompt_ref: Any = None,
+    runtime_id: Any = None,
+    user_id: Any = None,
+) -> dict[str, Any]:
+    delivery = delivery if isinstance(delivery, dict) else {}
+    execution_metadata = (
+        execution_metadata if isinstance(execution_metadata, dict) else {}
+    )
+    effective_user_id = (
+        user_id
+        or delivery.get("recipient_user_id")
+        or delivery.get("user_id")
+        or execution_metadata.get("user_id")
+    )
+    metadata: dict[str, Any] = {
+        "app": "centaur",
+        "environment": _deployment_environment(),
+        "thread_key": thread_key,
+        "execution_id": execution_id,
+        "execute_id": execute_id,
+        "assignment_generation": assignment_generation,
+        "platform": _delivery_platform(delivery),
+        "harness": harness,
+        "engine": engine,
+        "persona_id": persona_id,
+        "prompt_ref": prompt_ref,
+        "runtime_id": runtime_id,
+        "user_id": effective_user_id,
+    }
+    metadata.update(_slack_thread_metadata(thread_key))
+    channel = (
+        delivery.get("channel") if isinstance(delivery.get("channel"), str) else None
+    )
+    if channel and not metadata.get("slack_channel_id"):
+        metadata["slack_channel_id"] = channel
+    return metadata
 
 
 async def _write_agents_override(runtime_id: str, agents_md_override: str) -> None:
@@ -1140,80 +1068,6 @@ def _has_slackbot_live_delivery(metadata: dict[str, Any]) -> bool:
         metadata.get(_SLACKBOT_LIVE_DELIVERY_METADATA_KEY) is True
         or metadata.get(_LEGACY_SLACKBOT_LIVE_DELIVERY_METADATA_KEY) is True
     )
-
-
-def _event_has_answer_text(event: dict[str, Any]) -> bool:
-    if _canonical_text_blocks(event):
-        return True
-    for key in ("delta", "text", "result"):
-        value = event.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-    return False
-
-
-def _codex_item_type(event: dict[str, Any]) -> str:
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    return str(item.get("type") or "")
-
-
-def _should_forward_codex_live_event(event: dict[str, Any]) -> bool:
-    event_type = str(event.get("type") or "")
-    if event_type in {
-        "assistant",
-        "error",
-        "result",
-        "reasoning",
-        "thread.started",
-        "turn.completed",
-        "turn.done",
-        "turn.failed",
-        "turn.plan.updated",
-    }:
-        return True
-
-    if event_type not in {"item.started", "item.completed"}:
-        return False
-
-    item_type = _codex_item_type(event)
-    if item_type in {
-        "agentMessage",
-        "agent_message",
-        "commandExecution",
-        "command_execution",
-        "error",
-        "fileChange",
-        "file_change",
-        "plan",
-    }:
-        return True
-
-    if item_type in {
-        "mcp_tool_call",
-        "mcpToolCalls",
-        "tool_call",
-        "toolCall",
-        "function_call",
-        "functionCall",
-        "custom_tool_call",
-        "customToolCall",
-        "dynamicToolCalls",
-        "collabToolCalls",
-    }:
-        return True
-
-    return False
-
-
-def _slackbot_live_events(
-    engine: str,
-    payload: dict[str, Any],
-    canonical_events: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    events = canonical_events or [payload]
-    if (engine or "").strip().lower() != "codex":
-        return events
-    return [event for event in events if _should_forward_codex_live_event(event)]
 
 
 async def _mark_slackbot_live_delivery_failed(
@@ -2098,7 +1952,6 @@ async def _mark_execution_terminal(
     result_text: str,
     error_text: str | None,
     slackbot_streamed_answer_chars_override: int | None = None,
-    slackbot_live_answer_delivered: bool | None = None,
 ) -> None:
     next_attempt_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
         seconds=FINAL_DELIVERY_READY_GRACE_S,
@@ -2138,7 +1991,6 @@ async def _mark_execution_terminal(
     prompt_ref = None
     prompt_sha = None
     repo_context: dict[str, str] = {}
-    github_file_link_base_url = ""
     slackbot_streamed_answer_chars = 0
     suppress_final_delivery = False
     suppress_legacy_delivery = False
@@ -2157,11 +2009,6 @@ async def _mark_execution_terminal(
             repo_context = _extract_repo_context(
                 decode_jsonb(metadata.get("repo_context"), {})
             )
-            raw_github_file_link_base_url = metadata.get("github_file_link_base_url")
-            if isinstance(raw_github_file_link_base_url, str):
-                github_file_link_base_url = (
-                    raw_github_file_link_base_url.strip().rstrip("/")
-                )
             steer_replacement = decode_jsonb(metadata.get("steer_replacement"), {})
             suppress_final_delivery = bool(
                 isinstance(steer_replacement, dict)
@@ -2186,16 +2033,11 @@ async def _mark_execution_terminal(
                     0,
                 )
             result_has_text = bool(result_text.strip())
-            if slackbot_live_answer_delivered is None:
-                slackbot_live_answer_delivered = (
-                    not result_has_text or slackbot_streamed_answer_chars > 0
-                )
             suppress_legacy_delivery = (
                 _has_slackbot_live_delivery(metadata)
                 and not slackbot_live_delivery_failed
                 and (
-                    bool(slackbot_live_answer_delivered)
-                    or not result_has_text
+                    not result_has_text
                     or _slackbot_live_delivery_covers_result(
                         result_text,
                         slackbot_streamed_answer_chars,
@@ -2265,11 +2107,6 @@ async def _mark_execution_terminal(
             **({"agent_thread_id": agent_thread_id} if agent_thread_id else {}),
             **({"repo_context": repo_context} if repo_context else {}),
             **(
-                {"github_file_link_base_url": github_file_link_base_url}
-                if github_file_link_base_url
-                else {}
-            ),
-            **(
                 {"suppress_final_delivery": True}
                 if suppress_final_delivery_payload
                 else {}
@@ -2279,14 +2116,11 @@ async def _mark_execution_terminal(
     delivery_platform = _delivery_platform(
         decode_jsonb(row["delivery"], {}) if row else {}
     )
-    if delivery_platform == "dev" or suppress_legacy_delivery:
+    suppress_no_input_delivery = terminal_reason == "no_input"
+    if delivery_platform == "dev" or suppress_legacy_delivery or suppress_no_input_delivery:
         slackbot_agent_session_id = str(metadata.get("slackbot_agent_session_id") or "")
         result_size = payload_size_bytes(result_text)
-        if (
-            suppress_legacy_delivery
-            and result_size > 0
-            and slackbot_streamed_answer_chars <= 0
-        ):
+        if suppress_legacy_delivery and result_size > 0 and slackbot_streamed_answer_chars <= 0:
             log.warning(
                 "final_delivery_skipped_without_live_answer",
                 execution_id=execution_id,
@@ -2301,17 +2135,21 @@ async def _mark_execution_terminal(
                     metadata.get("slackbot_live_delivery_failed")
                 ),
             )
+        if suppress_no_input_delivery:
+            reason = "no_input"
+        elif suppress_legacy_delivery:
+            reason = "slackbot_live_delivery"
+        else:
+            reason = "dev_delivery"
         log.info(
             "final_delivery_skipped"
-            if suppress_legacy_delivery
+            if suppress_legacy_delivery or suppress_no_input_delivery
             else "final_delivery_skipped_dev",
             execution_id=execution_id,
             thread_key=thread_key,
             status=status,
             terminal_reason=terminal_reason,
-            reason="slackbot_live_delivery"
-            if suppress_legacy_delivery
-            else "dev_delivery",
+            reason=reason,
             agent_thread_id=agent_thread_id or None,
             slackbot_agent_session_id=slackbot_agent_session_id or None,
             slackbot_streamed_answer_chars=slackbot_streamed_answer_chars,
@@ -2379,11 +2217,6 @@ async def _mark_execution_terminal(
                     **({"agent_thread_id": agent_thread_id} if agent_thread_id else {}),
                     **({"repo_context": repo_context} if repo_context else {}),
                     **(
-                        {"github_file_link_base_url": github_file_link_base_url}
-                        if github_file_link_base_url
-                        else {}
-                    ),
-                    **(
                         {"suppress_final_delivery": True}
                         if suppress_final_delivery_payload
                         else {}
@@ -2413,11 +2246,6 @@ async def _mark_execution_terminal(
             "result_text": result_text,
             **({"error_text": error_text} if error_text else {}),
             **({"repo_context": repo_context} if repo_context else {}),
-            **(
-                {"github_file_link_base_url": github_file_link_base_url}
-                if github_file_link_base_url
-                else {}
-            ),
             **(
                 {"suppress_final_delivery": True}
                 if suppress_final_delivery_payload
@@ -2709,6 +2537,17 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                     exc_info=True,
                 )
         if isinstance(metadata, dict):
+            set_laminar_trace_metadata(
+                span,
+                _execution_laminar_metadata(
+                    thread_key=thread_key,
+                    execution_id=execution_id,
+                    execute_id=row.get("execute_id"),
+                    assignment_generation=assignment_generation,
+                    delivery=delivery,
+                    execution_metadata=metadata,
+                ),
+            )
             set_span_attributes(
                 span,
                 {
@@ -2958,16 +2797,29 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         await _write_agents_override(session.sandbox_id, str(assignment_override))
 
     if durable_turn_id:
+        injected_for_execution = True
         await _heartbeat_execution_lease(pool, execution_id)
         if silence_deadline <= dt.datetime.now(dt.timezone.utc):
             silence_deadline = await _touch_execution_progress(pool, execution_id)
     else:
         requester_user_id = None
         if isinstance(delivery, dict):
-            requester_user_id = delivery.get("recipient_user_id") or delivery.get(
-                "user_id"
-            )
+            requester_user_id = delivery.get("recipient_user_id") or delivery.get("user_id")
         requester_user_id = requester_user_id or execution_metadata.get("user_id")
+        trace_metadata = _execution_laminar_metadata(
+            thread_key=thread_key,
+            execution_id=execution_id,
+            execute_id=row.get("execute_id"),
+            assignment_generation=assignment_generation,
+            delivery=delivery,
+            execution_metadata=execution_metadata,
+            harness=harness,
+            engine=engine,
+            persona_id=persona_id,
+            prompt_ref=prompt_ref,
+            runtime_id=session.sandbox_id,
+            user_id=requester_user_id,
+        )
         with start_span(
             "centaur.sandbox.inject",
             attributes={
@@ -2978,6 +2830,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 if isinstance(delivery, dict)
                 else None,
                 "centaur.user_id": requester_user_id,
+                **laminar_trace_metadata_attributes(trace_metadata),
             },
         ) as span:
             inject_span_context = span_context_to_dict(span) or {}
@@ -2988,6 +2841,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 user_id=requester_user_id,
                 trace_id=inject_span_context.get("trace_id"),
                 traceparent=current_traceparent(span),
+                trace_metadata=trace_metadata,
             )
             set_span_attributes(
                 span,
@@ -2997,6 +2851,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 },
             )
         durable_turn_id = str(inject_result.get("durable_turn_id") or "")
+        injected_for_execution = bool(inject_result.get("injected"))
         await pool.execute(
             "UPDATE agent_execution_requests SET durable_turn_id = $1, updated_at = NOW() "
             "WHERE execution_id = $2",
@@ -3030,40 +2885,20 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     )
     user_id: str | None = str(user_id_row) if user_id_row else None
 
-    backend = get_backend()
-    replay_recovered_logs = bool(
-        durable_turn_id and execution_metadata.get(_STALE_LEASE_RECOVERY_METADATA_KEY)
-    )
-    await backend.attach(session, logs=replay_recovered_logs)
-    rt = _get_runtime(session.sandbox_id)
     observations = ExecutionObservationAccumulator()
     started_at = claimed_at or row.get("created_at")
     first_token_at: dt.datetime | None = None
     slackbot_session_id = str(execution_metadata.get("slackbot_agent_session_id") or "")
-    slackbot_forward_live = not replay_recovered_logs
+    slackbot_forward_live = True
     slackbot_text_sent = False
     slackbot_done = False
-    slackbot_live_finalize_failed = False
     harness_thread_id = ""
     # Tolerate up to 5 consecutive harness_event failures before falling back
     # to the outbox path; the streak resets on the next success.
     slackbot_live_failure_streak = 0
     slackbot_live_failure_limit = 5
-    github_file_link_context: dict[str, Any] = {}
-
-    async def _ensure_github_file_link_context() -> dict[str, Any]:
-        nonlocal github_file_link_context, execution_metadata
-        if github_file_link_context:
-            return github_file_link_context
-        github_file_link_context = await _sandbox_github_file_link_context(
-            session.sandbox_id
-        )
-        if github_file_link_context:
-            execution_metadata = {**execution_metadata, **github_file_link_context}
-            await _merge_execution_metadata(
-                pool, execution_id, github_file_link_context
-            )
-        return github_file_link_context
+    latest_terminal_result_text = ""
+    slackbot_streamed_answer_chars = 0
 
     async def _finalize_execution(
         *,
@@ -3072,10 +2907,6 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         result_text: str,
         error_text: str | None,
     ) -> None:
-        github_context = await _ensure_github_file_link_context()
-        github_file_link_base_url = str(
-            github_context.get("github_file_link_base_url") or ""
-        ).strip()
         current_status = await pool.fetchval(
             "SELECT status FROM agent_execution_requests WHERE execution_id = $1",
             execution_id,
@@ -3128,58 +2959,28 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         if user_id:
             record_execution_by_user(user_id, harness, status)
         nonlocal slackbot_session_id, slackbot_text_sent, slackbot_done
-        nonlocal slackbot_live_finalize_failed
         finalize_session_id = slackbot_session_id or str(
             execution_metadata.get("slackbot_agent_session_id") or ""
         )
         if finalize_session_id and not slackbot_done and slackbot_forward_live:
             try:
                 terminal_result_sent_to_slackbot = False
-                live_finalize_ok = True
-                if result_text.strip() and slackbot_streamed_answer_chars <= 0:
-                    live_finalize_ok = await slackbot_client.session_text(
-                        finalize_session_id,
-                        result_text,
-                        github_file_link_base_url=github_file_link_base_url or None,
-                    )
-                    terminal_result_sent_to_slackbot = live_finalize_ok
-                    slackbot_text_sent = slackbot_text_sent or live_finalize_ok
-                if live_finalize_ok:
-                    live_finalize_ok = await slackbot_client.session_done(
-                        finalize_session_id,
-                        harness_thread_id or None,
-                        github_file_link_base_url=github_file_link_base_url or None,
-                    )
-                if live_finalize_ok:
-                    slackbot_done = True
-                    log.info(
-                        "slackbot_live_delivery_finalized",
-                        execution_id=execution_id,
-                        thread_key=thread_key,
-                        slackbot_agent_session_id=finalize_session_id,
-                        harness_thread_id=harness_thread_id or None,
-                        streamed_answer_chars=slackbot_streamed_answer_chars,
-                        terminal_result_sent_to_slackbot=terminal_result_sent_to_slackbot,
-                        result_size_bytes=payload_size_bytes(result_text),
-                        slackbot_text_sent=slackbot_text_sent,
-                    )
-                else:
-                    slackbot_live_finalize_failed = True
-                    log.warning(
-                        "slackbot_live_delivery_finalize_failed",
-                        execution_id=execution_id,
-                        thread_key=thread_key,
-                        reason="slackbot_session_call_failed",
-                    )
-                    await _mark_slackbot_live_delivery_failed(
-                        pool,
-                        execution_id,
-                        "finalize_failed",
-                        streamed_answer_chars=slackbot_streamed_answer_chars,
-                    )
-                    slackbot_session_id = ""
+                await slackbot_client.session_done(
+                    finalize_session_id, harness_thread_id or None
+                )
+                slackbot_done = True
+                log.info(
+                    "slackbot_live_delivery_finalized",
+                    execution_id=execution_id,
+                    thread_key=thread_key,
+                    slackbot_agent_session_id=finalize_session_id,
+                    harness_thread_id=harness_thread_id or None,
+                    streamed_answer_chars=slackbot_streamed_answer_chars,
+                    terminal_result_sent_to_slackbot=terminal_result_sent_to_slackbot,
+                    result_size_bytes=payload_size_bytes(result_text),
+                    slackbot_text_sent=slackbot_text_sent,
+                )
             except Exception:
-                slackbot_live_finalize_failed = True
                 log.warning(
                     "slackbot_live_delivery_finalize_failed",
                     execution_id=execution_id,
@@ -3190,7 +2991,6 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                     pool,
                     execution_id,
                     "finalize_failed",
-                    streamed_answer_chars=slackbot_streamed_answer_chars,
                 )
                 slackbot_session_id = ""
         await _mark_execution_terminal(
@@ -3202,12 +3002,43 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             result_text=result_text,
             error_text=error_text,
             slackbot_streamed_answer_chars_override=slackbot_streamed_answer_chars,
-            slackbot_live_answer_delivered=bool(
-                slackbot_done
-                and not slackbot_live_finalize_failed
-                and (slackbot_text_sent or slackbot_streamed_answer_chars > 0)
-            ),
         )
+
+    if not injected_for_execution:
+        log.info(
+            "execution_no_input_skipped",
+            execution_id=execution_id,
+            thread_key=thread_key,
+            assignment_generation=assignment_generation,
+            runtime_id=session.sandbox_id,
+            queue_delay_s=round(queue_delay_s, 3),
+        )
+        add_span_event(
+            "centaur.agent.execution_no_input",
+            {
+                "execution_id": execution_id,
+                "thread_key": thread_key,
+                "assignment_generation": assignment_generation,
+                "runtime_id": session.sandbox_id,
+            },
+        )
+        set_span_attributes(
+            trace.get_current_span(),
+            {
+                "centaur.execution.no_input": True,
+            },
+        )
+        await _finalize_execution(
+            status="completed",
+            terminal_reason="no_input",
+            result_text="",
+            error_text=None,
+        )
+        return
+
+    backend = get_backend()
+    await backend.attach(session)
+    rt = _get_runtime(session.sandbox_id)
 
     execution_started_payload = {
         "type": "obs.execution_started",
@@ -3232,6 +3063,20 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         event_kind="execution_started",
         event_json=execution_started_payload,
     )
+    execution_trace_metadata = _execution_laminar_metadata(
+        thread_key=thread_key,
+        execution_id=execution_id,
+        execute_id=row.get("execute_id"),
+        assignment_generation=assignment_generation,
+        delivery=delivery,
+        execution_metadata=execution_metadata,
+        harness=harness,
+        engine=engine,
+        persona_id=persona_id,
+        prompt_ref=prompt_ref,
+        runtime_id=session.sandbox_id,
+        user_id=user_id,
+    )
     set_span_attributes(
         trace.get_current_span(),
         {
@@ -3243,6 +3088,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             "centaur.prompt_sha": prompt_sha,
             "centaur.execution_sequence": execution_sequence,
             "centaur.user_id": user_id,
+            **laminar_trace_metadata_attributes(execution_trace_metadata),
         },
     )
     add_span_event("centaur.agent.execution_started", execution_started_payload)
@@ -3250,8 +3096,6 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     await _touch_execution_progress(pool, execution_id)
 
     turn_done_event: dict[str, Any] | None = None
-    latest_terminal_result_text = ""
-    slackbot_streamed_answer_chars = 0
     pending_event: asyncio.Task | None = None
     stream = _stream_stdout(
         session,
@@ -3278,14 +3122,6 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 record_execution_watchdog_timeout(harness, "hard_deadline_exceeded")
                 return
             if now >= silence_deadline:
-                if durable_turn_id and not replay_recovered_logs:
-                    await _requeue_execution_for_log_replay(
-                        pool,
-                        execution_id=execution_id,
-                        thread_key=thread_key,
-                        reason="silence_deadline_exceeded",
-                    )
-                    return
                 await _finalize_execution(
                     status="failed_permanent",
                     terminal_reason="silence_deadline_exceeded",
@@ -3356,7 +3192,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 if extracted:
                     latest_terminal_result_text = extracted
             if slackbot_session_id and slackbot_forward_live:
-                slack_events = _slackbot_live_events(engine, payload, canonical_events)
+                slack_events = canonical_events or [payload]
                 for slack_event in slack_events:
                     if harness_thread_id and isinstance(slack_event, dict):
                         slack_event.setdefault("session_id", harness_thread_id)
@@ -3366,23 +3202,6 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                         slack_event.setdefault(
                             "centaur_assignment_generation", assignment_generation
                         )
-                        if slack_event.get("type") in {
-                            "result",
-                            "turn.done",
-                            "turn.completed",
-                        }:
-                            github_context = await _ensure_github_file_link_context()
-                            github_file_link_base_url = str(
-                                github_context.get("github_file_link_base_url") or ""
-                            ).strip()
-                            if github_file_link_base_url:
-                                slack_event.setdefault(
-                                    "github_file_link_base_url",
-                                    github_file_link_base_url,
-                                )
-                            repo_context = github_context.get("repo_context")
-                            if isinstance(repo_context, dict) and repo_context:
-                                slack_event.setdefault("repo_context", repo_context)
                     harness_result = await slackbot_client.harness_event(
                         slackbot_session_id, slack_event
                     )
@@ -3747,12 +3566,7 @@ async def _recover_stale_running(pool) -> int:
     result = await pool.execute(
         "UPDATE agent_execution_requests SET "
         "status = CASE WHEN status IN ('running', 'retry_wait') THEN 'queued' ELSE status END, "
-        "worker_id = NULL, worker_lease_expires_at = NULL, "
-        "metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object("
-        f"'{_STALE_LEASE_RECOVERY_METADATA_KEY}', TRUE, "
-        "'stale_lease_recovered_at', NOW()"
-        "), "
-        "updated_at = NOW() "
+        "worker_id = NULL, worker_lease_expires_at = NULL, updated_at = NOW() "
         "WHERE status IN ('running', 'retry_wait', 'cancel_requested') "
         "AND (worker_lease_expires_at IS NULL OR worker_lease_expires_at <= NOW())",
     )
@@ -3766,40 +3580,6 @@ async def _recover_stale_running(pool) -> int:
             recovered=recovered,
         )
     return recovered
-
-
-async def _requeue_execution_for_log_replay(
-    pool,
-    *,
-    execution_id: str,
-    thread_key: str,
-    reason: str,
-) -> None:
-    await pool.execute(
-        "UPDATE agent_execution_requests SET "
-        "status = 'queued', "
-        "worker_id = NULL, "
-        "worker_lease_expires_at = NULL, "
-        "silence_deadline_at = NOW() + make_interval(secs => $1::double precision), "
-        "stream_break_count = stream_break_count + 1, "
-        "last_stream_break_at = NOW(), "
-        "metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object("
-        f"'{_STALE_LEASE_RECOVERY_METADATA_KEY}', TRUE, "
-        "'stale_lease_recovered_at', NOW(), "
-        "'stale_lease_recovery_reason', $2::text"
-        "), "
-        "updated_at = NOW() "
-        "WHERE execution_id = $3 AND status = 'running'",
-        float(max(EXECUTION_TOOL_SILENCE_TIMEOUT_S, EXECUTION_SILENCE_TIMEOUT_S)),
-        reason,
-        execution_id,
-    )
-    log.warning(
-        "execution_requeued_for_log_replay",
-        execution_id=execution_id,
-        thread_key=thread_key,
-        reason=reason,
-    )
 
 
 async def recover_interrupted_executions_on_startup(pool) -> int:

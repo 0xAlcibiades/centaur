@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json as _json
 import os
 import re
@@ -23,9 +22,9 @@ from api.agent import (
     stop_session,
 )
 from api.deps import (
+    enforce_sandbox_thread_scope,
     get_sandbox_claims,
     require_scope,
-    sandbox_thread_in_scope,
     verify_api_key,
 )
 from api.final_delivery import (
@@ -60,16 +59,6 @@ router = APIRouter(
     tags=["agent"],
     dependencies=[Depends(verify_api_key)],
 )
-
-
-def _enforce_sandbox_thread_scope(request: Request, thread_key: str) -> None:
-    """Reject if a sandbox token is trying to access a different thread."""
-    claims = get_sandbox_claims(request)
-    if claims is None:
-        return
-    allowed = claims.get("thread_key")
-    if not sandbox_thread_in_scope(allowed, thread_key):
-        raise HTTPException(status_code=403, detail="Sandbox token is scoped to a different thread")
 
 
 # ── Known harness flags ─────────────────────────────────────────────────────
@@ -251,7 +240,7 @@ def _overlay_runtime_payload() -> dict[str, Any]:
 @router.post("/execute", dependencies=[Depends(require_scope("agent:execute"))])
 async def execute(request: Request):
     body = ExecuteRequest.model_validate(await request.json())
-    _enforce_sandbox_thread_scope(request, body.thread_key)
+    enforce_sandbox_thread_scope(request, body.thread_key, write=True)
     pool = request.app.state.db_pool
 
     # Auto-orchestrate spawn → message → execute when assignment_generation
@@ -360,7 +349,7 @@ async def _auto_execute(pool, body: ExecuteRequest) -> JSONResponse:
 
 @router.post("/spawn", dependencies=[Depends(require_scope("agent:execute"))])
 async def spawn(req: SpawnRequest, request: Request):
-    _enforce_sandbox_thread_scope(request, req.thread_key)
+    enforce_sandbox_thread_scope(request, req.thread_key, write=True)
     pool = request.app.state.db_pool
     spawn_id = req.spawn_id or f"spawn-{uuid.uuid4().hex[:16]}"
     try:
@@ -380,7 +369,7 @@ async def spawn(req: SpawnRequest, request: Request):
 @router.post("/message", dependencies=[Depends(require_scope("agent:execute"))])
 async def post_message(request: Request):
     body = MessageRequest.model_validate(await request.json())
-    _enforce_sandbox_thread_scope(request, body.thread_key)
+    enforce_sandbox_thread_scope(request, body.thread_key, write=True)
     event, metadata = _normalize_message_event(body.model_dump(exclude_none=True))
     message_id = body.message_id or f"msg-{uuid.uuid4().hex[:16]}"
     pool = request.app.state.db_pool
@@ -395,272 +384,6 @@ async def post_message(request: Request):
         )
     except ControlPlaneError as exc:
         return _json_error(exc.code, exc.message, exc.status_code)
-
-
-async def _extract_attachments(
-    pool, thread_key: str, message_id: str, parts: list[dict],
-) -> list[dict]:
-    """Replace inline base64 image/document parts with attachment_ref parts.
-
-    Stores the binary data in the ``attachments`` table and returns a new parts
-    list where each base64 blob is replaced by a lightweight reference.
-    """
-    out: list[dict] = []
-    for part in parts:
-        ptype = part.get("type")
-        if ptype in ("image", "document"):
-            source = part.get("source", {})
-            if source.get("type") == "base64" and source.get("data"):
-                att_id = f"att-{uuid.uuid4().hex[:16]}"
-                mime_type = source.get("media_type", "application/octet-stream")
-                raw_bytes = base64.b64decode(source["data"])
-                name = part.get("name") or f"{ptype}.{mime_type.split('/')[-1]}"
-                await pool.execute(
-                    "INSERT INTO attachments (id, thread_key, message_id, name, mime_type, data) "
-                    "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
-                    att_id, thread_key, message_id, name, mime_type, raw_bytes,
-                )
-                out.append({
-                    "type": "attachment_ref",
-                    "id": att_id,
-                    "name": name,
-                    "mime_type": mime_type,
-                })
-                log.info("attachment_stored", id=att_id, name=name, mime_type=mime_type, size=len(raw_bytes))
-                continue
-        out.append(part)
-    return out
-
-
-# URL patterns for auto-archiving
-_DOCSEND_RE = re.compile(r"https?://(?:[\w-]+\.)?docsend\.com/view/(?:s/)?([a-zA-Z0-9]+)")
-_GDOC_RE = re.compile(
-    r"https?://docs\.google\.com/(document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]+)"
-)
-_GDRIVE_RE = re.compile(r"https?://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)")
-_GDRIVE_FOLDER_RE = re.compile(
-    r"https?://drive\.google\.com/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)"
-)
-
-_GDOC_EXPORT_FORMATS: dict[str, tuple[str, str]] = {
-    "document": ("pdf", "application/pdf"),
-    "spreadsheets": ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    "presentation": ("pdf", "application/pdf"),
-}
-
-_MIME_EXT: dict[str, str] = {
-    "application/pdf": "pdf",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "text/plain": "txt",
-}
-
-
-async def _read_and_cleanup(path: str) -> bytes:
-    """Read a file's bytes and delete it."""
-    import os
-
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
-async def _resolve_urls(
-    pool, thread_key: str, message_id: str, parts: list[dict], request: Request,
-) -> list[dict]:
-    """Scan text parts for DocSend / Google Docs / Google Drive URLs.
-
-    Downloads the referenced documents via internal tool clients (gsuite,
-    docsend), stores them in the ``attachments`` table, and appends
-    ``attachment_ref`` parts to the returned list.  The original parts are
-    preserved unchanged.  Failures are logged but never block the message.
-    """
-    urls: list[tuple[str, str, dict]] = []  # (kind, url, extra)
-    for part in parts:
-        if part.get("type") != "text":
-            continue
-        text = part.get("text", "")
-        for m in _DOCSEND_RE.finditer(text):
-            urls.append(("docsend", m.group(0), {"doc_id": m.group(1)}))
-        for m in _GDOC_RE.finditer(text):
-            urls.append(("gdoc", m.group(0), {"doc_type": m.group(1), "file_id": m.group(2)}))
-        for m in _GDRIVE_RE.finditer(text):
-            urls.append(("gdrive", m.group(0), {"file_id": m.group(1)}))
-        for m in _GDRIVE_FOLDER_RE.finditer(text):
-            urls.append(("gdrive_folder", m.group(0), {"folder_id": m.group(1)}))
-
-    if not urls:
-        return parts
-
-    from api.app import get_tool_manager
-
-    tm = get_tool_manager()
-    new_refs: list[dict] = []
-
-    for kind, url, extra in urls:
-        try:
-            if kind == "docsend":
-                result = await tm.call_tool_raw("docsend", "download", {"url": url})
-                if not isinstance(result, dict):
-                    log.warning("url_resolve_failed", url=url, reason="unexpected result")
-                    continue
-                if result.get("error") and not result.get("data"):
-                    log.warning("url_resolve_failed", url=url, reason=result["error"])
-                    continue
-                if result.get("status") != "ok" or not result.get("data"):
-                    log.warning("url_resolve_failed", url=url, reason=result.get("error", "no data"))
-                    continue
-                raw_bytes = base64.b64decode(result["data"])
-                filename = result.get("filename", f"docsend_{extra['doc_id']}.pdf")
-                mime_type = result.get("mime_type", "application/pdf")
-
-            elif kind == "gdoc":
-                doc_type = extra["doc_type"]
-                file_id = extra["file_id"]
-                fmt, mime_type = _GDOC_EXPORT_FORMATS.get(doc_type, ("pdf", "application/pdf"))
-                result = await tm.call_tool_raw(
-                    "gsuite", "drive_export",
-                    {"file_id": file_id, "export_format": fmt},
-                )
-                if isinstance(result, dict) and result.get("error"):
-                    log.warning("url_resolve_failed", url=url, reason=result["error"])
-                    continue
-                raw_bytes = await _read_and_cleanup(str(result))
-                ext = "xlsx" if fmt == "xlsx" else "pdf"
-                filename = f"gdoc_{file_id}.{ext}"
-
-            elif kind == "gdrive":
-                file_id = extra["file_id"]
-                # Get file metadata first for name/mime
-                meta = await tm.call_tool_raw("gsuite", "drive_get", {"file_id": file_id})
-                if isinstance(meta, dict) and meta.get("error"):
-                    log.warning("url_resolve_failed", url=url, reason=meta["error"])
-                    continue
-
-                import tempfile
-
-                tmp = tempfile.mktemp(prefix=f"gdrive_{file_id}_")
-                result = await tm.call_tool_raw(
-                    "gsuite", "drive_download",
-                    {"file_id": file_id, "output_path": tmp},
-                )
-                if isinstance(result, dict) and result.get("error"):
-                    log.warning("url_resolve_failed", url=url, reason=result["error"])
-                    continue
-                raw_bytes = await _read_and_cleanup(str(result))
-                if isinstance(meta, dict):
-                    mime_type = meta.get("mimeType", "application/octet-stream")
-                    name = meta.get("name", file_id)
-                else:
-                    mime_type = "application/octet-stream"
-                    name = file_id
-                ext = _MIME_EXT.get(mime_type, mime_type.split("/")[-1] if "/" in mime_type else "bin")
-                filename = f"{name}.{ext}" if "." not in name else name
-
-            elif kind == "gdrive_folder":
-                folder_id = extra["folder_id"]
-                files = await tm.call_tool_raw(
-                    "gsuite", "drive_list", {"folder_id": folder_id, "max_results": 50},
-                )
-                if isinstance(files, dict) and files.get("error"):
-                    log.warning("url_resolve_failed", url=url, reason=files["error"])
-                    continue
-                if not isinstance(files, list) or not files:
-                    log.warning("url_resolve_failed", url=url, reason="empty folder or listing failed")
-                    continue
-                for f in files:
-                    f_id = f.get("id", "")
-                    f_mime = f.get("mime_type", "application/octet-stream")
-                    f_name = f.get("name", f_id)
-                    # Skip sub-folders
-                    if f_mime == "application/vnd.google-apps.folder":
-                        continue
-                    try:
-                        # Google-native docs need export; binary files use download
-                        if f_mime.startswith("application/vnd.google-apps."):
-                            gtype = f_mime.rsplit(".", 1)[-1]  # document, spreadsheet, etc.
-                            fmt_key = {
-                                "document": "document",
-                                "spreadsheet": "spreadsheets",
-                                "presentation": "presentation",
-                            }.get(gtype)
-                            if not fmt_key:
-                                continue
-                            fmt, m_type = _GDOC_EXPORT_FORMATS.get(fmt_key, ("pdf", "application/pdf"))
-                            r = await tm.call_tool_raw(
-                                "gsuite", "drive_export",
-                                {"file_id": f_id, "export_format": fmt},
-                            )
-                            if isinstance(r, dict) and r.get("error"):
-                                log.warning("url_resolve_failed", url=url, file=f_name, reason=r["error"])
-                                continue
-                            f_bytes = await _read_and_cleanup(str(r))
-                            f_ext = "xlsx" if fmt == "xlsx" else "pdf"
-                            f_filename = f"{f_name}.{f_ext}"
-                        else:
-                            import tempfile as _tf
-
-                            tmp = _tf.mktemp(prefix=f"gdrive_{f_id}_")
-                            r = await tm.call_tool_raw(
-                                "gsuite", "drive_download",
-                                {"file_id": f_id, "output_path": tmp},
-                            )
-                            if isinstance(r, dict) and r.get("error"):
-                                log.warning("url_resolve_failed", url=url, file=f_name, reason=r["error"])
-                                continue
-                            f_bytes = await _read_and_cleanup(str(r))
-                            m_type = f_mime
-                            f_ext = _MIME_EXT.get(f_mime, f_mime.split("/")[-1] if "/" in f_mime else "bin")
-                            f_filename = f"{f_name}.{f_ext}" if "." not in f_name else f_name
-
-                        a_id = f"att-{uuid.uuid4().hex[:16]}"
-                        await pool.execute(
-                            "INSERT INTO attachments (id, thread_key, message_id, name, mime_type, data) "
-                            "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
-                            a_id, thread_key, message_id, f_filename, m_type, f_bytes,
-                        )
-                        new_refs.append({
-                            "type": "attachment_ref",
-                            "id": a_id,
-                            "name": f_filename,
-                            "mime_type": m_type,
-                            "source_url": url,
-                        })
-                        log.info("url_resolved", url=url, kind="gdrive_folder_file", att_id=a_id, size=len(f_bytes))
-                    except Exception:
-                        log.warning("url_resolve_failed", url=url, file=f_name, kind="gdrive_folder_file", exc_info=True)
-                continue
-
-            else:
-                continue
-
-            att_id = f"att-{uuid.uuid4().hex[:16]}"
-            await pool.execute(
-                "INSERT INTO attachments (id, thread_key, message_id, name, mime_type, data) "
-                "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
-                att_id, thread_key, message_id, filename, mime_type, raw_bytes,
-            )
-            new_refs.append({
-                "type": "attachment_ref",
-                "id": att_id,
-                "name": filename,
-                "mime_type": mime_type,
-                "source_url": url,
-            })
-            log.info("url_resolved", url=url, kind=kind, att_id=att_id, size=len(raw_bytes))
-
-        except Exception:
-            log.warning("url_resolve_failed", url=url, kind=kind, exc_info=True)
-
-    return [*parts, *new_refs]
 
 
 @router.post("/messages", dependencies=[Depends(require_scope("agent:execute"))])
@@ -714,7 +437,7 @@ async def post_messages(request: Request):
 @router.get("/messages", dependencies=[Depends(require_scope("agent:execute"))])
 async def get_messages(request: Request, thread_key: str, cursor: str | None = None, limit: int = 50):
     """Paginated chat_messages for a thread."""
-    _enforce_sandbox_thread_scope(request, thread_key)
+    enforce_sandbox_thread_scope(request, thread_key, write=False)
     pool = request.app.state.db_pool
     limit = min(limit, 200)
 
@@ -773,7 +496,7 @@ class StopRequest(BaseModel):
 
 @router.post("/stop", dependencies=[Depends(require_scope("agent:stop"))])
 async def stop(req: StopRequest, request: Request):
-    _enforce_sandbox_thread_scope(request, req.thread_key)
+    enforce_sandbox_thread_scope(request, req.thread_key, write=True)
     ok = await stop_session(req.thread_key)
     return {"ok": ok}
 
@@ -785,7 +508,7 @@ class TitleRequest(BaseModel):
 
 @router.post("/title", dependencies=[Depends(require_scope("agent:execute"))])
 async def set_title(req: TitleRequest, request: Request):
-    _enforce_sandbox_thread_scope(request, req.thread_key)
+    enforce_sandbox_thread_scope(request, req.thread_key, write=True)
     pool = request.app.state.db_pool
     await pool.execute(
         "UPDATE sandbox_sessions SET thread_name = $1, updated_at = NOW() WHERE thread_key = $2",
@@ -797,7 +520,7 @@ async def set_title(req: TitleRequest, request: Request):
 
 @router.get("/status", dependencies=[Depends(require_scope("agent:status"))])
 async def status(request: Request, key: str):
-    _enforce_sandbox_thread_scope(request, key)
+    enforce_sandbox_thread_scope(request, key, write=False)
     result = await get_status(key)
     # Add pending message count
     try:
@@ -845,7 +568,7 @@ async def status(request: Request, key: str):
 
 @router.get("/runtime", dependencies=[Depends(require_scope("agent:status"))])
 async def runtime(request: Request, key: str):
-    _enforce_sandbox_thread_scope(request, key)
+    enforce_sandbox_thread_scope(request, key, write=False)
     active = await get_active_assignment(request.app.state.db_pool, key)
     persona_id = active["persona_id"] if active else None
     return {
@@ -867,13 +590,13 @@ async def execution_status(request: Request, execution_id: str):
     result = await get_execution(pool, execution_id)
     if not result:
         raise HTTPException(status_code=404, detail="execution not found")
-    _enforce_sandbox_thread_scope(request, result["thread_key"])
+    enforce_sandbox_thread_scope(request, result["thread_key"], write=False)
     return result
 
 
 @router.get("/threads/{thread_key}/executions", dependencies=[Depends(require_scope("agent:execute"))])
 async def thread_executions(request: Request, thread_key: str, limit: int = 20):
-    _enforce_sandbox_thread_scope(request, thread_key)
+    enforce_sandbox_thread_scope(request, thread_key, write=False)
     pool = request.app.state.db_pool
     return {
         "thread_key": thread_key,
@@ -889,7 +612,7 @@ async def thread_events(
     execution_id: str | None = None,
     poll_ms: int = 500,
 ):
-    _enforce_sandbox_thread_scope(request, thread_key)
+    enforce_sandbox_thread_scope(request, thread_key, write=False)
     pool = request.app.state.db_pool
     poll_s = max(0.05, min(poll_ms / 1000.0, 5.0))
 
@@ -964,7 +687,7 @@ class ReleaseRequest(BaseModel):
 
 @router.post("/threads/{thread_key}/release", dependencies=[Depends(require_scope("agent:execute"))])
 async def release_thread(request: Request, thread_key: str, body: ReleaseRequest):
-    _enforce_sandbox_thread_scope(request, thread_key)
+    enforce_sandbox_thread_scope(request, thread_key, write=True)
     pool = request.app.state.db_pool
     release_id = body.release_id or f"rel-{uuid.uuid4().hex[:16]}"
     try:
@@ -986,7 +709,7 @@ async def execution_cancel(request: Request, execution_id: str):
     existing = await get_execution(pool, execution_id)
     if not existing:
         raise HTTPException(status_code=404, detail="execution not found")
-    _enforce_sandbox_thread_scope(request, existing["thread_key"])
+    enforce_sandbox_thread_scope(request, existing["thread_key"], write=True)
     result = await cancel_execution(pool, execution_id)
     if not result:
         raise HTTPException(status_code=404, detail="execution not found")
@@ -1013,7 +736,7 @@ async def steer_execution_endpoint(execution_id: str, request: Request):
     existing = await get_execution(pool, execution_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Execution not found")
-    _enforce_sandbox_thread_scope(request, existing["thread_key"])
+    enforce_sandbox_thread_scope(request, existing["thread_key"], write=True)
     raw_bytes = await request.body()
     raw_body = _json.loads(raw_bytes) if raw_bytes else {}
     body = SteerExecutionRequest.model_validate(raw_body)
@@ -1392,7 +1115,7 @@ async def list_threads(request: Request, limit: int = 200):
 @router.get("/threads/detail", dependencies=[Depends(require_scope("agent:status"))])
 async def thread_detail(request: Request, key: str):
     """Get detailed info for a single thread."""
-    _enforce_sandbox_thread_scope(request, key)
+    enforce_sandbox_thread_scope(request, key, write=False)
     pool = request.app.state.db_pool
 
     rows = await pool.fetch(

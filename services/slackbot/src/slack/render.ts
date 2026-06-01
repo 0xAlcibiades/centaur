@@ -1,15 +1,10 @@
-import type { AnyBlock, AnyChunk, ContextBlock, MarkdownBlock, RichTextBlock } from '@slack/types'
+import type { AnyBlock, AnyChunk, MarkdownBlock, RichTextBlock } from '@slack/types'
 import { slackReplyLimits } from '../constants'
 
 const MAX_BLOCKS = slackReplyLimits.message.maxBlocks
 const MAX_MARKDOWN_CHARS = slackReplyLimits.stream.markdownChunkChars
 const MAX_FALLBACK_CHARS = slackReplyLimits.text.maxFallbackChars
 const MAX_STREAM_CHUNK_CHARS = slackReplyLimits.stream.markdownChunkChars
-const FILE_REF_PATTERN =
-  /(?<![\w./-])((?:\/home\/agent\/(?:workspace|(?:github|branches)\/[^/\s`]+\/[^/\s`]+)\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|rs|py|go|md|mdx|json|toml|ya?ml|css|scss|sql|sh)(?::\d+(?:-\d+)?)?)/g
-const INLINE_CODE_PATTERN = /`([^`\n]+)`/g
-const MARKDOWN_LINK_PATTERN = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g
-const FENCE_PATTERN = /```([A-Za-z0-9_-]*)?\n?([\s\S]*?)```/g
 
 export type StatusMetadata = {
   title?: string
@@ -24,41 +19,8 @@ export function blockquoteMarkdown(text: string): string {
     .join('\n')
 }
 
-/** Skip Thinking when Codex repeated the same prose in commentary and final_answer. */
-export function shouldShowThinkingBlock(commentary: string, answer: string): boolean {
-  const trimmedCommentary = commentary.trim()
-  const trimmedAnswer = answer.trim()
-  if (!trimmedCommentary) return false
-  if (!trimmedAnswer) return true
-  if (trimmedCommentary === trimmedAnswer) return false
-  if (trimmedAnswer.includes(trimmedCommentary)) return false
-  return true
-}
-
-export function thinkingContextBlock(
-  commentary: string,
-  opts: { heading?: boolean } = {}
-): ContextBlock | null {
-  const trimmed = commentary.trim()
-  if (!trimmed) return null
-  const maxChars = slackReplyLimits.message.thinkingContextChars
-  const body =
-    trimmed.length > maxChars ? `${trimmed.slice(0, maxChars - 13)}\n// truncated` : trimmed
-  return {
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text: opts.heading === false ? body : `*Thinking*\n${body}` }]
-  }
-}
-
-export type GithubFileLinkOptions = {
-  githubFileLinkBaseUrl?: string
-}
-
-export function renderMarkdownBlocks(
-  markdown: string,
-  opts: GithubFileLinkOptions = {}
-): MarkdownBlock[] {
-  const normalized = linkifyGithubFileRefs(markdown, opts).trim() || ' '
+export function renderMarkdownBlocks(markdown: string): MarkdownBlock[] {
+  const normalized = markdown.trim() || ' '
   const blocks: MarkdownBlock[] = []
   let used = 0
 
@@ -120,126 +82,11 @@ export function fallbackText(input: {
   return text.length > MAX_FALLBACK_CHARS ? `${text.slice(0, MAX_FALLBACK_CHARS - 1)}…` : text
 }
 
-export function markdownToStreamChunks(
-  markdown: string,
-  opts: GithubFileLinkOptions = {}
-): AnyChunk[] {
-  return splitText(linkifyGithubFileRefs(markdown || ' ', opts), MAX_STREAM_CHUNK_CHARS).map(
-    text => ({
-      type: 'markdown_text',
-      text
-    })
-  )
-}
-
-export function linkifyGithubFileRefs(markdown: string, opts: GithubFileLinkOptions = {}): string {
-  const baseUrl = githubFileLinkBaseUrl(opts)
-  if (!baseUrl || !markdown) return markdown
-  const fenced: string[] = []
-  const inline: string[] = []
-  const markdownLinks: string[] = []
-  const withoutFences = markdown.replace(FENCE_PATTERN, (match, language: string, body: string) => {
-    if (shouldUnwrapFileListFence(language, body)) {
-      return linkifyPlainFileRefs(baseUrl, body.trimEnd())
-    }
-    const index = fenced.push(match) - 1
-    return `@@CENTAUR_FENCE_${index}@@`
-  })
-  const withoutMarkdownLinks = withoutFences.replace(
-    MARKDOWN_LINK_PATTERN,
-    (match, label: string, url: string) => {
-      const index = markdownLinks.push(slackLink(url, label)) - 1
-      return `@@CENTAUR_MARKDOWN_LINK_${index}@@`
-    }
-  )
-  const withoutInline = withoutMarkdownLinks.replace(INLINE_CODE_PATTERN, (match, code: string) => {
-    const url = githubUrlForFileRef(baseUrl, code.trim())
-    const replacement = url ? slackLink(url, code) : match
-    const index = inline.push(replacement) - 1
-    return `@@CENTAUR_INLINE_${index}@@`
-  })
-  const linked = linkifyPlainFileRefs(baseUrl, withoutInline)
-  return linked
-    .replace(
-      /@@CENTAUR_MARKDOWN_LINK_(\d+)@@/g,
-      (_match, index: string) => markdownLinks[Number(index)] ?? ''
-    )
-    .replace(/@@CENTAUR_INLINE_(\d+)@@/g, (_match, index: string) => inline[Number(index)] ?? '')
-    .replace(/@@CENTAUR_FENCE_(\d+)@@/g, (_match, index: string) => fenced[Number(index)] ?? '')
-}
-
-function githubFileLinkBaseUrl(opts: GithubFileLinkOptions): string {
-  return (opts.githubFileLinkBaseUrl ?? process.env.CENTAUR_GITHUB_FILE_LINK_BASE_URL ?? '')
-    .trim()
-    .replace(/\/+$/, '')
-}
-
-function shouldUnwrapFileListFence(language: string | undefined, body: string): boolean {
-  const normalizedLanguage = (language ?? '').trim().toLowerCase()
-  if (normalizedLanguage && normalizedLanguage !== 'text' && normalizedLanguage !== 'plain')
-    return false
-  const refs = body.match(FILE_REF_PATTERN) ?? []
-  return refs.length >= 2
-}
-
-function linkifyPlainFileRefs(baseUrl: string, text: string): string {
-  return text.replace(FILE_REF_PATTERN, (match: string) => {
-    if (match.includes('://')) return match
-    const url = githubUrlForFileRef(baseUrl, match)
-    return url ? slackLink(url, match) : match
-  })
-}
-
-function slackLink(url: string, label: string): string {
-  return `<${url}|${escapeSlackLinkText(label)}>`
-}
-
-function escapeSlackLinkText(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\|/g, '\u2223')
-}
-
-function githubUrlForFileRef(baseUrl: string, rawRef: string): string | null {
-  const parsed = parseFileRef(rawRef)
-  if (!parsed) return null
-  const path = parsed.path
-    .split('/')
-    .filter(Boolean)
-    .map(part => encodeURIComponent(part))
-    .join('/')
-  const url = `${baseUrl}/${path}`
-  if (!parsed.lineStart) return url
-  return `${url}#L${parsed.lineStart}${parsed.lineEnd ? `-L${parsed.lineEnd}` : ''}`
-}
-
-function parseFileRef(
-  rawRef: string
-): { path: string; lineStart?: string; lineEnd?: string } | null {
-  const trimmed = rawRef.trim()
-  const match = /^(.+?)(?::(\d+)(?:-(\d+))?)?$/.exec(trimmed)
-  if (!match) return null
-  const rawPath = match[1]
-  if (!rawPath) return null
-  const path = normalizeRepoPath(rawPath)
-  if (!path || !isLinkableFileRef(path)) return null
-  return { path, lineStart: match[2], lineEnd: match[3] }
-}
-
-function normalizeRepoPath(path: string): string | null {
-  let normalized = path.replace(/^\.\/+/, '').replace(/^\/home\/agent\/workspace\/+/, '')
-  normalized = normalized.replace(/^\/home\/agent\/(?:github|branches)\/[^/]+\/[^/]+\/+/, '')
-  if (normalized.startsWith('/') || normalized.startsWith('../')) return null
-  return normalized
-}
-
-function isLinkableFileRef(path: string): boolean {
-  FILE_REF_PATTERN.lastIndex = 0
-  const matched = FILE_REF_PATTERN.test(path)
-  FILE_REF_PATTERN.lastIndex = 0
-  return matched
+export function markdownToStreamChunks(markdown: string): AnyChunk[] {
+  return splitText(markdown || ' ', MAX_STREAM_CHUNK_CHARS).map(text => ({
+    type: 'markdown_text',
+    text
+  }))
 }
 
 function splitText(input: string, maxChars: number): string[] {

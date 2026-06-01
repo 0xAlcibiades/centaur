@@ -987,7 +987,7 @@ async def _compute_agent_session_header(
     the persona/engine pair the slackbot renders italic at the top of every
     assistant message. Persona defaults to the literal ``"base"`` when no
     persona is active. The engine segment is upgraded to a concrete model
-    identifier (e.g. ``claude-opus-4-7``, ``codex-gpt-5``) when known.
+    identifier (e.g. ``claude-opus-4-8``, ``codex-gpt-5``) when known.
     """
     from api.runtime_control import _agent_session_header  # local to avoid cycle
 
@@ -2399,7 +2399,95 @@ async def _execute_run(pool, run_id: str) -> None:
                 float(WORKFLOW_WORKER_LEASE_S),
             )
     if row:
-        await _run_handler(pool, dict(row))
+        await _dispatch_run(pool, dict(row))
+
+
+def _workflow_sandbox_enabled() -> bool:
+    """Whether claimed runs should execute in a one-shot per-run Pod.
+
+    Off by default. Set ``WORKFLOW_RUN_SANDBOX_ENABLED=1`` to opt in to the
+    per-run pod path; otherwise runs execute in-process inside the API.
+    """
+    return os.getenv("WORKFLOW_RUN_SANDBOX_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+async def _dispatch_run(pool, run_row: dict[str, Any]) -> None:
+    """Execute a claimed run, in a per-run sandbox when supported.
+
+    The API only claims rows from ``workflow_runs`` and dispatches; the
+    actual handler runs inside the spawned Pod via ``api.workflow_executor``.
+    Falls back to in-process execution when the backend has no sandbox
+    spawner (non-K8s) or the toggle is off.
+    """
+    backend = None
+    if _workflow_sandbox_enabled():
+        try:
+            from api.sandbox.registry import get_backend
+
+            backend = get_backend()
+        except Exception:
+            log.debug("workflow_sandbox_backend_unavailable", exc_info=True)
+            backend = None
+    if backend is not None and hasattr(backend, "spawn_workflow_run"):
+        run_id = str(run_row["run_id"])
+        workflow_name = str(run_row.get("workflow_name") or "")
+        log.info(
+            "workflow_run_dispatch_sandbox",
+            run_id=run_id,
+            workflow_name=workflow_name,
+        )
+        pod_name = await backend.spawn_workflow_run(run_id)
+        try:
+            phase = await backend.wait_workflow_run_terminal(pod_name)
+            log.info(
+                "workflow_run_sandbox_terminal",
+                run_id=run_id,
+                pod=pod_name,
+                phase=phase,
+            )
+            if phase == "failed":
+                # The executor inside the pod owns DB status updates; if the
+                # pod failed before reaching _run_handler we surface that as
+                # a backend error so the worker can retry/expire normally.
+                await _mark_run_failed_on_sandbox_crash(pool, run_id, pod_name)
+        finally:
+            await backend.cleanup_workflow_run_pod(pod_name)
+        return
+    await _run_handler(pool, run_row)
+
+
+async def _mark_run_failed_on_sandbox_crash(pool, run_id: str, pod_name: str) -> None:
+    """If the executor pod exited Failed without writing a terminal status,
+    move the row to ``failed`` so the worker stops re-leasing it.
+
+    A clean handler exit (success or handled failure) updates ``status`` from
+    ``running`` to a terminal value. A crashed pod leaves the row in
+    ``running`` with the lease still set — this releases it.
+    """
+    row = await pool.fetchrow(
+        "SELECT status FROM workflow_runs WHERE run_id = $1",
+        run_id,
+    )
+    if row is None:
+        return
+    if str(row["status"]) != "running":
+        return
+    await pool.execute(
+        "UPDATE workflow_runs "
+        "SET status = 'failed', "
+        "    error_text = $2, "
+        "    worker_id = NULL, "
+        "    worker_lease_expires_at = NULL, "
+        "    completed_at = NOW(), "
+        "    updated_at = NOW() "
+        "WHERE run_id = $1 AND status = 'running'",
+        run_id,
+        f"workflow executor pod {pod_name} exited without writing terminal status",
+    )
 
 
 async def _run_handler(pool, run_row: dict[str, Any]) -> None:
@@ -2927,7 +3015,7 @@ async def _workflow_worker_loop(pool) -> None:
                 except TimeoutError:
                     pass
                 continue
-            await _run_handler(pool, run_row)
+            await _dispatch_run(pool, run_row)
             # Yield to the event loop after each handler run so execution
             # workers and other asyncio tasks are not starved.
             await asyncio.sleep(0)

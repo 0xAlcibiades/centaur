@@ -5,6 +5,9 @@ release := env_var_or_default("CENTAUR_RELEASE", "centaur")
 source := env_var_or_default("CENTAUR_IMAGE_SOURCE", "local")
 chart := "contrib/chart"
 dev_values := "contrib/chart/values.dev.yaml"
+# Command used to import images into k3s's containerd. Override for rootless or
+# remote setups, e.g. CENTAUR_K3S_CTR="k3s ctr" or "ssh host sudo k3s ctr".
+k3s_ctr := env_var_or_default("CENTAUR_K3S_CTR", "sudo k3s ctr")
 
 default:
     just --list
@@ -56,6 +59,17 @@ _build-slackbot:
 _build-agent:
     docker build --target sandbox -t centaur-agent:latest -f services/sandbox/Dockerfile .
 
+# Import locally-built images into k3s's containerd. k3s uses containerd, not
+# the Docker daemon, so `docker build` images are otherwise invisible to it
+# (pods ImagePullBackOff on the :latest tags). Used by `just up k3s`.
+_import-k3s:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for img in centaur-api centaur-iron-proxy centaur-slackbot centaur-agent; do
+      echo "importing ${img}:latest into k3s containerd..."
+      docker save "${img}:latest" | {{k3s_ctr}} images import -
+    done
+
 bootstrap-secrets *args:
     contrib/scripts/bootstrap-k8s-secrets.sh --namespace {{namespace}} {{args}}
 
@@ -68,10 +82,10 @@ deploy:
       local) ;;
       ghcr)
         extra_args+=(
-          --set api.image.repository=ghcr.io/paradigmxyz/centaur-api
-          --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur-iron-proxy
-          --set slackbot.image.repository=ghcr.io/paradigmxyz/centaur-slackbot
-          --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur-agent
+          --set api.image.repository=ghcr.io/paradigmxyz/centaur/centaur-api
+          --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur/centaur-iron-proxy
+          --set slackbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbot
+          --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur/centaur-agent
         )
         ;;
       *) echo "unknown source: {{source}} (expected local or ghcr)" >&2; exit 2 ;;
@@ -87,14 +101,28 @@ deploy:
         --set sandbox.extraEnv.CODEX_AUTH_MODE=${CODEX_AUTH_MODE}
       )
     fi
+    if [[ -n "${CLAUDE_CODE_AUTH_MODE:-}" ]]; then
+      extra_args+=(
+        --set sandbox.extraEnv.CLAUDE_CODE_AUTH_MODE=${CLAUDE_CODE_AUTH_MODE}
+      )
+    fi
     helm upgrade --install {{release}} {{chart}} -n {{namespace}} --create-namespace -f {{dev_values}} ${extra_args[@]+"${extra_args[@]}"}
 
-up:
+# Bring up the dev stack; pass `k3s` (just up k3s) to import local images into k3s's containerd.
+up import="":
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ -n "{{import}}" && "{{import}}" != "k3s" ]]; then
+      echo "unknown argument: {{import}} (expected nothing or 'k3s')" >&2; exit 2
+    fi
     just bootstrap-secrets
     case "{{source}}" in
-      local) just build ;;
+      local)
+        just build
+        if [[ "{{import}}" == "k3s" ]]; then
+          just _import-k3s
+        fi
+        ;;
       ghcr) ;;
       *) echo "unknown source: {{source}} (expected local or ghcr)" >&2; exit 2 ;;
     esac
@@ -158,36 +186,33 @@ cleanup-orphan-proxy-services mode="dry-run":
 shell component:
     kubectl exec -it -n {{namespace}} deploy/{{release}}-centaur-{{component}} -- sh
 
-smoke:
+smoke harness="codex":
     #!/usr/bin/env bash
     set -euo pipefail
     THREAD_KEY="smoke-$(date +%s)"
     API_DEPLOY="deploy/{{release}}-centaur-api"
-    API_KEY="$(kubectl exec -n {{namespace}} "$API_DEPLOY" -- printenv SLACKBOT_API_KEY)"
-    if [[ -z "$API_KEY" ]]; then
-      echo "SLACKBOT_API_KEY is not set in $API_DEPLOY" >&2
-      exit 1
-    fi
+    SMOKE_HARNESS="{{harness}}"
+    api_curl() {
+      kubectl exec -n {{namespace}} "$API_DEPLOY" -c api -- \
+        sh -lc 'curl -s -H "x-api-key: ${SLACKBOT_API_KEY:?SLACKBOT_API_KEY is not set}" "$@"' sh "$@"
+    }
 
-    SPAWN=$(kubectl exec -n {{namespace}} "$API_DEPLOY" -- curl -s -X POST http://localhost:8000/agent/spawn \
-      -H "Authorization: Bearer ${API_KEY}" \
+    SPAWN=$(api_curl -X POST http://localhost:8000/agent/spawn \
       -H "Content-Type: application/json" \
-      -d "{\"thread_key\":\"${THREAD_KEY}\"}")
+      -d "{\"thread_key\":\"${THREAD_KEY}\",\"harness\":\"${SMOKE_HARNESS}\"}")
     ASSIGNMENT_GENERATION=$(printf '%s' "$SPAWN" | jq -r '.assignment_generation')
 
-    kubectl exec -n {{namespace}} "$API_DEPLOY" -- curl -s -X POST http://localhost:8000/agent/message \
-      -H "Authorization: Bearer ${API_KEY}" \
+    api_curl -X POST http://localhost:8000/agent/message \
       -H "Content-Type: application/json" \
       -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG and nothing else.\"}]}" >/dev/null
 
-    EXECUTE=$(kubectl exec -n {{namespace}} "$API_DEPLOY" -- curl -s -X POST http://localhost:8000/agent/execute \
-      -H "Authorization: Bearer ${API_KEY}" \
+    EXECUTE=$(api_curl -X POST http://localhost:8000/agent/execute \
       -H "Content-Type: application/json" \
       -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"delivery\":{\"platform\":\"dev\"}}")
     EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
     for _ in $(seq 1 60); do
-      STATE=$(kubectl exec -n {{namespace}} "$API_DEPLOY" -- curl -s -H "Authorization: Bearer ${API_KEY}" "http://localhost:8000/agent/executions/${EXECUTION_ID}")
+      STATE=$(api_curl "http://localhost:8000/agent/executions/${EXECUTION_ID}")
       STATUS=$(printf '%s' "$STATE" | jq -r '.status // empty')
       case "$STATUS" in
         completed)
@@ -203,6 +228,6 @@ smoke:
       sleep 2
     done
 
-    kubectl exec -n {{namespace}} "$API_DEPLOY" -- curl -s -H "Authorization: Bearer ${API_KEY}" "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
+    api_curl "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
     echo "smoke timed out waiting for execution ${EXECUTION_ID}" >&2
     exit 1

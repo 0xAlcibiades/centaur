@@ -16,9 +16,6 @@ import { renderMarkdownBlocks } from "../slack/render";
 const CONSUMER_ID = `slackbot-${process.pid}`;
 const FINAL_DELIVERY_CHUNK_CHARS = slackReplyLimits.text.maxFallbackChars;
 const FINAL_DELIVERY_CHUNK_EVENT = "centaur_final_delivery_chunk";
-const FINAL_DELIVERY_POLL_ALERT_FAILURES = 3;
-const FINAL_DELIVERY_POLL_ALERT_FAILURE_MS = 60_000;
-const FINAL_DELIVERY_POLL_ALERT_INTERVAL_MS = 5 * 60 * 1000;
 const NON_RETRYABLE_SLACK_ERRORS = new Set([
   "msg_too_long",
   "msg_blocks_too_long",
@@ -37,56 +34,15 @@ export function startFinalDeliveryPoller(
   client: WebClient,
 ): void {
   if (!centaurApiKey(config)) return;
-  let consecutiveFailures = 0;
-  let firstFailureAt = 0;
-  let lastAlertAt = 0;
   const tick = async () => {
     try {
       await pollFinalDeliveriesOnce(config, client);
-      consecutiveFailures = 0;
-      firstFailureAt = 0;
     } catch (error) {
-      consecutiveFailures += 1;
       logError("final_delivery_poll_failed", error);
-      const now = Date.now();
-      if (!firstFailureAt) firstFailureAt = now;
-      if (
-        shouldAlertFinalDeliveryPollFailure({
-          consecutiveFailures,
-          firstFailureAt,
-          lastAlertAt,
-          now,
-        })
-      ) {
-        lastAlertAt = now;
-        await postRuntimeAlert(config, client, {
-          kind: "final_delivery_poll_failed",
-          error,
-          text: finalDeliveryPollFailureText(config, consecutiveFailures, error),
-        });
-      }
     }
   };
   setInterval(tick, 2_000).unref?.();
   void tick();
-}
-
-export function shouldAlertFinalDeliveryPollFailure({
-  consecutiveFailures,
-  firstFailureAt,
-  lastAlertAt,
-  now,
-}: {
-  consecutiveFailures: number;
-  firstFailureAt: number;
-  lastAlertAt: number;
-  now: number;
-}): boolean {
-  return (
-    consecutiveFailures >= FINAL_DELIVERY_POLL_ALERT_FAILURES &&
-    now - firstFailureAt >= FINAL_DELIVERY_POLL_ALERT_FAILURE_MS &&
-    (!lastAlertAt || now - lastAlertAt >= FINAL_DELIVERY_POLL_ALERT_INTERVAL_MS)
-  );
 }
 
 export async function pollFinalDeliveriesOnce(
@@ -129,8 +85,7 @@ export async function pollFinalDeliveriesOnce(
         }),
         async (span) => {
           try {
-            await deliver(client, delivery);
-            await maybeAlertRuntimeFailure(config, client, delivery);
+            await deliver(client, delivery, config);
             await centaur(
               config,
               `/agent/final-deliveries/${executionId}/delivered`,
@@ -169,76 +124,11 @@ export async function pollFinalDeliveriesOnce(
   }
 }
 
-async function maybeAlertRuntimeFailure(
-  config: AppConfig,
+async function deliver(
   client: WebClient,
   delivery: any,
-): Promise<void> {
-  const text = extractText(delivery.final_payload ?? {});
-  if (!isRuntimeFailureText(text)) return;
-  await postRuntimeAlert(config, client, {
-    kind: "runtime_startup_failure",
-    executionId: executionId(delivery),
-    text,
-    delivery,
-  });
-}
-
-const RUNTIME_FAILURE_LINE_PATTERNS = [
-  /^Failed to start\b/i,
-  /^sandbox readiness timed out\b/i,
-  /^sandbox pod exited before ready\b/i,
-  /^node capacity\b/i,
-  /^iron-proxy\b.*\b(?:failed|error|unavailable|timeout|timed out)\b/i,
-  /^1Password\b.*\b(?:failed|error|unavailable|timeout|timed out)\b/i,
-];
-
-export function isRuntimeFailureText(text: string): boolean {
-  const firstMeaningfulLine =
-    text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) ?? "";
-  return RUNTIME_FAILURE_LINE_PATTERNS.some((pattern) =>
-    pattern.test(firstMeaningfulLine),
-  );
-}
-
-async function postRuntimeAlert(
   config: AppConfig,
-  client: WebClient,
-  details: {
-    kind: string;
-    executionId?: string;
-    text?: string;
-    error?: unknown;
-    delivery?: any;
-  },
 ): Promise<void> {
-  const channel = config.RUNTIME_ERROR_ALERT_CHANNEL.trim();
-  if (!channel) return;
-  const meta = details.delivery?.delivery ?? {};
-  const context = [
-    `kind=${details.kind}`,
-    details.executionId ? `execution=${details.executionId}` : null,
-    meta.channel_id ? `channel=${meta.channel_id}` : null,
-    meta.thread_ts ? `thread=${meta.thread_ts}` : null,
-  ].filter(Boolean);
-  const body = details.text ?? slackDeliveryErrorMessage(details.error);
-  const truncated = body.length > 600 ? `${body.slice(0, 597)}...` : body;
-  try {
-    await client.chat.postMessage({
-      channel,
-      text: `Centaur alert: ${context.join(" ")}\n${truncated}`,
-      unfurl_links: false,
-      unfurl_media: false,
-    });
-  } catch (error) {
-    logError("runtime_alert_post_failed", error);
-  }
-}
-
-async function deliver(client: WebClient, delivery: any): Promise<void> {
   const meta = delivery.delivery ?? {};
   const payload = delivery.final_payload ?? {};
   const target = targetFromDelivery(delivery);
@@ -257,8 +147,8 @@ async function deliver(client: WebClient, delivery: any): Promise<void> {
     channel,
     threadTs,
     executionId(delivery),
+    config.SLACK_TEAM_ID,
     chunks,
-    githubFileLinkBaseUrl(payload),
   );
 }
 
@@ -266,45 +156,13 @@ function executionId(delivery: any): string {
   return String(delivery?.execution_id ?? "");
 }
 
-function githubFileLinkBaseUrl(payload: any): string | undefined {
-  const direct = cleanGithubFileLinkBaseUrl(payload?.github_file_link_base_url);
-  if (direct) return direct;
-  const repoContext = payload?.repo_context;
-  if (!repoContext || typeof repoContext !== "object") return undefined;
-  const owner = cleanPathPart(repoContext.repo_owner);
-  const repo = cleanPathPart(repoContext.repo_name);
-  const ref = cleanGithubRef(
-    repoContext.github_ref ?? repoContext.git_ref ?? repoContext.git_commit,
-  );
-  if (!owner || !repo || !ref) return undefined;
-  return `https://github.com/${owner}/${repo}/blob/${ref}`;
-}
-
-function cleanGithubFileLinkBaseUrl(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const cleaned = value.trim().replace(/\/+$/, "");
-  return cleaned || undefined;
-}
-
-function cleanPathPart(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const cleaned = value.trim();
-  return cleaned && !cleaned.includes("/") ? encodeURIComponent(cleaned) : undefined;
-}
-
-function cleanGithubRef(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const cleaned = value.trim();
-  return cleaned ? cleaned.split("/").map(encodeURIComponent).join("/") : undefined;
-}
-
 async function postFollowups(
   client: WebClient,
   channel: string,
   threadTs: string,
   executionId: string,
+  teamId: string | undefined,
   chunks: string[],
-  githubFileLinkBaseUrl?: string,
 ): Promise<void> {
   const posted = await withSpan(
     "centaur.slackbot.slack.conversations_replies",
@@ -317,6 +175,7 @@ async function postFollowups(
   );
   for (const [index, chunk] of chunks.entries()) {
     if (posted.has(index)) continue;
+    const renderedChunk = rewriteSlackArchiveLinksForApp(chunk, teamId);
     const response = await withSpan(
       "centaur.slackbot.slack.post_message",
       clientSpanOptions({
@@ -325,14 +184,14 @@ async function postFollowups(
         "centaur.execution_id": executionId,
         "centaur.final_delivery.chunk_index": index,
         "centaur.final_delivery.chunk_count": chunks.length,
-        "centaur.final_delivery.chunk_chars": chunk.length,
+        "centaur.final_delivery.chunk_chars": renderedChunk.length,
       }),
       () =>
         client.chat.postMessage({
           channel,
           thread_ts: threadTs,
-          text: chunk,
-          blocks: renderMarkdownBlocks(chunk, { githubFileLinkBaseUrl }),
+          text: renderedChunk,
+          blocks: renderMarkdownBlocks(renderedChunk),
           unfurl_links: false,
           unfurl_media: false,
           metadata: chunkMetadata(executionId, index, chunks.length),
@@ -398,7 +257,6 @@ function extractText(payload: any): string {
     payload?.text,
     payload?.final_text,
     payload?.message,
-    payload?.error_text,
   );
   if (value) return value;
 
@@ -409,20 +267,9 @@ function extractText(payload: any): string {
 
 function firstNonEmpty(...values: unknown[]): string {
   for (const value of values) {
-    const text = primitiveText(value).trim();
+    const text =
+      value === undefined || value === null ? "" : String(value).trim();
     if (text) return text;
-  }
-  return "";
-}
-
-function primitiveText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "bigint"
-  ) {
-    return String(value);
   }
   return "";
 }
@@ -433,6 +280,52 @@ function continuationText(payload: any, text: string): string | null {
   const offset = Math.floor(rawOffset);
   if (offset >= text.length) return null;
   return text.slice(offset).trimStart();
+}
+
+function rewriteSlackArchiveLinksForApp(
+  text: string,
+  teamId: string | undefined,
+): string {
+  const team = String(teamId ?? "").trim();
+  if (!team) return text;
+  return text.replace(
+    /\[([^\]]+)\]\((https:\/\/(?:[A-Za-z0-9-]+\.)*slack\.com\/archives\/([A-Z0-9]+)\/p(\d{16})(?:\?([^)]*))?)\)/g,
+    (
+      match,
+      label: string,
+      _url: string,
+      channel: string,
+      rawMessageTs: string,
+      query: string | undefined,
+    ) => {
+      const messageTs = slackTsFromArchivePath(rawMessageTs);
+      if (!messageTs) return match;
+      const params = new URLSearchParams(query ?? "");
+      const threadTs = params.get("thread_ts") || undefined;
+      const deepLink = slackAppDeepLink({ team, channel, messageTs, threadTs });
+      return `[${label}](${deepLink})`;
+    },
+  );
+}
+
+function slackTsFromArchivePath(raw: string): string | null {
+  if (!/^\d{16}$/.test(raw)) return null;
+  return `${raw.slice(0, 10)}.${raw.slice(10)}`;
+}
+
+function slackAppDeepLink(opts: {
+  team: string;
+  channel: string;
+  messageTs: string;
+  threadTs?: string;
+}): string {
+  const params = new URLSearchParams({
+    team: opts.team,
+    id: opts.channel,
+    message: opts.messageTs,
+  });
+  if (opts.threadTs) params.set("thread_ts", opts.threadTs);
+  return `slack://channel?${params.toString()}`;
 }
 
 function splitFinalDeliveryText(text: string): string[] {
@@ -460,23 +353,6 @@ function splitFinalDeliveryText(text: string): string[] {
 function slackDeliveryErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
-}
-
-function finalDeliveryPollFailureText(
-  config: AppConfig,
-  consecutiveFailures: number,
-  error: unknown,
-): string {
-  const apiOrigin = apiUrlOrigin(config.CENTAUR_API_URL);
-  return `final delivery poll failed ${consecutiveFailures} times consecutively for ${apiOrigin}: ${slackDeliveryErrorMessage(error)}`;
-}
-
-function apiUrlOrigin(value: string): string {
-  try {
-    return new URL(value).origin;
-  } catch {
-    return "configured Centaur API URL";
-  }
 }
 
 function slackDeliveryErrorClass(error: unknown): string | null {

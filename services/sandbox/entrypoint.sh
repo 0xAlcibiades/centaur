@@ -17,12 +17,6 @@ fi
 
 mkdir -p "$HOME_DIR/.config/amp"
 
-if [ "${SCCACHE_ENABLE:-}" = "1" ] && command -v sccache >/dev/null 2>&1; then
-    export SCCACHE_DIR="${SCCACHE_DIR:-$HOME_DIR/.cache/sccache}"
-    mkdir -p "$SCCACHE_DIR"
-    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
-fi
-
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────
 cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
 {
@@ -98,31 +92,6 @@ if [ -n "${CENTAUR_TRACE_ID:-}" ]; then
     printf '%s' "$CENTAUR_TRACE_ID" > "$HOME_DIR/.trace_id"
 fi
 
-toml_escape() {
-    printf '%s' "$1" | sed 's/\/\\/g; s/"/\"/g'
-}
-
-is_placeholder_secret() {
-    case "${1:-}" in
-        "" | "GITHUB_TOKEN" | "GH_TOKEN" | "GITHUB_PAT")
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-truthy_env() {
-    local value="${1:-}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    case "${value,,}" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
@@ -136,6 +105,34 @@ mkdir -p "$HOME_DIR/.claude"
 if [ -f "$HARNESS_CONFIG_DIR/claude/settings.json" ]; then
     cp "$HARNESS_CONFIG_DIR/claude/settings.json" "$HOME_DIR/.claude/settings.json"
 fi
+
+# CLAUDE_CODE_AUTH_MODE selects how Claude Code authenticates with the upstream
+# (mirrors CODEX_AUTH_MODE):
+#   - api_key (default): Claude Code uses ANTHROPIC_API_KEY against
+#     api.anthropic.com. The harness stub key is left in the env; iron-proxy's
+#     ANTHROPIC_API_KEY HttpSecret rewrites the X-Api-Key header on the wire.
+#   - access_token: Claude Code runs as a Claude.ai Pro or Max subscription
+#     user. We install a dummy ~/.claude/.credentials.json so the CLI emits
+#     OAuth-shaped requests, unset the API-key stub so it does not fall back
+#     to X-Api-Key, and let iron-token-broker mint a real Bearer at request
+#     time via the anthropic-claude brokered_token secret.
+CLAUDE_CODE_AUTH_MODE="${CLAUDE_CODE_AUTH_MODE:-api_key}"
+case "$CLAUDE_CODE_AUTH_MODE" in
+    api_key)
+        :
+        ;;
+    access_token)
+        unset ANTHROPIC_API_KEY
+        if [ -f /etc/centaur/claude-credentials.default.json ]; then
+            cp /etc/centaur/claude-credentials.default.json "$HOME_DIR/.claude/.credentials.json"
+            chmod 600 "$HOME_DIR/.claude/.credentials.json"
+        fi
+        ;;
+    *)
+        echo "unknown CLAUDE_CODE_AUTH_MODE: $CLAUDE_CODE_AUTH_MODE (expected api_key or access_token)" >&2
+        exit 1
+        ;;
+esac
 
 # ── Pi-mono settings ─────────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.pi/agent/extensions"
@@ -169,21 +166,11 @@ if [ -n "${AGENT_REPO:-}" ]; then
             git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
         fi
 
+        BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
+        git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
     fi
-
-    case "$AGENT_REPO" in
-        */*) git -C "$WORKSPACE_DIR" remote set-url origin "https://github.com/${AGENT_REPO}.git" ;;
-    esac
-
-    BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
-    git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
 else
     mkdir -p "$WORKSPACE_DIR"
-fi
-
-if [ -n "${WORKSPACE_ENV_LOCAL_B64:-}" ]; then
-    printf '%s' "$WORKSPACE_ENV_LOCAL_B64" | base64 -d > "$WORKSPACE_DIR/.env.local"
-    chmod 600 "$WORKSPACE_DIR/.env.local"
 fi
 
 # ── Ensure uploads directory exists ──────────────────────────────────────────
@@ -202,61 +189,10 @@ if [ -d "$HOME_DIR/github" ]; then
     CENTAUR_SKILLS="$(find "$HOME_DIR/github" -path '*/centaur/.agents/skills' -type d -print -quit 2>/dev/null || true)"
 fi
 WS_SKILLS="$WORKSPACE_DIR/.agents/skills"
-copy_skills_into_workspace() {
-    local skills_src="$1"
-    local entry
-    local name
-    local target
-
-    mkdir -p "$WS_SKILLS"
-    for entry in "$skills_src"/* "$skills_src"/.[!.]* "$skills_src"/..?*; do
-        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
-            continue
-        fi
-        name="$(basename "$entry")"
-        target="$WS_SKILLS/$name"
-        if [ -L "$target" ]; then
-            rm -f "$target"
-        elif [ -d "$entry" ] && [ -e "$target" ] && [ ! -d "$target" ]; then
-            rm -f "$target"
-        elif [ ! -d "$entry" ] && [ -d "$target" ]; then
-            rm -rf "$target"
-        fi
-    done
-    cp -r "$skills_src"/. "$WS_SKILLS"/
-}
-
-import_workspace_claude_skills() {
-    local claude_skills="$WORKSPACE_DIR/.claude/skills"
-    local entry
-    local name
-    local target
-
-    if [ ! -d "$claude_skills" ] || [ "$claude_skills" -ef "$WS_SKILLS" ]; then
-        return
-    fi
-
-    mkdir -p "$WS_SKILLS"
-    for entry in "$claude_skills"/* "$claude_skills"/.[!.]* "$claude_skills"/..?*; do
-        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
-            continue
-        fi
-        name="$(basename "$entry")"
-        target="$WS_SKILLS/$name"
-        if [ -L "$target" ]; then
-            rm -f "$target"
-        elif [ -e "$target" ]; then
-            rm -rf "$target"
-        fi
-        cp -r "$entry" "$target"
-    done
-}
-
-import_workspace_claude_skills
-
 for SKILLS_SRC in "$BAKED_IN_CENTAUR_SKILLS" "$MOUNTED_CENTAUR_SKILLS" "$CENTAUR_SKILLS" "$MOUNTED_ORG_SKILLS" "$OVERLAY_TREE_SKILLS"; do
     if [ -d "$SKILLS_SRC" ]; then
-        copy_skills_into_workspace "$SKILLS_SRC"
+        mkdir -p "$WS_SKILLS"
+        cp -r "$SKILLS_SRC"/. "$WS_SKILLS"/
     fi
 done
 
@@ -291,41 +227,39 @@ if [ -x "$HARNESS_ADAPTER" ]; then
     "$HARNESS_ADAPTER" "${1:-}" "$TARGET_PROMPT"
 fi
 
-CODEX_LOCAL_AUTH_LOADED=0
-if truthy_env "${CODEX_USE_LOCAL_AUTH:-}"; then
-    mkdir -p "$HOME_DIR/.codex"
-    cat > "$HOME_DIR/.codex/auth.json" <<'JSON'
-{"auth_mode":"chatgpt","last_refresh":"1970-01-01T00:00:00Z","tokens":{"access_token":"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImVtYWlsIjoiaXJvbi1wcm94eS1jb2RleC1zdHViQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vcHJvZmlsZSI6eyJlbWFpbCI6Imlyb24tcHJveHktY29kZXgtc3R1YkBleGFtcGxlLmludmFsaWQifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7InVzZXJfaWQiOiJpcm9uLXByb3h5LWNvZGV4LXN0dWItdXNlciIsImNoYXRncHRfdXNlcl9pZCI6Imlyb24tcHJveHktY29kZXgtc3R1Yi11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiaXJvbi1wcm94eS1jb2RleC1zdHViLWFjY291bnQiLCJjaGF0Z3B0X2FjY291bnRfaXNfZmVkcmFtcCI6ZmFsc2V9fQ.stub-signature","refresh_token":"iron-proxy-codex-stub-refresh-token","id_token":"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImVtYWlsIjoiaXJvbi1wcm94eS1jb2RleC1zdHViQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vcHJvZmlsZSI6eyJlbWFpbCI6Imlyb24tcHJveHktY29kZXgtc3R1YkBleGFtcGxlLmludmFsaWQifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7InVzZXJfaWQiOiJpcm9uLXByb3h5LWNvZGV4LXN0dWItdXNlciIsImNoYXRncHRfdXNlcl9pZCI6Imlyb24tcHJveHktY29kZXgtc3R1Yi11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiaXJvbi1wcm94eS1jb2RleC1zdHViLWFjY291bnQiLCJjaGF0Z3B0X2FjY291bnRfaXNfZmVkcmFtcCI6ZmFsc2V9fQ.stub-signature","account_id":"iron-proxy-codex-stub-account"}}
-JSON
-    chmod 600 "$HOME_DIR/.codex/auth.json"
-    CODEX_LOCAL_AUTH_LOADED=1
-    unset CODEX_API_KEY OPENAI_API_KEY
-fi
-unset CODEX_AUTH_JSON CODEX_AUTH_JSON_FILE CODEX_ACCESS_TOKEN CODEX_PROXY_AUTH
-
 # Codex reads its auth file when the app server starts. Complete this before
 # signaling readiness, otherwise warm pods can be claimed with no auth loaded.
 # Skipped under access_token mode — that path relies on the chatgpt auth.json
 # installed above plus iron-proxy injecting the real Bearer at request time.
-if [ "$CODEX_LOCAL_AUTH_LOADED" != "1" ] && [ "$CODEX_AUTH_MODE" != "access_token" ]; then
+if [ "$CODEX_AUTH_MODE" != "access_token" ]; then
     CODEX_KEY="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
-    if ! is_placeholder_secret "$CODEX_KEY"; then
+    if [ -n "$CODEX_KEY" ]; then
         echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true
     fi
 fi
 
-unset CLAUDE_CREDENTIALS_JSON CLAUDE_CREDENTIALS_JSON_FILE
+# Wait for the tool-server sidecar before signalling readiness, so the harness
+# doesn't issue its first tool call before the server is listening.
+if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
+    _tools_deadline=$(( $(date +%s) + ${CENTAUR_TOOLS_WAIT_SECONDS:-10} ))
+    until curl -fsS --noproxy '*' --max-time 2 "${CENTAUR_TOOLS_URL}/healthz" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$_tools_deadline" ]; then
+            echo "tool-server /healthz not ready after ${CENTAUR_TOOLS_WAIT_SECONDS:-10}s; continuing" >&2
+            break
+        fi
+        sleep 0.5
+    done
+fi
 
 # Signal readiness
 touch "$HOME_DIR/.ready"
 
 # ── Background: slow auth tasks ─────────────────────────────────────────────
 {
-    GIT_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-    if ! is_placeholder_secret "$GIT_AUTH_TOKEN"; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
         git config --global credential.helper store
-        printf 'https://x-access-token:%s@github.com\n' "$GIT_AUTH_TOKEN" > "$HOME_DIR/.git-credentials"
-        printf '%s\n' "$GIT_AUTH_TOKEN" | gh auth login --with-token 2>/dev/null || true
+        printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
+        echo "${GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null || true
         gh auth setup-git 2>/dev/null || true
     fi
 } &

@@ -41,7 +41,6 @@ type CodexSessionState = {
   streamedCommentaryText: string
   streamedAnswerText: string
   deliveredAnswerChars: number
-  githubFileLinkBaseUrl?: string
   agentMessagePhase: AgentMessagePhase | null
   agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
@@ -88,8 +87,6 @@ export class CodexSessionRenderer {
     const state = getState(agentSessionId)
     if (event?.session_id) state.threadId = String(event.session_id)
     if (event?.thread_id) state.threadId = String(event.thread_id)
-    const githubFileLinkBaseUrl = githubFileLinkBaseUrlFromEvent(event)
-    if (githubFileLinkBaseUrl) state.githubFileLinkBaseUrl = githubFileLinkBaseUrl
 
     trackAgentMessageLifecycle(event, state)
     ensureCommentarySegmentBreak(event, state)
@@ -241,15 +238,10 @@ export class CodexSessionRenderer {
     }
   }
 
-  async done(
-    agentSessionId: string,
-    threadId?: string,
-    opts: { githubFileLinkBaseUrl?: string } = {}
-  ): Promise<void> {
+  async done(agentSessionId: string, threadId?: string): Promise<void> {
     const state = getState(agentSessionId)
     if (state.done) return
     if (threadId) state.threadId = threadId
-    if (opts.githubFileLinkBaseUrl) state.githubFileLinkBaseUrl = opts.githubFileLinkBaseUrl
     state.done = true
     completeThinkingTasks(state)
     completeOpenTasks(state)
@@ -257,9 +249,7 @@ export class CodexSessionRenderer {
     await this.publishPendingAssistantText(agentSessionId, state, { force: true })
     const { streamedTextChars } = await this.renderer.done(agentSessionId, {
       streamFinalUpdates: true,
-      commentaryMarkdown: state.commentaryText,
-      answerMarkdown: state.answerText,
-      githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
+      answerMarkdown: state.answerText
     })
     state.deliveredAnswerChars = streamedTextChars
     state.done = true
@@ -319,8 +309,7 @@ export class CodexSessionRenderer {
     if (!delta) return
     const acceptedChars = await this.renderer.textDelta(agentSessionId, delta, {
       force: opts.force ?? false,
-      planPrefix: hasPlan,
-      githubFileLinkBaseUrl: state.githubFileLinkBaseUrl
+      planPrefix: hasPlan
     })
     if (acceptedChars > 0) {
       state.streamedAnswerText += delta.slice(0, acceptedChars)
@@ -567,16 +556,18 @@ function applyAgentMessageUpdate(
   }
 
   if (event?.type === 'assistant') {
-    const cumulative = assistantTextFromAssistantEvent(event)
-    if (!cumulative) return { bufferChanged: false }
+    const text = assistantTextFromAssistantEvent(event)
+    if (!text) return { bufferChanged: false }
     const key = buffer === 'answer' ? 'harnessAnswerText' : 'harnessCommentaryText'
     const before = state[key]
-    if (cumulative === before || before.endsWith(cumulative)) return { bufferChanged: false }
-    state[key] = cumulative.startsWith(before)
-      ? cumulative
-      : before
-        ? `${before}\n${cumulative}`
-        : cumulative
+    if (text === before || before.endsWith(text)) return { bufferChanged: false }
+    if (assistantEventLooksCanonical(event)) {
+      state[key] = text
+    } else if (text.startsWith(before)) {
+      state[key] = text
+    } else {
+      state[key] = before + text
+    }
     recomposeBuffers(state)
     return { bufferChanged: true }
   }
@@ -606,6 +597,18 @@ function assistantTextFromAssistantEvent(event: any): string {
     .map(part => (part?.type === 'text' ? (part.text ?? '') : ''))
     .filter(Boolean)
     .join('')
+}
+
+function assistantEventLooksCanonical(event: any): boolean {
+  const message = event?.message
+  return Boolean(
+    event?.uuid ||
+    event?.request_id ||
+    event?.session_id ||
+    message?.id ||
+    message?.model ||
+    message?.usage
+  )
 }
 
 function logCanonicalCorrection(
@@ -638,13 +641,6 @@ function logCanonicalCorrection(
 
 function textHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 16)
-}
-
-function githubFileLinkBaseUrlFromEvent(event: any): string | undefined {
-  const value = event?.github_file_link_base_url ?? event?.githubFileLinkBaseUrl
-  if (typeof value !== 'string') return undefined
-  const cleaned = value.trim().replace(/\/+$/, '')
-  return cleaned || undefined
 }
 
 function reasoningText(event: any): string {

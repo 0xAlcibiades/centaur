@@ -78,7 +78,7 @@ delete_if_forced() {
 }
 
 rand_hex() {
-  openssl rand -hex 32
+  openssl rand -hex 32 | tr -d '\n'
 }
 
 require_cmd kubectl
