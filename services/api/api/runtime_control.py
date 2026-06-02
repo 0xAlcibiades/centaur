@@ -2036,6 +2036,7 @@ async def _mark_execution_terminal(
             suppress_legacy_delivery = (
                 _has_slackbot_live_delivery(metadata)
                 and not slackbot_live_delivery_failed
+                and slackbot_streamed_answer_chars > 0
                 and (
                     not result_has_text
                     or _slackbot_live_delivery_covers_result(
