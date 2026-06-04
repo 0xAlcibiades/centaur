@@ -65,6 +65,7 @@ Minimum keys:
 | `SLACK_BOT_TOKEN` | Slackbot | Bot User OAuth Token from the Slack app. |
 | `SLACK_SIGNING_SECRET` | Slackbot/API | Used to verify Slack webhook signatures. |
 | `SLACKBOT_API_KEY` | Slackbot to API | Static service token; API bootstraps it into Postgres on startup with `agent` scope. |
+| `LOCAL_DEV_API_KEY` | Initial operator/admin access | Optional but recommended for first boot; API bootstraps it into Postgres on startup with `admin`, `agent`, `threads`, and `tools:*` scopes. |
 | `OP_CONNECT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password Connect source (preferred) | Needed when `ironProxy.secretSource` is `onepassword-connect`. |
 | `OP_SERVICE_ACCOUNT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password service-account source | Needed when `ironProxy.secretSource` is `onepassword`. |
 | `OP_VAULT` | [iron-proxy](https://docs.iron.sh) 1Password source | Vault name or id used for `op://` references (either mode). |
@@ -97,62 +98,6 @@ Whatever source you pick, the vault is shared across the whole deployment,
 so any thread can use any configured credential. Per-user and per-channel
 scoping is on the roadmap; until then, scope tool and harness access
 accordingly. See [Security](/security) for the full threat model.
-
-### Optional local OAuth/subscription auth
-
-Codex and Claude Code can use local CLI auth state instead of the API-key
-path. This is meant for deployments that need Codex subscriptions or Claude
-Code subscription/card auth. It is not automatic. Codex reconstructs its local
-auth file inside matching sandboxes; Claude Code uses a refresh token through
-[iron-proxy](https://docs.iron.sh) by default.
-
-For local development, run:
-
-```bash
-bun run auth:bootstrap
-source .env.local
-just bootstrap-secrets
-```
-
-If local auth is missing, `auth:bootstrap` prints the exact login command. To
-stream the device/browser setup flow from the bootstrap command itself, run:
-
-```bash
-bun run auth:bootstrap -- --login
-```
-
-For production, deliver these keys through the same infra Secret transport you
-use for other chart secrets, but put them in a separate Secret. The chart
-defaults to:
-
-```yaml
-harnessAuth:
-  existingSecretName: centaur-harness-auth
-```
-
-| Secret | Used for |
-|--------|----------|
-| `CODEX_AUTH_JSON` | Store this value in the configured 1Password field for iron-proxy writeback. |
-| `CLAUDE_CODE_OAUTH_CLIENT_ID` | Claude Code public OAuth client id for iron-proxy. |
-| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Claude Code OAuth refresh token for iron-proxy. |
-
-Then enable only the providers you intend to use:
-
-```yaml
-sandbox:
-  extraEnv:
-    CODEX_USE_LOCAL_AUTH: "true"
-    CLAUDE_USE_LOCAL_AUTH: "true"
-```
-
-The Kubernetes sandbox backend scopes auth payloads by engine: Codex auth stays
-in iron-proxy, Claude proxy pods receive only Claude OAuth material, and Amp
-receives none. Do not put these payloads in `centaur-infra-env`; the API pod
-imports that Secret with `envFrom`.
-
-Claude Code subscription credentials contain a rotating refresh token, so they
-are best treated as a narrow opt-in path rather than fleet auth. Prefer Console
-API keys, `ANTHROPIC_AUTH_TOKEN`, or an auth helper/gateway for concurrent pods.
 
 ## 4. Configure Slack
 
@@ -227,9 +172,8 @@ helm upgrade --install centaur contrib/chart \
 
 ## 6. Verify the deployment
 
-Check health from inside the API deployment first. Localhost is accepted for
-operator-only routes, so this avoids needing an external admin key for the first
-smoke check:
+Check health from inside the API deployment first. The basic health and
+readiness endpoints do not require auth:
 
 ```bash
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
@@ -237,58 +181,75 @@ kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
 
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
   curl -fsS http://localhost:8000/health/ready | jq
-
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS http://localhost:8000/health/tools | jq
 ```
 
-If you need to call operator routes from outside the cluster, use a configured
-admin key such as `LOCAL_DEV_API_KEY` to create a narrower operator key and
-save the returned plaintext key:
+Operator routes such as `/health/tools` and `/admin/*` require an admin API key.
+There is no localhost auth bypass. Bootstrap the first admin key by setting
+`LOCAL_DEV_API_KEY` in `centaur-infra-env` before API startup, or patch it in and
+restart the API:
 
 ```bash
-ADMIN_KEY=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- printenv LOCAL_DEV_API_KEY)
+export ADMIN_KEY="aiv2_$(openssl rand -hex 32)"
 
+kubectl patch secret -n centaur-system centaur-infra-env \
+  --type merge \
+  -p "{\"stringData\":{\"LOCAL_DEV_API_KEY\":\"${ADMIN_KEY}\"}}"
+
+kubectl rollout restart -n centaur-system deploy/centaur-centaur-api
+kubectl rollout status -n centaur-system deploy/centaur-centaur-api
+```
+
+Then verify tool discovery with that key:
+
+```bash
+kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
+  curl -fsS http://localhost:8000/health/tools \
+    -H "X-Api-Key: ${ADMIN_KEY}" | jq
+```
+
+You can create a named operator key and save the returned plaintext key:
+
+```bash
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
   curl -fsS -X POST http://localhost:8000/admin/api-keys \
-    -H "Authorization: Bearer ${ADMIN_KEY}" \
     -H "Content-Type: application/json" \
+    -H "X-Api-Key: ${ADMIN_KEY}" \
     -d '{"name":"operator","scopes":["admin"],"created_by":"ops"}' | jq
 ```
 
-External operator calls then use:
+External operator calls use the same header:
 
 ```bash
 curl -s "$CENTAUR_API_URL/health/tools" \
   -H "X-Api-Key: $ADMIN_KEY" | jq
 ```
 
-Run one agent turn from inside the API deployment:
+Run one agent turn from inside the API deployment. Use either the admin key or a
+service key with `agent` scope, such as `SLACKBOT_API_KEY`:
 
 ```bash
 THREAD_KEY=production-smoke-codex
-API_KEY=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- printenv SLACKBOT_API_KEY)
 
 SPAWN=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/spawn \
-  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: ${ADMIN_KEY}" \
   -d "{\"thread_key\":\"${THREAD_KEY}\"}")
 ASSIGNMENT_GENERATION=$(printf '%s' "$SPAWN" | jq -r '.assignment_generation')
 
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/message \
-  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: ${ADMIN_KEY}" \
   -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}"
 
 EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/execute \
-  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: ${ADMIN_KEY}" \
   -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"delivery\":{\"platform\":\"dev\"}}")
 EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
-  -H "Authorization: Bearer ${API_KEY}" \
-  "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
+  "http://localhost:8000/agent/executions/${EXECUTION_ID}" \
+  -H "X-Api-Key: ${ADMIN_KEY}" | jq
 ```
 
 Then run the same prompt through Slack:
@@ -311,7 +272,6 @@ execution before retrying:
 
 ```bash
 kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
-  -H "Authorization: Bearer ${API_KEY}" \
   "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
 
 kubectl logs -n centaur-system deploy/centaur-centaur-api --tail=200

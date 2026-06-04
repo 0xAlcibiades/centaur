@@ -522,6 +522,24 @@ def _build_tool_server_container(
         env.append({"name": name, "value": dsn})
     _apply_tool_server_extra_env(env, no_proxy)
 
+    # AWS region for the cloudwatch tool (non-secret). The tool signs with
+    # placeholder credentials and iron-proxy re-signs with the real keys, so no
+    # AWS credentials belong in this process — only the region, which boto3
+    # needs to pick the endpoint host and signing scope. Optional: the tool
+    # defaults to us-east-1 when unset.
+    env.append(
+        {
+            "name": "AWS_REGION",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_name,
+                    "key": _secret_env_key("AWS_REGION"),
+                    "optional": True,
+                }
+            },
+        }
+    )
+
     volume_mounts: list[dict[str, Any]] = [
         {
             "name": "firewall-ca",

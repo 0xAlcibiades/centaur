@@ -304,6 +304,31 @@ class HmacSignSecret:
     allow_chunked_body: bool = False
 
 
+@dataclass(frozen=True)
+class AwsAuthSecret:
+    """AWS SigV4 re-signing handled by iron-proxy's ``aws_auth`` transform.
+
+    The tool's AWS SDK signs each request with throwaway *placeholder*
+    credentials; iron-proxy reads the region and service from the inbound
+    signature's credential scope, strips that signature, and re-signs with the
+    real credentials resolved from ``access_key_id``/``secret_access_key`` (and
+    optional ``session_token``). The real keys never reach the sandbox — this is
+    the SigV4 analogue of the ``secrets`` transform's placeholder swap.
+
+    ``allowed_services``/``allowed_regions`` scope which AWS services/regions the
+    proxy will sign for; ``hosts`` becomes the iron-proxy ``rules``. Credential
+    refs resolve like every other secret (env var or 1Password item).
+    """
+
+    name: str
+    hosts: tuple[str, ...]
+    access_key_id_ref: str
+    secret_access_key_ref: str
+    session_token_ref: str | None = None
+    allowed_regions: tuple[str, ...] = ()
+    allowed_services: tuple[str, ...] = ()
+
+
 SecretDef = (
     HttpSecret
     | GcpAuthSecret
@@ -311,6 +336,7 @@ SecretDef = (
     | OAuthTokenSecret
     | BrokeredTokenSecret
     | HmacSignSecret
+    | AwsAuthSecret
 )
 
 
@@ -1036,6 +1062,59 @@ def _parse_secret(entry: Any, *, default_hosts: tuple[str, ...] = ()) -> SecretD
             timestamp_format=timestamp_format,
             allow_chunked_body=allow_chunked_body,
         )
+    if secret_type == "aws_auth":
+        hosts = entry.get("hosts", [])
+        if (
+            not isinstance(hosts, list)
+            or not hosts
+            or not all(isinstance(h, str) and h for h in hosts)
+        ):
+            raise ValueError(
+                f"aws_auth entry {name!r} 'hosts' must be a non-empty array "
+                f"of non-empty strings"
+            )
+        access_key_id_ref = entry.get("access_key_id")
+        if not isinstance(access_key_id_ref, str) or not access_key_id_ref:
+            raise ValueError(
+                f"aws_auth entry {name!r} requires a non-empty 'access_key_id'"
+            )
+        secret_access_key_ref = entry.get("secret_access_key")
+        if not isinstance(secret_access_key_ref, str) or not secret_access_key_ref:
+            raise ValueError(
+                f"aws_auth entry {name!r} requires a non-empty 'secret_access_key'"
+            )
+        session_token_ref = entry.get("session_token")
+        if session_token_ref is not None and (
+            not isinstance(session_token_ref, str) or not session_token_ref
+        ):
+            raise ValueError(
+                f"aws_auth entry {name!r} 'session_token' must be a non-empty string"
+            )
+        allowed_regions = entry.get("allowed_regions", [])
+        if not isinstance(allowed_regions, list) or not all(
+            isinstance(r, str) and r for r in allowed_regions
+        ):
+            raise ValueError(
+                f"aws_auth entry {name!r} 'allowed_regions' must be an array of "
+                f"non-empty strings"
+            )
+        allowed_services = entry.get("allowed_services", [])
+        if not isinstance(allowed_services, list) or not all(
+            isinstance(s, str) and s for s in allowed_services
+        ):
+            raise ValueError(
+                f"aws_auth entry {name!r} 'allowed_services' must be an array of "
+                f"non-empty strings"
+            )
+        return AwsAuthSecret(
+            name=name,
+            hosts=tuple(hosts),
+            access_key_id_ref=access_key_id_ref,
+            secret_access_key_ref=secret_access_key_ref,
+            session_token_ref=session_token_ref,
+            allowed_regions=tuple(allowed_regions),
+            allowed_services=tuple(allowed_services),
+        )
     raise ValueError(f"unknown secret type {secret_type!r}")
 
 
@@ -1061,10 +1140,11 @@ async def _resolve_secrets(secrets: list[SecretDef]) -> dict[str, str]:
     ``ToolContext`` — the tool gets back the ``replacer`` token, which iron-proxy
     swaps for the real credential at the network boundary. Inject-mode HTTP
     secrets are applied entirely by iron-proxy and never reach the tool.
-    ``GcpAuthSecret``, ``OAuthTokenSecret`` and ``PgDsnSecret`` are likewise not
-    exposed via context: gcp_auth and oauth_token are minted and injected on the
-    wire by iron-proxy, and pg_dsn reaches the tool as an environment variable
-    set on the sandbox by the kubernetes backend.
+    ``GcpAuthSecret``, ``OAuthTokenSecret``, ``AwsAuthSecret`` and ``PgDsnSecret``
+    are likewise not exposed via context: gcp_auth, oauth_token and aws_auth are
+    minted/re-signed and injected on the wire by iron-proxy (the tool signs AWS
+    requests with placeholder credentials), and pg_dsn reaches the tool as an
+    environment variable set on the sandbox by the kubernetes backend.
     """
     return {s.name: s.replacer for s in secrets if _is_replace_secret(s)}
 
@@ -1920,12 +2000,12 @@ class ToolManager:
         )
         return loaded
 
-    # Base infrastructure secrets — credentials every sandbox's iron-proxy
-    # needs regardless of which harness is running. Each ``HttpSecret``
-    # carries the hosts iron-proxy attaches it to. Harness-specific provider
-    # credentials (Anthropic, OpenAI) live in ``_HARNESS_SECRETS`` below
-    # because the right credential depends on the sandbox's harness and
-    # auth mode.
+    # Global proxy secrets — credentials the shared API-side proxy and sandbox
+    # proxies may need regardless of which harness is running. Each
+    # ``HttpSecret`` carries the hosts iron-proxy attaches it to.
+    # Harness-specific provider credentials (Anthropic, OpenAI) live in
+    # ``_HARNESS_SECRETS`` below because the right credential depends on the
+    # sandbox's harness and auth mode.
     _INFRA_SECRETS: ClassVar[list[HttpSecret]] = [
         HttpSecret(
             name="XAI_API_KEY",
@@ -1954,6 +2034,12 @@ class ToolManager:
         HttpSecret(
             name="SLACK_BOT_TOKEN",
             secret_ref="SLACK_BOT_TOKEN",
+            hosts=("*.slack.com",),
+            match_headers=("Authorization",),
+        ),
+        HttpSecret(
+            name="SLACK_ETL_TOKEN",
+            secret_ref="SLACK_ETL_TOKEN",
             hosts=("*.slack.com",),
             match_headers=("Authorization",),
         ),

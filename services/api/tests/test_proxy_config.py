@@ -12,6 +12,7 @@ from api.proxy_config import (
 )
 from api.tool_manager import (
     DEFAULT_MATCH_HEADERS,
+    AwsAuthSecret,
     GcpAuthSecret,
     HmacHeader,
     HmacSignSecret,
@@ -1868,4 +1869,101 @@ def test_render_brokered_token_merges_hosts_across_duplicate_names(
     assert {r["host"] for r in entries[0]["rules"]} == {
         "api.anthropic.com",
         "console.anthropic.com",
+    }
+
+
+# ── aws_auth parser ──────────────────────────────────────────────────────────
+
+
+def _aws_entry(**overrides):
+    entry = {
+        "type": "aws_auth",
+        "name": "cloudwatch",
+        "access_key_id": "AWS_ACCESS_KEY_ID",
+        "secret_access_key": "AWS_SECRET_ACCESS_KEY",
+        "hosts": ["logs.*.amazonaws.com", "monitoring.*.amazonaws.com"],
+        "allowed_services": ["logs", "monitoring"],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_parser_typed_aws_auth_full_example() -> None:
+    secret = _parse_secret(_aws_entry())
+    assert isinstance(secret, AwsAuthSecret)
+    assert secret.access_key_id_ref == "AWS_ACCESS_KEY_ID"
+    assert secret.secret_access_key_ref == "AWS_SECRET_ACCESS_KEY"
+    assert secret.session_token_ref is None
+    assert secret.hosts == ("logs.*.amazonaws.com", "monitoring.*.amazonaws.com")
+    assert secret.allowed_services == ("logs", "monitoring")
+    assert secret.allowed_regions == ()
+
+
+def test_parser_aws_auth_accepts_session_token_and_regions() -> None:
+    secret = _parse_secret(
+        _aws_entry(session_token="AWS_SESSION_TOKEN", allowed_regions=["us-east-1"])
+    )
+    assert isinstance(secret, AwsAuthSecret)
+    assert secret.session_token_ref == "AWS_SESSION_TOKEN"
+    assert secret.allowed_regions == ("us-east-1",)
+
+
+def test_parser_aws_auth_requires_access_key_id() -> None:
+    entry = _aws_entry()
+    del entry["access_key_id"]
+    with pytest.raises(ValueError, match="requires a non-empty 'access_key_id'"):
+        _parse_secret(entry)
+
+
+def test_parser_aws_auth_requires_secret_access_key() -> None:
+    entry = _aws_entry()
+    del entry["secret_access_key"]
+    with pytest.raises(ValueError, match="requires a non-empty 'secret_access_key'"):
+        _parse_secret(entry)
+
+
+def test_parser_aws_auth_requires_hosts() -> None:
+    with pytest.raises(ValueError, match="'hosts' must be a non-empty array"):
+        _parse_secret(_aws_entry(hosts=[]))
+
+
+# ── aws_auth renderer ────────────────────────────────────────────────────────
+
+
+def test_render_emits_aws_auth_transform() -> None:
+    secrets = [
+        AwsAuthSecret(
+            name="cloudwatch",
+            hosts=("logs.*.amazonaws.com", "monitoring.*.amazonaws.com"),
+            access_key_id_ref="AWS_ACCESS_KEY_ID",
+            secret_access_key_ref="AWS_SECRET_ACCESS_KEY",
+            allowed_services=("logs", "monitoring"),
+        )
+    ]
+    cfg = yaml.safe_load(render_proxy_yaml(secrets))
+    aws = next(t for t in cfg["transforms"] if t["name"] == "aws_auth")
+    assert aws["config"]["access_key_id"] == {"type": "env", "var": "AWS_ACCESS_KEY_ID"}
+    assert aws["config"]["secret_access_key"] == {
+        "type": "env",
+        "var": "AWS_SECRET_ACCESS_KEY",
+    }
+    assert aws["config"]["allowed_services"] == ["logs", "monitoring"]
+    assert "session_token" not in aws["config"]
+    assert {r["host"] for r in aws["config"]["rules"]} == {
+        "logs.*.amazonaws.com",
+        "monitoring.*.amazonaws.com",
+    }
+
+
+def test_render_merges_aws_auth_hosts_for_shared_credentials() -> None:
+    secrets = [
+        AwsAuthSecret("a", ("logs.*.amazonaws.com",), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+        AwsAuthSecret("b", ("monitoring.*.amazonaws.com",), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+    ]
+    cfg = yaml.safe_load(render_proxy_yaml(secrets))
+    blocks = [t for t in cfg["transforms"] if t["name"] == "aws_auth"]
+    assert len(blocks) == 1
+    assert {r["host"] for r in blocks[0]["config"]["rules"]} == {
+        "logs.*.amazonaws.com",
+        "monitoring.*.amazonaws.com",
     }

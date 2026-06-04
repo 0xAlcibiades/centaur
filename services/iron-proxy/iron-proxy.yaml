@@ -78,6 +78,15 @@ transforms:
         - "x-as-user-email"
         - "/^x-codex-.*$/"
         - "/^x-openai-.*$/"
+        # AWS SigV4 request headers (x-amz-target, x-amz-date,
+        # x-amz-content-sha256, x-amz-security-token) for the aws_auth transform.
+        - "/^x-amz-.*$/"
+        # AWS SDK headers that the SDK signer folds into the SigV4 signed-headers
+        # set (amz-sdk-request, amz-sdk-invocation-id, and x-amzn-query-mode for
+        # CloudWatch's query-JSON protocol). aws_auth signs them, so they must
+        # survive egress filtering or AWS rejects with InvalidSignatureException.
+        - "/^amz-sdk-.*$/"
+        - "/^x-amzn-.*$/"
         - "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/"
 
 log:

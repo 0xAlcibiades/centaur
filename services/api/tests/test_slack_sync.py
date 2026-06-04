@@ -170,8 +170,12 @@ async def _clear_slack_sync_tables(db_pool, monkeypatch):
     monkeypatch.delenv("SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS", raising=False)
     await db_pool.execute(
         "TRUNCATE TABLE company_context_documents, google_drive_sync_checkpoints, "
-        "google_drive_sync_files, google_drive_sync_runs, slack_sync_backfill_jobs, slack_sync_checkpoints, "
-        "slack_sync_messages, slack_sync_runs, slack_sync_users, slack_sync_channels CASCADE",
+        "google_drive_sync_files, google_drive_sync_runs, google_calendar_sync_checkpoints, "
+        "google_calendar_sync_events, google_calendar_sync_calendars, google_calendar_sync_runs, "
+        "linear_sync_checkpoints, linear_sync_comments, linear_sync_issues, "
+        "linear_sync_projects, linear_sync_runs, "
+        "slack_sync_backfill_jobs, slack_sync_checkpoints, slack_sync_messages, "
+        "slack_sync_runs, slack_sync_users, slack_sync_channels CASCADE",
     )
     yield
 
@@ -297,7 +301,7 @@ def test_backfill_schedule_defaults_disabled(monkeypatch):
     assert reloaded.DEFAULT_CHANNEL_PAGES_PER_JOB == 5
     assert reloaded.SCHEDULE == {
         "schedule_id": "slack_backfill",
-        "interval_seconds": 60,
+        "interval_seconds": 600,
         "enabled": False,
         "no_delivery": True,
     }
@@ -318,15 +322,6 @@ def test_backfill_schedule_respects_env_overrides(monkeypatch):
     assert reloaded.SCHEDULE["interval_seconds"] == 120
     assert reloaded.DEFAULT_CHANNEL_BATCH_LIMIT == 12
     assert reloaded.DEFAULT_CHANNEL_PAGES_PER_JOB == 3
-
-
-def test_repo_slack_client_paths_prefer_reorganized_tool_layout():
-    from workflows import slack_sync
-
-    paths = [path.as_posix() for path in slack_sync._repo_slack_client_paths()]
-
-    assert paths[0].endswith("tools/productivity/slack/client.py")
-    assert paths[1].endswith("tools/slack/client.py")
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1020,119 @@ async def test_first_incremental_run_seeds_historical_backfill_job(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_incremental_widens_completed_bootstrap_for_existing_checkpoint(db_pool):
+    from workflows import slack_sync
+
+    await db_pool.execute(
+        "INSERT INTO slack_sync_channels (channel_id, channel_name, is_syncable) "
+        "VALUES ('C_PUBLIC', 'ai-agent', TRUE)",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_checkpoints (channel_id, watermark_ts) "
+        "VALUES ('C_PUBLIC', '3000000.000000')",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_backfill_jobs ("
+        "job_key, job_type, payload_version, channel_id, payload_json, status, "
+        "last_completed_at"
+        ") VALUES ("
+        "'bootstrap:C_PUBLIC', 'channel_bootstrap', 1, 'C_PUBLIC', "
+        "$1::jsonb, 'completed', NOW())",
+        json.dumps(
+            {
+                "cursor": None,
+                "window_oldest": "2000000.000000",
+                "window_latest": "2900000.000000",
+                "lookback_days": 30,
+                "thread_lookback_days": 3,
+            }
+        ),
+    )
+    fake = FakeSlackClient(channels=[_public_channel()], messages=[], replies={})
+    ctx = FakeCtx(db_pool, run_id="wfr-bootstrap-widen")
+
+    with (
+        patch.object(slack_sync, "_client", return_value=fake),
+        patch.object(slack_sync, "_ts_now_minus_days", return_value="1000000.000000"),
+    ):
+        await slack_sync.handler(slack_sync.Input(lookback_days=365), ctx)
+
+    backfill = await db_pool.fetchrow(
+        "SELECT job_key, job_type, payload_version, payload_json, status, "
+        "last_completed_at "
+        "FROM slack_sync_backfill_jobs "
+        "WHERE channel_id = 'C_PUBLIC' AND job_key = 'bootstrap:C_PUBLIC'",
+    )
+    assert backfill is not None
+    payload = json.loads(str(backfill["payload_json"]))
+    assert backfill["job_type"] == "channel_bootstrap"
+    assert backfill["payload_version"] == 1
+    assert backfill["status"] == "pending"
+    assert backfill["last_completed_at"] is None
+    assert payload == {
+        "cursor": None,
+        "window_oldest": "1000000.000000",
+        "window_latest": "2000000.000000",
+        "lookback_days": 365,
+        "thread_lookback_days": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_active_bootstrap_cursor_is_not_widened(db_pool):
+    from workflows import slack_sync
+
+    await db_pool.execute(
+        "INSERT INTO slack_sync_channels (channel_id, channel_name, is_syncable) "
+        "VALUES ('C_PUBLIC', 'ai-agent', TRUE)",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_checkpoints (channel_id, watermark_ts) "
+        "VALUES ('C_PUBLIC', '3000000.000000')",
+    )
+    await db_pool.execute(
+        "INSERT INTO slack_sync_backfill_jobs ("
+        "job_key, job_type, payload_version, channel_id, payload_json, status"
+        ") VALUES ("
+        "'bootstrap:C_PUBLIC', 'channel_bootstrap', 1, 'C_PUBLIC', "
+        "$1::jsonb, 'running')",
+        json.dumps(
+            {
+                "cursor": "cursor-2",
+                "window_oldest": "2000000.000000",
+                "window_latest": "2900000.000000",
+                "lookback_days": 30,
+                "thread_lookback_days": 3,
+            }
+        ),
+    )
+    fake = FakeSlackClient(channels=[_public_channel()], messages=[], replies={})
+    ctx = FakeCtx(db_pool, run_id="wfr-bootstrap-active-cursor")
+
+    with (
+        patch.object(slack_sync, "_client", return_value=fake),
+        patch.object(slack_sync, "_ts_now_minus_days", return_value="1000000.000000"),
+    ):
+        await slack_sync.handler(slack_sync.Input(lookback_days=365), ctx)
+
+    backfill = await db_pool.fetchrow(
+        "SELECT status, payload_json "
+        "FROM slack_sync_backfill_jobs "
+        "WHERE job_key = 'bootstrap:C_PUBLIC'",
+    )
+    assert backfill is not None
+    payload = json.loads(str(backfill["payload_json"]))
+    assert backfill["status"] == "running"
+    assert payload == {
+        "cursor": "cursor-2",
+        "window_oldest": "2000000.000000",
+        "window_latest": "2900000.000000",
+        "lookback_days": 30,
+        "thread_lookback_days": 3,
+    }
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_seed_is_one_row_per_channel_even_without_watermark(db_pool):
     from workflows import slack_sync
 
@@ -1483,6 +1591,18 @@ async def test_etl_freshness_metrics_refresh_from_slack_sync_tables(db_pool):
 
     now = dt.datetime.now(dt.timezone.utc)
     await db_pool.execute(
+        "INSERT INTO workflow_schedules ("
+        "schedule_id, workflow_name, schedule_kind, interval_seconds, next_run_at"
+        ") VALUES "
+        "('slack_sync', 'slack_sync', 'interval', 20, $1), "
+        "('google_drive_sync', 'google_drive_sync', 'interval', 30, $1), "
+        "('google_calendar_sync', 'google_calendar_sync', 'interval', 40, $1), "
+        "('linear_sync', 'linear_sync', 'interval', 50, $1) "
+        "ON CONFLICT (schedule_id) DO UPDATE SET "
+        "interval_seconds = EXCLUDED.interval_seconds",
+        now,
+    )
+    await db_pool.execute(
         "INSERT INTO slack_sync_channels (channel_id, channel_name, is_syncable) "
         "VALUES ('C_PUBLIC', 'ai-agent', TRUE), ('C_OTHER', 'other-channel', TRUE)",
     )
@@ -1527,6 +1647,40 @@ async def test_etl_freshness_metrics_refresh_from_slack_sync_tables(db_pool):
         now - dt.timedelta(seconds=20),
     )
     await db_pool.execute(
+        "INSERT INTO google_calendar_sync_calendars (calendar_id, summary, updated_at) "
+        "VALUES ('primary@example.com', 'Primary', $1), ('team@example.com', 'Team', $2)",
+        now - dt.timedelta(seconds=40),
+        now - dt.timedelta(seconds=35),
+    )
+    await db_pool.execute(
+        "INSERT INTO google_calendar_sync_checkpoints ("
+        "calendar_id, sync_token, watermark_time, last_success_at, last_error, updated_at"
+        ") VALUES "
+        "('primary@example.com', 'token-1', $1, $2, '', $2), "
+        "('team@example.com', 'token-2', $3, NULL, 'api_error', $4)",
+        now - dt.timedelta(seconds=150),
+        now - dt.timedelta(seconds=55),
+        now - dt.timedelta(seconds=240),
+        now - dt.timedelta(seconds=50),
+    )
+    await db_pool.execute(
+        "INSERT INTO linear_sync_runs (run_id, status) VALUES ('linear-seed', 'completed')"
+    )
+    await db_pool.execute(
+        "INSERT INTO linear_sync_checkpoints ("
+        "scope_id, watermark_time, last_run_id, last_success_at, last_error, updated_at"
+        ") VALUES "
+        "('projects', $1, 'linear-seed', $2, '', $2), "
+        "('issues', $3, 'linear-seed', $4, '', $4), "
+        "('comments', $5, 'linear-seed', NULL, 'api_error', $6)",
+        now - dt.timedelta(seconds=180),
+        now - dt.timedelta(seconds=65),
+        now - dt.timedelta(seconds=210),
+        now - dt.timedelta(seconds=75),
+        now - dt.timedelta(seconds=300),
+        now - dt.timedelta(seconds=70),
+    )
+    await db_pool.execute(
         "INSERT INTO company_context_documents ("
         "document_id, source, source_type, source_document_id, title, body, "
         "source_updated_at, content_hash"
@@ -1543,6 +1697,16 @@ async def test_etl_freshness_metrics_refresh_from_slack_sync_tables(db_pool):
     assert 'etl_failed_scopes{source="slack",source_type="channel"} 1' in metrics
     assert 'etl_active_scopes{source="google_drive",source_type="doc"} 1' in metrics
     assert 'etl_failed_scopes{source="google_drive",source_type="doc"} 0' in metrics
+    assert (
+        'etl_active_scopes{source="google_calendar",source_type="calendar"} 2'
+        in metrics
+    )
+    assert (
+        'etl_failed_scopes{source="google_calendar",source_type="calendar"} 1'
+        in metrics
+    )
+    assert 'etl_active_scopes{source="linear",source_type="workspace"} 3' in metrics
+    assert 'etl_failed_scopes{source="linear",source_type="workspace"} 1' in metrics
     assert (
         'etl_backfill_jobs{job_type="channel_bootstrap",source="slack",status="pending"} 1'
         in metrics
@@ -1566,7 +1730,7 @@ async def test_etl_freshness_metrics_refresh_from_slack_sync_tables(db_pool):
         metrics,
     )
     assert freshness_match is not None
-    assert 25 <= float(freshness_match.group(1)) < 100
+    assert 5 <= float(freshness_match.group(1)) < 60
     drive_lag_match = re.search(
         r'etl_source_cursor_lag_seconds\{source="google_drive",source_type="doc"\} ([0-9.]+)',
         metrics,
@@ -1578,7 +1742,31 @@ async def test_etl_freshness_metrics_refresh_from_slack_sync_tables(db_pool):
         metrics,
     )
     assert drive_freshness_match is not None
-    assert 40 <= float(drive_freshness_match.group(1)) < 120
+    assert 10 <= float(drive_freshness_match.group(1)) < 70
+    calendar_lag_match = re.search(
+        r'etl_source_cursor_lag_seconds\{source="google_calendar",source_type="calendar"\} ([0-9.]+)',
+        metrics,
+    )
+    assert calendar_lag_match is not None
+    assert float(calendar_lag_match.group(1)) >= 200
+    calendar_freshness_match = re.search(
+        r'etl_scope_sync_freshness_seconds\{source="google_calendar",source_type="calendar"\} ([0-9.]+)',
+        metrics,
+    )
+    assert calendar_freshness_match is not None
+    assert 10 <= float(calendar_freshness_match.group(1)) < 70
+    linear_lag_match = re.search(
+        r'etl_source_cursor_lag_seconds\{source="linear",source_type="workspace"\} ([0-9.]+)',
+        metrics,
+    )
+    assert linear_lag_match is not None
+    assert float(linear_lag_match.group(1)) >= 250
+    linear_freshness_match = re.search(
+        r'etl_scope_sync_freshness_seconds\{source="linear",source_type="workspace"\} ([0-9.]+)',
+        metrics,
+    )
+    assert linear_freshness_match is not None
+    assert 20 <= float(linear_freshness_match.group(1)) < 80
     drive_projection_lag_match = re.search(
         r'company_context_projection_lag_seconds\{source="google_drive"\} ([0-9.]+)',
         metrics,

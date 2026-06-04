@@ -1565,6 +1565,31 @@ def test_proxy_iron_env_injects_broker_when_url_set(
     }
 
 
+def test_tool_server_container_exposes_aws_region_not_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api.sandbox.kubernetes import _build_tool_server_container
+
+    monkeypatch.setenv("KUBERNETES_TOOL_SERVER_IMAGE", "centaur-api:latest")
+    monkeypatch.setenv("KUBERNETES_SECRET_ENV_NAME", "centaur-infra-env")
+
+    container = _build_tool_server_container(
+        firewall_host="fw", api_url="http://api:8000", overlay_mount=None
+    )
+    by_name = {e["name"]: e for e in container["env"]}
+
+    # Region (non-secret) is exposed, optional so sandboxes start without it.
+    assert by_name["AWS_REGION"]["valueFrom"]["secretKeyRef"] == {
+        "name": "centaur-infra-env",
+        "key": "AWS_REGION",
+        "optional": True,
+    }
+    # Credentials must NOT be here — iron-proxy's aws_auth transform holds them
+    # and re-signs on the wire; they never enter the tool process.
+    assert "AWS_ACCESS_KEY_ID" not in by_name
+    assert "AWS_SECRET_ACCESS_KEY" not in by_name
+
+
 @pytest.mark.asyncio
 async def test_per_sandbox_proxy_uses_bootstrap_secret_for_onepassword(
     monkeypatch: pytest.MonkeyPatch,
