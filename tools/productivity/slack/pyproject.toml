@@ -30,4 +30,5 @@ secrets = [
 ]
 optional_secrets = [
     {type = "http", name = "SLACK_SEARCH_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]},
+    {type = "http", name = "SLACK_BOT_SEARCH_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]},
 ]

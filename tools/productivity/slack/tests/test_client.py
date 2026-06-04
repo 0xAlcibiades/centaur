@@ -907,6 +907,41 @@ def test_native_search_uses_dedicated_search_client() -> None:
     assert fake_bot_client.api_calls == []
 
 
+def test_client_accepts_bot_search_token_alias() -> None:
+    token = set_tool_context(
+        ToolContext(
+            name="slack",
+            secrets={
+                "SLACK_BOT_TOKEN": "xoxb-bot",
+                "SLACK_BOT_SEARCH_TOKEN": "xoxp-search",
+            },
+        )
+    )
+    try:
+        client = SlackClient()
+    finally:
+        reset_tool_context(token)
+
+    assert client.search_token == "xoxp-search"
+
+
+def test_client_ignores_missing_optional_token_placeholders() -> None:
+    token = set_tool_context(
+        ToolContext(
+            name="slack",
+            secrets={
+                "SLACK_BOT_TOKEN": "xoxb-bot",
+            },
+        )
+    )
+    try:
+        client = SlackClient()
+    finally:
+        reset_tool_context(token)
+
+    assert client.search_token == ""
+
+
 def test_sync_channel_history_uses_watermark_lookback() -> None:
     client, _ = _make_client()
     captured: dict = {}
