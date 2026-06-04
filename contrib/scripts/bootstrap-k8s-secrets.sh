@@ -101,6 +101,7 @@ require_env SLACKBOT_API_KEY
 optional_secret_env_names=(
   LMNR_PROJECT_API_KEY
   LMNR_BASE_URL
+  LINEAR_API_KEY
   OP_CONNECT_TOKEN
   LOCAL_DEV_API_KEY
 )
