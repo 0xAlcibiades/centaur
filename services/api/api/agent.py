@@ -920,22 +920,32 @@ async def get_or_spawn(
                         error=str(exc),
                         exc_info=True,
                     )
-                    raise RuntimeError(
-                        f"failed to resume suspended sandbox: {session.sandbox_id}"
-                    ) from exc
+                    old_agent_thread_id = session.agent_thread_id
+                    old_last_delivered_id = session.last_delivered_id
+                    old_inflight_turn_id = session.inflight_turn_id
+                    old_inflight_turn_input = session.inflight_turn_input
+                    old_inflight_attempts = session.inflight_attempts
+                    old_last_result = session.last_result
+                    old_trace_id = session.trace_id
+                    with contextlib.suppress(Exception):
+                        await backend.stop_by_id(session.sandbox_id)
+                    await _db_delete_session(thread_key)
+                    _drop_runtime(session.sandbox_id)
+                    session = None
             # Container is gone — save agent_thread_id and cursor for resume, clean up row
-            old_agent_thread_id = session.agent_thread_id
-            old_last_delivered_id = session.last_delivered_id
-            old_inflight_turn_id = session.inflight_turn_id
-            old_inflight_turn_input = session.inflight_turn_input
-            old_inflight_attempts = session.inflight_attempts
-            old_last_result = session.last_result
-            old_trace_id = session.trace_id
-            if session.db_state == "suspended":
-                with contextlib.suppress(Exception):
-                    await backend.stop_by_id(session.sandbox_id)
-            await _db_delete_session(thread_key)
-            _drop_runtime(session.sandbox_id)
+            if session is not None:
+                old_agent_thread_id = session.agent_thread_id
+                old_last_delivered_id = session.last_delivered_id
+                old_inflight_turn_id = session.inflight_turn_id
+                old_inflight_turn_input = session.inflight_turn_input
+                old_inflight_attempts = session.inflight_attempts
+                old_last_result = session.last_result
+                old_trace_id = session.trace_id
+                if session.db_state == "suspended":
+                    with contextlib.suppress(Exception):
+                        await backend.stop_by_id(session.sandbox_id)
+                await _db_delete_session(thread_key)
+                _drop_runtime(session.sandbox_id)
         else:
             # state is stopped/gone — clean up stale row
             old_agent_thread_id = session.agent_thread_id

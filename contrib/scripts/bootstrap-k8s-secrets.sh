@@ -21,6 +21,8 @@ set to onepassword-connect in the Helm values):
                                Claude Code public OAuth client id; added to centaur-harness-auth
   CLAUDE_CODE_OAUTH_REFRESH_TOKEN
                                Claude Code OAuth refresh token; added to centaur-harness-auth
+  CLAUDE_CODE_CLIENT_ID        Claude Code public OAuth client id for brokered auth
+  CLAUDE_CODE_BLOB             JSON refresh-token blob for brokered auth
 
 Optional local-dev admin key:
   LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
@@ -109,6 +111,8 @@ optional_secret_env_names=(
 harness_auth_env_names=(
   CLAUDE_CODE_OAUTH_CLIENT_ID
   CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  CLAUDE_CODE_CLIENT_ID
+  CLAUDE_CODE_BLOB
 )
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null

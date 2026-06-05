@@ -129,8 +129,11 @@ if (codex) {
 
 const claudeCredentials = claudeCredentialsPayload();
 if (claudeCredentials) {
+  const blob = JSON.stringify({ refresh_token: claudeCredentials.refreshToken });
   updates.CLAUDE_CODE_OAUTH_CLIENT_ID = CLAUDE_CODE_OAUTH_CLIENT_ID;
   updates.CLAUDE_CODE_OAUTH_REFRESH_TOKEN = claudeCredentials.refreshToken;
+  updates.CLAUDE_CODE_CLIENT_ID = CLAUDE_CODE_OAUTH_CLIENT_ID;
+  updates.CLAUDE_CODE_BLOB = blob;
   imported.push([
     "Claude Code OAuth refresh token",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
@@ -139,6 +142,11 @@ if (claudeCredentials) {
   imported.push([
     "Claude Code OAuth client id",
     "CLAUDE_CODE_OAUTH_CLIENT_ID",
+    claudeCredentials.path,
+  ]);
+  imported.push([
+    "Claude Code broker refresh blob",
+    "CLAUDE_CODE_BLOB",
     claudeCredentials.path,
   ]);
 } else {
@@ -184,6 +192,8 @@ if (loginRequested && loginCommands.length > 0) {
         upsertEnvValues(envFile, {
           CLAUDE_CODE_OAUTH_CLIENT_ID: CLAUDE_CODE_OAUTH_CLIENT_ID,
           CLAUDE_CODE_OAUTH_REFRESH_TOKEN: credentials.refreshToken,
+          CLAUDE_CODE_CLIENT_ID: CLAUDE_CODE_OAUTH_CLIENT_ID,
+          CLAUDE_CODE_BLOB: JSON.stringify({ refresh_token: credentials.refreshToken }),
         });
         console.log(`Wrote ${envFile}`);
         console.log(
@@ -191,6 +201,9 @@ if (loginRequested && loginCommands.length > 0) {
         );
         console.log(
           `Claude Code OAuth client id: imported ${credentials.path} into CLAUDE_CODE_OAUTH_CLIENT_ID=[redacted]`,
+        );
+        console.log(
+          `Claude Code broker refresh blob: imported ${credentials.path} into CLAUDE_CODE_BLOB=[redacted]`,
         );
       } else {
         console.error("Claude: login completed but Claude Code credentials were not found.");
