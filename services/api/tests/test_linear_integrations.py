@@ -100,6 +100,31 @@ def test_linear_readonly_client_builds_issue_filters():
     assert 'state: { name: { containsIgnoreCase: "In Progress" } }' in query
 
 
+def test_linear_readonly_client_searches_issues_with_term_argument():
+    from api.integrations.linear import LinearReadonlyClient
+
+    http = FakeHttpClient(
+        [
+            {
+                "data": {
+                    "searchIssues": {
+                        "nodes": [{"id": "issue-1", "identifier": "ENG-1"}],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        ]
+    )
+    client = LinearReadonlyClient(api_key="lin-test", http_client=http)
+
+    result = client.search_issues("livermore", limit=1)
+
+    assert result == [{"id": "issue-1", "identifier": "ENG-1"}]
+    request = http.requests[0]["json"]
+    assert "searchIssues(term: $term" in request["query"]
+    assert request["variables"] == {"term": "livermore", "first": 1, "after": None}
+
+
 def test_linear_readonly_client_lists_etl_projects_with_incremental_filter():
     from api.integrations.linear import LinearReadonlyClient
 
