@@ -1229,7 +1229,7 @@ async def _active_execution_parent_context(
         return None
     pool = getattr(getattr(request, "app", None), "state", None)
     pool = getattr(pool, "db_pool", None) if pool else None
-    if pool is None:
+    if pool is None or not hasattr(pool, "fetchrow"):
         return None
     row = await pool.fetchrow(
         "SELECT metadata FROM agent_execution_requests "
@@ -2327,6 +2327,7 @@ class ToolManager:
         args: dict[str, Any],
         *,
         request: Request | None = None,
+        format: str = "json",
     ) -> Any:
         """Call a tool method by name and return the raw Python result.
 
@@ -2567,6 +2568,23 @@ class ToolManager:
                 )
             finally:
                 reset_tool_context(token)
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        method_name: str,
+        args: dict[str, Any],
+        *,
+        request: Request | None = None,
+        format: str = "json",
+    ) -> Any:
+        return await self.call_tool_raw(
+            tool_name,
+            method_name,
+            args,
+            request=request,
+            format=format,
+        )
 
     def create_rest_router(self) -> APIRouter:
         """Create a stable FastAPI router that dispatches to tools via live lookup.
