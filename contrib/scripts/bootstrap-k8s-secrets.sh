@@ -29,6 +29,12 @@ Optional local-dev admin key:
                                (envFrom centaur-infra-env). Re-run with --force
                                or kubectl patch to rotate.
 
+Optional repo-cache GitHub token:
+  GITHUB_TOKEN                 added to centaur-infra-env when present; the
+                               repo-cache DaemonSet reads it (repoCache.githubToken
+                               -> existingSecretName) to clone tool/overlay repos.
+                               Updated on every run when set, so it rotates.
+
 Optional iron-control bootstrap (consumed when ironControl.enabled=true):
   IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
                                bundled Postgres server with no database path, so
@@ -144,6 +150,11 @@ if secret_exists centaur-infra-env; then
   if ! secret_key_present IRON_BROKER_TOKEN; then
     patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
   fi
+  # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
+  # rotated; harmless when repoCache is disabled.
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    patch_data+=("\"GITHUB_TOKEN\":\"$(printf '%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')\"")
+  fi
   # iron-control keys: top up only when absent so we never rotate them out from
   # under a running pod (its ActiveRecord-encrypted data would become
   # undecryptable). Generated values mirror the create path.
@@ -223,6 +234,9 @@ else
       secret_args+=(--from-literal="$name=${!name}")
     fi
   done
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")
+  fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
 fi

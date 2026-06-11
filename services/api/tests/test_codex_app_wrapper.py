@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 from pathlib import Path
 import tomllib
@@ -89,30 +90,6 @@ def test_configure_trace_context_ignores_invalid_trace_id(monkeypatch) -> None:
     assert "TRACEPARENT" not in wrapper.os.environ
 
 
-def test_resume_uses_amp_var(monkeypatch) -> None:
-    wrapper = _load_wrapper()
-    monkeypatch.delenv("CODEX_CONTINUE_THREAD_ID", raising=False)
-    monkeypatch.setenv("AMP_CONTINUE_THREAD_ID", "legacy-thread")
-    monkeypatch.setattr(wrapper.os, "getcwd", lambda: "/workspace")
-    calls = []
-
-    def fake_request(method, params=None, timeout=30.0):
-        calls.append((method, params, timeout))
-        return {"thread": {"id": params["threadId"]}}
-
-    monkeypatch.setattr(wrapper, "request", fake_request)
-    wrapper.THREAD_ID = None
-
-    assert wrapper.start_or_resume_thread() == "legacy-thread"
-    assert calls == [
-        (
-            "thread/resume",
-            {"threadId": "legacy-thread", "cwd": "/workspace"},
-            60,
-        )
-    ]
-
-
 def test_configure_traceparent_uses_exact_parent_context(monkeypatch) -> None:
     wrapper = _load_wrapper()
     traceparent = "00-00000000000040008000000000000123-1111111122223333-01"
@@ -152,6 +129,65 @@ def test_request_attaches_traceparent(monkeypatch) -> None:
             },
         }
     ]
+
+
+def test_input_items_materializes_data_url_image(monkeypatch, tmp_path) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.setattr(wrapper, "UPLOADS_DIR", tmp_path)
+
+    items = wrapper.input_items(
+        {
+            "message": {
+                "content": [
+                    {"type": "text", "text": "please invert this"},
+                    {
+                        "type": "image",
+                        "name": "image.png",
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(b"png-bytes").decode(),
+                    },
+                ]
+            }
+        }
+    )
+
+    assert items == [
+        {
+            "type": "text",
+            "text": "please invert this\n"
+            + f"[Attached image saved to {tmp_path / 'image.png'}]",
+        },
+        {"type": "localImage", "path": str(tmp_path / "image.png"), "detail": "auto"},
+    ]
+    assert (tmp_path / "image.png").read_bytes() == b"png-bytes"
+
+
+def test_input_items_materializes_slack_attachment_part(monkeypatch, tmp_path) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.setattr(wrapper, "UPLOADS_DIR", tmp_path)
+
+    items = wrapper.input_items(
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "attachment",
+                        "attachment_type": "image",
+                        "mimeType": "image/png",
+                        "name": "meme.png",
+                        "dataBase64": base64.b64encode(b"meme-bytes").decode(),
+                    }
+                ]
+            }
+        }
+    )
+
+    assert items == [
+        {"type": "text", "text": f"[Attached image saved to {tmp_path / 'meme.png'}]"},
+        {"type": "localImage", "path": str(tmp_path / "meme.png"), "detail": "auto"},
+    ]
+    assert (tmp_path / "meme.png").read_bytes() == b"meme-bytes"
+    assert "dataBase64" not in str(items)
 
 
 def test_configure_codex_otel_writes_startup_config(monkeypatch, tmp_path) -> None:
@@ -461,42 +497,104 @@ def test_main_lazy_starts_app_server_after_input(monkeypatch) -> None:
     assert {"type": "turn.completed"} in emitted
 
 
-def test_handle_input_sets_codex_sandbox_policy(monkeypatch) -> None:
+def test_start_or_resume_thread_falls_back_to_fresh_thread_on_resume_failure(
+    monkeypatch,
+) -> None:
     wrapper = _load_wrapper()
-    requests: list[tuple[str, dict]] = []
+    emitted: list[dict] = []
+    requests: list[str] = []
 
-    def fake_request(method: str, params: dict, timeout: float = 30.0) -> dict:
-        requests.append((method, params))
-        if method == "turn/start":
-            return {"turn": {"id": "turn-123"}}
+    def fake_request(method: str, params: dict, timeout: float | None = None) -> dict:
+        requests.append(method)
+        if method == "thread/resume":
+            raise RuntimeError(
+                "no rollout found for thread id 019ead10-eee3-74c3-a9fc-aa3e8bc53783"
+            )
+        assert method == "thread/start"
+        return {"thread": {"id": "fresh-thread-id"}}
+
+    monkeypatch.setenv(
+        "CODEX_CONTINUE_THREAD_ID", "019ead10-eee3-74c3-a9fc-aa3e8bc53783"
+    )
+    monkeypatch.setattr(wrapper, "request", fake_request)
+    monkeypatch.setattr(wrapper, "emit", emitted.append)
+    wrapper.THREAD_ID = None
+
+    assert wrapper.start_or_resume_thread() == "fresh-thread-id"
+    assert requests == ["thread/resume", "thread/start"]
+    failure_events = [
+        event for event in emitted if event.get("subtype") == "thread_resume_failed"
+    ]
+    assert len(failure_events) == 1
+    assert "no rollout found" in failure_events[0]["message"]
+    assert (
+        failure_events[0]["resume_thread_id"]
+        == "019ead10-eee3-74c3-a9fc-aa3e8bc53783"
+    )
+    assert {"type": "thread.started", "thread_id": "fresh-thread-id"} in emitted
+
+
+def test_start_or_resume_thread_fallback_never_reuses_dead_resume_id(
+    monkeypatch,
+) -> None:
+    wrapper = _load_wrapper()
+
+    def fake_request(method: str, params: dict, timeout: float | None = None) -> dict:
+        if method == "thread/resume":
+            raise RuntimeError("no rollout found for thread id dead-thread-id")
         return {}
 
-    monkeypatch.setattr(
-        wrapper, "configure_codex_otel_for_startup", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(wrapper, "start_app_server", lambda: None)
-    monkeypatch.setattr(wrapper, "start_or_resume_thread", lambda: "thread-123")
+    monkeypatch.setenv("CODEX_CONTINUE_THREAD_ID", "dead-thread-id")
     monkeypatch.setattr(wrapper, "request", fake_request)
+    monkeypatch.setattr(wrapper, "emit", lambda _event: None)
+    wrapper.THREAD_ID = None
 
-    wrapper.ACTIVE_TURN_ID = None
-    while not wrapper.EVENTS.empty():
-        wrapper.EVENTS.get_nowait()
-    wrapper.EVENTS.put({"method": "turn/completed", "params": {}})
+    assert wrapper.start_or_resume_thread() != "dead-thread-id"
 
-    wrapper.handle_input(
-        {
-            "type": "user",
-            "message": {"content": [{"type": "text", "text": "hello"}]},
-        }
-    )
 
-    assert requests == [
-        (
-            "turn/start",
-            {
-                "threadId": "thread-123",
-                "input": [{"type": "text", "text": "hello"}],
-                "sandboxPolicy": {"type": "dangerFullAccess"},
-            },
-        )
-    ]
+def test_start_or_resume_thread_resumes_existing_thread(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    emitted: list[dict] = []
+    requests: list[str] = []
+
+    def fake_request(method: str, params: dict, timeout: float | None = None) -> dict:
+        requests.append(method)
+        assert method == "thread/resume"
+        assert params["threadId"] == "existing-thread-id"
+        return {"thread": {"id": "existing-thread-id"}}
+
+    monkeypatch.setenv("CODEX_CONTINUE_THREAD_ID", "existing-thread-id")
+    monkeypatch.setattr(wrapper, "request", fake_request)
+    monkeypatch.setattr(wrapper, "emit", emitted.append)
+    wrapper.THREAD_ID = None
+
+    assert wrapper.start_or_resume_thread() == "existing-thread-id"
+    assert requests == ["thread/resume"]
+    assert {"type": "thread.started", "thread_id": "existing-thread-id"} in emitted
+
+
+def test_export_slack_thread_env_handles_both_key_shapes(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.delenv("SLACK_CHANNEL", raising=False)
+    monkeypatch.delenv("SLACK_THREAD_TS", raising=False)
+
+    wrapper.export_slack_thread_env("slack:C0A87C21805:1781122990.363779")
+    assert wrapper.os.environ["SLACK_CHANNEL"] == "C0A87C21805"
+    assert wrapper.os.environ["SLACK_THREAD_TS"] == "1781122990.363779"
+
+    wrapper.export_slack_thread_env("slack:T092R71U6QY:C0B2ZRAMV9C:1781123220.343859")
+    assert wrapper.os.environ["SLACK_CHANNEL"] == "C0B2ZRAMV9C"
+    assert wrapper.os.environ["SLACK_THREAD_TS"] == "1781123220.343859"
+
+
+def test_export_slack_thread_env_ignores_non_slack_keys(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    monkeypatch.delenv("SLACK_CHANNEL", raising=False)
+    monkeypatch.delenv("SLACK_THREAD_TS", raising=False)
+
+    wrapper.export_slack_thread_env("cli:test-thread")
+    wrapper.export_slack_thread_env("slack:onlyonepart")
+    wrapper.export_slack_thread_env("slack:a:b:c:d:e")
+
+    assert "SLACK_CHANNEL" not in wrapper.os.environ
+    assert "SLACK_THREAD_TS" not in wrapper.os.environ

@@ -27,76 +27,6 @@ def test_agent_session_title_formats_base_and_persona_runs():
     )
 
 
-def test_live_delivery_answer_text_detection_ignores_turn_done_without_text():
-    from api.runtime_control import _event_has_answer_text
-
-    assert _event_has_answer_text({"type": "turn.done"}) is False
-    assert (
-        _event_has_answer_text({"type": "item.agentMessage.delta", "delta": "done"})
-        is True
-    )
-    assert _event_has_answer_text({"type": "result", "result": "finished"}) is True
-
-
-def test_codex_live_delivery_filters_noisy_deltas():
-    from api.runtime_control import _slackbot_live_events
-
-    assert (
-        _slackbot_live_events(
-            "codex",
-            {"type": "item.agentMessage.delta", "delta": "h"},
-            [{"type": "item.agentMessage.delta", "delta": "h"}],
-        )
-        == []
-    )
-    assert (
-        _slackbot_live_events(
-            "codex",
-            {"type": "item.commandExecution.outputDelta", "delta": "log"},
-            [{"type": "item.commandExecution.outputDelta", "delta": "log"}],
-        )
-        == []
-    )
-
-
-def test_codex_live_delivery_keeps_semantic_events():
-    from api.runtime_control import _slackbot_live_events
-
-    command_completed = {
-        "type": "item.completed",
-        "item": {
-            "type": "commandExecution",
-            "command": "bun check",
-            "status": "completed",
-        },
-    }
-    thinking_completed = {
-        "type": "item.completed",
-        "item": {
-            "type": "agentMessage",
-            "phase": "commentary",
-            "text": "I am checking the relevant files.",
-        },
-    }
-
-    assert _slackbot_live_events("codex", command_completed, [command_completed]) == [
-        command_completed
-    ]
-    assert _slackbot_live_events("codex", thinking_completed, [thinking_completed]) == [
-        thinking_completed
-    ]
-    assert _slackbot_live_events(
-        "codex", {"type": "turn.done"}, [{"type": "turn.done"}]
-    ) == [{"type": "turn.done"}]
-
-
-def test_non_codex_live_delivery_keeps_existing_behavior():
-    from api.runtime_control import _slackbot_live_events
-
-    event = {"type": "tool", "content": [{"tool_use_id": "t1"}]}
-    assert _slackbot_live_events("amp", event, [event]) == [event]
-
-
 def test_slackbot_streamed_answer_chars_requires_positive_integer_offset():
     from api.runtime_control import (
         _slackbot_live_delivery_covers_result,
@@ -1156,9 +1086,7 @@ async def test_mark_execution_terminal_delays_outbox_claimability(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(
-    db_pool,
-):
+async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(db_pool):
     from api.runtime_control import _mark_execution_terminal
 
     execution_id = f"exe-{uuid.uuid4().hex[:10]}"
@@ -1225,83 +1153,6 @@ async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(
         execution_id,
     )
     assert int(ready_events or 0) == 0
-
-
-@pytest.mark.asyncio
-async def test_mark_execution_terminal_falls_back_when_live_delivery_sent_nothing(
-    db_pool,
-):
-    from api.runtime_control import _mark_execution_terminal
-
-    execution_id = f"exe-{uuid.uuid4().hex[:10]}"
-    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
-    runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
-    result_text = "Execution completed, but no final text was captured."
-
-    await db_pool.execute(
-        "INSERT INTO sandbox_sessions (thread_key, sandbox_id, harness, engine, state) "
-        "VALUES ($1, $2, 'codex', 'codex', 'idle')",
-        thread_key,
-        runtime_id,
-    )
-    await db_pool.execute(
-        "INSERT INTO agent_runtime_assignments ("
-        "thread_key, assignment_generation, runtime_id, harness, engine, "
-        "persona_id, prompt_ref, effective_agents_md_sha256, state"
-        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
-        thread_key,
-        runtime_id,
-    )
-    await db_pool.execute(
-        "INSERT INTO agent_execution_requests ("
-        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
-        "delivery, metadata, started_at"
-        ") VALUES ($1, $2, 1, 'exec-live-empty', 'hash-live-empty', 'running', "
-        "$3::jsonb, $4::jsonb, NOW())",
-        execution_id,
-        thread_key,
-        json.dumps({"platform": "slack", "channel": "C-test"}),
-        json.dumps(
-            {
-                "slackbot_live_delivery": True,
-                "slackbot_agent_session_id": "sess-live-empty",
-            }
-        ),
-    )
-    await db_pool.execute(
-        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
-        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
-        execution_id,
-        thread_key,
-    )
-
-    await _mark_execution_terminal(
-        db_pool,
-        execution_id=execution_id,
-        thread_key=thread_key,
-        status="completed",
-        terminal_reason="completed",
-        result_text=result_text,
-        error_text=None,
-    )
-
-    outbox = await db_pool.fetchrow(
-        "SELECT state, final_payload FROM agent_final_delivery_outbox WHERE execution_id = $1",
-        execution_id,
-    )
-    assert outbox is not None
-    assert outbox["state"] == "pending"
-    final_payload = outbox["final_payload"]
-    if isinstance(final_payload, str):
-        final_payload = json.loads(final_payload)
-    assert final_payload["result_text"] == result_text
-    assert "slackbot_streamed_answer_chars" not in final_payload
-    ready_events = await db_pool.fetchval(
-        "SELECT COUNT(*) FROM agent_execution_events "
-        "WHERE execution_id = $1 AND event_kind = 'final_delivery_ready'",
-        execution_id,
-    )
-    assert int(ready_events or 0) == 1
 
 
 @pytest.mark.asyncio
@@ -1826,7 +1677,7 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
     ):
         await _process_execution(db_pool, row)
 
-    session_text_mock.assert_awaited_once_with("sess-blank", final_text)
+    session_text_mock.assert_not_awaited()
     session_done_mock.assert_awaited_once_with("sess-blank", "turn-059d374be813486b")
     execution = await db_pool.fetchrow(
         "SELECT status, terminal_reason, result_text FROM agent_execution_requests WHERE execution_id = $1",
@@ -1841,8 +1692,11 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
         execution_id,
     )
     assert outbox is not None
-    assert outbox["state"] == "awaiting_terminal"
-    assert outbox["final_payload"] is None
+    assert outbox["state"] == "pending"
+    final_payload = outbox["final_payload"]
+    if isinstance(final_payload, str):
+        final_payload = json.loads(final_payload)
+    assert final_payload["result_text"] == final_text
 
 
 @pytest.mark.asyncio
@@ -3018,102 +2872,11 @@ async def test_recover_stale_running_requeues_expired_execution(db_pool):
     await _recover_stale_running(db_pool)
 
     row = await db_pool.fetchrow(
-        "SELECT status, metadata FROM agent_execution_requests WHERE execution_id = $1",
+        "SELECT status FROM agent_execution_requests WHERE execution_id = $1",
         execution_id,
     )
     assert row is not None
     assert row["status"] == "queued"
-    metadata = json.loads(row["metadata"])
-    assert metadata["recovered_from_stale_lease"] is True
-    assert metadata["stale_lease_recovered_at"]
-
-
-@pytest.mark.asyncio
-async def test_worker_replays_logs_for_stale_lease_recovery(db_pool):
-    from api.runtime_control import _process_execution
-
-    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
-    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
-    runtime_id = f"rt-recovered-{uuid.uuid4().hex[:8]}"
-    recovered_metadata = {"recovered_from_stale_lease": True}
-
-    await db_pool.execute(
-        "INSERT INTO agent_runtime_assignments ("
-        "thread_key, assignment_generation, runtime_id, harness, engine, "
-        "persona_id, prompt_ref, effective_agents_md_sha256, state"
-        ") VALUES ($1, 1, $2, 'amp', 'amp', NULL, 'harness:amp', 'sha', 'active')",
-        thread_key,
-        runtime_id,
-    )
-    await db_pool.execute(
-        "INSERT INTO agent_execution_requests ("
-        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, durable_turn_id, "
-        "delivery, metadata, silence_deadline_at, hard_deadline_at"
-        ") VALUES ($1, $2, 1, 'exec-recovered', 'hash-recovered', 'running', 'turn-existing', "
-        "'{}'::jsonb, $3::jsonb, NOW() + INTERVAL '10 minutes', NOW() + INTERVAL '30 minutes')",
-        execution_id,
-        thread_key,
-        json.dumps(recovered_metadata),
-    )
-
-    row = {
-        "execution_id": execution_id,
-        "thread_key": thread_key,
-        "assignment_generation": 1,
-        "status": "running",
-        "durable_turn_id": "turn-existing",
-        "delivery": {},
-        "metadata": recovered_metadata,
-        "silence_deadline_at": dt.datetime.now(dt.timezone.utc)
-        + dt.timedelta(minutes=10),
-        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30),
-        "created_at": dt.datetime.now(dt.timezone.utc),
-        "claimed_at": dt.datetime.now(dt.timezone.utc),
-    }
-    session = SandboxSession(
-        sandbox_id=runtime_id,
-        thread_key=thread_key,
-        harness="amp",
-        engine="amp",
-    )
-
-    async def _replayed_done_stream(*_args, **_kwargs):
-        yield {
-            "data": json.dumps(
-                {
-                    "type": "turn.done",
-                    "turn_id": 1,
-                    "result": "replayed final answer",
-                    "agent_thread_id": "",
-                }
-            )
-        }
-
-    backend = SimpleNamespace(
-        attach=AsyncMock(), status=AsyncMock(return_value="running")
-    )
-
-    with (
-        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
-        patch("api.runtime_control.inject_stdin", AsyncMock()),
-        patch("api.runtime_control.get_backend", return_value=backend),
-        patch(
-            "api.runtime_control._get_runtime",
-            return_value=SimpleNamespace(turn_counter=1),
-        ),
-        patch("api.runtime_control._stream_stdout", _replayed_done_stream),
-    ):
-        await _process_execution(db_pool, row)
-
-    backend.attach.assert_awaited_once_with(session, logs=True)
-    execution = await db_pool.fetchrow(
-        "SELECT status, terminal_reason, result_text FROM agent_execution_requests WHERE execution_id = $1",
-        execution_id,
-    )
-    assert execution is not None
-    assert execution["status"] == "completed"
-    assert execution["terminal_reason"] == "completed"
-    assert execution["result_text"] == "replayed final answer"
 
 
 @pytest.mark.asyncio
@@ -3288,7 +3051,7 @@ async def test_release_stale_runtime_assignments_preserves_undelivered_messages(
 
 
 @pytest.mark.asyncio
-async def test_worker_requeues_durable_turn_for_log_replay_on_silence(db_pool):
+async def test_worker_marks_silence_deadline_exceeded_and_stops_session(db_pool):
     from api.runtime_control import _process_execution
 
     thread_key = f"slack:C-test:{uuid.uuid4().hex}"
@@ -3361,17 +3124,14 @@ async def test_worker_requeues_durable_turn_for_log_replay_on_silence(db_pool):
         await _process_execution(db_pool, row)
 
     execution = await db_pool.fetchrow(
-        "SELECT status, terminal_reason, error_text, metadata FROM agent_execution_requests WHERE execution_id = $1",
+        "SELECT status, terminal_reason, error_text FROM agent_execution_requests WHERE execution_id = $1",
         execution_id,
     )
     assert execution is not None
-    assert execution["status"] == "queued"
-    assert execution["terminal_reason"] is None
-    assert execution["error_text"] is None
-    metadata = json.loads(execution["metadata"])
-    assert metadata["recovered_from_stale_lease"] is True
-    assert metadata["stale_lease_recovery_reason"] == "silence_deadline_exceeded"
-    stop_session_mock.assert_not_awaited()
+    assert execution["status"] == "failed_permanent"
+    assert execution["terminal_reason"] == "silence_deadline_exceeded"
+    assert "no progress" in (execution["error_text"] or "")
+    stop_session_mock.assert_awaited_once_with(thread_key)
 
 
 @pytest.mark.asyncio
@@ -4422,26 +4182,146 @@ async def test_bootstrap_service_api_keys_includes_local_dev_key(db_pool, monkey
     assert row["created_by"] == "service-bootstrap"
 
 
-@pytest.mark.asyncio
-async def test_sandbox_github_file_link_context_uses_backend_exec(monkeypatch):
-    from api import runtime_control
+def test_silence_timeout_streak_counts_until_last_completed():
+    from api.runtime_control import _silence_timeout_streak
 
-    class Backend:
-        async def exec_run(self, sandbox_id, cmd, *, environment=None, user=""):
-            assert sandbox_id == "sandbox-1"
-            assert cmd[:2] == ["python3", "-c"]
-            assert user == "agent"
-            return (
-                0,
-                b'{"github_file_link_base_url":"https://github.com/leanxyz/livermore/blob/abc123","repo_context":{"repo_owner":"leanxyz","repo_name":"livermore","github_ref":"abc123","git_commit":"abc123"}}',
-            )
+    def row(status: str, terminal_reason: str | None) -> dict:
+        return {"status": status, "terminal_reason": terminal_reason}
 
-    monkeypatch.setattr(runtime_control, "get_backend", lambda: Backend())
-
-    context = await runtime_control._sandbox_github_file_link_context("sandbox-1")
-
+    assert _silence_timeout_streak([]) == 0
+    assert _silence_timeout_streak([row("completed", "completed")]) == 0
+    # Other failure reasons neither count nor reset the streak.
     assert (
-        context["github_file_link_base_url"]
-        == "https://github.com/leanxyz/livermore/blob/abc123"
+        _silence_timeout_streak(
+            [
+                row("failed_permanent", "harness_error"),
+                row("failed_permanent", "harness_error"),
+                row("failed_permanent", "silence_deadline_exceeded"),
+            ]
+        )
+        == 1
     )
-    assert context["repo_context"]["github_ref"] == "abc123"
+    assert (
+        _silence_timeout_streak(
+            [
+                row("failed_permanent", "silence_deadline_exceeded"),
+                row("failed_permanent", "silence_deadline_exceeded"),
+                row("completed", "completed"),
+                row("failed_permanent", "silence_deadline_exceeded"),
+            ]
+        )
+        == 2
+    )
+
+
+def test_escalated_silence_timeout_doubles_and_caps():
+    from api.runtime_control import (
+        EXECUTION_HARD_TIMEOUT_S,
+        EXECUTION_SILENCE_TIMEOUT_MAX_S,
+        EXECUTION_SILENCE_TIMEOUT_S,
+        _escalated_silence_timeout_s,
+    )
+
+    base = float(EXECUTION_SILENCE_TIMEOUT_S)
+    cap = min(float(EXECUTION_SILENCE_TIMEOUT_MAX_S), float(EXECUTION_HARD_TIMEOUT_S))
+    assert _escalated_silence_timeout_s(0) == base
+    assert _escalated_silence_timeout_s(1) == min(base * 2, cap)
+    assert _escalated_silence_timeout_s(2) == min(base * 4, cap)
+    assert _escalated_silence_timeout_s(10) == cap
+
+
+@pytest.mark.asyncio
+async def test_enqueue_after_silence_timeout_escalates_silence_deadline(db_pool):
+    from api.runtime_control import (
+        EXECUTION_SILENCE_TIMEOUT_S,
+        enqueue_execution,
+    )
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:timeout-retry"
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, 'sbx-1', 'codex', 'codex', 'harness:codex', 'sha', 'active')",
+        thread_key,
+    )
+    # Prior turn timed out long ago (outside the failure-loop window).
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, "
+        "status, terminal_reason, created_at, completed_at"
+        ") VALUES ($1, $2, 1, 'exec-timed-out', 'hash-1', "
+        "'failed_permanent', 'silence_deadline_exceeded', "
+        "NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours')",
+        f"exe-{uuid.uuid4().hex[:12]}",
+        thread_key,
+    )
+
+    before = dt.datetime.now(dt.timezone.utc)
+    result = await enqueue_execution(
+        db_pool,
+        thread_key=thread_key,
+        assignment_generation=1,
+        execute_id="exec-retry",
+        harness="codex",
+        delivery={},
+        metadata={},
+    )
+
+    row = await db_pool.fetchrow(
+        "SELECT metadata, silence_deadline_at FROM agent_execution_requests "
+        "WHERE execution_id = $1",
+        result["execution_id"],
+    )
+    metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
+    assert metadata["silence_timeout_s"] == EXECUTION_SILENCE_TIMEOUT_S * 2
+    assert row["silence_deadline_at"] > before + dt.timedelta(
+        seconds=EXECUTION_SILENCE_TIMEOUT_S * 2 - 5
+    )
+
+    # Don't leave a claimable queued execution behind for other tests.
+    await db_pool.execute(
+        "DELETE FROM agent_execution_requests WHERE execution_id = $1",
+        result["execution_id"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_next_execution_honors_escalated_silence_timeout(db_pool):
+    from api.runtime_control import (
+        EXECUTION_SILENCE_TIMEOUT_S,
+        _claim_next_execution,
+    )
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:escalated-claim"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    escalated_s = EXECUTION_SILENCE_TIMEOUT_S * 2
+
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, created_at, last_progress_at, silence_deadline_at, hard_deadline_at"
+        ") VALUES ("
+        "$1, $2, 1, 'exec-escalated', 'hash-escalated', 'queued', "
+        "'{}'::jsonb, $3::jsonb, NOW(), NOW(), NOW() + INTERVAL '20 minutes', "
+        "NOW() + INTERVAL '60 minutes')",
+        execution_id,
+        thread_key,
+        json.dumps({"silence_timeout_s": escalated_s}),
+    )
+
+    before_claim = dt.datetime.now(dt.timezone.utc)
+    # Earlier tests can leave claimable rows behind; keep claiming until ours.
+    claimed = None
+    for _ in range(20):
+        candidate = await _claim_next_execution(db_pool)
+        if candidate is None:
+            break
+        if candidate["execution_id"] == execution_id:
+            claimed = candidate
+            break
+
+    assert claimed is not None
+    assert claimed["silence_deadline_at"] > before_claim + dt.timedelta(
+        seconds=escalated_s - 5
+    )

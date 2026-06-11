@@ -251,59 +251,61 @@ async def test_reconcile_tick_isolates_row_failures() -> None:
     assert "thread-2" in touched_threads
 
 
-@pytest.mark.asyncio
-async def test_get_or_spawn_replaces_suspended_session_when_resume_is_gone() -> None:
-    from api.agent import get_or_spawn
+class _ResumeFailedBackend:
+    async def stream_stdout(self, _session):
+        yield json.dumps(
+            {
+                "type": "system",
+                "subtype": "thread_resume_failed",
+                "message": "no rollout found for thread id dead-thread-id",
+                "resume_thread_id": "dead-thread-id",
+            }
+        )
+        yield json.dumps({"type": "thread.started", "thread_id": "fresh-thread-id"})
+        yield json.dumps({"type": "turn.completed", "turn": {}})
 
-    old_session = SandboxSession(
-        sandbox_id="sandbox-old",
-        thread_key="thread-resume-gone",
+    async def status(self, _session):
+        return "gone"
+
+
+@pytest.mark.asyncio
+async def test_stream_stdout_clears_delivery_cursor_on_thread_resume_failed() -> None:
+    """When the harness falls back to a fresh thread after a failed resume,
+    the delivery cursor must be cleared so the next flush replays the full
+    durable transcript into the new thread."""
+    from api.agent import _stream_stdout
+
+    session = SandboxSession(
+        sandbox_id="sbx-resume-failed",
+        thread_key="test:resume-failed",
         harness="codex",
         engine="codex",
-        db_state="suspended",
-        agent_thread_id="agent-thread-1",
-        last_delivered_id="delivery-1",
-        inflight_turn_id="turn-1",
-        inflight_turn_input={"message": "retry me"},
-        inflight_attempts=2,
-        last_result="partial",
-        trace_id="trace-1",
+        last_delivered_id="msg-old",
     )
-    new_session = SandboxSession(
-        sandbox_id="sandbox-new",
-        thread_key="thread-resume-gone",
-        harness="codex",
-        engine="codex",
-    )
-    backend = AsyncMock()
-    backend.status = AsyncMock(return_value="gone")
-    backend.resume_by_id = AsyncMock(side_effect=RuntimeError("gone"))
-    backend.stop_by_id = AsyncMock()
-    backend.create = AsyncMock(return_value=new_session)
+    rt = RuntimeState()
+    pool = AsyncMock()
 
     with (
-        patch("api.agent._get_pool", return_value=AsyncMock()),
-        patch("api.agent._db_get_session", new=AsyncMock(return_value=old_session)),
-        patch("api.agent.get_backend", return_value=backend),
-        patch("api.agent._db_delete_session", new_callable=AsyncMock) as delete_session,
-        patch("api.agent._drop_runtime") as drop_runtime,
-        patch(
-            "api.agent.get_or_create_thread_trace_id",
-            new=AsyncMock(return_value="trace-1"),
-        ),
-        patch("api.agent._evict_idle_sessions_for_capacity", new_callable=AsyncMock),
-        patch("api.agent._db_insert_session", new=AsyncMock(return_value=True)),
-        patch("api.agent._resolve_harness_profile", return_value=("codex", "lean", None)),
+        patch("api.agent._persist_turn_messages", new_callable=AsyncMock),
+        patch("api.agent._db_complete_inflight_turn", new_callable=AsyncMock),
+        patch("api.agent._get_pool", return_value=pool),
     ):
-        result = await get_or_spawn("thread-resume-gone", "codex")
+        [
+            event
+            async for event in _stream_stdout(
+                session,
+                _ResumeFailedBackend(),
+                rt,
+                turn_id=1,
+                t0=time.monotonic(),
+            )
+        ]
 
-    assert result is new_session
-    assert result.agent_thread_id == "agent-thread-1"
-    backend.resume_by_id.assert_awaited_once_with("sandbox-old")
-    backend.stop_by_id.assert_awaited_once_with("sandbox-old")
-    delete_session.assert_awaited_once_with("thread-resume-gone")
-    drop_runtime.assert_any_call("sandbox-old")
-    backend.create.assert_awaited_once()
-    create_kwargs = backend.create.await_args.kwargs
-    assert create_kwargs["resume_thread_id"] == "agent-thread-1"
-    assert create_kwargs["trace_id"] == "trace-1"
+    assert session.last_delivered_id == ""
+    cursor_updates = [
+        call
+        for call in pool.execute.await_args_list
+        if "last_delivered_id = NULL" in call.args[0]
+    ]
+    assert len(cursor_updates) == 1
+    assert cursor_updates[0].args[1] == "test:resume-failed"

@@ -15,6 +15,7 @@ export const sidebar = [
     text: 'Operate',
     items: [
       { text: 'Slack ETL', link: '/operate/slack-etl' },
+      { text: 'Expose Slackbot with Tailscale Funnel', link: '/operate/tailscale-funnel' },
     ],
   },
   {
@@ -25,6 +26,7 @@ export const sidebar = [
       { text: 'Creating Skills', link: '/extend/skills' },
       { text: 'Creating Tools', link: '/extend/tools' },
       { text: 'Creating Workflows', link: '/extend/workflows' },
+      { text: 'Workflows v2 Migration', link: '/extend/workflows-v2' },
       { text: '🚧 Creating Apps', link: '/extend/apps' },
     ],
   },

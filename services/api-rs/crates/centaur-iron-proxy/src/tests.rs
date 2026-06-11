@@ -1,0 +1,64 @@
+use super::*;
+
+#[test]
+fn harness_auth_fragments_are_baked_in() {
+    let codex = harness_auth_fragment("codex", "api_key").unwrap().unwrap();
+    assert!(placeholder_env(&[codex]).is_empty());
+
+    // access_token carries the token-broker credential, not a replace
+    // placeholder, so it contributes no sandbox placeholder env.
+    let codex_access = harness_auth_fragment("codex", "access_token")
+        .unwrap()
+        .unwrap();
+    assert!(placeholder_env(&[codex_access]).is_empty());
+
+    assert!(harness_auth_fragment("codex", "bogus").unwrap().is_none());
+
+    let infra = infra_fragment().unwrap();
+    let placeholders = placeholder_env(&[infra]);
+    for name in ["AMP_API_KEY", "GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
+        assert_eq!(placeholders.get(name).map(String::as_str), Some(name));
+    }
+}
+
+#[test]
+fn pg_sandbox_dsns_reads_name_and_database_from_fragments() {
+    // A listener with a sandbox_env (the api-rs-internal annotation api-rs
+    // stamps from each tool's declared pg_dsn name/database) is surfaced; a
+    // listener without one (proxy-only) is skipped. Results are sorted/deduped.
+    let fragment = load_fragment_str(
+        r#"
+postgres:
+  - name: reshift_dsn
+    sandbox_env:
+      name: RESHIFT_DSN
+      database: warehouse
+  - name: analytics_dsn
+    sandbox_env:
+      name: ANALYTICS_DSN
+      database: analytics
+  - name: proxy_only
+"#,
+    )
+    .unwrap();
+
+    let dsns = pg_sandbox_dsns(&[fragment.clone(), fragment]);
+    assert_eq!(
+        dsns,
+        vec![
+            ("ANALYTICS_DSN".to_owned(), "analytics".to_owned()),
+            ("RESHIFT_DSN".to_owned(), "warehouse".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn access_token_fragment_carries_no_broker_credentials_block() {
+    // Broker credentials now live in iron-control, not the proxy fragment. The
+    // access-token fragment still references the credential via a token_broker
+    // source, but the unknown `broker_credentials:` key (if any) is ignored.
+    let codex = harness_auth_fragment("codex", "access_token")
+        .unwrap()
+        .unwrap();
+    assert!(!codex.top_level.contains_key("broker_credentials"));
+}

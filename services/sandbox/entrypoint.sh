@@ -5,6 +5,50 @@ HOME_DIR="$(eval echo ~)"
 FIREWALL_HOSTNAME="${FIREWALL_HOST:-firewall}"
 STATE_DIR="${CENTAUR_STATE_DIR:-$HOME_DIR/state}"
 
+append_tool_dirs() {
+    if [ -z "${1:-}" ]; then
+        return
+    fi
+    if [ -n "${TOOL_DIRS:-}" ]; then
+        TOOL_DIRS="${TOOL_DIRS}:$1"
+    else
+        TOOL_DIRS="$1"
+    fi
+}
+
+append_tool_dirs "${TOOLS_PATH:-}"
+append_tool_dirs "${TOOLS_OVERLAY_PATH:-}"
+if [ -n "${TOOL_DIRS:-}" ]; then
+    export TOOL_DIRS
+fi
+
+_add_pythonpath_entry() {
+    local entry="$1"
+    [ -d "$entry" ] || return 0
+    case ":${PYTHONPATH:-}:" in
+        *":$entry:"*) ;;
+        *) export PYTHONPATH="$entry${PYTHONPATH:+:$PYTHONPATH}" ;;
+    esac
+}
+
+_add_pythonpath_entry "/opt/centaur"
+if [ -n "${TOOL_DIRS:-}" ]; then
+    IFS=':' read -ra _centaur_tool_dirs <<< "$TOOL_DIRS"
+    for _centaur_tool_dir in "${_centaur_tool_dirs[@]}"; do
+        if [ -d "$_centaur_tool_dir" ]; then
+            _centaur_tool_root="$(cd "$_centaur_tool_dir/.." && pwd -P)"
+            _add_pythonpath_entry "$_centaur_tool_root"
+        fi
+    done
+    unset _centaur_tool_dir _centaur_tool_dirs _centaur_tool_root
+fi
+export CENTAUR_TOOL_PYTHONPATH="${PYTHONPATH:-}"
+unset -f _add_pythonpath_entry
+
+if [ -n "${TOOL_DIRS:-}" ]; then
+    install-tool-shims || echo "warning: failed to install Centaur tool CLI shims" >&2
+fi
+
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude"
     rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/uploads" "$HOME_DIR/branches"
@@ -95,6 +139,36 @@ fi
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
+from pathlib import Path
+import os
+
+path = Path(os.environ["CODEX_CONFIG_PATH"])
+lines = path.read_text().splitlines()
+features_start = next((i for i, line in enumerate(lines) if line.strip() == "[features]"), None)
+if features_start is None:
+    lines.extend(["", "[features]", "multi_agent = false", "multi_agent_v2 = false"])
+else:
+    features_end = next(
+        (i for i in range(features_start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
+        len(lines),
+    )
+    feature_names = {"multi_agent", "multi_agent_v2"}
+    seen = set()
+    rewritten = []
+    for line in lines[features_start + 1 : features_end]:
+        stripped = line.strip()
+        name = stripped.split("=", 1)[0].strip() if "=" in stripped else None
+        if name in feature_names:
+            rewritten.append(f"{name} = false")
+            seen.add(name)
+        else:
+            rewritten.append(line)
+    for name in sorted(feature_names - seen):
+        rewritten.append(f"{name} = false")
+    lines = lines[: features_start + 1] + rewritten + lines[features_end:]
+path.write_text("\n".join(lines).rstrip() + "\n")
+PYEOF
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
     exit 1
@@ -222,9 +296,9 @@ fi
 # Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
 cd "$WORKSPACE_DIR"
 
-HARNESS_ADAPTER="${CENTAUR_HARNESS_ADAPTER:-/usr/local/bin/harness-adapter}"
-if [ -x "$HARNESS_ADAPTER" ]; then
-    "$HARNESS_ADAPTER" "${1:-}" "$TARGET_PROMPT"
+if [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "amp" ] && [ -f "$TARGET_PROMPT" ]; then
+    rm -f "$WORKSPACE_DIR/AGENT.md"
+    ln -s "$(basename "$TARGET_PROMPT")" "$WORKSPACE_DIR/AGENT.md"
 fi
 
 # Codex reads its auth file when the app server starts. Complete this before

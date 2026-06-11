@@ -160,3 +160,6 @@ https://<trycloudflare-host>/api/webhooks/slack
 
 Temporary tunnel URLs usually change when the tunnel restarts, so update the
 Slack Request URL each time or configure a named tunnel/domain.
+
+For a durable, in-cluster alternative that keeps a stable public URL, see
+[Expose the Slackbot with Tailscale Funnel](/operate/tailscale-funnel).
