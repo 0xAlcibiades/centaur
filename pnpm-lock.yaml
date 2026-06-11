@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@chat-adapter/slack@4.30.0':
-    hash: 3969edeaa8632fe39c4f2a10d6c3505e86aa4eb1cb970fb86eacca4f5deea5ca
+    hash: 3e8d6dee602bd42d548fc5933b418b95a9ca3ec96f27f60fb2b4946845f7c787
     path: patches/@chat-adapter__slack@4.30.0.patch
 
 importers:
