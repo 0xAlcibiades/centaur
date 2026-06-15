@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@chat-adapter/discord@4.30.0':
-    hash: 8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab
+    hash: b56538b42ddadb93fdc754a934995e311375f7dd1e2a389a8fdc2e5f7295bb08
     path: patches/@chat-adapter__discord@4.30.0.patch
   '@chat-adapter/slack@4.30.0':
     hash: 3e8d6dee602bd42d548fc5933b418b95a9ca3ec96f27f60fb2b4946845f7c787
@@ -73,7 +73,7 @@ importers:
         version: link:../../packages/rendering
       '@chat-adapter/discord':
         specifier: ^4.30.0
-        version: 4.30.0(patch_hash=8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab)(zod@4.4.3)
+        version: 4.30.0(patch_hash=b56538b42ddadb93fdc754a934995e311375f7dd1e2a389a8fdc2e5f7295bb08)(zod@4.4.3)
       '@chat-adapter/state-pg':
         specifier: ^4.30.0
         version: 4.30.0(zod@4.4.3)
@@ -119,7 +119,7 @@ importers:
         version: link:../../packages/rendering
       '@chat-adapter/slack':
         specifier: ^4.30.0
-        version: 4.30.0(patch_hash=3969edeaa8632fe39c4f2a10d6c3505e86aa4eb1cb970fb86eacca4f5deea5ca)(zod@4.4.3)
+        version: 4.30.0(patch_hash=3e8d6dee602bd42d548fc5933b418b95a9ca3ec96f27f60fb2b4946845f7c787)(zod@4.4.3)
       '@chat-adapter/state-pg':
         specifier: ^4.30.0
         version: 4.30.0(zod@4.4.3)
@@ -1257,7 +1257,7 @@ packages:
 
 snapshots:
 
-  '@chat-adapter/discord@4.30.0(patch_hash=8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab)(zod@4.4.3)':
+  '@chat-adapter/discord@4.30.0(patch_hash=b56538b42ddadb93fdc754a934995e311375f7dd1e2a389a8fdc2e5f7295bb08)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.30.0(zod@4.4.3)
       chat: 4.30.0(zod@4.4.3)
@@ -1279,7 +1279,7 @@ snapshots:
       - supports-color
       - zod
 
-  '@chat-adapter/slack@4.30.0(patch_hash=3969edeaa8632fe39c4f2a10d6c3505e86aa4eb1cb970fb86eacca4f5deea5ca)(zod@4.4.3)':
+  '@chat-adapter/slack@4.30.0(patch_hash=3e8d6dee602bd42d548fc5933b418b95a9ca3ec96f27f60fb2b4946845f7c787)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.30.0(zod@4.4.3)
       '@slack/socket-mode': 2.0.7
