@@ -9,6 +9,7 @@ context operations back to api-rs.
 from __future__ import annotations
 
 import asyncio
+import ast
 import dataclasses
 import importlib.util
 import inspect
@@ -20,6 +21,7 @@ import sys
 import traceback
 import types
 import typing
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -195,11 +197,389 @@ class RegisteredWorkflow:
 
 
 def install_api_compat_module() -> None:
-    api_mod = sys.modules.setdefault("api", types.ModuleType("api"))
+    api_mod = sys.modules.get("api")
+    if api_mod is None:
+        try:
+            import api as imported_api  # type: ignore
+
+            api_mod = imported_api
+        except ImportError:
+            api_mod = types.ModuleType("api")
+            api_mod.__path__ = []  # Mark as package so compat submodules can import.
+            sys.modules["api"] = api_mod
+
     workflow_engine = types.ModuleType("api.workflow_engine")
     workflow_engine.WorkflowContext = WorkflowContext
-    sys.modules.setdefault("api.workflow_engine", workflow_engine)
+    sys.modules["api.workflow_engine"] = workflow_engine
     setattr(api_mod, "workflow_engine", workflow_engine)
+
+    runtime_control = types.ModuleType("api.runtime_control")
+    runtime_control.canonical_json = canonical_json
+    runtime_control.decode_jsonb = decode_jsonb
+    sys.modules.setdefault("api.runtime_control", runtime_control)
+    setattr(api_mod, "runtime_control", runtime_control)
+
+    install_vm_metrics_compat_module(api_mod)
+
+    install_centaur_sdk_compat_module()
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def decode_jsonb(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return fallback
+    return value
+
+
+def install_centaur_sdk_compat_module() -> None:
+    if "centaur_sdk" in sys.modules:
+        return
+    try:
+        __import__("centaur_sdk")
+        return
+    except ImportError:
+        pass
+    centaur_sdk = types.ModuleType("centaur_sdk")
+
+    def secret(name: str, default: str | None = None) -> str:
+        return os.getenv(name, default or "")
+
+    centaur_sdk.secret = secret
+    sys.modules["centaur_sdk"] = centaur_sdk
+
+
+_METRIC_COUNTERS: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+_METRIC_GAUGES: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+_METRIC_HISTOGRAMS: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
+_COMPANY_CONTEXT_DOCUMENT_SIZE_BUCKETS = [
+    100,
+    500,
+    1_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+]
+
+
+def install_vm_metrics_compat_module(api_mod: types.ModuleType) -> None:
+    if "api.vm_metrics" in sys.modules:
+        setattr(api_mod, "vm_metrics", sys.modules["api.vm_metrics"])
+        return
+    try:
+        import api.vm_metrics as vm_metrics  # type: ignore
+
+        setattr(api_mod, "vm_metrics", vm_metrics)
+        return
+    except ImportError:
+        pass
+
+    vm_metrics = types.ModuleType("api.vm_metrics")
+    vm_metrics.record_etl_items_deleted = record_etl_items_deleted
+    vm_metrics.record_etl_items_enqueued = record_etl_items_enqueued
+    vm_metrics.record_etl_items_failed = record_etl_items_failed
+    vm_metrics.record_etl_items_seen = record_etl_items_seen
+    vm_metrics.record_etl_items_upserted = record_etl_items_upserted
+    vm_metrics.record_company_context_documents_changed = (
+        record_company_context_documents_changed
+    )
+    vm_metrics.observe_company_context_document_size = (
+        observe_company_context_document_size
+    )
+    vm_metrics.set_company_context_projection_lag = (
+        set_company_context_projection_lag
+    )
+    sys.modules["api.vm_metrics"] = vm_metrics
+    setattr(api_mod, "vm_metrics", vm_metrics)
+
+
+def record_etl_items_seen(
+    source: str, source_type: str, item_type: str, count: int
+) -> None:
+    increment_metric(
+        "etl_items_seen_total",
+        count,
+        source=source,
+        source_type=source_type,
+        item_type=item_type,
+    )
+
+
+def record_etl_items_enqueued(
+    source: str, source_type: str, item_type: str, count: int
+) -> None:
+    increment_metric(
+        "etl_items_enqueued_total",
+        count,
+        source=source,
+        source_type=source_type,
+        item_type=item_type,
+    )
+
+
+def record_etl_items_upserted(
+    source: str, source_type: str, item_type: str, count: int
+) -> None:
+    increment_metric(
+        "etl_items_upserted_total",
+        count,
+        source=source,
+        source_type=source_type,
+        item_type=item_type,
+    )
+
+
+def record_etl_items_deleted(
+    source: str, source_type: str, item_type: str, count: int
+) -> None:
+    increment_metric(
+        "etl_items_deleted_total",
+        count,
+        source=source,
+        source_type=source_type,
+        item_type=item_type,
+    )
+
+
+def record_etl_items_failed(
+    source: str,
+    source_type: str,
+    item_type: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "etl_items_failed_total",
+        count,
+        source=source,
+        source_type=source_type,
+        item_type=item_type,
+        reason=reason,
+    )
+
+
+def record_company_context_documents_changed(
+    source: str,
+    source_type: str,
+    action: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "company_context_documents_changed_total",
+        count,
+        source=source,
+        source_type=source_type,
+        action=action,
+    )
+
+
+def observe_company_context_document_size(
+    source: str, source_type: str, chars: int
+) -> None:
+    observe_histogram(
+        "company_context_document_size_chars",
+        max(chars, 0),
+        _COMPANY_CONTEXT_DOCUMENT_SIZE_BUCKETS,
+        source=source,
+        source_type=source_type,
+    )
+
+
+def set_company_context_projection_lag(source: str, projection_lag_s: float) -> None:
+    set_gauge(
+        "company_context_projection_lag_seconds",
+        max(projection_lag_s, 0.0),
+        source=source,
+    )
+
+
+def increment_metric(metric: str, count: int, **labels: str) -> None:
+    if count <= 0:
+        return
+    labels = metric_runtime_labels(labels)
+    key = metric_key(metric, labels)
+    _METRIC_COUNTERS[key] = _METRIC_COUNTERS.get(key, 0.0) + float(count)
+    push_metric_lines([format_metric_line(metric, labels, _METRIC_COUNTERS[key])])
+
+
+def set_gauge(metric: str, value: float, **labels: str) -> None:
+    labels = metric_runtime_labels(labels)
+    key = metric_key(metric, labels)
+    _METRIC_GAUGES[key] = float(value)
+    push_metric_lines([format_metric_line(metric, labels, _METRIC_GAUGES[key])])
+
+
+def observe_histogram(
+    metric: str,
+    value: int | float,
+    buckets: list[int],
+    **labels: str,
+) -> None:
+    labels = metric_runtime_labels(labels)
+    key = metric_key(metric, labels)
+    histogram = _METRIC_HISTOGRAMS.setdefault(
+        key,
+        {
+            "buckets": {bucket: 0 for bucket in buckets},
+            "count": 0,
+            "sum": 0.0,
+        },
+    )
+    numeric = float(value)
+    histogram["count"] += 1
+    histogram["sum"] += numeric
+    for bucket in buckets:
+        if numeric <= bucket:
+            histogram["buckets"][bucket] += 1
+
+    lines = []
+    for bucket in buckets:
+        lines.append(
+            format_metric_line(
+                f"{metric}_bucket",
+                {**labels, "le": str(float(bucket))},
+                histogram["buckets"][bucket],
+            )
+        )
+    lines.append(
+        format_metric_line(
+            f"{metric}_bucket",
+            {**labels, "le": "+Inf"},
+            histogram["count"],
+        )
+    )
+    lines.append(format_metric_line(f"{metric}_count", labels, histogram["count"]))
+    lines.append(format_metric_line(f"{metric}_sum", labels, histogram["sum"]))
+    push_metric_lines(lines)
+
+
+def metric_key(
+    metric: str, labels: dict[str, str]
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return (metric, tuple(sorted((key, str(value)) for key, value in labels.items())))
+
+
+def metric_runtime_labels(labels: dict[str, str]) -> dict[str, str]:
+    runtime_labels = dict(labels)
+    for key, value in default_metric_runtime_labels().items():
+        runtime_labels.setdefault(key, value)
+    return runtime_labels
+
+
+def default_metric_runtime_labels() -> dict[str, str]:
+    labels: dict[str, str] = {}
+    namespace = runtime_namespace()
+    if namespace:
+        labels["namespace"] = namespace
+    environment = runtime_environment()
+    if environment:
+        labels["environment"] = environment
+    return labels
+
+
+def runtime_namespace() -> str | None:
+    for name in (
+        "METRICS_NAMESPACE",
+        "KUBERNETES_NAMESPACE",
+        "POD_NAMESPACE",
+        "SESSION_SANDBOX_K8S_NAMESPACE",
+    ):
+        value = clean_metric_label_value(os.environ.get(name))
+        if value:
+            return value
+
+    try:
+        namespace = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        if namespace.exists():
+            return clean_metric_label_value(namespace.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return None
+
+
+def runtime_environment() -> str | None:
+    for name in ("METRICS_ENVIRONMENT", "ENVIRONMENT", "DEPLOYMENT_ENVIRONMENT"):
+        value = clean_metric_label_value(os.environ.get(name))
+        if value:
+            return value
+
+    for attr in os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "").split(","):
+        key, separator, value = attr.partition("=")
+        if separator and key.strip() in {
+            "deployment.environment",
+            "deployment.environment.name",
+        }:
+            cleaned = clean_metric_label_value(value)
+            if cleaned:
+                return cleaned
+
+    namespace = runtime_namespace()
+    if namespace == "centaur-system":
+        return "production"
+    if namespace and namespace.startswith("stg-"):
+        return "staging"
+    return None
+
+
+def clean_metric_label_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def format_metric_line(metric: str, labels: dict[str, str], value: float) -> str:
+    if labels:
+        label_text = ",".join(
+            f'{key}="{escape_label_value(str(label_value))}"'
+            for key, label_value in sorted(labels.items())
+        )
+        return f"{metric}{{{label_text}}} {value}"
+    return f"{metric} {value}"
+
+
+def escape_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def push_metric_lines(lines: list[str]) -> None:
+    if not victoria_metrics_push_enabled():
+        return
+    payload = ("\n".join(lines) + "\n").encode("utf-8")
+    request = urllib.request.Request(
+        f"{victoria_metrics_url().rstrip('/')}/api/v1/import/prometheus",
+        data=payload,
+        headers={"Content-Type": "text/plain"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=2).close()
+    except Exception as exc:
+        print(f"workflow_metric_push_error error={exc}", file=sys.stderr)
+
+
+def victoria_metrics_url() -> str:
+    return os.environ.get("VICTORIAMETRICS_URL", "http://victoriametrics:8428")
+
+
+def victoria_metrics_push_enabled() -> bool:
+    return os.environ.get("VICTORIAMETRICS_PUSH_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def workflow_dirs() -> list[Path]:
@@ -212,6 +592,16 @@ def workflow_dirs() -> list[Path]:
             if path.is_dir():
                 dirs.append(path)
     return dirs
+
+
+def configure_workflow_import_paths(dirs: list[Path]) -> None:
+    for directory in dirs:
+        candidate_paths = [directory.parent, directory]
+        if directory.name == "workflows":
+            candidate_paths.append(directory.parent / "services" / "api")
+        for path in candidate_paths:
+            if path.is_dir() and str(path) not in sys.path:
+                sys.path.insert(0, str(path))
 
 
 def module_name_for(path: Path) -> str:
@@ -240,15 +630,33 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
     )
 
 
+def has_workflow_name_assignment(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text())
+    except Exception:
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "WORKFLOW_NAME":
+                    return True
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            if isinstance(target, ast.Name) and target.id == "WORKFLOW_NAME":
+                return True
+    return False
+
+
 def discover_workflows() -> dict[str, RegisteredWorkflow]:
+    dirs = workflow_dirs()
+    configure_workflow_import_paths(dirs)
     install_api_compat_module()
     discovered: dict[str, RegisteredWorkflow] = {}
-    for directory in workflow_dirs():
-        if str(directory) not in sys.path:
-            sys.path.insert(0, str(directory.parent))
-            sys.path.insert(0, str(directory))
-        for path in sorted(directory.glob("*.py")):
-            if path.name.startswith("_"):
+    for directory in dirs:
+        for path in sorted(directory.rglob("*.py")):
+            if path.name == "__init__.py" or path.name.startswith("_"):
+                continue
+            if not has_workflow_name_assignment(path):
                 continue
             try:
                 registered = load_workflow_file(path)

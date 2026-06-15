@@ -31,7 +31,14 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
     asyncpg==0.30.0 \
+    google-api-python-client>=2.100.0 \
+    google-auth-httplib2>=0.2.0 \
+    google-auth-oauthlib>=1.2.0 \
+    httplib2>=0.20.0 \
+    httpx>=0.28.0 \
     opentelemetry-proto==1.42.1 \
+    pysocks>=1.7.1 \
+    slack-sdk==3.39.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI (single layer, cached) ─────────────
@@ -249,6 +256,4 @@ COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGEN
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Default CMD uses Rust blocks mode; pass --mode=jsonrpc for raw App Server JSON-RPC.
-# NOTE: claude-code is a preview-463 dogfood default — flip back to codex
-# (together with sandbox.harnessEngine in contrib/chart) before merging.
-CMD ["harness-server", "claude-code"]
+CMD ["harness-server", "codex"]

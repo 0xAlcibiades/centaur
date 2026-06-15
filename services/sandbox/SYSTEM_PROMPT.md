@@ -182,11 +182,16 @@
 |    "delivery":{"platform":"dev"}
 |  }}'
 |
-|**Custom workflows** — write a Python file in `workflows/`:
-|  1. `git-branch <org/repo>` to get a writable clone
-|  2. Create `workflows/my_task.py`
-|  3. Push → auto-merge → hot-reload (no restart)
-|  4. `call workflow run '{"workflow_name":"my_task"}'`
+|**Custom workflows** — write a Python file in the right repo's `workflows/`:
+|  1. Add workflows to `/centaur/workflows/` only when they are generic,
+|     reusable Centaur capabilities that should ship with the base repo.
+|     If the workflow depends on one organization's channels, business
+|     process, private data shape, schedule, or naming, nudge the user toward
+|     adding it to that organization's overlay repo instead.
+|  2. `git-branch <org/repo>` to get a writable clone
+|  3. Create `workflows/my_task.py`
+|  4. Push → auto-merge → hot-reload (no restart)
+|  5. `call workflow run '{"workflow_name":"my_task"}'`
 |
 |  Simple (just constants, engine auto-generates the handler):
 |    ```python

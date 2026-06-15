@@ -17,23 +17,33 @@ set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
                                creates Secret centaur-onepassword-connect-credentials
   OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
-  CLAUDE_CODE_OAUTH_CLIENT_ID
-                               Claude Code public OAuth client id; added to centaur-harness-auth
-  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
-                               Claude Code OAuth refresh token; added to centaur-harness-auth
-  CLAUDE_CODE_CLIENT_ID        Claude Code public OAuth client id for brokered auth
-  CLAUDE_CODE_BLOB             JSON refresh-token blob for brokered auth
 
 Optional local-dev admin key:
   LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
                                (envFrom centaur-infra-env). Re-run with --force
                                or kubectl patch to rotate.
 
+Optional Lean tool credentials:
+  LINEAR_API_KEY
+  LMNR_PROJECT_API_KEY
+  LMNR_BASE_URL
+
 Optional repo-cache GitHub token:
   GITHUB_TOKEN                 added to centaur-infra-env when present; the
                                repo-cache DaemonSet reads it (repoCache.githubToken
                                -> existingSecretName) to clone tool/overlay repos.
                                Updated on every run when set, so it rotates.
+
+Optional Discord ingress bootstrap (consumed when discordbot.enabled=true):
+  DISCORD_BOT_TOKEN            when set, seeds the discordbot keys; requires
+                               DISCORD_PUBLIC_KEY and DISCORD_APPLICATION_ID
+                               (the script fails fast if either is missing).
+                               DISCORD_* values are overwritten on every run so
+                               they rotate.
+  DISCORD_PUBLIC_KEY           Ed25519 public key from the Discord application
+  DISCORD_APPLICATION_ID       Discord application id (doubles as the bot user id)
+  DISCORDBOT_API_KEY           bearer the bot sends to api-rs; auto-generated
+                               once when absent (never rotated in place)
 
 Optional iron-control bootstrap (consumed when ironControl.enabled=true):
   IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
@@ -106,20 +116,12 @@ require_env SLACK_BOT_TOKEN
 require_env SLACK_SIGNING_SECRET
 require_env SLACKBOT_API_KEY
 
-optional_secret_env_names=(
-  LMNR_PROJECT_API_KEY
-  LMNR_BASE_URL
-  LINEAR_API_KEY
-  OP_CONNECT_TOKEN
-  LOCAL_DEV_API_KEY
-)
-
-harness_auth_env_names=(
-  CLAUDE_CODE_OAUTH_CLIENT_ID
-  CLAUDE_CODE_OAUTH_REFRESH_TOKEN
-  CLAUDE_CODE_CLIENT_ID
-  CLAUDE_CODE_BLOB
-)
+# Discord keys are optional as a group, but partial configuration would silently
+# seed empty values and crashloop the bot at deploy time instead of failing here.
+if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+  require_env DISCORD_PUBLIC_KEY
+  require_env DISCORD_APPLICATION_ID
+fi
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -127,7 +129,6 @@ delete_if_forced centaur-infra-env
 delete_if_forced centaur-firewall-ca
 delete_if_forced centaur-firewall-ca-key
 delete_if_forced centaur-onepassword-connect-credentials
-delete_if_forced centaur-harness-auth
 
 secret_key_present() {
   local key="$1"
@@ -139,21 +140,37 @@ secret_key_present() {
 
 if secret_exists centaur-infra-env; then
   patch_data=()
-  for name in "${optional_secret_env_names[@]}"; do
-    if [[ -n "${!name:-}" ]]; then
-      patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
-    fi
-  done
+  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+    patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
+  fi
   # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
   # support landed. Only generated when absent so we don't rotate it out from
   # under cached iron-proxy access tokens on every script run.
   if ! secret_key_present IRON_BROKER_TOKEN; then
     patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
   fi
+  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
+    patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
+  fi
+  for name in LINEAR_API_KEY LMNR_PROJECT_API_KEY LMNR_BASE_URL; do
+    if [[ -n "${!name:-}" ]]; then
+      patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
+    fi
+  done
   # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
   # rotated; harmless when repoCache is disabled.
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     patch_data+=("\"GITHUB_TOKEN\":\"$(printf '%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')\"")
+  fi
+  # Discord ingress (discordbot) keys: added when DISCORD_BOT_TOKEN is in the env. DISCORD_* are
+  # overwritten on each run (so rotation works); DISCORDBOT_API_KEY is generated once if absent.
+  if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+    patch_data+=("\"DISCORD_BOT_TOKEN\":\"$(printf '%s' "$DISCORD_BOT_TOKEN" | base64 | tr -d '\n')\"")
+    patch_data+=("\"DISCORD_PUBLIC_KEY\":\"$(printf '%s' "$DISCORD_PUBLIC_KEY" | base64 | tr -d '\n')\"")
+    patch_data+=("\"DISCORD_APPLICATION_ID\":\"$(printf '%s' "$DISCORD_APPLICATION_ID" | base64 | tr -d '\n')\"")
+    if ! secret_key_present DISCORDBOT_API_KEY; then
+      patch_data+=("\"DISCORDBOT_API_KEY\":\"$(printf '%s' "${DISCORDBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
   fi
   # iron-control keys: top up only when absent so we never rotate them out from
   # under a running pod (its ActiveRecord-encrypted data would become
@@ -229,7 +246,21 @@ else
     --from-literal=IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT="$(rand_hex)"
     --from-literal=IRON_CONTROL_SECRET_KEY_BASE="$(rand_hex)$(rand_hex)"
   )
-  for name in "${optional_secret_env_names[@]}"; do
+  if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+    secret_args+=(
+      --from-literal=DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN"
+      --from-literal=DISCORD_PUBLIC_KEY="$DISCORD_PUBLIC_KEY"
+      --from-literal=DISCORD_APPLICATION_ID="$DISCORD_APPLICATION_ID"
+      --from-literal=DISCORDBOT_API_KEY="${DISCORDBOT_API_KEY:-$(rand_hex)}"
+    )
+  fi
+  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
+  fi
+  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
+    secret_args+=(--from-literal=LOCAL_DEV_API_KEY="$LOCAL_DEV_API_KEY")
+  fi
+  for name in LINEAR_API_KEY LMNR_PROJECT_API_KEY LMNR_BASE_URL; do
     if [[ -n "${!name:-}" ]]; then
       secret_args+=(--from-literal="$name=${!name}")
     fi
@@ -239,29 +270,6 @@ else
   fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
-fi
-
-harness_auth_args=()
-for name in "${harness_auth_env_names[@]}"; do
-  if [[ -n "${!name:-}" ]]; then
-    harness_auth_args+=(--from-literal="$name=${!name}")
-  fi
-done
-if [[ "${#harness_auth_args[@]}" -gt 0 ]]; then
-  if secret_exists centaur-harness-auth; then
-    patch_data=()
-    for name in "${harness_auth_env_names[@]}"; do
-      if [[ -n "${!name:-}" ]]; then
-        patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
-      fi
-    done
-    patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
-    kubectl -n "$NAMESPACE" patch secret centaur-harness-auth --type merge -p "$patch_json" >/dev/null
-    echo "Updated local auth payload keys in Secret centaur-harness-auth in namespace $NAMESPACE"
-  else
-    kubectl -n "$NAMESPACE" create secret generic centaur-harness-auth "${harness_auth_args[@]}" >/dev/null
-    echo "Created Secret centaur-harness-auth in namespace $NAMESPACE"
-  fi
 fi
 
 if secret_exists centaur-firewall-ca && secret_exists centaur-firewall-ca-key; then

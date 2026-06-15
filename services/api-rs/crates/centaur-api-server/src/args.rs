@@ -24,7 +24,7 @@ use centaur_sandbox_agent_k8s::{
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
-use centaur_sandbox_manager::WarmPoolConfig;
+use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::SandboxWorkloadMode;
 use centaur_workflows::WorkflowHostSandboxRuntime;
@@ -79,6 +79,10 @@ impl Args {
 
     pub(crate) fn warm_pool_config(&self) -> Option<WarmPoolConfig> {
         self.sandbox.warm_pool_config()
+    }
+
+    pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
+        self.sandbox.sandbox_reaper_config()
     }
 
     pub(crate) async fn workflow_host_sandbox_runtime(
@@ -176,7 +180,9 @@ impl IronControlToolReconciler {
             for source in &self.tool_git_sources {
                 source.sync()?;
                 let tools_dir = source.tools_dir();
-                if source.repo_cache_path.is_some() && !tools_dir.is_dir() {
+                // Skip sources without a tools tree (chart-defaulted subdirs
+                // make this a normal case for non-tool overlay repos).
+                if !tools_dir.is_dir() {
                     continue;
                 }
                 dirs.push(tools_dir);
@@ -314,11 +320,15 @@ impl ToolGitSource {
             }
         }
 
+        // A synced source without the tools subdir is skipped by callers, not
+        // an error: with chart-defaulted subdirs, workflows- or skills-only
+        // overlay repos legitimately carry no tools tree.
         if !self.tools_dir().is_dir() {
-            return Err(ServerError::ToolSource(format!(
-                "configured tools subdir does not exist after sync: {}",
-                self.tools_dir().display()
-            )));
+            warn!(
+                repo = %self.repo,
+                tools_dir = %self.tools_dir().display(),
+                "tools subdir missing after sync; skipping tools source"
+            );
         }
         Ok(())
     }
@@ -497,6 +507,30 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
+    /// Stop sandboxes that have been idle-paused longer than this. 0 disables
+    /// the idle sweep.
+    #[arg(
+        long = "session-sandbox-idle-stop-ttl-secs",
+        env = "SESSION_SANDBOX_IDLE_STOP_TTL_SECS",
+        default_value_t = 3600
+    )]
+    sandbox_idle_stop_ttl_secs: u64,
+    /// Stop any sandbox older than this regardless of status; sessions replace
+    /// reaped sandboxes on their next message. 0 disables the max-lifetime
+    /// sweep.
+    #[arg(
+        long = "session-sandbox-max-lifetime-secs",
+        env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
+        default_value_t = 86_400
+    )]
+    sandbox_max_lifetime_secs: u64,
+    #[arg(
+        long = "session-sandbox-reap-interval-secs",
+        env = "SESSION_SANDBOX_REAP_INTERVAL_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    sandbox_reap_interval_secs: u64,
     #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
@@ -541,6 +575,8 @@ struct SandboxArgs {
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
     workflow_host_command: Option<String>,
+    #[arg(long = "kubernetes-workflow-dirs", env = "KUBERNETES_WORKFLOW_DIRS")]
+    kubernetes_workflow_dirs: Option<String>,
     #[command(flatten)]
     tools_source: ToolsArgs,
     #[arg(
@@ -751,8 +787,16 @@ impl SandboxArgs {
     }
 
     fn agent_k8s_workflow_dirs(&self) -> String {
-        if let Some(repo) = clean_optional_value(self.tools_source.repo.as_deref()) {
-            return format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows");
+        if let Some(value) = clean_optional_value(self.kubernetes_workflow_dirs.as_deref()) {
+            return value;
+        }
+        let source_repos = self.tools_source.source_repos();
+        if !source_repos.is_empty() {
+            return source_repos
+                .into_iter()
+                .map(|repo| format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows"))
+                .collect::<Vec<_>>()
+                .join(":");
         }
         "/opt/centaur/workflows".to_owned()
     }
@@ -879,11 +923,7 @@ impl SandboxArgs {
             }
         }
 
-        for name in &self.passthrough_env {
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
+        for name in self.passthrough_env_names() {
             if let Ok(value) = env::var(name) {
                 if let Some((_, existing_value)) = envs
                     .iter_mut()
@@ -1031,11 +1071,7 @@ impl SandboxArgs {
             envs.push(("TOOLS_OVERLAY_PATH".to_owned(), value));
         }
 
-        for name in &self.passthrough_env {
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
+        for name in self.passthrough_env_names() {
             if let Ok(value) = env::var(name) {
                 if let Some((_, existing_value)) = envs
                     .iter_mut()
@@ -1049,6 +1085,14 @@ impl SandboxArgs {
         }
 
         Ok(envs)
+    }
+
+    fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
+        self.passthrough_env
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     fn discover_tool_proxy_fragment(
@@ -1074,7 +1118,9 @@ impl SandboxArgs {
             for source in sources {
                 source.sync()?;
                 let tools_dir = source.tools_dir();
-                if source.repo_cache_path.is_some() && !tools_dir.is_dir() {
+                // Skip sources without a tools tree (chart-defaulted subdirs
+                // make this a normal case for non-tool overlay repos).
+                if !tools_dir.is_dir() {
                     continue;
                 }
                 dirs.push(tools_dir);
@@ -1090,6 +1136,15 @@ impl SandboxArgs {
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
             bootstrap_iron_control_principal: None,
         })
+    }
+
+    fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
+        let ttl = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
+        SandboxReaperConfig {
+            interval: Duration::from_secs(self.sandbox_reap_interval_secs),
+            idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
+            max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+        }
     }
 }
 
@@ -1235,6 +1290,31 @@ struct ToolsArgs {
 }
 
 impl ToolsArgs {
+    fn source_repos(&self) -> Vec<String> {
+        let Some(repo) = clean_optional_value(self.repo.as_deref()) else {
+            return Vec::new();
+        };
+        let mut repos = vec![repo];
+        repos.extend(self.extra_sources().into_iter().map(|source| source.repo));
+        repos
+    }
+
+    fn extra_sources(&self) -> Vec<ToolSource> {
+        let Some(value) = clean_optional_value(self.extra_sources.as_deref()) else {
+            return Vec::new();
+        };
+        match serde_json::from_str::<Vec<ToolSourceArg>>(&value) {
+            Ok(sources) => sources
+                .into_iter()
+                .filter_map(ToolSourceArg::into_source)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid KUBERNETES_TOOLS_EXTRA_SOURCES; ignoring extra tool sources");
+                Vec::new()
+            }
+        }
+    }
+
     /// `None` when no repo or runner image is configured (tools disabled).
     fn to_config(&self) -> Option<ToolsConfig> {
         let repo = clean_optional_value(self.repo.as_deref())?;
@@ -1253,19 +1333,7 @@ impl ToolsArgs {
             });
         }
         config.repo_cache_path = clean_optional_value(self.repo_cache_path.as_deref());
-        if let Some(value) = clean_optional_value(self.extra_sources.as_deref()) {
-            match serde_json::from_str::<Vec<ToolSourceArg>>(&value) {
-                Ok(sources) => {
-                    config.extra_sources = sources
-                        .into_iter()
-                        .filter_map(ToolSourceArg::into_source)
-                        .collect();
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "invalid KUBERNETES_TOOLS_EXTRA_SOURCES; ignoring extra tool sources");
-                }
-            }
-        }
+        config.extra_sources = self.extra_sources();
         Some(config)
     }
 }
@@ -1692,6 +1760,46 @@ fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, &'static str)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| (*name, env::var(name).ok()))
+                .collect();
+            for (name, value) in vars {
+                // SAFETY: tests that mutate process env hold ENV_LOCK for the
+                // duration of the guard, so concurrent tests in this module
+                // cannot observe partial mutations.
+                unsafe {
+                    env::set_var(name, value);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                // SAFETY: see EnvGuard::set; the lock outlives the guard.
+                unsafe {
+                    if let Some(value) = value {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_session_sandbox_flags() {
@@ -1812,6 +1920,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_k8s_workflow_dirs_fan_out_across_extra_sources() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"acme/overlay"},{"repo":"acme/other","subdir":"packages/tools"}]"#,
+        ])
+        .unwrap();
+
+        // Every source contributes its repo-root `workflows/` tree, base first,
+        // colon-joined. The tools `subdir` does not affect the workflows path.
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/home/agent/github/paradigmxyz/centaur/workflows:\
+             /home/agent/github/acme/overlay/workflows:\
+             /home/agent/github/acme/other/workflows",
+        );
+    }
+
+    #[test]
+    fn agent_k8s_workflow_dirs_falls_back_when_tools_disabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/opt/centaur/workflows"
+        );
+    }
+
+    #[test]
     fn agent_k8s_workflow_host_mounts_repos_and_tool_env() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -1827,6 +1983,8 @@ mod tests {
             "/home/agent/github/paradigmxyz/centaur/tools",
             "--tools-overlay-path",
             "/home/agent/github/tempoxyz/centaur-tempo/tools",
+            "--kubernetes-workflow-dirs",
+            "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows",
             "--session-sandbox-passthrough-env",
             "TOOLS_PATH,TOOLS_OVERLAY_PATH",
         ])
@@ -1855,6 +2013,55 @@ mod tests {
                 .find(|env| env.name == "TOOLS_OVERLAY_PATH")
                 .map(|env| env.value.as_str()),
             Some("/home/agent/github/tempoxyz/centaur-tempo/tools")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "WORKFLOW_DIRS")
+                .map(|env| env.value.as_str()),
+            Some(
+                "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows"
+            )
+        );
+    }
+
+    #[test]
+    fn workflow_host_env_template_splits_passthrough_env_from_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "SESSION_SANDBOX_PASSTHROUGH_ENV",
+                "SLACK_ETL_ENABLED,SLACK_BACKFILL_ENABLED",
+            ),
+            ("SLACK_ETL_ENABLED", "true"),
+            ("SLACK_BACKFILL_ENABLED", "true"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec(None).unwrap();
+
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "SLACK_ETL_ENABLED")
+                .map(|env| env.value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "SLACK_BACKFILL_ENABLED")
+                .map(|env| env.value.as_str()),
+            Some("true")
         );
     }
 

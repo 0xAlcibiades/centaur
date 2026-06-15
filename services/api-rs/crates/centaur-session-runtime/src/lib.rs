@@ -10,15 +10,15 @@ use centaur_sandbox_core::{
     SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
-    SandboxManager, WarmPoolConfig, WarmPoolError, WarmPoolManager, WarmSandboxSpecFactory,
+    SandboxManager, SandboxReaper, SandboxReaperConfig, WarmPoolConfig, WarmPoolError,
+    WarmPoolManager, WarmSandboxSpecFactory,
 };
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent, SessionExecution,
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    CreateFeedbackInput, PgSessionStore, SessionEventListener, SessionStoreError, UserFeedback,
-    default_metadata,
+    PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
@@ -182,6 +182,16 @@ impl SessionRuntime {
         ));
         pool.clone().spawn_replenisher();
         self.warm_pool = Some(pool);
+        self
+    }
+
+    /// Spawn the background reaper that stops sandboxes whose idle pause or
+    /// total lifetime expired. No-op when both TTLs are disabled.
+    pub fn with_sandbox_reaper(self, config: SandboxReaperConfig) -> Self {
+        if !config.is_enabled() {
+            return self;
+        }
+        SandboxReaper::new(self.sandbox_runtime.manager.clone(), config).spawn();
         self
     }
 
@@ -378,13 +388,6 @@ impl SessionRuntime {
             }
         }
         Ok(report)
-    }
-
-    pub async fn create_feedback(
-        &self,
-        input: CreateFeedbackInput,
-    ) -> Result<UserFeedback, SessionRuntimeError> {
-        Ok(self.store.create_feedback(input).await?)
     }
 
     pub async fn execute_session(

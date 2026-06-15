@@ -11,6 +11,7 @@ import {
   type Thread
 } from 'chat'
 import { createSlackAdapter } from '@chat-adapter/slack'
+import { fetchSlackThreadReplies } from '@chat-adapter/slack/api'
 import { createPostgresState } from '@chat-adapter/state-pg'
 import pg from 'pg'
 import {
@@ -20,7 +21,6 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
-import { feedbackEndBlocks, registerFeedbackHandlers } from './feedback'
 import {
   collectInitialContext,
   forwardToSessionApi,
@@ -84,6 +84,7 @@ const RENDER_OBLIGATION_INDEX_KEY = 'slackbotv2:render:index'
 const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000
+const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000
 const RENDER_RECOVERY_THREAD_TIMEOUT_MS = 2 * 60 * 1000
 const RENDER_RECOVERY_MAX_THREAD_FAILURES = 5
 const RENDER_RETRY_INITIAL_DELAY_MS = 250
@@ -110,12 +111,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     adapters: { slack },
     state,
     onLockConflict: 'force',
-    logger
-  })
-
-  registerFeedbackHandlers(chat, {
-    apiKey: options.apiKey,
-    apiUrl: options.apiUrl,
     logger
   })
 
@@ -257,7 +252,9 @@ async function syncThreadMessageToSession(
   const executedMessageIds = new Set(state.executedMessageIds ?? [])
   const shouldStartExecution =
     input.mode === 'execute' && state.activeExecution !== true && !executedMessageIds.has(message.id)
-  const shouldIncludeContext = shouldStartExecution && state.historyForwarded !== true
+  const shouldRefreshThreadContext = shouldStartExecution && isSlackThreadReply(message)
+  const shouldIncludeContext =
+    shouldStartExecution && (state.historyForwarded !== true || shouldRefreshThreadContext)
   const isDuplicateIncrementalMessage =
     messageIds.has(message.id) && !shouldStartExecution && !shouldIncludeContext
   const trace: SlackbotV2Trace = {
@@ -293,9 +290,11 @@ async function syncThreadMessageToSession(
   })
   let context: SlackbotV2ApiMessage[] | undefined
 
-  if (shouldIncludeContext && !state.historyForwarded) {
+  if (shouldIncludeContext) {
     const contextStartedAtMs = nowMs()
-    context = await collectInitialContext(thread, message)
+    context = shouldRefreshThreadContext
+      ? await collectSlackThreadContext(input.options, message)
+      : await collectInitialContext(thread, message)
     // collectInitialContext re-serializes the current message; mirror the
     // flag-stripped text on that copy too.
     for (const item of context) {
@@ -312,11 +311,14 @@ async function syncThreadMessageToSession(
   }
 
   let lastEventId = state.lastEventId ?? 0
+  const renderLease: { release: (() => Promise<void>) | null } = { release: null }
   const candidateMessages = context ?? [serializedMessage]
   const messagesToAppend = candidateMessages.filter(item => !messageIds.has(item.id))
 
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
+    executeContextMessages:
+      shouldStartExecution && shouldIncludeContext ? candidateMessages : undefined,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     harnessType: overrides.harnessType,
     messages: messagesToAppend,
@@ -351,6 +353,16 @@ async function syncThreadMessageToSession(
     const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
     latestExecutedMessageIds.add(serializedMessage.id)
     forwardInput.executionId = execution.execution_id
+    // Take the render lease before the obligation becomes visible so a
+    // concurrent recovery sweep never claims it while this process is about
+    // to render it live.
+    try {
+      renderLease.release = await acquireRenderLease(input.state, thread.id)
+    } catch (error) {
+      traceLog(input.options, 'slackbotv2_render_lease_acquire_failed', trace, {
+        error: errorMessage(error)
+      })
+    }
     await thread.setState({
       activeExecution: true,
       executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000),
@@ -415,12 +427,16 @@ async function syncThreadMessageToSession(
       input.options,
       forwardInput,
       () => lastEventId,
+      renderLease,
       trace
     )
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
     })
   } catch (error) {
+    // The live render is not happening; let the recovery sweep claim the
+    // obligation (if one was committed) as soon as it scans.
+    await renderLease.release?.()
     const latest = (await thread.state) ?? {}
     await thread.setState({
       activeExecution: false,
@@ -465,27 +481,32 @@ function scheduleExecutionRender(
   options: SlackbotV2Options,
   input: ForwardSessionInput,
   getLastEventId: () => number,
+  renderLease: { release: (() => Promise<void>) | null },
   trace?: SlackbotV2Trace
 ): void {
   const promise = (async () => {
-    let attempt = 0
-    while (true) {
-      const result = await renderExecutionAttempt(
-        thread,
-        message,
-        options,
-        input,
-        getLastEventId,
-        trace
-      )
-      if (result === 'complete') return
-      const delayMs = renderRetryDelayMs(attempt)
-      attempt += 1
-      traceLog(options, 'slackbotv2_render_retry_scheduled', trace, {
-        retry_delay_ms: delayMs,
-        retry_attempt: attempt
-      })
-      await sleep(delayMs)
+    try {
+      let attempt = 0
+      while (true) {
+        const result = await renderExecutionAttempt(
+          thread,
+          message,
+          options,
+          input,
+          getLastEventId,
+          trace
+        )
+        if (result === 'complete') return
+        const delayMs = renderRetryDelayMs(attempt)
+        attempt += 1
+        traceLog(options, 'slackbotv2_render_retry_scheduled', trace, {
+          retry_delay_ms: delayMs,
+          retry_attempt: attempt
+        })
+        await sleep(delayMs)
+      }
+    } finally {
+      await renderLease.release?.()
     }
   })()
   backgroundWaitUntil(promise)
@@ -783,7 +804,13 @@ async function recoverRenderObligations(
       if (outcome.timedOut) {
         void recovery.catch(() => undefined)
         deferredCount += 1
+        // Count timeouts toward the abandonment budget: an obligation whose
+        // recovery hangs on every claim (for example an event stream that
+        // never yields) would otherwise keep the sweep loop spinning forever,
+        // racing every live render in the process.
+        failureCounts.set(threadId, (failureCounts.get(threadId) ?? 0) + 1)
         traceLog(options, 'slackbotv2_render_recovery_thread_timeout', undefined, {
+          failure_count: failureCounts.get(threadId),
           thread_id: threadId,
           timeout_ms: timeoutMs
         })
@@ -944,6 +971,40 @@ function renderRecoveryLeaseKey(threadId: string): string {
   return `slackbotv2:render:lease:${threadId}`
 }
 
+/**
+ * Holds the per-thread render lease for the duration of a live render so the
+ * recovery sweep cannot claim the just-indexed obligation and post a
+ * duplicate answer (it lease-skips instead). The TTL keeps this crash-safe:
+ * if the pod dies mid-render the lease expires and recovery takes over. The
+ * lease is refreshed while the render runs because agent turns routinely
+ * outlive a single TTL window.
+ */
+async function acquireRenderLease(
+  state: StateAdapter,
+  threadId: string
+): Promise<() => Promise<void>> {
+  const key = renderRecoveryLeaseKey(threadId)
+  const token = randomUUID()
+  await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+  const refresh = setInterval(() => {
+    void state
+      .get<string>(key)
+      .then(current =>
+        current === token ? state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS) : undefined
+      )
+      .catch(() => undefined)
+  }, RENDER_LEASE_REFRESH_INTERVAL_MS)
+  return async () => {
+    clearInterval(refresh)
+    try {
+      const current = await state.get<string>(key)
+      if (current === token) await state.delete(key)
+    } catch {
+      // Best effort: TTL expiry is the backstop.
+    }
+  }
+}
+
 async function renderExecutionStream(
   thread: Thread,
   stream: AsyncIterable<SlackbotV2RendererSource>,
@@ -976,10 +1037,7 @@ async function renderExecutionStream(
     await thread.post(
       new StreamingPlan(
         visibleStream,
-        {
-          endWith: feedbackEndBlocks(),
-          groupTasks: options.streamTaskDisplayMode ?? 'plan'
-        }
+        { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
       )
     )
   } finally {
@@ -1022,7 +1080,6 @@ async function renderRecoveredExecutionStream(
       {
         recipientTeamId: message.teamId,
         recipientUserId: message.author.userId,
-        stopBlocks: feedbackEndBlocks(),
         taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
       }
     )
@@ -1236,6 +1293,150 @@ function shouldAwaitSlackHandoff(rawBody: string): boolean {
   } catch {
     return false
   }
+}
+
+function isSlackThreadReply(message: ChatMessage): boolean {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const item = raw as Record<string, unknown>
+  const threadTs = typeof item.thread_ts === 'string' ? item.thread_ts : ''
+  const ts = typeof item.ts === 'string' ? item.ts : message.id
+  return Boolean(threadTs && ts && threadTs !== ts)
+}
+
+async function collectSlackThreadContext(
+  options: SlackbotV2Options,
+  currentMessage: ChatMessage
+): Promise<SlackbotV2ApiMessage[]> {
+  const raw = slackRawRecord(currentMessage)
+  const channel = stringField(raw.channel)
+  const threadTs = stringField(raw.thread_ts)
+  const currentTs = stringField(raw.ts) || currentMessage.id
+  if (!channel || !threadTs) return [await serializeMessage(currentMessage)]
+
+  const messages: SlackbotV2ApiMessage[] = []
+  let cursor: string | undefined
+  do {
+    const response = await fetchSlackThreadReplies({
+      apiUrl: options.slackApiUrl,
+      channel,
+      cursor,
+      limit: 200,
+      token: options.botToken,
+      ts: threadTs
+    })
+    const slackMessages = Array.isArray(response.messages) ? response.messages : []
+    for (const rawMessage of slackMessages) {
+      const message = rawMessage as Record<string, unknown>
+      const messageTs = stringField(message.ts)
+      if (!messageTs || compareSlackTs(messageTs, currentTs) > 0) continue
+      if (isSelfSlackBotMessage(options, message)) continue
+      messages.push(slackApiMessageFromSlack(message, currentMessage))
+    }
+    cursor = response.nextCursor
+  } while (cursor)
+
+  const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
+  const serializedCurrent = await serializeMessage(currentMessage)
+  if (currentIndex >= 0) {
+    messages[currentIndex] = serializedCurrent
+  } else {
+    messages.push(serializedCurrent)
+  }
+  return messages
+}
+
+function slackApiMessageFromSlack(
+  message: Record<string, unknown>,
+  currentMessage: ChatMessage
+): SlackbotV2ApiMessage {
+  const rawCurrent = slackRawRecord(currentMessage)
+  const id = stringField(message.ts) || randomUUID()
+  const actorId = slackActorId(message)
+  const isBot = Boolean(message.bot_id || message.bot_profile)
+  return {
+    attachments: [],
+    author: {
+      fullName: actorId,
+      isBot,
+      isMe: Boolean(actorId && actorId === currentMessage.author.userId),
+      userId: actorId,
+      userName: actorId
+    },
+    id,
+    isMention: id === currentMessage.id ? currentMessage.isMention === true : false,
+    raw: message,
+    teamId:
+      stringField(message.team)
+      || stringField(message.team_id)
+      || stringField(rawCurrent.team)
+      || stringField(rawCurrent.team_id),
+    text: normalizeSlackText(stringField(message.text)),
+    threadId: currentMessage.threadId,
+    timestamp: slackTimestampToIso(id)
+  }
+}
+
+function slackRawRecord(message: ChatMessage): Record<string, unknown> {
+  return message.raw && typeof message.raw === 'object' && !Array.isArray(message.raw)
+    ? (message.raw as Record<string, unknown>)
+    : {}
+}
+
+function slackActorId(message: Record<string, unknown>): string {
+  const profile = message.bot_profile
+  if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+    const userId = stringField((profile as Record<string, unknown>).user_id)
+    if (userId) return userId
+  }
+  return stringField(message.user) || stringField(message.bot_id)
+}
+
+function isSelfSlackBotMessage(
+  options: SlackbotV2Options,
+  message: Record<string, unknown>
+): boolean {
+  const botUserId = options.botUserId
+  if (!botUserId) return false
+  if (stringField(message.user) === botUserId) return true
+  const profile = message.bot_profile
+  if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+    return stringField((profile as Record<string, unknown>).user_id) === botUserId
+  }
+  return false
+}
+
+function stringField(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function compareSlackTs(a: string, b: string): number {
+  const left = Number(a)
+  const right = Number(b)
+  if (Number.isFinite(left) && Number.isFinite(right)) return left - right
+  return a.localeCompare(b)
+}
+
+function slackTimestampToIso(ts: string): string {
+  const seconds = Number(ts)
+  return Number.isFinite(seconds)
+    ? new Date(seconds * 1000).toISOString()
+    : new Date().toISOString()
+}
+
+function normalizeSlackText(input: string): string {
+  return input
+    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, '$2 ($1)')
+    .replace(/<([a-z]+:\/\/[^>]+)>/gi, '$1')
+    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, '#$2')
+    .replace(/<#([A-Z0-9]+)>/g, '#$1')
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
+    .replace(/<!(channel|here|everyone)>/g, '@$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .trim()
 }
 
 function rendererOptions(thread: Thread, options: SlackbotV2Options): CodexAppServerToChatStreamOptions {
