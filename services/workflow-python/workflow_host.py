@@ -85,6 +85,9 @@ class WorkflowContext:
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         tool_shim = resolve_tool_shim()
         if tool_shim is not None:
+            # Sandboxed workflow hosts cannot rely on api-rs having a /tools
+            # backend. Use the generated catalog's method bridge for durable
+            # workflow ctx.call_tool(...); interactive agents use tool CLIs.
             return await call_tool_shim(tool_shim, tool, method, args or {})
         return await self._rpc.request(
             {
@@ -110,6 +113,7 @@ class RpcClient:
     def __init__(self) -> None:
         self._next_request_id = 1
         self._pending: dict[str, asyncio.Future[Any]] = {}
+        self._notifications: set[asyncio.Task[None]] = set()
         self._write_lock = asyncio.Lock()
 
     async def write(self, payload: dict[str, Any]) -> None:
@@ -118,7 +122,13 @@ class RpcClient:
             sys.stdout.flush()
 
     def notify(self, payload: dict[str, Any]) -> None:
-        asyncio.create_task(self.write(payload))
+        task = asyncio.create_task(self.write(payload))
+        self._notifications.add(task)
+        task.add_done_callback(self._notifications.discard)
+
+    async def drain_notifications(self) -> None:
+        if self._notifications:
+            await asyncio.gather(*list(self._notifications), return_exceptions=True)
 
     async def request(self, payload: dict[str, Any]) -> Any:
         request_id = str(self._next_request_id)
@@ -140,6 +150,9 @@ class RpcClient:
             fut.set_result(response.get("value"))
         else:
             fut.set_exception(RuntimeError(str(response.get("error") or "context RPC failed")))
+
+
+_METRIC_RPC: RpcClient | None = None
 
 
 def resolve_tool_shim() -> str | None:
@@ -291,6 +304,13 @@ def install_vm_metrics_compat_module(api_mod: types.ModuleType) -> None:
     vm_metrics.record_etl_items_failed = record_etl_items_failed
     vm_metrics.record_etl_items_seen = record_etl_items_seen
     vm_metrics.record_etl_items_upserted = record_etl_items_upserted
+    vm_metrics.set_etl_active_scopes = set_etl_active_scopes
+    vm_metrics.set_etl_backfill_job_age_seconds = set_etl_backfill_job_age_seconds
+    vm_metrics.set_etl_backfill_jobs = set_etl_backfill_jobs
+    vm_metrics.set_etl_failed_scopes = set_etl_failed_scopes
+    vm_metrics.set_etl_scope_sync_freshness_seconds = (
+        set_etl_scope_sync_freshness_seconds
+    )
     vm_metrics.record_company_context_documents_changed = (
         record_company_context_documents_changed
     )
@@ -369,6 +389,63 @@ def record_etl_items_failed(
     )
 
 
+def set_etl_active_scopes(source: str, count: int) -> None:
+    set_gauge(
+        "etl_active_scopes",
+        max(count, 0),
+        source=source,
+    )
+
+
+def set_etl_failed_scopes(source: str, count: int) -> None:
+    set_gauge(
+        "etl_failed_scopes",
+        max(count, 0),
+        source=source,
+    )
+
+
+def set_etl_scope_sync_freshness_seconds(
+    source: str,
+    freshness_s: int | float,
+) -> None:
+    set_gauge(
+        "etl_scope_sync_freshness_seconds",
+        max(float(freshness_s), 0.0),
+        source=source,
+    )
+
+
+def set_etl_backfill_jobs(
+    source: str,
+    job_type: str,
+    status: str,
+    count: int,
+) -> None:
+    set_gauge(
+        "etl_backfill_jobs",
+        max(count, 0),
+        source=source,
+        job_type=job_type,
+        status=status,
+    )
+
+
+def set_etl_backfill_job_age_seconds(
+    source: str,
+    job_type: str,
+    status: str,
+    age_s: int | float,
+) -> None:
+    set_gauge(
+        "etl_backfill_job_age_seconds",
+        max(float(age_s), 0.0),
+        source=source,
+        job_type=job_type,
+        status=status,
+    )
+
+
 def record_company_context_documents_changed(
     source: str,
     source_type: str,
@@ -405,11 +482,12 @@ def set_company_context_projection_lag(source: str, projection_lag_s: float) -> 
 
 
 def increment_metric(metric: str, count: int, **labels: str) -> None:
-    if count <= 0:
+    if count < 0:
         return
     labels = metric_runtime_labels(labels)
     key = metric_key(metric, labels)
     _METRIC_COUNTERS[key] = _METRIC_COUNTERS.get(key, 0.0) + float(count)
+    emit_metric_event("counter", metric, count, labels)
     push_metric_lines([format_metric_line(metric, labels, _METRIC_COUNTERS[key])])
 
 
@@ -417,6 +495,7 @@ def set_gauge(metric: str, value: float, **labels: str) -> None:
     labels = metric_runtime_labels(labels)
     key = metric_key(metric, labels)
     _METRIC_GAUGES[key] = float(value)
+    emit_metric_event("gauge", metric, float(value), labels)
     push_metric_lines([format_metric_line(metric, labels, _METRIC_GAUGES[key])])
 
 
@@ -439,6 +518,7 @@ def observe_histogram(
     numeric = float(value)
     histogram["count"] += 1
     histogram["sum"] += numeric
+    emit_metric_event("histogram", metric, numeric, labels)
     for bucket in buckets:
         if numeric <= bucket:
             histogram["buckets"][bucket] += 1
@@ -468,6 +548,22 @@ def metric_key(
     metric: str, labels: dict[str, str]
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
     return (metric, tuple(sorted((key, str(value)) for key, value in labels.items())))
+
+
+def emit_metric_event(
+    kind: str, metric: str, value: int | float, labels: dict[str, str]
+) -> None:
+    if _METRIC_RPC is None:
+        return
+    _METRIC_RPC.notify(
+        {
+            "type": "ctx.metric",
+            "kind": kind,
+            "name": metric,
+            "value": value,
+            "labels": labels,
+        }
+    )
 
 
 def metric_runtime_labels(labels: dict[str, str]) -> dict[str, str]:
@@ -564,7 +660,8 @@ def push_metric_lines(lines: list[str]) -> None:
         method="POST",
     )
     try:
-        urllib.request.urlopen(request, timeout=2).close()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open(request, timeout=2).close()
     except Exception as exc:
         print(f"workflow_metric_push_error error={exc}", file=sys.stderr)
 
@@ -777,6 +874,7 @@ def normalize_schedule(workflow: RegisteredWorkflow) -> dict[str, Any] | None:
 
 
 async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any]:
+    global _METRIC_RPC
     workflows = discover_workflows()
     workflow_name = str(message.get("workflow_name") or "")
     registered = workflows.get(workflow_name)
@@ -791,6 +889,8 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
         workflow_name=workflow_name,
         pool=pool,
     )
+    previous_metric_rpc = _METRIC_RPC
+    _METRIC_RPC = rpc
     try:
         inp = coerce_input(message.get("input") or {}, registered.input_cls)
         result = registered.handler(inp, ctx)
@@ -798,6 +898,8 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
             result = await result
         return {"type": "workflow.result", "result": jsonable(result)}
     finally:
+        await rpc.drain_notifications()
+        _METRIC_RPC = previous_metric_rpc
         if pool is not None:
             await pool.close()
 

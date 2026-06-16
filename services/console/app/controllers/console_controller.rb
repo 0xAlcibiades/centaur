@@ -31,11 +31,45 @@ class ConsoleController < ApplicationController
       "pg_dsn" => @principal.granted_pg_dsn_secrets,
       "hmac" => @principal.granted_hmac_secrets
     }
+    # Direct grants (revocable here) -- distinct from @granted, which also folds in
+    # grants inherited from roles.
+    @direct_grants = @principal.grants
+      .includes(Grant::GRANTABLE_ASSOCIATIONS)
+      .order(:id)
+    # How each effective secret is reached, for the Source column: keyed by
+    # [kind, secret_id], a list of { type: :direct } / { type: :role, role: } --
+    # a secret can be granted directly and/or through one or more roles.
+    @grant_sources = Hash.new { |h, k| h[k] = [] }
+    @principal.effective_grants.includes(:role).each do |grant|
+      assoc = Grant::GRANTABLE_ASSOCIATIONS.find { |a| grant.public_send("#{a}_id") }
+      next unless assoc
+      kind = assoc.to_s.delete_suffix("_secret")
+      @grant_sources[[ kind, grant.public_send("#{assoc}_id") ]] <<
+        (grant.role ? { type: :role, role: grant.role } : { type: :direct })
+    end
+    # Assignment options for the inline forms. Roles/secrets span all namespaces;
+    # the namespace is shown as a label on each option. Already-directly-granted
+    # secrets are filtered out of the grant dropdown (they're in the table above);
+    # a role-inherited secret stays offered, so it can be promoted to a direct grant.
+    @assignable_roles = Role.where.not(id: @principal.role_ids).order(:namespace, :id)
+    granted_ids = Hash.new { |h, k| h[k] = [] }
+    @direct_grants.each do |grant|
+      assoc = Grant::GRANTABLE_ASSOCIATIONS.find { |a| grant.public_send("#{a}_id") }
+      next unless assoc
+      granted_ids[assoc.to_s.delete_suffix("_secret")] << grant.public_send("#{assoc}_id")
+    end
+    @assignable_secrets = SECRET_KINDS.each_with_object({}) do |(kind, cfg), acc|
+      acc[kind] = cfg[:model].where.not(id: granted_ids[kind]).order(:namespace, :id)
+    end
   end
 
   def secrets
     @secrets_by_kind = SECRET_KINDS.transform_values do |cfg|
-      cfg[:model].includes(cfg[:includes]).order(created_at: :asc, id: :asc)
+      rel = cfg[:model].includes(cfg[:includes]).order(created_at: :asc, id: :asc)
+      # Static secrets may wrap a broker credential (the "managed" badge); eager
+      # load the credential and its app so the list doesn't fan out per row.
+      rel = rel.includes(broker_credential: :oauth_app) if cfg[:model] == StaticSecret
+      rel
     end
   end
 
@@ -56,6 +90,8 @@ class ConsoleController < ApplicationController
 
   def credential
     @credential = BrokerCredential.find_by_oid!(params[:id])
+    # The grantable static secret wrapping this credential, for the cross-link.
+    @wrapping_secret = @credential.static_secret
   end
 
   # Registered OAuth apps and the consent flows they drive. Like credentials,

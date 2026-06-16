@@ -33,6 +33,17 @@ module Console
       assert_response :ok
     end
 
+    # The managed-secret guard banner is behavior (a warning), not form markup, so
+    # it is asserted here unlike the rest of the rendered form.
+    test "edit warns when the secret is an OAuth-flow-managed wrapper" do
+      get edit_console_static_secret_url(static_secrets(:acme_managed_gmail_secret).oid)
+      assert_response :ok
+      assert_match "Managed secret", response.body
+      # An ordinary secret shows no such warning.
+      get edit_console_static_secret_url(static_secrets(:acme_prod_api_key).oid)
+      assert_no_match "Managed secret", response.body
+    end
+
     test "POST create builds a static secret with a source and rules" do
       assert_difference -> { StaticSecret.count } => 1,
                         -> { SecretSource.count } => 1,
@@ -96,6 +107,16 @@ module Console
       assert_equal [ "only.example.com" ], secret.rules.map(&:host)
     end
 
+    test "DELETE destroy removes the secret and cascades its grants" do
+      secret = static_secrets(:github_token_inject) # granted directly to acme_channel
+      assert_difference -> { StaticSecret.count } => -1, -> { Grant.count } => -1 do
+        delete console_static_secret_url(secret.oid)
+      end
+      assert_redirected_to console_secrets_path
+      assert_equal "Secret deleted.", flash[:notice]
+      assert_not StaticSecret.exists?(secret.id)
+    end
+
     # --- pg_dsn -----------------------------------------------------------
 
     test "GET new renders without error" do
@@ -146,6 +167,15 @@ module Console
       secret.reload
       assert_nil secret.role.presence
       assert_equal "REPORTING_DSN", secret.dsn_source.config["var"]
+    end
+
+    test "DELETE destroy removes a pg_dsn secret" do
+      secret = pg_dsn_secrets(:acme_reporting_pg)
+      assert_difference -> { PgDsnSecret.count } => -1 do
+        delete console_pg_dsn_secret_url(secret.oid)
+      end
+      assert_redirected_to console_secrets_path
+      assert_equal "Secret deleted.", flash[:notice]
     end
 
     test "POST create captures ordered session settings and drops blank-name rows" do

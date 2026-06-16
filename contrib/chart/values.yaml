@@ -98,6 +98,14 @@ console:
     # database.yml — the connection URL carries no database path, so Rails
     # resolves the name from there.
     name: iron_control_production
+  # Google as an OAuth identity provider for console sign-in (and the
+  # broker-credential refresh loop). Off by default — not every deployment uses
+  # Google to log in. When enabled, the IRON_CONTROL_GOOGLE_CLIENT_ID and
+  # IRON_CONTROL_GOOGLE_CLIENT_SECRET env vars are sourced from the shared infra
+  # Secret (keys <secretManager.envPrefix>IRON_CONTROL_GOOGLE_CLIENT_ID /
+  # _SECRET), which must exist or the console pods CreateContainerConfigError.
+  googleOauth:
+    enabled: false
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale
@@ -193,9 +201,13 @@ sandbox:
   #                  subscription token (proxy injects the brokered credential).
   codexAuthMode: api_key
   claudeCodeAuthMode: api_key
-  # Which harness the sandbox runs: codex | amp | claudecode. Selects the
-  # iron-proxy auth fragment api-rs registers and must agree with the sandbox
-  # image's default CMD (services/sandbox/Dockerfile).
+  # The deployment's default harness: codex | amp | claudecode. Decides what
+  # warm sandboxes boot (SESSION_SANDBOX_HARNESS) and which harness auth
+  # fragment is required at startup (the other harnesses' fragments are
+  # registered too when available, so per-session --claude/--amp/--codex
+  # overrides keep working credentials). Per-session sandboxes always run
+  # their session's harness via container args; the sandbox image CMD only
+  # matters for containers started outside api-rs.
   harnessEngine: codex
   extraEnv: {}
   stateVolume:
@@ -215,7 +227,7 @@ repoCache:
   # tool server is enabled.
   repositories: []
   repositoryRefs: {}
-  syncIntervalSeconds: 300
+  syncIntervalSeconds: 30
   image:
     repository: ""
     tag: ""

@@ -142,9 +142,35 @@ if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
 from pathlib import Path
 import os
+import sys
 
 path = Path(os.environ["CODEX_CONFIG_PATH"])
 lines = path.read_text().splitlines()
+
+# CODEX_MODEL_REASONING_SUMMARY overrides model_reasoning_summary so deployments
+# can re-enable reasoning summaries (Codex >= 0.139 no longer emits them by
+# default) without rebuilding the sandbox image.
+summary = os.environ.get("CODEX_MODEL_REASONING_SUMMARY", "").strip()
+if summary:
+    if summary not in {"auto", "concise", "detailed", "none"}:
+        print(
+            f"ignoring invalid CODEX_MODEL_REASONING_SUMMARY: {summary!r} "
+            "(expected auto, concise, detailed, or none)",
+            file=sys.stderr,
+        )
+    else:
+        first_section = next(
+            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")),
+            len(lines),
+        )
+        override = f'model_reasoning_summary = "{summary}"'
+        for i in range(first_section):
+            if lines[i].split("=", 1)[0].strip() == "model_reasoning_summary":
+                lines[i] = override
+                break
+        else:
+            lines.insert(first_section, override)
+
 features_start = next((i for i, line in enumerate(lines) if line.strip() == "[features]"), None)
 if features_start is None:
     lines.extend(["", "[features]", "multi_agent = false", "multi_agent_v2 = false"])
@@ -167,6 +193,33 @@ else:
     for name in sorted(feature_names - seen):
         rewritten.append(f"{name} = false")
     lines = lines[: features_start + 1] + rewritten + lines[features_end:]
+
+# Optional deploy-time override of the codex reasoning effort. Lets a deployment
+# (e.g. an org overlay via sandbox.extraEnv) set the default without forking the
+# baked-in config.toml. Named after codex's own config key (model_reasoning_effort)
+# and validated against its ReasoningEffort enum; an unknown value is ignored (the
+# config default stands) rather than written.
+effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
+if effort:
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    if effort not in valid:
+        print(
+            f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
+            f"expected one of {sorted(valid)}",
+            file=sys.stderr,
+        )
+    else:
+        # model_reasoning_effort is a top-level key, before the first [table].
+        first_table = next(
+            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
+        )
+        override = f'model_reasoning_effort = "{effort}"'
+        for i in range(first_table):
+            if lines[i].split("=", 1)[0].strip() == "model_reasoning_effort":
+                lines[i] = override
+                break
+        else:
+            lines.insert(first_table, override)
 path.write_text("\n".join(lines).rstrip() + "\n")
 PYEOF
 else

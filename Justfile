@@ -19,7 +19,6 @@ registry := env_var_or_default("CENTAUR_LOCAL_REGISTRY", "localhost:5000")
 agent_dockerfile := env_var_or_default("CENTAUR_AGENT_DOCKERFILE", "services/sandbox/Dockerfile")
 agent_build_target := env_var_or_default("CENTAUR_AGENT_BUILD_TARGET", "sandbox")
 agent_image := env_var_or_default("CENTAUR_AGENT_IMAGE", "centaur-agent:latest")
-thin_agent_image := env_var_or_default("CENTAUR_THIN_AGENT_IMAGE", "centaur-agent:thin")
 
 default:
     just --list
@@ -59,7 +58,6 @@ build-one service:
       slackbotv2) just _build-slackbotv2 ;;
       discordbot) just _build-discordbot ;;
       agent|sandbox) just _build-agent ;;
-      agent-thin|sandbox-thin) just _build-agent-thin ;;
       console) just _build-console ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
     esac
@@ -83,9 +81,6 @@ _build-agent:
 # the other services which build from the repo root.
 _build-console:
     docker build -t centaur-console:latest -f services/console/Dockerfile services/console
-
-_build-agent-thin:
-    docker build --target sandbox -t "{{thin_agent_image}}" -f services/sandbox/Dockerfile.thin .
 
 # Push locally-built images to the local registry under library/ so k3s pulls
 # them via its docker.io mirror. Used by `just up k3s`. Only changed layers are

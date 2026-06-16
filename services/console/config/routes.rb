@@ -26,13 +26,22 @@ Rails.application.routes.draw do
   root "console#principals"
   get "console/principals", to: "console#principals", as: :console_principals
   get "console/principals/:id", to: "console#principal", as: :console_principal
+  # Role assignments and direct grants managed from the principal detail page. The
+  # extra /roles and /grants path segments keep these clear of the show route above
+  # and avoid clobbering the console_principal_path helper.
+  namespace :console do
+    post   "principals/:id/roles",            to: "principals#assign_role",   as: :principal_assign_role
+    delete "principals/:id/roles/:role_id",   to: "principals#unassign_role", as: :principal_unassign_role
+    post   "principals/:id/grants",           to: "principals#grant_secret",  as: :principal_grant_secret
+    delete "principals/:id/grants/:grant_id", to: "principals#revoke_grant",  as: :principal_revoke_grant
+  end
   get "console/secrets", to: "console#secrets", as: :console_secrets
   # One controller per secret kind for the create/edit forms. Declared before the
   # show route so their paths win over the generic `:kind/:id` match.
   namespace :console do
-    resources :static_secrets, only: %i[new create edit update], path: "secrets/static"
-    resources :pg_dsn_secrets, only: %i[new create edit update], path: "secrets/pg_dsn"
-    resources :gcp_auth_secrets, only: %i[new create edit update], path: "secrets/gcp_auth"
+    resources :static_secrets, only: %i[new create edit update destroy], path: "secrets/static"
+    resources :pg_dsn_secrets, only: %i[new create edit update destroy], path: "secrets/pg_dsn"
+    resources :gcp_auth_secrets, only: %i[new create edit update destroy], path: "secrets/gcp_auth"
   end
   get "console/secrets/:kind/:id", to: "console#secret", as: :console_secret
   get "console/credentials", to: "console#credentials", as: :console_credentials
