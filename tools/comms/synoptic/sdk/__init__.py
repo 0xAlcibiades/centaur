@@ -1,4 +1,5 @@
 """Twitter SDK - Lightweight Twitter API client library."""
+# ruff: noqa
 
 from .clients.synoptic import (
     BUDGET_EXCEEDED_ERROR,

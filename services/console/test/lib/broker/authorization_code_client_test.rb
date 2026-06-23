@@ -47,6 +47,7 @@ module Broker
       assert_equal 3600, result.expires_in
       assert_equal "openid email", result.scope
       assert_equal "the.id.token", result.id_token
+      assert_equal "AT", result.response["access_token"]
 
       form = http.captured[:form]
       assert_equal "authorization_code", form["grant_type"]
@@ -70,6 +71,13 @@ module Broker
       assert_equal "invalid_grant", err.reason
     end
 
+    test "Slack-style ok false response raises an oauth ExchangeError" do
+      client, _ = client_with(status: 200, body: { ok: false, error: "invalid_code" }.to_json)
+      err = assert_raises(ExchangeError) { client.exchange(**base_args) }
+      assert_equal "oauth", err.stage
+      assert_equal "invalid_code", err.code
+    end
+
     test "5xx raises an http ExchangeError" do
       client, _ = client_with(status: 503, body: "upstream down")
       err = assert_raises(ExchangeError) { client.exchange(**base_args) }
@@ -88,6 +96,30 @@ module Broker
       result = client.exchange(**base_args, require_refresh_token: false)
       assert_equal "AT", result.access_token
       assert_nil result.refresh_token
+    end
+
+    test "parses Slack nested authed_user token payload" do
+      body = {
+        ok: true,
+        access_token: "BOT",
+        refresh_token: "BOT-RT",
+        expires_in: 43_200,
+        scope: "commands",
+        authed_user: {
+          id: "U123",
+          access_token: "USER",
+          refresh_token: "USER-RT",
+          expires_in: 43_200,
+          scope: "channels:history,im:history"
+        }
+      }.to_json
+
+      client, _ = client_with(status: 200, body: body)
+      result = client.exchange(**base_args)
+      assert_equal "USER", result.access_token
+      assert_equal "USER-RT", result.refresh_token
+      assert_equal "channels:history,im:history", result.scope
+      assert_equal "U123", result.response.dig("authed_user", "id")
     end
 
     test "empty access_token raises a parse error" do

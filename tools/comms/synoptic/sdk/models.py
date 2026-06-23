@@ -1,4 +1,5 @@
 """API response models for Twitter SDK."""
+# ruff: noqa
 
 from enum import Enum
 

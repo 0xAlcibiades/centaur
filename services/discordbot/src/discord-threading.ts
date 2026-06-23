@@ -82,6 +82,47 @@ export async function renameThreadFromMessage(
   }
 }
 
+/**
+ * Best-effort fetch of a Discord channel's name (`GET /channels/{id}`), used to
+ * name the session principal in iron-control. Returns undefined on any failure
+ * — the name is cosmetic, so a lookup failure just falls back to the synthetic
+ * id-based principal name in api-rs.
+ */
+export async function fetchDiscordChannelName(
+  options: DiscordbotOptions,
+  channelId: string,
+  logger: Logger,
+): Promise<string | undefined> {
+  const fetchFn = options.fetch ?? fetch;
+  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
+    /\/$/,
+    "",
+  );
+  try {
+    const response = await fetchFn(`${apiBase}/channels/${channelId}`, {
+      method: "GET",
+      headers: { authorization: `Bot ${options.botToken}` },
+    });
+    if (!response.ok) {
+      logger.warn("discordbot_channel_name_failed", {
+        status: response.status,
+        channel_id: channelId,
+      });
+      return undefined;
+    }
+    const channel = (await response.json()) as { name?: unknown };
+    return typeof channel.name === "string" && channel.name.length > 0
+      ? channel.name
+      : undefined;
+  } catch (error) {
+    logger.warn("discordbot_channel_name_error", {
+      error: error instanceof Error ? error.message : String(error),
+      channel_id: channelId,
+    });
+    return undefined;
+  }
+}
+
 function clipOneLine(value: string, max: number): string {
   const oneLine = value.replace(/\s+/g, " ").trim();
   if (oneLine.length <= max) return oneLine;

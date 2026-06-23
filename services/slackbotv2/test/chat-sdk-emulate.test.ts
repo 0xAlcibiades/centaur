@@ -12,6 +12,7 @@ import { createMemoryState } from '@chat-adapter/state-memory'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
+  normalizeSlackText,
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2ApiMessage,
@@ -32,6 +33,14 @@ const TEAM_ID = 'T000000001'
 const CHANNEL_ID = 'C000000001'
 /** How real Slack renders a streamed message whose stream broke or was never stopped. */
 const BROKEN_STREAM_TEXT = ':warning: Something went wrong'
+
+describe('normalizeSlackText', () => {
+  it('preserves Slack channel IDs when rendering labeled channel mentions', () => {
+    expect(normalizeSlackText('<#C0AJ07U8Z1N|eng-centaur>')).toBe(
+      '#eng-centaur (C0AJ07U8Z1N)'
+    )
+  })
+})
 
 let emulator: Emulator
 let slackApi: PatchedSlackApi
@@ -1312,6 +1321,85 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('swaps the streamed message for the durable final answer when the live answer diverges', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a diverging render.')
+    const mentionText = `<@${BOT_USER_ID}> answer with a late correction`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-divergence-swap',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const draft = 'Draft answer from the live deltas.'
+    const finalAnswer = 'Final reconciled answer from the result.'
+    // Stream a plan + the draft answer (so the answer delta reaches Slack), then
+    // seal the answer item with a DIFFERENT canonical text. The recomposed
+    // answer no longer extends the already-streamed text, so the renderer
+    // freezes the live stream instead of interleaving, and the render swaps the
+    // message for the durable result.
+    codexApi.emitOutputLines(
+      key,
+      sampleCodexNotifications(draft).map(notification => JSON.stringify(notification))
+    )
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'agentMessage',
+            id: 'answer-1',
+            text: finalAnswer,
+            phase: 'final_answer',
+            memoryCitation: null
+          }
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-divergence-swap',
+      status: 'completed',
+      result_text: finalAnswer
+    })
+
+    await Promise.all(waits)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3000)
+
+    const texts = await threadTexts(parent.ts)
+    // The streamed message was replaced in place with the durable final answer...
+    expect(texts.filter(text => text.includes(finalAnswer))).toHaveLength(1)
+    // ...and the diverging live draft is gone (neither interleaved nor left behind).
+    expect(texts.some(text => text.includes('Draft answer from the live deltas'))).toBe(false)
+  })
+
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -1478,6 +1566,99 @@ describe('slackbotv2', () => {
     }
   })
 
+  it('marks open tasks complete before rotating an aged progress segment', async () => {
+    process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
+    try {
+      codexApi.autoRespond = false
+
+      const parent = await postUserMessage('Context before an aged open task.')
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> keep thinking`, parent.ts)
+      const key = threadKey(parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: 'Ev-slackbotv2-open-task-age-rotation',
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> keep thinking`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.executes.length === 1)
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      await waitFor(() => codexApi.streamCount === 1)
+
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.started',
+          item: {
+            id: 'cmd-aging-open',
+            type: 'commandExecution',
+            command: `sleep 1 # ${'x'.repeat(300)}`,
+            status: 'inProgress'
+          }
+        })
+      )
+      await waitFor(() =>
+        slackApi.calls.some(call =>
+          streamChunks(call.body.chunks).some(
+            chunk => chunk.id === 'cmd-aging-open' && chunk.status === 'in_progress'
+          )
+        )
+      )
+
+      await new Promise(resolve => setTimeout(resolve, 250))
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.completed',
+          item: {
+            id: 'cmd-aging-open',
+            type: 'commandExecution',
+            command: 'sleep 1',
+            status: 'completed',
+            aggregatedOutput: ''
+          }
+        })
+      )
+      codexApi.emitSessionEvent(key, 'session.execution_completed', {
+        execution_id: 'exe-open-task-age-rotation',
+        status: 'completed',
+        result_text: 'OPEN_TASK_AGE_ROTATION_OK'
+      })
+
+      await Promise.all(waits)
+      const transcripts = slackStreamTranscripts(slackApi.calls)
+      expect(transcripts.length).toBeGreaterThan(1)
+      const taskTranscripts = transcripts.filter(transcript =>
+        transcript.chunks.some(chunk => chunk.type === 'task_update' && chunk.id === 'cmd-aging-open')
+      )
+      expect(taskTranscripts.length).toBeGreaterThan(0)
+      for (const transcript of taskTranscripts) {
+        const statuses = transcript.chunks
+          .filter(chunk => chunk.type === 'task_update' && chunk.id === 'cmd-aging-open')
+          .map(chunk => stringField(chunk.status))
+        expect(statuses[statuses.length - 1]).toBe('complete')
+      }
+      const texts = await threadTexts(parent.ts)
+      expect(texts.some(text => text.includes(BROKEN_STREAM_TEXT))).toBe(false)
+      expect(texts.filter(text => text.includes('OPEN_TASK_AGE_ROTATION_OK'))).toHaveLength(1)
+    } finally {
+      delete process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS
+    }
+  })
+
   it('rotates structured plan segments before they exceed the task char budget', async () => {
     process.env.SLACK_STREAM_SEGMENT_TASK_CHAR_BUDGET = '400'
     try {
@@ -1549,6 +1730,101 @@ describe('slackbotv2', () => {
         text.includes('BUDGET_ROTATION_ANSWER_VISIBLE')
       )
       expect(visibleFinalReplies).toHaveLength(1)
+    } finally {
+      delete process.env.SLACK_STREAM_SEGMENT_TASK_CHAR_BUDGET
+    }
+  })
+
+  it('seals open tasks before stopping older structured progress segments', async () => {
+    process.env.SLACK_STREAM_SEGMENT_TASK_CHAR_BUDGET = '520'
+    try {
+      codexApi.autoRespond = false
+
+      const parent = await postUserMessage('Context before an open card spillover.')
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> keep one step open`, parent.ts)
+      const key = threadKey(parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: 'Ev-slackbotv2-open-task-structured-spillover',
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> keep one step open`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.executes.length === 1)
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      await waitFor(() => codexApi.streamCount === 1)
+
+      codexApi.emitOutputLine(
+        key,
+        JSON.stringify({
+          type: 'item.started',
+          item: {
+            id: 'cmd-open-spillover',
+            type: 'commandExecution',
+            command: `sleep 1 # ${'x'.repeat(220)}`,
+            status: 'inProgress'
+          }
+        })
+      )
+      await waitFor(() =>
+        slackApi.calls.some(call =>
+          streamChunks(call.body.chunks).some(
+            chunk => chunk.id === 'cmd-open-spillover' && chunk.status === 'in_progress'
+          )
+        )
+      )
+
+      for (let index = 1; index <= 4; index += 1) {
+        codexApi.emitOutputLine(
+          key,
+          JSON.stringify({
+            type: 'item.completed',
+            item: {
+              id: `cmd-spillover-${index}`,
+              type: 'commandExecution',
+              command: `printf spillover-${index} ${'x'.repeat(220)}`,
+              status: 'completed',
+              aggregatedOutput: ''
+            }
+          })
+        )
+      }
+      codexApi.emitSessionEvent(key, 'session.execution_completed', {
+        execution_id: 'exe-open-task-structured-spillover',
+        status: 'completed',
+        result_text: 'OPEN_TASK_STRUCTURED_SPILLOVER_OK'
+      })
+
+      await Promise.all(waits)
+      const transcripts = slackStreamTranscripts(slackApi.calls)
+      expect(transcripts.length).toBeGreaterThanOrEqual(2)
+      const taskTranscripts = transcripts.filter(transcript =>
+        transcript.chunks.some(
+          chunk => chunk.type === 'task_update' && chunk.id === 'cmd-open-spillover'
+        )
+      )
+      expect(taskTranscripts.length).toBeGreaterThan(0)
+      for (const transcript of taskTranscripts) {
+        const statuses = transcript.chunks
+          .filter(chunk => chunk.type === 'task_update' && chunk.id === 'cmd-open-spillover')
+          .map(chunk => stringField(chunk.status))
+        expect(statuses).toContain('in_progress')
+        expect(statuses[statuses.length - 1]).toBe('complete')
+      }
+      expect(await threadText(parent.ts)).toContain('OPEN_TASK_STRUCTURED_SPILLOVER_OK')
     } finally {
       delete process.env.SLACK_STREAM_SEGMENT_TASK_CHAR_BUDGET
     }
@@ -2297,6 +2573,8 @@ describe('slackbotv2', () => {
   })
 
   it('shows assistant status while waiting for slow session execute', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({ logger: captureLogger(logs) })
     codexApi.autoRespond = false
     const releaseExecute = codexApi.holdNextExecute()
 
@@ -2337,10 +2615,57 @@ describe('slackbotv2', () => {
     ).toEqual(['Thinking...'])
     expect(slackApi.calls.some(call => call.method === 'chat.startStream')).toBe(false)
     expect(codexApi.eventRequests).toHaveLength(0)
+    await waitFor(() => hasLog(logs, 'slackbotv2_webhook_handoff_wait_started'))
+    expect(logData(logs, 'slackbotv2_handoff_started')).toEqual(
+      expect.objectContaining({
+        assistant_status_requested: true,
+        message_id: mention.ts,
+        mode: 'execute',
+        thread_id: threadKey(parent.ts),
+        trigger: 'new_mention'
+      })
+    )
+    expect(logData(logs, 'slackbotv2_assistant_status_started')).toEqual(
+      expect.objectContaining({
+        message_id: mention.ts,
+        operation: 'set',
+        thread_id: threadKey(parent.ts)
+      })
+    )
+    expect(logData(logs, 'slackbotv2_assistant_status_complete')).toEqual(
+      expect.objectContaining({
+        operation: 'set',
+        visible: true
+      })
+    )
+    expect(logData(logs, 'slackbotv2_handoff_sync_starting')).toEqual(
+      expect.objectContaining({
+        initial_assistant_status_visible: true,
+        trigger: 'new_mention'
+      })
+    )
+    expect(logData(logs, 'slackbotv2_webhook_handoff_wait_started')).toEqual(
+      expect.objectContaining({
+        slack_channel: CHANNEL_ID,
+        slack_event_id: 'Ev-slackbotv2-slow-execute',
+        slack_event_type: 'app_mention',
+        slack_message_ts: mention.ts,
+        slack_thread_ts: parent.ts,
+        task_count: expect.any(Number)
+      })
+    )
 
     releaseExecute()
     const response = await responsePromise
     expect(response.status).toBe(200)
+    await waitFor(() => hasLog(logs, 'slackbotv2_webhook_handoff_wait_complete'))
+    expect(logData(logs, 'slackbotv2_webhook_handoff_wait_complete')).toEqual(
+      expect.objectContaining({
+        phase_ms: expect.any(Number),
+        retryable_error_count: 0,
+        slack_event_id: 'Ev-slackbotv2-slow-execute'
+      })
+    )
     await waitFor(() => codexApi.eventRequests.length === 1)
     await waitFor(() => codexApi.streamCount === 1)
     codexApi.closeStreams()
@@ -2414,6 +2739,67 @@ describe('slackbotv2', () => {
       })
     )
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
+  })
+
+  it('skips stale render obligations from Chat SDK state on startup', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+
+    const parent = await postUserMessage('Context before stale recovery.')
+    const mentionText = `<@${BOT_USER_ID}> this answer is too old to recover`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = {
+      ...apiMessageFromSlackEvent({
+        isMention: true,
+        text: mentionText,
+        threadId: key,
+        ts: mention.ts
+      }),
+      timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+    }
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-stale-recovery',
+        message
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Stale recovered request.'))
+
+    bot = createTestBot({
+      logger: captureLogger(logs),
+      renderRecoveryMaxObligationAgeMs: 60 * 60 * 1000,
+      state: sharedState
+    })
+
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 2000)
+
+    expect(codexApi.eventRequests).toHaveLength(0)
+    expect(slackApi.calls.some(call => call.method === 'chat.startStream')).toBe(false)
+    expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(false)
+    const staleState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(staleState).toEqual(
+      expect.objectContaining({ activeExecution: false, renderObligation: null })
+    )
+    expect(logData(logs, 'slackbotv2_render_recovery_stale_obligation_skipped')).toEqual(
+      expect.objectContaining({
+        execution_id: 'exe-stale-recovery',
+        max_obligation_age_ms: 60 * 60 * 1000,
+        message_id: mention.ts,
+        thread_id: key
+      })
+    )
   })
 
   it('does not let one hung recovery block the obligations queued behind it', async () => {
@@ -2923,6 +3309,34 @@ function createTestBot(
     state: createMemoryState(),
     ...overrides
   })
+}
+
+type CapturedLog = {
+  data?: unknown
+  event: string
+  level: 'debug' | 'info' | 'warn' | 'error'
+}
+
+function captureLogger(
+  logs: CapturedLog[]
+): NonNullable<Parameters<typeof createSlackbotV2>[0]['logger']> {
+  const logger: NonNullable<Parameters<typeof createSlackbotV2>[0]['logger']> = {
+    debug: (event: string, data?: unknown) => logs.push({ data, event, level: 'debug' }),
+    info: (event: string, data?: unknown) => logs.push({ data, event, level: 'info' }),
+    warn: (event: string, data?: unknown) => logs.push({ data, event, level: 'warn' }),
+    error: (event: string, data?: unknown) => logs.push({ data, event, level: 'error' }),
+    child: () => logger
+  }
+  return logger
+}
+
+function hasLog(logs: CapturedLog[], event: string): boolean {
+  return logs.some(log => log.event === event)
+}
+
+function logData(logs: CapturedLog[], event: string): Record<string, unknown> | undefined {
+  const data = logs.find(log => log.event === event)?.data
+  return isRecord(data) ? data : undefined
 }
 
 function sampleCodexNotifications(answer: string): ServerNotification[] {

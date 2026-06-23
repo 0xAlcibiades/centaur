@@ -1,10 +1,25 @@
-import { describe, expect, it } from "bun:test";
-import type { Thread } from "chat";
-import { hasLiveActiveExecution, streamAnswerToThread } from "../src/index";
-import type { DiscordbotOptions } from "../src/types";
+import { beforeEach, describe, expect, it } from "bun:test";
+import type { Logger, Thread } from "chat";
+import {
+  clearConversationNameCacheForTests,
+  hasLiveActiveExecution,
+  resolveDiscordConversationName,
+  streamAnswerToThread,
+} from "../src/index";
+import type { DiscordbotFetch, DiscordbotOptions } from "../src/types";
 import { AsyncTextQueue } from "../src/utils";
 
 const TTL_MS = 30 * 60 * 1000;
+
+const noopLogger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  child() {
+    return noopLogger;
+  },
+} as unknown as Logger;
 
 describe("hasLiveActiveExecution", () => {
   it("is false when no execution is marked", () => {
@@ -154,5 +169,74 @@ describe("streamAnswerToThread", () => {
     expect(messages.length).toBe(2);
     expect(messages[0]?.content).toBe("partial answer ");
     expect(messages[1]?.content).toContain("⚠️");
+  });
+});
+
+describe("resolveDiscordConversationName", () => {
+  beforeEach(() => clearConversationNameCacheForTests());
+
+  function options(fetchFn: DiscordbotFetch): DiscordbotOptions {
+    return {
+      apiUrl: "http://localhost",
+      applicationId: "app",
+      botToken: "token",
+      discordApiUrl: "https://discord.test/api",
+      fetch: fetchFn,
+      publicKey: "key",
+    };
+  }
+
+  it("resolves the channel name from GET /channels/{channelId}", async () => {
+    const fetchFn: DiscordbotFetch = async (url) => {
+      expect(String(url)).toBe("https://discord.test/api/channels/C1");
+      return Response.json({ name: "general" });
+    };
+    expect(
+      await resolveDiscordConversationName(
+        options(fetchFn),
+        "discord:G1:C1:T1",
+        noopLogger,
+      ),
+    ).toBe("general");
+  });
+
+  it("caches by channel so a second thread does not re-fetch", async () => {
+    let fetches = 0;
+    const fetchFn: DiscordbotFetch = async () => {
+      fetches += 1;
+      return Response.json({ name: "general" });
+    };
+    const opts = options(fetchFn);
+    expect(
+      await resolveDiscordConversationName(opts, "discord:G1:C1:T1", noopLogger),
+    ).toBe("general");
+    expect(
+      await resolveDiscordConversationName(opts, "discord:G1:C1:T2", noopLogger),
+    ).toBe("general");
+    expect(fetches).toBe(1);
+  });
+
+  it("returns undefined when the thread key has no channel segment", async () => {
+    let fetched = false;
+    const fetchFn: DiscordbotFetch = async () => {
+      fetched = true;
+      return Response.json({ name: "general" });
+    };
+    expect(
+      await resolveDiscordConversationName(options(fetchFn), "api", noopLogger),
+    ).toBeUndefined();
+    expect(fetched).toBe(false);
+  });
+
+  it("returns undefined (never throws) when the channel fetch fails", async () => {
+    const fetchFn: DiscordbotFetch = async () =>
+      Response.json({ message: "Missing Access" }, { status: 403 });
+    expect(
+      await resolveDiscordConversationName(
+        options(fetchFn),
+        "discord:G1:C1:T1",
+        noopLogger,
+      ),
+    ).toBeUndefined();
   });
 });

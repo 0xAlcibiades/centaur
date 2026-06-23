@@ -1,4 +1,5 @@
 """Synoptic Twitter API client with retry logic and connection reuse."""
+# ruff: noqa
 
 from __future__ import annotations
 

@@ -220,7 +220,57 @@ if effort:
                 break
         else:
             lines.insert(first_table, override)
-path.write_text("\n".join(lines).rstrip() + "\n")
+
+text = "\n".join(lines).rstrip() + "\n"
+
+# CODEX_BEDROCK_REGION: when codex's built-in `amazon-bedrock` provider is enabled
+# (the api-rs sandbox env injects this), pin its AWS region from the SAME env var
+# that scopes iron-proxy's SigV4 re-signing, so the in-sandbox client signs/sends
+# for the region the proxy is bound to. One source of truth instead of a
+# hand-written CODEX_CONFIG_OVERLAY that can silently disagree and fail signing.
+# Applied before the overlay below, so an operator can still override it. tomli_w
+# quotes the value (no TOML injection); a parse failure just skips the patch.
+bedrock_region = (os.environ.get("CODEX_BEDROCK_REGION") or "").strip()
+if bedrock_region:
+    import tomllib
+    import tomli_w
+
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        print(f"ignoring CODEX_BEDROCK_REGION patch: {exc}", file=sys.stderr)
+    else:
+        config.setdefault("model_providers", {}).setdefault(
+            "amazon-bedrock", {}
+        ).setdefault("aws", {})["region"] = bedrock_region
+        text = tomli_w.dumps(config)
+
+# CODEX_CONFIG_OVERLAY: deep-merge an operator-supplied TOML fragment over the
+# baked config so a deployment can configure codex -- e.g. point it at a custom
+# model provider via a [model_providers.*] block -- through sandbox.extraEnv,
+# without forking config.toml. Unset is a no-op; invalid TOML is ignored (the
+# baked config stands) rather than written.
+overlay_raw = (os.environ.get("CODEX_CONFIG_OVERLAY") or "").strip()
+if overlay_raw:
+    import tomllib
+    import tomli_w
+
+    def _deep_merge(base, overlay):
+        for key, value in overlay.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                _deep_merge(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    try:
+        merged = _deep_merge(tomllib.loads(text), tomllib.loads(overlay_raw))
+    except tomllib.TOMLDecodeError as exc:
+        print(f"ignoring invalid CODEX_CONFIG_OVERLAY: {exc}", file=sys.stderr)
+    else:
+        text = tomli_w.dumps(merged)
+
+path.write_text(text)
 PYEOF
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
@@ -231,6 +281,39 @@ fi
 mkdir -p "$HOME_DIR/.claude"
 if [ -f "$HARNESS_CONFIG_DIR/claude/settings.json" ]; then
     cp "$HARNESS_CONFIG_DIR/claude/settings.json" "$HOME_DIR/.claude/settings.json"
+fi
+
+# CLAUDE_SETTINGS_OVERLAY: deep-merge an operator-supplied JSON fragment over the
+# baked settings.json (symmetric to CODEX_CONFIG_OVERLAY), so a deployment can
+# configure Claude Code via sandbox.extraEnv without forking the image. Unset is
+# a no-op; invalid JSON is ignored.
+if [ -n "${CLAUDE_SETTINGS_OVERLAY:-}" ]; then
+    CLAUDE_SETTINGS_PATH="$HOME_DIR/.claude/settings.json" python3 - <<'PYEOF'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.environ["CLAUDE_SETTINGS_PATH"])
+try:
+    overlay = json.loads(os.environ["CLAUDE_SETTINGS_OVERLAY"])
+except json.JSONDecodeError as exc:
+    print(f"ignoring invalid CLAUDE_SETTINGS_OVERLAY: {exc}", file=sys.stderr)
+    sys.exit(0)
+existing = path.read_text() if path.exists() else ""
+base = json.loads(existing) if existing.strip() else {}
+
+def _deep_merge(b, o):
+    for key, value in o.items():
+        if isinstance(value, dict) and isinstance(b.get(key), dict):
+            _deep_merge(b[key], value)
+        else:
+            b[key] = value
+    return b
+
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(_deep_merge(base, overlay), indent=2) + "\n")
+PYEOF
 fi
 
 # CLAUDE_CODE_AUTH_MODE selects how Claude Code authenticates with the upstream
@@ -304,56 +387,8 @@ fi
 mkdir -p "$HOME_DIR/uploads"
 
 # ── Copy project skills into workspace (so `skill` tool discovers them) ──────
-BAKED_IN_CENTAUR_SKILLS="$HOME_DIR/.agents/skills"
-MOUNTED_CENTAUR_SKILLS="$HOME_DIR/centaur-skills"
-MOUNTED_ORG_SKILLS="$HOME_DIR/centaur-overlay-skills"
-OVERLAY_TREE_SKILLS=""
-if [ -n "${CENTAUR_OVERLAY_DIR:-}" ] && [ -d "${CENTAUR_OVERLAY_DIR}/.agents/skills" ]; then
-    OVERLAY_TREE_SKILLS="${CENTAUR_OVERLAY_DIR}/.agents/skills"
-fi
-CENTAUR_SKILLS=""
-if [ -d "$HOME_DIR/github" ]; then
-    CENTAUR_SKILLS="$(find "$HOME_DIR/github" -path '*/centaur/.agents/skills' -type d -print -quit 2>/dev/null || true)"
-fi
-WS_SKILLS="$WORKSPACE_DIR/.agents/skills"
-
-copy_skill_dir() {
-    local skills_src="$1"
-    local skill_entry skill_name
-    if [ ! -d "$skills_src" ]; then
-        return 0
-    fi
-    mkdir -p "$WS_SKILLS"
-    for skill_entry in "$skills_src"/* "$skills_src"/.[!.]* "$skills_src"/..?*; do
-        if [ ! -e "$skill_entry" ]; then
-            continue
-        fi
-        skill_name="$(basename "$skill_entry")"
-        rm -rf "$WS_SKILLS/$skill_name"
-        cp -R "$skill_entry" "$WS_SKILLS"/
-    done
-}
-
-for SKILLS_SRC in "$BAKED_IN_CENTAUR_SKILLS" "$MOUNTED_CENTAUR_SKILLS" "$CENTAUR_SKILLS" "$MOUNTED_ORG_SKILLS" "$OVERLAY_TREE_SKILLS"; do
-    copy_skill_dir "$SKILLS_SRC"
-done
-
-if [ -n "${CENTAUR_SKILL_DIRS:-}" ]; then
-    IFS=':' read -ra _centaur_skill_dirs <<< "$CENTAUR_SKILL_DIRS"
-    for SKILLS_SRC in "${_centaur_skill_dirs[@]}"; do
-        if [ -n "$SKILLS_SRC" ]; then
-            copy_skill_dir "$SKILLS_SRC"
-        fi
-    done
-    unset _centaur_skill_dirs
-fi
-unset -f copy_skill_dir
-
-if [ -d "$WS_SKILLS" ]; then
-    mkdir -p "$WORKSPACE_DIR/.claude"
-    rm -rf "$WORKSPACE_DIR/.claude/skills"
-    ln -sf "$WS_SKILLS" "$WORKSPACE_DIR/.claude/skills"
-fi
+WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \
+    || echo "warning: failed to reload Centaur skills" >&2
 
 # ── Assemble system prompt from bind mounts ──────────────────────────────────
 # Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.

@@ -128,6 +128,25 @@ describe('forwardToSessionApi overrides', () => {
     expect('model' in line).toBe(false)
   })
 
+  test('includes reasoning override on the execute input line', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('audit this'), { reasoning: 'high' })
+    )
+    const execute = requests.find(request => request.url.endsWith('/execute'))
+    const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
+    expect(line.reasoning).toBe('high')
+  })
+
+  test('omits reasoning field when no override is set', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
+    const execute = requests.find(request => request.url.endsWith('/execute'))
+    const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
+    expect('reasoning' in line).toBe(false)
+  })
+
   test('retries session creation with existing harness on 409 conflict', async () => {
     const { fetchFn, requests } = fakeApi({
       createSession: [
@@ -184,6 +203,16 @@ describe('forwardToSessionApi overrides', () => {
     await expect(
       forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
     ).rejects.toThrow('create session failed: 500')
+  })
+
+  test('times out when session creation never settles', async () => {
+    const fetchFn = (() => new Promise<Response>(() => undefined)) as SlackbotV2Options['fetch']
+    await expect(
+      forwardToSessionApi(
+        { ...options(fetchFn), sessionApiTimeoutMs: 25 },
+        forwardInput(apiMessage('hi'))
+      )
+    ).rejects.toThrow('create session timed out after 25ms')
   })
 })
 
@@ -306,7 +335,7 @@ describe('session principal display name', () => {
   // stubbed by swapping globalThis.fetch for the duration of the run; the
   // session API itself still goes through the injected options.fetch.
   async function withSlackStub(
-    stub: (url: string) => Response,
+    stub: (url: string) => Promise<Response> | Response,
     run: () => Promise<void>
   ): Promise<void> {
     const realFetch = globalThis.fetch
@@ -333,6 +362,29 @@ describe('session principal display name', () => {
       }
     )
     expect(createBody(requests).metadata?.slack_conversation_name).toBe('eng-oncall')
+  })
+
+  test('continues creating the session when the channel lookup never settles', async () => {
+    const { fetchFn, requests } = fakeApi()
+    let slackCalls = 0
+    await withSlackStub(
+      url => {
+        if (url.includes('conversations.info')) {
+          slackCalls += 1
+          return new Promise<Response>(() => undefined)
+        }
+        return Response.json({ ok: true })
+      },
+      async () => {
+        await forwardToSessionApi(
+          { ...slackOptions(fetchFn), slackApiTimeoutMs: 25 },
+          forwardInput(apiMessage('hi'))
+        )
+      }
+    )
+    expect(slackCalls).toBe(1)
+    expect('slack_conversation_name' in (createBody(requests).metadata ?? {})).toBe(false)
+    expect(requests.some(request => request.url.endsWith('/execute'))).toBe(true)
   })
 
   test('DM sessions name the principal after the DM partner', async () => {

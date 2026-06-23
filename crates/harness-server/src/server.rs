@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::amp::AmpHarness;
 use crate::claude::ClaudeCodeHarness;
 use crate::codex::CodexHarnessServer;
+use crate::otel::TraceContext;
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
     NormalizedEvent, ThreadState,
@@ -34,7 +35,7 @@ use crate::{HarnessServerError, Result};
 
 pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
     match kind {
-        HarnessKind::Codex => Box::new(CodexHarnessServer),
+        HarnessKind::Codex => Box::new(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => Box::new(AppServerNormalizer::new(ClaudeCodeHarness)),
         HarnessKind::Amp => Box::new(AppServerNormalizer::new(AmpHarness)),
     }
@@ -46,7 +47,7 @@ pub fn run_harness_server(kind: HarnessKind) -> Result<()> {
 
 pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
     match kind {
-        HarnessKind::Codex => crate::codex::run_codex_blocks_server(),
+        HarnessKind::Codex => crate::codex::run_codex_blocks_server(CodexHarnessServer::codex()),
         HarnessKind::ClaudeCode => run_blocks_app_server(&ClaudeCodeHarness),
         HarnessKind::Amp => run_blocks_app_server(&AmpHarness),
     }
@@ -92,6 +93,12 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 input,
                 client_user_message_id,
                 model,
+                // Provider selection and reasoning effort only apply to the codex
+                // harness; the emulated (claude/amp) app-server has no equivalent
+                // knob (its provider is fixed at thread start from session params).
+                provider: _,
+                reasoning: _,
+                trace_context: _,
             }) => {
                 if let Some(model) = model {
                     state.model = model;
@@ -196,6 +203,9 @@ pub(crate) enum BlocksCommand {
         input: Vec<UserInput>,
         client_user_message_id: Option<String>,
         model: Option<String>,
+        provider: Option<String>,
+        reasoning: Option<String>,
+        trace_context: TraceContext,
     },
     Interrupt,
     AttachmentChunk,
@@ -228,6 +238,18 @@ struct BlocksLine {
     client_user_message_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thread_key: Option<String>,
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    trace_metadata: Option<Value>,
     #[serde(rename = "attachmentId", default)]
     attachment_id: Option<String>,
     #[serde(default)]
@@ -240,6 +262,27 @@ struct BlocksLine {
     final_chunk: bool,
     #[serde(rename = "dataBase64", default)]
     data_base64: Option<String>,
+}
+
+impl BlocksLine {
+    fn trace_context(&self) -> TraceContext {
+        TraceContext {
+            thread_key: clean_string(self.thread_key.as_deref()),
+            trace_id: clean_string(self.trace_id.as_deref()),
+            traceparent: clean_string(self.traceparent.as_deref()),
+            metadata: self
+                .trace_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .map(|metadata| {
+                    metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +347,7 @@ pub(crate) fn parse_blocks_line_with_state(
 
     match parsed.kind.as_str() {
         "user" => {
+            let trace_context = parsed.trace_context();
             let content = parsed
                 .message
                 .as_ref()
@@ -336,6 +380,15 @@ pub(crate) fn parse_blocks_line_with_state(
                     .model
                     .map(|model| model.trim().to_owned())
                     .filter(|model| !model.is_empty()),
+                provider: parsed
+                    .provider
+                    .map(|provider| provider.trim().to_owned())
+                    .filter(|provider| !provider.is_empty()),
+                reasoning: parsed
+                    .reasoning
+                    .map(|reasoning| reasoning.trim().to_owned())
+                    .filter(|reasoning| !reasoning.is_empty()),
+                trace_context,
             })
         }
         "attachment.chunk" => {
@@ -603,6 +656,10 @@ fn is_image_attachment(attachment_type: Option<&str>, mime_type: Option<&str>) -
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn clean_string(value: Option<&str>) -> Option<String> {
+    non_empty(value).map(ToOwned::to_owned)
 }
 
 fn handle_request<H: HarnessServer, W: Write>(
@@ -1157,12 +1214,83 @@ mod tests {
     }
 
     #[test]
+    fn parses_blocks_user_line_with_trace_context() {
+        let line = r#"{"type":"user","thread_key":"web:t1","trace_id":"01234567-89ab-cdef-0123-456789abcdef","traceparent":"00-0123456789abcdef0123456789abcdef-0123456789abcdef-01","trace_metadata":{"execution_id":"exe_123"},"text":"hi"}"#;
+        let BlocksCommand::User { trace_context, .. } = parse_blocks_line(line).expect("parses")
+        else {
+            panic!("expected user command");
+        };
+
+        assert_eq!(trace_context.thread_key.as_deref(), Some("web:t1"));
+        assert_eq!(
+            trace_context.trace_id.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(
+            trace_context.traceparent.as_deref(),
+            Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
+        );
+        assert_eq!(
+            trace_context
+                .metadata
+                .get("execution_id")
+                .and_then(Value::as_str),
+            Some("exe_123")
+        );
+    }
+
+    #[test]
     fn ignores_blank_model_on_blocks_user_line() {
         let line = r#"{"type":"user","model":"  ","text":"hi"}"#;
         let BlocksCommand::User { model, .. } = parse_blocks_line(line).expect("parses") else {
             panic!("expected user command");
         };
         assert_eq!(model, None);
+    }
+
+    #[test]
+    fn parses_blocks_user_line_with_provider_override() {
+        let line = r#"{"type":"user","thread_key":"web:t1","provider":"amazon-bedrock","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let BlocksCommand::User { provider, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        assert_eq!(provider.as_deref(), Some("amazon-bedrock"));
+    }
+
+    #[test]
+    fn ignores_blank_provider_on_blocks_user_line() {
+        let line = r#"{"type":"user","provider":"  ","text":"hi"}"#;
+        let BlocksCommand::User { provider, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        assert_eq!(provider, None);
+    }
+
+    #[test]
+    fn parses_blocks_user_line_with_reasoning_override() {
+        let line = r#"{"type":"user","thread_key":"web:t1","reasoning":"high","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let BlocksCommand::User { reasoning, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        assert_eq!(reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn ignores_blank_reasoning_on_blocks_user_line() {
+        let line = r#"{"type":"user","reasoning":"  ","text":"hi"}"#;
+        let BlocksCommand::User { reasoning, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn defaults_reasoning_to_none_when_absent() {
+        let line = r#"{"type":"user","text":"hi"}"#;
+        let BlocksCommand::User { reasoning, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        assert_eq!(reasoning, None);
     }
 
     #[test]

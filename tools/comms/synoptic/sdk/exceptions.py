@@ -1,4 +1,5 @@
 """Custom exceptions for Twitter SDK."""
+# ruff: noqa
 
 
 class TwitterSDKError(Exception):

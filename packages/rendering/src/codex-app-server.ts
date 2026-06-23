@@ -55,6 +55,7 @@ type CodexMapperState = {
   firstBufferedTextAt: number | null
   streamedCommentaryText: string
   streamedAnswerText: string
+  answerStreamDiverged: boolean
   agentMessagePhase: AgentMessagePhase | null
   agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
@@ -72,6 +73,7 @@ export type CodexAppServerRendererEventMapperOptions = {
   sessionId?: string
   logInfo?: RendererLogInfo
   unknownAgentMessagePhase?: AgentMessagePhase
+  taskOutput?: 'full' | 'omit'
 }
 
 export type CodexAppServerToChatStreamOptions = CodexAppServerRendererEventMapperOptions & {
@@ -86,11 +88,13 @@ export class CodexAppServerRendererEventMapper
   private readonly sessionId: string
   private readonly logInfo?: RendererLogInfo
   private readonly unknownAgentMessagePhase: AgentMessagePhase
+  private readonly includeTaskOutput: boolean
 
   constructor(options: CodexAppServerRendererEventMapperOptions = {}) {
     this.sessionId = options.sessionId ?? ''
     this.logInfo = options.logInfo
     this.unknownAgentMessagePhase = options.unknownAgentMessagePhase ?? 'final_answer'
+    this.includeTaskOutput = options.taskOutput === 'full'
   }
 
   process(source: ServerNotification | RustSessionStreamEvent | unknown): RendererEvent[] {
@@ -198,16 +202,19 @@ export class CodexAppServerRendererEventMapper
     const command = commandExecution(event)
     if (command) {
       const id = commandId(command)
-      const aggregatedOutput = commandAggregatedOutput(command)
-      if (aggregatedOutput) this.state.commandOutputById.set(id, aggregatedOutput)
+      if (this.includeTaskOutput) {
+        const aggregatedOutput = commandAggregatedOutput(command)
+        if (aggregatedOutput) this.state.commandOutputById.set(id, aggregatedOutput)
+      }
       const existing = this.state.taskByUseId.get(id)
       const commandIndex = commandNumber(this.state, existing)
       const task = commandTask(
         command,
         String(event?.type ?? ''),
         existing,
-        this.state.commandOutputById.get(id),
-        commandIndex
+        this.includeTaskOutput ? this.state.commandOutputById.get(id) : undefined,
+        commandIndex,
+        this.includeTaskOutput
       )
       const merged = mergeTask(existing, task)
       this.state.taskByUseId.set(merged.id, merged)
@@ -224,7 +231,7 @@ export class CodexAppServerRendererEventMapper
     }
 
     const outputDelta = commandOutputDelta(event)
-    if (outputDelta) {
+    if (outputDelta && this.includeTaskOutput) {
       const current = this.state.commandOutputById.get(outputDelta.id) ?? ''
       const output = current + outputDelta.delta
       this.state.commandOutputById.set(outputDelta.id, output)
@@ -454,6 +461,31 @@ export class CodexAppServerRendererEventMapper
     if (!canStream) return
 
     if (this.state.commentaryText.length > this.state.streamedCommentaryText.length) return
+    // Text already streamed to the consumer is immutable: Slack streaming, the
+    // chat adapter, and this delta stream all only ever append. answerText is
+    // recomposed on every event from compose(answerByItemId, harnessAnswerText),
+    // so when a non-trailing item grows, or an item.completed/assistant event
+    // rewrites an already-streamed region, the recomposed answerText stops being
+    // an extension of what we have already sent. Slicing by byte offset would
+    // then append misaligned bytes and interleave the answer with fragments of
+    // its own earlier text. Stream only a genuine continuation; the divergent
+    // text is left to the terminal reconcile rather than corrupting the live
+    // message. When the invariant holds (the common case) this is identical to a
+    // plain suffix slice.
+    if (!this.state.answerText.startsWith(this.state.streamedAnswerText)) {
+      if (!this.state.answerStreamDiverged) {
+        this.state.answerStreamDiverged = true
+        this.log('codex_renderer_stream_divergence_suppressed', {
+          agent_session_id: this.sessionId,
+          codex_session_id: this.state.threadId || undefined,
+          streamed_chars: this.state.streamedAnswerText.length,
+          answer_chars: this.state.answerText.length,
+          streamed_hash: textHash(this.state.streamedAnswerText),
+          answer_hash: textHash(this.state.answerText)
+        })
+      }
+      return
+    }
     if (this.state.answerText.length <= this.state.streamedAnswerText.length) return
     const delta = this.state.answerText.slice(this.state.streamedAnswerText.length)
     if (!delta) return
@@ -736,6 +768,7 @@ function newState(): CodexMapperState {
     firstBufferedTextAt: null,
     streamedCommentaryText: '',
     streamedAnswerText: '',
+    answerStreamDiverged: false,
     agentMessagePhase: null,
     agentMessagePhaseByItemId: new Map(),
     planText: '',
@@ -1269,7 +1302,8 @@ function commandTask(
   eventType: string,
   existing?: HarnessTask,
   accumulatedOutput?: string,
-  commandIndex?: number
+  commandIndex?: number,
+  includeOutput = true
 ): HarnessTask {
   const id = commandId(item)
   const rawCommand = String(item.command ?? 'Command')
@@ -1280,7 +1314,7 @@ function commandTask(
   const failed = isCommandFailure(item, eventType)
   const isCompletionUpdate =
     eventType === 'item.completed' || status === 'complete' || status === 'error'
-  const output = commandOutputElements(accumulatedOutput ?? '', exitCode)
+  const output = includeOutput ? commandOutputElements(accumulatedOutput ?? '', exitCode) : []
   return {
     id,
     title: commandExecutionTitle(commandIndex),

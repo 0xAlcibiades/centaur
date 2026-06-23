@@ -27,10 +27,17 @@ module Oauth
       VALID_ISSUERS = %w[https://accounts.google.com accounts.google.com].freeze
 
       def key = KEY
+      def display_name = "Google"
       def authorization_endpoint = AUTHORIZATION_ENDPOINT
       def token_endpoint = TOKEN_ENDPOINT
       def identity_scopes = IDENTITY_SCOPES
       def api_hosts = API_HOSTS
+      def authorization_scope_param = "scope"
+      def scope_separator = " "
+      def refreshable? = true
+
+      def parse_granted_scopes(scope) = scope.to_s.split
+      def refresh_scopes(scopes) = Array(scopes)
 
       # Provider-specific query params for the authorization redirect. Both are
       # required to guarantee a refresh token, including on re-consent:

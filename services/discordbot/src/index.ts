@@ -28,6 +28,7 @@ import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
 import { fetchThreadStarterMessage } from "./discord-starter";
 import {
   deriveThreadName,
+  fetchDiscordChannelName,
   isThreadCreatedForMessage,
   renameThreadFromMessage,
 } from "./discord-threading";
@@ -124,6 +125,51 @@ const DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD = 3;
 const ANSWER_EDIT_INTERVAL_MS = 1_500;
 const ANSWER_MESSAGE_MAX_CHARS = DISCORD_FALLBACK_TEXT_MAX_CHARS;
 const ANSWER_MAX_FULL_MESSAGES = 10;
+
+// The resolved channel name becomes the session principal's display name in
+// iron-control (see api-rs derive_principal). api-rs re-upserts the principal on
+// every create, so the name must ride every create to stay stable — cache the
+// per-channel lookup (mirrors slackbotv2's conversations.info cache). Misses
+// expire sooner so a transient channel-fetch failure self-heals.
+const CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
+const CONVERSATION_NAME_CACHE_MISS_TTL_MS = 10 * 60 * 1000;
+type ConversationNameCacheEntry = {
+  expiresAtMs: number;
+  name: string | undefined;
+};
+const conversationNameCache = new Map<string, ConversationNameCacheEntry>();
+
+export function clearConversationNameCacheForTests(): void {
+  conversationNameCache.clear();
+}
+
+/**
+ * Resolve the Discord channel name for a thread key, used to name the session
+ * principal. Cached per channel and never throws — the name is cosmetic, so a
+ * fetch failure just falls back to the synthetic id-based principal name in
+ * api-rs.
+ */
+export async function resolveDiscordConversationName(
+  options: DiscordbotOptions,
+  threadKey: string,
+  logger: Logger,
+): Promise<string | undefined> {
+  const { channelId } = parseDiscordThreadKey(threadKey);
+  if (!channelId) return undefined;
+  const cached = conversationNameCache.get(channelId);
+  if (cached && cached.expiresAtMs > Date.now()) return cached.name;
+
+  const name = await fetchDiscordChannelName(options, channelId, logger);
+  conversationNameCache.set(channelId, {
+    expiresAtMs:
+      Date.now() +
+      (name
+        ? CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS
+        : CONVERSATION_NAME_CACHE_MISS_TTL_MS),
+    name,
+  });
+  return name;
+}
 
 export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
@@ -464,9 +510,17 @@ async function syncThreadMessageToSession(
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
   );
+  // Names the session principal in iron-control; resolved (and cached) here so
+  // it rides every create. Cosmetic, so a failed lookup just yields undefined.
+  const conversationName = await resolveDiscordConversationName(
+    input.options,
+    thread.id,
+    logger,
+  );
 
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
+    conversationName,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     messages: messagesToAppend,
     onEventId: (eventId) => {

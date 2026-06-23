@@ -163,6 +163,12 @@ export type DiscordbotTrace = {
 
 export type ForwardSessionInput = {
   afterEventId: number;
+  /**
+   * Human-readable channel name carried in the create-session metadata as
+   * `discord_conversation_name`; api-rs uses it as the session principal's
+   * display name.
+   */
+  conversationName?: string;
   executionId?: string;
   executeMessage?: DiscordbotApiMessage;
   messages: DiscordbotApiMessage[];

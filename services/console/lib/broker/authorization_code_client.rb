@@ -13,10 +13,11 @@ module Broker
   # response body. Callers must keep the same discipline. Mirrors RefreshClient's
   # injectable-HTTP design and 64 KiB body cap.
   class AuthorizationCodeClient
-    # Normalized success result. scope is the space-separated granted-scope string
-    # (nil if the IdP omitted it); id_token is the raw JWT (nil if absent -- the
-    # provider strategy decides whether that is fatal).
-    Result = Data.define(:access_token, :refresh_token, :expires_in, :scope, :id_token)
+    # Normalized success result. scope is the granted-scope string in the
+    # provider's native format (nil if omitted); id_token is the raw JWT (nil if
+    # absent -- the provider strategy decides whether that is fatal). response is
+    # the parsed provider response for provider-specific metadata.
+    Result = Data.define(:access_token, :refresh_token, :expires_in, :scope, :id_token, :response)
 
     # The minimal HTTP response shape consumed, so tests can inject a double
     # without Net::HTTP.
@@ -90,13 +91,19 @@ module Broker
 
     def parse_success(response, require_refresh_token:)
       parsed = JSON.parse(response.body)
-      access_token = parsed["access_token"]
+      if parsed["ok"] == false && parsed["error"].present?
+        raise ExchangeError.new("token endpoint rejected code: #{parsed["error"]}",
+                                stage: "oauth", code: parsed["error"], status: response.status)
+      end
+
+      token_payload = parsed["authed_user"].is_a?(Hash) && parsed.dig("authed_user", "access_token").present? ? parsed["authed_user"] : parsed
+      access_token = token_payload["access_token"]
       if access_token.blank?
         raise ExchangeError.new("token endpoint returned an empty access_token",
                                 stage: "parse", status: response.status)
       end
 
-      refresh_token = parsed["refresh_token"]
+      refresh_token = token_payload["refresh_token"]
       if require_refresh_token && refresh_token.blank?
         # With access_type=offline + prompt=consent a refresh token is always
         # returned; its absence means the app is misconfigured at the IdP. The
@@ -105,13 +112,14 @@ module Broker
                                 stage: "oauth", code: "missing_refresh_token", status: response.status)
       end
 
-      expires_in = parsed["expires_in"]
+      expires_in = token_payload["expires_in"]
       Result.new(
         access_token: access_token,
         refresh_token: refresh_token,
         expires_in: expires_in ? Integer(expires_in) : nil,
-        scope: parsed["scope"],
-        id_token: parsed["id_token"]
+        scope: token_payload["scope"] || parsed["scope"],
+        id_token: token_payload["id_token"] || parsed["id_token"],
+        response: parsed
       )
     rescue JSON::ParserError, ArgumentError, TypeError
       raise ExchangeError.new("parsing token response failed", stage: "parse", status: response.status)

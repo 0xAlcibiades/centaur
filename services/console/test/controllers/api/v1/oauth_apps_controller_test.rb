@@ -27,7 +27,8 @@ module Api
       test "index lists apps without the client_secret" do
         get api_v1_oauth_apps_url, headers: auth_headers
         assert_response :ok
-        row = json_body.fetch("data").first
+        row = json_body.fetch("data").find { |app| app["slug"] == "google" }
+        assert_not_nil row
         assert_equal "google", row["provider"]
         refute row.key?("client_secret")
         refute row.key?("namespace")
@@ -68,7 +69,7 @@ module Api
 
       test "create rejects an unsupported provider" do
         assert_no_difference -> { OauthApp.count } do
-          post api_v1_oauth_apps_url, params: valid_body(provider: "github").to_json, headers: auth_headers
+          post api_v1_oauth_apps_url, params: valid_body(provider: "unsupported").to_json, headers: auth_headers
         end
         assert_response :unprocessable_entity
       end

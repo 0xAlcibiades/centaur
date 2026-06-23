@@ -16,6 +16,12 @@ from urllib import request as urllib_request
 
 from centaur_sdk import secret
 from api.runtime_control import canonical_json
+from api.vm_metrics import (
+    record_slack_etl_rate_limit,
+    set_etl_active_scopes,
+    set_etl_failed_scopes,
+    set_etl_scope_sync_freshness_seconds,
+)
 
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 DEFAULT_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
@@ -29,6 +35,10 @@ BACKFILL_JOB_TYPES = (
     BACKFILL_JOB_THREAD_REFRESH,
 )
 BACKFILL_JOB_STATUSES = ("pending", "running", "completed", "failed")
+PERMANENT_SLACK_BACKFILL_ERRORS = (
+    "channel_not_found",
+    "thread_not_found",
+)
 
 
 def positive_int(value: int | str | None, default: int) -> int:
@@ -216,72 +226,102 @@ def _attachment_rows(row: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-async def _replace_message_attachments(conn, row: dict[str, Any]) -> int:
-    """Replace attachment rows for one observed Slack message."""
-    attachments = _attachment_rows(row)
-    attachment_ids = [attachment["slack_file_id"] for attachment in attachments]
+_ATTACHMENT_UPSERT_SQL = (
+    "INSERT INTO slack_sync_message_attachments ("
+    "channel_id, message_ts, slack_file_id, name, title, mimetype, filetype, "
+    "size_bytes, url_private, permalink, download_status, download_error, "
+    "content_sha256, content_bytes, raw_payload, source_run_id, last_seen_at, updated_at"
+    ") VALUES ("
+    "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, "
+    "$15::jsonb, $16, NOW(), NOW()"
+    ") ON CONFLICT (channel_id, message_ts, slack_file_id) DO UPDATE SET "
+    "name = EXCLUDED.name, "
+    "title = EXCLUDED.title, "
+    "mimetype = EXCLUDED.mimetype, "
+    "filetype = EXCLUDED.filetype, "
+    "size_bytes = EXCLUDED.size_bytes, "
+    "url_private = EXCLUDED.url_private, "
+    "permalink = EXCLUDED.permalink, "
+    "download_status = EXCLUDED.download_status, "
+    "download_error = EXCLUDED.download_error, "
+    "content_sha256 = EXCLUDED.content_sha256, "
+    "content_bytes = EXCLUDED.content_bytes, "
+    "raw_payload = EXCLUDED.raw_payload, "
+    "source_run_id = EXCLUDED.source_run_id, "
+    "last_seen_at = NOW(), "
+    "updated_at = NOW()"
+)
 
-    for attachment in attachments:
-        await conn.execute(
-            "INSERT INTO slack_sync_message_attachments ("
-            "channel_id, message_ts, slack_file_id, name, title, mimetype, filetype, "
-            "size_bytes, url_private, permalink, download_status, download_error, "
-            "content_sha256, content_bytes, raw_payload, source_run_id, last_seen_at, updated_at"
-            ") VALUES ("
-            "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, "
-            "$15::jsonb, $16, NOW(), NOW()"
-            ") ON CONFLICT (channel_id, message_ts, slack_file_id) DO UPDATE SET "
-            "name = EXCLUDED.name, "
-            "title = EXCLUDED.title, "
-            "mimetype = EXCLUDED.mimetype, "
-            "filetype = EXCLUDED.filetype, "
-            "size_bytes = EXCLUDED.size_bytes, "
-            "url_private = EXCLUDED.url_private, "
-            "permalink = EXCLUDED.permalink, "
-            "download_status = EXCLUDED.download_status, "
-            "download_error = EXCLUDED.download_error, "
-            "content_sha256 = EXCLUDED.content_sha256, "
-            "content_bytes = EXCLUDED.content_bytes, "
-            "raw_payload = EXCLUDED.raw_payload, "
-            "source_run_id = EXCLUDED.source_run_id, "
-            "last_seen_at = NOW(), "
-            "updated_at = NOW()",
-            attachment["channel_id"],
-            attachment["message_ts"],
-            attachment["slack_file_id"],
-            attachment["name"],
-            attachment["title"],
-            attachment["mimetype"],
-            attachment["filetype"],
-            attachment["size_bytes"],
-            attachment["url_private"],
-            attachment["permalink"],
-            attachment["download_status"],
-            attachment["download_error"],
-            attachment["content_sha256"],
-            attachment["content_bytes"],
-            canonical_json(attachment["raw_payload"]),
-            attachment["source_run_id"],
-        )
 
-    if attachment_ids:
-        await conn.execute(
-            "DELETE FROM slack_sync_message_attachments "
-            "WHERE channel_id = $1 "
-            "  AND message_ts = $2 "
-            "  AND NOT (slack_file_id = ANY($3::text[]))",
-            row["channel_id"],
-            row["message_ts"],
-            attachment_ids,
-        )
-    else:
-        await conn.execute(
-            "DELETE FROM slack_sync_message_attachments "
-            "WHERE channel_id = $1 AND message_ts = $2",
-            row["channel_id"],
-            row["message_ts"],
-        )
-    return len(attachments)
+def _attachment_upsert_params(attachment: dict[str, Any]) -> tuple[Any, ...]:
+    """Positional parameters for ``_ATTACHMENT_UPSERT_SQL`` for one attachment."""
+    return (
+        attachment["channel_id"],
+        attachment["message_ts"],
+        attachment["slack_file_id"],
+        attachment["name"],
+        attachment["title"],
+        attachment["mimetype"],
+        attachment["filetype"],
+        attachment["size_bytes"],
+        attachment["url_private"],
+        attachment["permalink"],
+        attachment["download_status"],
+        attachment["download_error"],
+        attachment["content_sha256"],
+        attachment["content_bytes"],
+        canonical_json(attachment["raw_payload"]),
+        attachment["source_run_id"],
+    )
+
+
+async def _replace_message_attachments_batch(conn, rows: list[dict[str, Any]]) -> None:
+    """Replace attachment rows for a batch of observed Slack messages.
+
+    Upserts every attachment across the batch with a single ``executemany`` and
+    drops attachments that are no longer present with one set-based delete,
+    rather than a statement per message. Semantics match the previous per-row
+    reconciliation: for each message in the batch, attachments not in the freshly
+    observed set are removed (messages with no attachments have all of theirs
+    removed).
+    """
+    if not rows:
+        return
+
+    attachment_params: list[tuple[Any, ...]] = []
+    kept_channel_ids: list[str] = []
+    kept_message_ts: list[str] = []
+    kept_file_ids: list[str] = []
+    for row in rows:
+        for attachment in _attachment_rows(row):
+            attachment_params.append(_attachment_upsert_params(attachment))
+            kept_channel_ids.append(attachment["channel_id"])
+            kept_message_ts.append(attachment["message_ts"])
+            kept_file_ids.append(attachment["slack_file_id"])
+
+    if attachment_params:
+        await conn.executemany(_ATTACHMENT_UPSERT_SQL, attachment_params)
+
+    message_channel_ids = [row["channel_id"] for row in rows]
+    message_ts = [row["message_ts"] for row in rows]
+    await conn.execute(
+        "DELETE FROM slack_sync_message_attachments a "
+        "USING unnest($1::text[], $2::text[]) AS m(channel_id, message_ts) "
+        "WHERE a.channel_id = m.channel_id "
+        "  AND a.message_ts = m.message_ts "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
+        "      AS k(channel_id, message_ts, slack_file_id) "
+        "    WHERE k.channel_id = a.channel_id "
+        "      AND k.message_ts = a.message_ts "
+        "      AND k.slack_file_id = a.slack_file_id"
+        "  )",
+        message_channel_ids,
+        message_ts,
+        kept_channel_ids,
+        kept_message_ts,
+        kept_file_ids,
+    )
 
 
 def channel_ref(channel: dict[str, Any], reason: str | None = None) -> dict[str, str]:
@@ -315,59 +355,118 @@ def failure_reason(error: str) -> str:
     return "unknown_error"
 
 
+def is_permanent_slack_backfill_error(error: str) -> bool:
+    """Return whether a Slack backfill error should terminally skip the job."""
+    lowered = error.lower()
+    return any(
+        f"slack api error: {error_code}" in lowered
+        for error_code in PERMANENT_SLACK_BACKFILL_ERRORS
+    )
+
+
+async def emit_slack_checkpoint_metrics(pool) -> None:
+    """Publish current Slack checkpoint health gauges for Grafana panels."""
+    row = await pool.fetchrow(
+        "SELECT COUNT(*) AS active_scopes, "
+        "COUNT(*) FILTER (WHERE c.last_error <> '') AS failed_scopes, "
+        "COALESCE("
+        "  EXTRACT(EPOCH FROM NOW() - MIN(c.last_success_at) "
+        "    FILTER (WHERE c.last_success_at IS NOT NULL)"
+        "  ), "
+        "  0"
+        ") AS freshness_seconds "
+        "FROM slack_sync_checkpoints c "
+        "JOIN slack_sync_channels ch ON ch.channel_id = c.channel_id "
+        "WHERE ch.is_syncable IS TRUE "
+        "AND ch.is_archived IS FALSE",
+    )
+    set_etl_active_scopes("slack", int(row["active_scopes"] or 0) if row else 0)
+    set_etl_failed_scopes("slack", int(row["failed_scopes"] or 0) if row else 0)
+    set_etl_scope_sync_freshness_seconds(
+        "slack",
+        float(row["freshness_seconds"] or 0.0) if row else 0.0,
+    )
+
+
+_MESSAGE_UPSERT_SQL = (
+    "INSERT INTO slack_sync_messages ("
+    "channel_id, message_ts, occurred_at, thread_ts, parent_message_ts, "
+    "is_thread_root, user_id, bot_id, message_type, message_subtype, text, "
+    "permalink, reply_count, reply_users, latest_reply_ts, raw_payload, "
+    "source_run_id, last_seen_at, updated_at"
+    ") VALUES ("
+    "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, "
+    "$14::jsonb, $15, $16::jsonb, $17, NOW(), NOW()"
+    ") ON CONFLICT (channel_id, message_ts) DO UPDATE SET "
+    "occurred_at = EXCLUDED.occurred_at, "
+    "thread_ts = EXCLUDED.thread_ts, "
+    "parent_message_ts = EXCLUDED.parent_message_ts, "
+    "is_thread_root = EXCLUDED.is_thread_root, "
+    "user_id = EXCLUDED.user_id, "
+    "bot_id = EXCLUDED.bot_id, "
+    "message_type = EXCLUDED.message_type, "
+    "message_subtype = EXCLUDED.message_subtype, "
+    "text = EXCLUDED.text, "
+    "permalink = EXCLUDED.permalink, "
+    "reply_count = EXCLUDED.reply_count, "
+    "reply_users = EXCLUDED.reply_users, "
+    "latest_reply_ts = EXCLUDED.latest_reply_ts, "
+    "raw_payload = EXCLUDED.raw_payload, "
+    "source_run_id = EXCLUDED.source_run_id, "
+    "last_seen_at = NOW(), "
+    "updated_at = NOW()"
+)
+
+
+def _message_upsert_params(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Positional parameters for ``_MESSAGE_UPSERT_SQL`` for one message row."""
+    return (
+        row["channel_id"],
+        row["message_ts"],
+        row["occurred_at"],
+        row["thread_ts"],
+        row["parent_message_ts"],
+        row["is_thread_root"],
+        row["user_id"],
+        row["bot_id"],
+        row["message_type"],
+        row["message_subtype"],
+        row["text"],
+        row["permalink"],
+        row["reply_count"],
+        canonical_json(row["reply_users"]),
+        row["latest_reply_ts"],
+        canonical_json(row["raw_payload"]),
+        row["source_run_id"],
+    )
+
+
+def _dedupe_message_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate channel/message rows so attachment reconciliation is last-write-wins."""
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        by_key[(row["channel_id"], row["message_ts"])] = row
+    return list(by_key.values())
+
+
 async def upsert_messages(pool, rows: list[dict[str, Any]]) -> int:
-    """Upsert Slack messages and replies by their channel-scoped Slack ts."""
+    """Upsert Slack messages and replies by their channel-scoped Slack ts.
+
+    The whole batch is written with set-based statements (one ``executemany``
+    for the messages, one for their attachments, and a single stale-attachment
+    delete) instead of one statement per row. Backfill jobs upsert thousands of
+    messages at a time; the previous per-row loop kept one long transaction open
+    and saturated Postgres, starving the interactive session path that runs on
+    the same database.
+    """
     if not rows:
         return 0
+    deduped_rows = _dedupe_message_rows(rows)
+    message_params = [_message_upsert_params(row) for row in deduped_rows]
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for row in rows:
-                await conn.execute(
-                    "INSERT INTO slack_sync_messages ("
-                    "channel_id, message_ts, occurred_at, thread_ts, parent_message_ts, "
-                    "is_thread_root, user_id, bot_id, message_type, message_subtype, text, "
-                    "permalink, reply_count, reply_users, latest_reply_ts, raw_payload, "
-                    "source_run_id, last_seen_at, updated_at"
-                    ") VALUES ("
-                    "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, "
-                    "$14::jsonb, $15, $16::jsonb, $17, NOW(), NOW()"
-                    ") ON CONFLICT (channel_id, message_ts) DO UPDATE SET "
-                    "occurred_at = EXCLUDED.occurred_at, "
-                    "thread_ts = EXCLUDED.thread_ts, "
-                    "parent_message_ts = EXCLUDED.parent_message_ts, "
-                    "is_thread_root = EXCLUDED.is_thread_root, "
-                    "user_id = EXCLUDED.user_id, "
-                    "bot_id = EXCLUDED.bot_id, "
-                    "message_type = EXCLUDED.message_type, "
-                    "message_subtype = EXCLUDED.message_subtype, "
-                    "text = EXCLUDED.text, "
-                    "permalink = EXCLUDED.permalink, "
-                    "reply_count = EXCLUDED.reply_count, "
-                    "reply_users = EXCLUDED.reply_users, "
-                    "latest_reply_ts = EXCLUDED.latest_reply_ts, "
-                    "raw_payload = EXCLUDED.raw_payload, "
-                    "source_run_id = EXCLUDED.source_run_id, "
-                    "last_seen_at = NOW(), "
-                    "updated_at = NOW()",
-                    row["channel_id"],
-                    row["message_ts"],
-                    row["occurred_at"],
-                    row["thread_ts"],
-                    row["parent_message_ts"],
-                    row["is_thread_root"],
-                    row["user_id"],
-                    row["bot_id"],
-                    row["message_type"],
-                    row["message_subtype"],
-                    row["text"],
-                    row["permalink"],
-                    row["reply_count"],
-                    canonical_json(row["reply_users"]),
-                    row["latest_reply_ts"],
-                    canonical_json(row["raw_payload"]),
-                    row["source_run_id"],
-                )
-                await _replace_message_attachments(conn, row)
+            await conn.executemany(_MESSAGE_UPSERT_SQL, message_params)
+            await _replace_message_attachments_batch(conn, deduped_rows)
     return len(rows)
 
 
@@ -601,16 +700,39 @@ class SlackEtlClient:
         }
     )
 
-    def __init__(self, etl_token: str | None = None) -> None:
+    def __init__(
+        self,
+        etl_token: str | None = None,
+        *,
+        workflow_name: str = "slack_unknown",
+    ) -> None:
         from slack_sdk import WebClient
 
         token = (etl_token or secret("SLACK_ETL_TOKEN", default="")).strip()
         if not token:
             raise RuntimeError("SLACK_ETL_TOKEN not set for Slack ETL workflow")
         self.token = token
+        self._workflow_name = workflow_name
         self._client = WebClient(token=token, timeout=self._api_timeout_seconds())
         self._user_cache: dict[str, str] = {}
         self._ratelimit_deadlines: dict[str, float] = {}
+
+    def _record_rate_limit(
+        self,
+        *,
+        method: str,
+        outcome: str,
+        retry_after_seconds: float,
+    ) -> None:
+        try:
+            record_slack_etl_rate_limit(
+                getattr(self, "_workflow_name", "slack_unknown"),
+                method,
+                outcome,
+                retry_after_seconds,
+            )
+        except Exception:
+            pass
 
     @classmethod
     def _api_timeout_seconds(cls) -> int:
@@ -693,10 +815,20 @@ class SlackEtlClient:
             remaining = blocked_until - time.time()
             if remaining > 0:
                 if remaining > max_sleep:
+                    self._record_rate_limit(
+                        method=key,
+                        outcome="failed_fast",
+                        retry_after_seconds=round(remaining, 3),
+                    )
                     raise SlackEtlRateLimitError(
                         slack_method=key,
                         retry_after=round(remaining, 3),
                     )
+                self._record_rate_limit(
+                    method=key,
+                    outcome="slept_retry",
+                    retry_after_seconds=remaining,
+                )
                 time.sleep(remaining)
 
             try:
@@ -711,8 +843,18 @@ class SlackEtlClient:
                     )
                     self._ratelimit_deadlines[key] = time.time() + retry_after
                     if attempt < max_retries - 1 and retry_after <= max_sleep:
+                        self._record_rate_limit(
+                            method=key,
+                            outcome="slept_retry",
+                            retry_after_seconds=retry_after,
+                        )
                         time.sleep(retry_after)
                         continue
+                    self._record_rate_limit(
+                        method=key,
+                        outcome="failed_fast",
+                        retry_after_seconds=retry_after,
+                    )
                     raise SlackEtlRateLimitError(
                         slack_method=key,
                         retry_after=retry_after,
@@ -1015,6 +1157,7 @@ class SlackEtlClient:
                     {
                         "id": channel.get("id", ""),
                         "name": channel.get("name", ""),
+                        "created": channel.get("created"),
                         "purpose": channel.get("purpose", {}).get("value", ""),
                         "topic": channel.get("topic", {}).get("value", ""),
                         "member_count": channel.get("num_members", 0),
@@ -1284,9 +1427,9 @@ class SlackEtlClient:
         return sorted(users[:limit], key=lambda x: x["name"])
 
 
-def client() -> SlackSyncClient:
+def client(*, workflow_name: str = "slack_unknown") -> SlackSyncClient:
     """Construct the workflow-owned Slack ETL client."""
-    return SlackEtlClient()
+    return SlackEtlClient(workflow_name=workflow_name)
 
 
 async def enqueue_backfill_job(
@@ -1522,6 +1665,32 @@ async def mark_backfill_job_failed(
     await pool.execute(
         "UPDATE slack_sync_backfill_jobs SET "
         "status = 'failed', last_run_id = $2, last_error = $3, updated_at = NOW() "
+        "WHERE job_id = $1",
+        job_id,
+        run_id,
+        error,
+    )
+
+
+async def mark_backfill_job_terminal_skipped(
+    pool,
+    *,
+    job_id: int,
+    run_id: str,
+    error: str,
+) -> None:
+    """Mark a permanently unrefreshable backfill job terminal without retrying."""
+    await pool.execute(
+        "UPDATE slack_sync_backfill_jobs SET "
+        "status = 'completed', "
+        "last_run_id = $2, "
+        "payload_json = COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object("
+        "    'terminal_skip_reason', $3::text, "
+        "    'terminal_skip_at', NOW()::text"
+        "), "
+        "last_completed_at = NOW(), "
+        "last_error = '', "
+        "updated_at = NOW() "
         "WHERE job_id = $1",
         job_id,
         run_id,

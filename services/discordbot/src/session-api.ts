@@ -188,7 +188,7 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<DiscordbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  await createSession(options, input.threadId);
+  await createSession(options, input.threadId, input.conversationName);
   traceLog(options, "discordbot_session_create_complete", input.trace, {
     phase_ms: elapsedMs(createStartedAtMs),
   });
@@ -357,14 +357,18 @@ async function bytesToBase64(data: Buffer | Blob): Promise<string> {
 async function createSession(
   options: DiscordbotOptions,
   threadId: string,
+  conversationName?: string,
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch;
+  const name = conversationName?.trim();
   const body: DiscordbotCreateSessionRequest = {
     harness_type: "codex",
     metadata: {
       source: "discordbot",
       platform: "discord",
       thread_id: threadId,
+      // api-rs reads this as the session principal's display name.
+      ...(name ? { discord_conversation_name: name } : {}),
     },
   };
   const response = await fetchFn(apiSessionUrl(options.apiUrl, threadId), {
@@ -494,10 +498,7 @@ function ensureTrailingSlash(value: string): string {
 }
 
 function apiHeaders(options: DiscordbotOptions, jsonBody = true): HeadersInit {
-  const apiKey =
-    options.apiKey ??
-    process.env.DISCORDBOT_API_KEY ??
-    process.env.CENTAUR_API_KEY;
+  const apiKey = options.apiKey ?? process.env.DISCORDBOT_API_KEY;
   return {
     ...(jsonBody ? { "content-type": "application/json" } : {}),
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),

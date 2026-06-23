@@ -1,4 +1,5 @@
 """SDK configuration for Twitter API clients."""
+# ruff: noqa
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict

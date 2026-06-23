@@ -3,6 +3,7 @@
 This is the main client class for the Twitter SDK. It inherits from SynopticClient
 and can be extended with additional providers and features in the future.
 """
+# ruff: noqa
 
 from .synoptic import (
     ApiUsage,
