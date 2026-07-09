@@ -20,7 +20,7 @@ use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
 use kube::{Api, Client, Error};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
@@ -477,8 +477,9 @@ impl SandboxBackend for AgentSandboxBackend {
         }
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
-        if let Some(sandbox) = self.get_sandbox(id).await?
-            && let Err(error) = self.adopt_iron_proxy_resources(id, &sandbox).await
+        let sandbox = self.get_sandbox(id).await?;
+        if let Some(sandbox) = &sandbox
+            && let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await
         {
             tracing::warn!(
                 sandbox_id = id.as_str(),
@@ -486,7 +487,22 @@ impl SandboxBackend for AgentSandboxBackend {
                 "failed to set ownerReferences on resumed iron-proxy resources"
             );
         }
-        self.patch_sandbox_merge(id, sandbox_resume_patch()).await?;
+        // A pod that was deleted out from under a `Suspended`/`Created`
+        // sandbox (janitor, node pressure, manual reap) comes back through
+        // this same resume path. Re-derive the capability labels from the
+        // sandbox's own recorded env (the durable source of truth `resolve_
+        // iron_proxy_for_resume` already reads for the same purpose) and
+        // reassert them on both the Sandbox and its pod template, so the
+        // recreated agent pod keeps the labels the create path applied —
+        // otherwise it loses `centaur.ai/api-server-enabled` /
+        // `observability-enabled` and the chart's NetworkPolicy stops
+        // routing its model-proxy egress.
+        let capability_labels = sandbox
+            .as_ref()
+            .map(|sandbox| sandbox_capability_labels(sandbox, &self.config.container_name))
+            .unwrap_or_default();
+        self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
+            .await?;
         self.wait_until_running(id).await
     }
 }
@@ -498,12 +514,52 @@ fn sandbox_pause_patch(paused_at: jiff::Timestamp) -> Value {
     })
 }
 
-fn sandbox_resume_patch() -> Value {
-    // A JSON merge patch null removes the annotation.
+fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
+    // A JSON merge patch null removes a key, so a disabled capability clears
+    // its label rather than writing "false" — matching `build_agent_sandbox`,
+    // which only ever inserts these labels, never sets them false.
+    let labels: Map<String, Value> = capability_labels
+        .iter()
+        .map(|(&label, &enabled)| {
+            (
+                label.to_owned(),
+                if enabled { json!("true") } else { Value::Null },
+            )
+        })
+        .collect();
     json!({
-        "spec": { "replicas": 1 },
-        "metadata": { "annotations": { PAUSED_AT_ANNOTATION: null } },
+        "spec": {
+            "replicas": 1,
+            "podTemplate": { "metadata": { "labels": labels } },
+        },
+        "metadata": {
+            "annotations": { PAUSED_AT_ANNOTATION: null },
+            "labels": labels,
+        },
     })
+}
+
+/// Re-derive the capability labels `build_agent_sandbox` would apply for this
+/// sandbox's recorded capabilities, reading them back from the durable env
+/// vars `apply_sandbox_capabilities` stamped on the container at create time
+/// (the same source `resolve_iron_proxy_for_resume` uses for its
+/// NetworkPolicy scoping). Used to reassert the labels on resume, since a pod
+/// recreated after external deletion (janitor, node pressure, manual reap)
+/// only inherits whatever the Sandbox's `podTemplate` currently carries.
+fn sandbox_capability_labels(
+    sandbox: &crd::Sandbox,
+    container_name: &str,
+) -> BTreeMap<&'static str, bool> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        OBSERVABILITY_ENABLED_LABEL,
+        iron_proxy::sandbox_observability_enabled(sandbox, container_name).unwrap_or(true),
+    );
+    labels.insert(
+        API_SERVER_ENABLED_LABEL,
+        iron_proxy::sandbox_api_server_enabled(sandbox, container_name).unwrap_or(true),
+    );
+    labels
 }
 
 fn sandbox_creation_time(sandbox: &crd::Sandbox) -> Option<SystemTime> {
@@ -1013,6 +1069,108 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.labels.as_ref())
                 .is_none_or(|labels| !labels.contains_key(API_SERVER_ENABLED_LABEL))
+        );
+    }
+
+    /// A pod deleted out from under a sandbox (janitor, node pressure, manual
+    /// reap) comes back through `resume`, which only has the sandbox id, not
+    /// the original `SandboxSpec`. Regression test for the recreated agent
+    /// pod losing `centaur.ai/api-server-enabled` and
+    /// `centaur.ai/observability-enabled`: the resume patch must restore both
+    /// labels (derived from the sandbox's own recorded capability env, the
+    /// same durable source `resolve_iron_proxy_for_resume` already trusts)
+    /// on the Sandbox and its pod template, matching what `build_agent_sandbox`
+    /// would have applied for these capabilities.
+    #[test]
+    fn resume_reasserts_capability_labels_from_recorded_env() {
+        // Mirrors what `apply_sandbox_capabilities` (centaur-session-runtime)
+        // stamps onto the spec env alongside `.capabilities(..)`, since that's
+        // the durable record `sandbox_capability_labels` reads back on resume.
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .capabilities(SandboxCapabilities {
+                repo_cache: RepoCacheAccess::All,
+                observability_enabled: true,
+                api_server_enabled: true,
+            })
+            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true")
+            .env("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true");
+        let config = AgentSandboxConfig::new("centaur");
+        let mut sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        // Simulate the observed production bug: the recreated pod's template
+        // lost the capability labels even though the container's capability
+        // env (the create path's durable record) is untouched.
+        if let Some(labels) = sandbox
+            .spec
+            .pod_template
+            .metadata
+            .as_mut()
+            .and_then(|metadata| metadata.labels.as_mut())
+        {
+            labels.remove(OBSERVABILITY_ENABLED_LABEL);
+            labels.remove(API_SERVER_ENABLED_LABEL);
+        }
+        if let Some(labels) = sandbox.metadata.labels.as_mut() {
+            labels.remove(OBSERVABILITY_ENABLED_LABEL);
+            labels.remove(API_SERVER_ENABLED_LABEL);
+        }
+
+        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME);
+        assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&true));
+        assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&true));
+
+        let patch = sandbox_resume_patch(&labels);
+        assert_eq!(
+            patch["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL],
+            json!("true")
+        );
+        assert_eq!(
+            patch["metadata"]["labels"][API_SERVER_ENABLED_LABEL],
+            json!("true")
+        );
+        assert_eq!(
+            patch["spec"]["podTemplate"]["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL],
+            json!("true")
+        );
+        assert_eq!(
+            patch["spec"]["podTemplate"]["metadata"]["labels"][API_SERVER_ENABLED_LABEL],
+            json!("true")
+        );
+    }
+
+    #[test]
+    fn resume_patch_clears_labels_for_restricted_capabilities() {
+        // Mirrors what `apply_sandbox_capabilities` (centaur-session-runtime)
+        // stamps onto the spec env alongside `.capabilities(..)`, since that's
+        // the durable record `sandbox_capability_labels` reads back on resume.
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .capabilities(SandboxCapabilities {
+                repo_cache: RepoCacheAccess::All,
+                observability_enabled: false,
+                api_server_enabled: false,
+            })
+            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "false")
+            .env("CENTAUR_SANDBOX_API_SERVER_ENABLED", "false");
+        let config = AgentSandboxConfig::new("centaur");
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME);
+        assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&false));
+        assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&false));
+
+        // A JSON merge patch null removes the key rather than writing
+        // "false", matching how `build_agent_sandbox` omits (not falsifies)
+        // the label for a disabled capability.
+        let patch = sandbox_resume_patch(&labels);
+        assert!(patch["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL].is_null());
+        assert!(patch["metadata"]["labels"][API_SERVER_ENABLED_LABEL].is_null());
+        assert!(
+            patch["spec"]["podTemplate"]["metadata"]["labels"][OBSERVABILITY_ENABLED_LABEL]
+                .is_null()
+        );
+        assert!(
+            patch["spec"]["podTemplate"]["metadata"]["labels"][API_SERVER_ENABLED_LABEL].is_null()
         );
     }
 
