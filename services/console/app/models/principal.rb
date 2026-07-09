@@ -1,3 +1,5 @@
+require "uri"
+
 class Principal < ApplicationRecord
   oid_prefix "prn"
 
@@ -12,8 +14,13 @@ class Principal < ApplicationRecord
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
+  has_many :mcp_oauth_authorization_codes, dependent: :destroy
+  has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   belongs_to :created_by, class_name: "User"
 
+  after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
+  before_validation :apply_sandbox_repo_cache_setting
+  after_save :clear_sandbox_repo_cache_setting
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
@@ -26,6 +33,11 @@ class Principal < ApplicationRecord
   # Stand-in for an inline secret value in redacted config: effective_config
   # reports that a control_plane source carries a value without revealing it.
   REDACTED = "[redacted]".freeze
+  SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
+  SLACK_CHANNEL_ID_LABEL = "slack_channel_id".freeze
+  SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
+  SANDBOX_REPO_CACHE_ALIASES = { "pub" => "public" }.freeze
+  SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
 
   # The config of a principal with no effective grants; also what an unassigned
   # proxy resolves to.
@@ -46,6 +58,11 @@ class Principal < ApplicationRecord
   # gcp_auth credentials this principal resolves to, via its effective grants.
   def granted_gcp_auth_secrets
     granted_secrets_by_priority(GcpAuthSecret, :gcp_auth_secret_id, includes: %i[keyfile_source rules])
+  end
+
+  # gcp_id_token credentials this principal resolves to, via its effective grants.
+  def granted_gcp_id_token_secrets
+    granted_secrets_by_priority(GcpIdTokenSecret, :gcp_id_token_secret_id, includes: %i[keyfile_source rules])
   end
 
   # aws_auth credentials this principal resolves to, via its effective grants.
@@ -76,9 +93,8 @@ class Principal < ApplicationRecord
     proxy_secrets_for(served_credentials)
   end
 
-  # The `transforms` array delivered to iron-proxy: one gcp_auth transform per
-  # granted GcpAuthSecret, one aws_auth transform per granted AwsAuthSecret, one
-  # hmac_sign transform per granted HmacSecret, plus a single oauth_token
+  # The `transforms` array delivered to iron-proxy: one gcp_auth/gcp_id_token/
+  # aws_auth/hmac_sign transform per granted secret, plus a single oauth_token
   # transform bundling every granted OauthTokenSecret as one `tokens` entry.
   # Credentials that lost a cross-type conflict are omitted (see
   # #served_credentials).
@@ -109,11 +125,31 @@ class Principal < ApplicationRecord
   def effective_config(redact_secrets: true)
     served = served_credentials
     config = {
-      "secrets" => proxy_secrets_for(served),
+      "secrets" => proxy_secrets_for(served) + generated_proxy_secrets,
       "transforms" => proxy_transforms_for(served),
       "postgres" => sync_postgres
     }
     redact_secrets ? self.class.redact_live_secrets(config) : config
+  end
+
+  def sandbox_repo_cache
+    raw = labels.to_h[SANDBOX_REPO_CACHE_LABEL].to_s.strip.downcase
+    raw = SANDBOX_REPO_CACHE_ALIASES.fetch(raw, raw)
+    SANDBOX_REPO_CACHE_VALUES.include?(raw) ? raw : (sandbox_repo_cache_enabled? ? "all" : "none")
+  end
+
+  def sandbox_repo_cache=(value)
+    normalized = value.to_s.strip.downcase
+    normalized = SANDBOX_REPO_CACHE_ALIASES.fetch(normalized, normalized)
+    normalized = "none" unless SANDBOX_REPO_CACHE_VALUES.include?(normalized)
+    @sandbox_repo_cache_setting = normalized
+    apply_sandbox_repo_cache_setting
+  end
+
+  def sandbox_repo_cache_enabled=(value)
+    enabled = ActiveModel::Type::Boolean.new.cast(value)
+    super(enabled)
+    self.labels = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => (enabled ? "all" : "none"))
   end
 
   def self.bump_sync_config_cache_versions(ids)
@@ -149,6 +185,20 @@ class Principal < ApplicationRecord
 
   private
 
+  def auto_grant_matching_oauth_credentials
+    PrincipalCredentialReconciliation.new.apply_for_principal(self)
+  end
+
+  def apply_sandbox_repo_cache_setting
+    return if @sandbox_repo_cache_setting.blank?
+    self.labels = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => @sandbox_repo_cache_setting)
+    self[:sandbox_repo_cache_enabled] = @sandbox_repo_cache_setting == "all"
+  end
+
+  def clear_sandbox_repo_cache_setting
+    @sandbox_repo_cache_setting = nil
+  end
+
   # The credentials actually delivered to the proxy, grouped by type, after
   # cross-type conflict resolution. Static secrets without a deliverable source
   # are dropped first (the proxy can't resolve a value for them) so a
@@ -157,15 +207,17 @@ class Principal < ApplicationRecord
   def served_credentials
     static = granted_static_secrets.select { |ss| ss.source&.deliverable? }
     gcp_auth = granted_gcp_auth_secrets.to_a
+    gcp_id_token = granted_gcp_id_token_secrets.to_a
     aws_auth = granted_aws_auth_secrets.to_a
     hmac = granted_hmac_secrets.to_a
     oauth = granted_oauth_token_secrets.to_a
 
-    suppressed = suppressed_conflict_credentials(static + gcp_auth + aws_auth + hmac + oauth)
+    suppressed = suppressed_conflict_credentials(static + gcp_auth + gcp_id_token + aws_auth + hmac + oauth)
 
     {
       static: static - suppressed,
       gcp_auth: gcp_auth - suppressed,
+      gcp_id_token: gcp_id_token - suppressed,
       aws_auth: aws_auth - suppressed,
       hmac: hmac - suppressed,
       oauth: oauth - suppressed
@@ -176,8 +228,42 @@ class Principal < ApplicationRecord
     served[:static].map(&:to_proxy_secret)
   end
 
+  def generated_proxy_secrets
+    secret = api_server_jwt_secret
+    secret ? [ secret ] : []
+  end
+
+  def api_server_jwt_secret
+    return nil unless sandbox_api_server_enabled?
+
+    channel_id = labels.to_h[SLACK_CHANNEL_ID_LABEL].to_s.strip
+    return nil unless channel_id.match?(SLACK_CHANNEL_ID_FORMAT)
+
+    token = ApiServer::Jwt.encode_for_principal(self)
+    return nil if token.blank?
+
+    rules = api_server_hosts.map { |host| { "host" => host } }
+    return nil if rules.empty?
+
+    {
+      "source" => { "type" => "control_plane", "value" => token },
+      "inject" => { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+      "rules" => rules
+    }
+  end
+
+  def api_server_hosts
+    configured = ENV["CENTAUR_API_SERVER_PROXY_HOSTS"].to_s.split(",")
+    from_url = self.class.host_from_url(ENV["CENTAUR_API_URL"])
+    (configured + [ from_url, "centaur-api-rs", "api" ])
+      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
+      .reject(&:blank?)
+      .uniq
+  end
+
   def proxy_transforms_for(served)
     transforms = served[:gcp_auth].map(&:to_proxy_transform)
+    transforms += served[:gcp_id_token].map(&:to_proxy_transform)
     transforms += served[:aws_auth].map(&:to_proxy_transform)
     transforms += served[:hmac].map(&:to_proxy_transform)
 
@@ -185,6 +271,12 @@ class Principal < ApplicationRecord
     transforms << { "name" => "oauth_token", "config" => { "tokens" => oauth_entries } } if oauth_entries.any?
 
     transforms
+  end
+
+  def self.host_from_url(value)
+    URI.parse(value.to_s).host
+  rescue URI::InvalidURIError
+    nil
   end
 
   # Cross-type conflict resolution. The wire protocol applies the `secrets` array

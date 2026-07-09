@@ -1,5 +1,56 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoCacheAccess {
+    None,
+    Public,
+    #[default]
+    All,
+}
+
+impl RepoCacheAccess {
+    pub fn enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Public => "public",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxCapabilities {
+    #[serde(default)]
+    pub repo_cache: RepoCacheAccess,
+    pub observability_enabled: bool,
+    pub api_server_enabled: bool,
+}
+
+impl SandboxCapabilities {
+    pub const fn default_enabled() -> Self {
+        Self {
+            repo_cache: RepoCacheAccess::All,
+            observability_enabled: true,
+            api_server_enabled: true,
+        }
+    }
+
+    pub fn is_default_enabled(&self) -> bool {
+        self.repo_cache.enabled() && self.observability_enabled && self.api_server_enabled
+    }
+}
+
+impl Default for SandboxCapabilities {
+    fn default() -> Self {
+        Self::default_enabled()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
@@ -16,6 +67,8 @@ pub struct SandboxSpec {
     /// proxy for the sandbox instead of rendering a static proxy config.
     #[serde(default)]
     pub iron_control_principal: Option<String>,
+    #[serde(default)]
+    pub capabilities: SandboxCapabilities,
 }
 
 impl SandboxSpec {
@@ -30,11 +83,17 @@ impl SandboxSpec {
             mounts: Vec::new(),
             resources: None,
             iron_control_principal: None,
+            capabilities: SandboxCapabilities::default_enabled(),
         }
     }
 
     pub fn iron_control_principal(mut self, principal_foreign_id: impl Into<String>) -> Self {
         self.iron_control_principal = Some(principal_foreign_id.into());
+        self
+    }
+
+    pub fn capabilities(mut self, capabilities: SandboxCapabilities) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -94,6 +153,8 @@ pub struct Mount {
     pub kind: MountKind,
     pub target_path: String,
     pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
 }
 
 impl Mount {
@@ -102,11 +163,17 @@ impl Mount {
             kind,
             target_path: target_path.into(),
             read_only: false,
+            sub_path: None,
         }
     }
 
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    pub fn sub_path(mut self, sub_path: impl Into<String>) -> Self {
+        self.sub_path = Some(sub_path.into());
         self
     }
 }

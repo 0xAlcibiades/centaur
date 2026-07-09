@@ -1,10 +1,13 @@
 # Operator console: a lightweight, server-rendered HTML view over principals,
 # their effective grants, and secrets. Read-only; gated behind a console session
-# via ApplicationController#require_login. Distinct from the JSON API.
+# (ApplicationController#require_login) and restricted to admins (require_admin),
+# like every Control/Data Sync page. Distinct from the JSON API.
 class ConsoleController < ApplicationController
   include SecretKinds
 
   layout "console"
+
+  before_action :require_admin
 
   # Friendly labels for the source backend (and the gcp_auth credentials_provider
   # type). The secrets table shows only this -- the full reference lives on the
@@ -26,6 +29,7 @@ class ConsoleController < ApplicationController
     @granted = {
       "static" => @principal.granted_static_secrets,
       "gcp_auth" => @principal.granted_gcp_auth_secrets,
+      "gcp_id_token" => @principal.granted_gcp_id_token_secrets,
       "aws_auth" => @principal.granted_aws_auth_secrets,
       "oauth_token" => @principal.granted_oauth_token_secrets,
       "pg_dsn" => @principal.granted_pg_dsn_secrets,
@@ -129,6 +133,7 @@ class ConsoleController < ApplicationController
     case record
     when StaticSecret then [ source_segment(record.source) ].compact
     when PgDsnSecret  then [ source_segment(record.dsn_source) ].compact
+    when GcpIdTokenSecret then [ source_segment(record.keyfile_source) ].compact
     when GcpAuthSecret
       if record.keyfile_source
         [ source_segment(record.keyfile_source) ].compact
@@ -169,6 +174,9 @@ class ConsoleController < ApplicationController
     case record
     when StaticSecret  then static_injection(record)
     when GcpAuthSecret  then "Authorization: Bearer"
+    when GcpIdTokenSecret
+      header = record.header.presence || "authorization"
+      "#{header}: Bearer"
     when AwsAuthSecret  then "Authorization: AWS4-HMAC-SHA256"
     when OauthTokenSecret
       header = record.header.presence || "Authorization"

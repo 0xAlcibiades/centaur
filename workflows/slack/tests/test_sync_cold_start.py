@@ -20,20 +20,34 @@ def _load_sync():
     api_module.runtime_control = runtime_control
     sys.modules["api.runtime_control"] = runtime_control
 
-    vm_metrics = types.ModuleType("api.vm_metrics")
+    etl_metrics = types.ModuleType("workflows.etl_metrics")
     for name in (
         "record_etl_items_enqueued",
         "record_etl_items_failed",
         "record_etl_items_seen",
         "record_etl_items_upserted",
-        "record_slack_etl_rate_limit",
         "set_etl_active_scopes",
         "set_etl_failed_scopes",
         "set_etl_scope_sync_freshness_seconds",
     ):
-        setattr(vm_metrics, name, lambda *_args, **_kwargs: None)
-    api_module.vm_metrics = vm_metrics
-    sys.modules["api.vm_metrics"] = vm_metrics
+        setattr(etl_metrics, name, lambda *_args, **_kwargs: None)
+    sys.modules["workflows.etl_metrics"] = etl_metrics
+
+    slack_metrics = types.ModuleType("workflows.slack.metrics")
+    for name in (
+        "observe_slack_retention_run_duration",
+        "record_slack_etl_rate_limit",
+        "record_slack_retention_api_rate_limited",
+        "record_slack_retention_api_request",
+        "record_slack_retention_channel_failure",
+        "record_slack_retention_failure",
+        "record_slack_retention_messages_processed",
+        "record_slack_retention_run",
+        "set_slack_retention_last_failure_timestamp",
+        "set_slack_retention_watermark_lag_seconds",
+    ):
+        setattr(slack_metrics, name, lambda *_args, **_kwargs: None)
+    sys.modules["workflows.slack.metrics"] = slack_metrics
 
     workflow_engine = types.ModuleType("api.workflow_engine")
     workflow_engine.WorkflowContext = object
@@ -60,12 +74,14 @@ class FakeContext:
 class FakeClient:
     def __init__(self, *, cursor: str | None = None) -> None:
         self.history_calls: list[dict] = []
+        self.channel_calls: list[dict] = []
         self.cursor = cursor
 
     def _etl_access_mode(self):
         return "test"
 
-    def _list_etl_channels(self, *_args, **_kwargs):
+    def _list_etl_channels(self, *_args, **kwargs):
+        self.channel_calls.append(kwargs)
         return [{"id": "C123", "name": "cold-start"}]
 
     def _list_etl_users(self, *_args, **_kwargs):
@@ -104,6 +120,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
         "checkpoint_success": [],
         "enqueued": [],
         "finish": [],
+        "run_start": [],
         "widened": [],
     }
     fake_client = client or FakeClient()
@@ -126,6 +143,9 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     async def fake_record_run_finish(_pool, **kwargs):
         calls["finish"].append(kwargs)
 
+    async def fake_record_run_start(_pool, **kwargs):
+        calls["run_start"].append(kwargs)
+
     async def fake_widen_channel_bootstrap_job(_pool, **kwargs):
         calls["widened"].append(kwargs)
         return False
@@ -140,7 +160,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     monkeypatch.setattr(sync, "_update_checkpoint_failure", _noop)
     monkeypatch.setattr(sync, "enqueue_backfill_job", fake_enqueue_backfill_job)
     monkeypatch.setattr(sync, "emit_slack_checkpoint_metrics", _noop)
-    monkeypatch.setattr(sync, "record_run_start", _noop)
+    monkeypatch.setattr(sync, "record_run_start", fake_record_run_start)
     monkeypatch.setattr(sync, "record_run_finish", fake_record_run_finish)
     monkeypatch.setattr(
         sync,
@@ -161,7 +181,9 @@ def test_cold_start_channel_uses_full_lookback_window(monkeypatch):
     result = asyncio.run(sync.handler(sync.Input(), FakeContext()))
 
     assert result["status"] == "completed"
+    assert client.channel_calls[0]["include_private_channels"] is False
     assert client.history_calls[0]["oldest"] == "days:30"
+    assert calls["run_start"][0]["metadata"]["index_private_channels"] is False
     assert calls["checkpoint_success"] == [
         {
             "channel_id": "C123",
@@ -203,3 +225,18 @@ def test_watermarked_channel_keeps_incremental_overlap(monkeypatch):
             "priority": 150,
         }
     ]
+
+
+def test_private_channel_flag_is_passed_to_discovery(monkeypatch):
+    monkeypatch.setenv("SLACK_ETL_ENABLED", "true")
+    monkeypatch.setenv("SLACK_SYNC_INDEX_PRIVATE_CHANNELS", "true")
+    sync = _load_sync()
+    client, calls = _patch_handler_io(monkeypatch, sync)
+
+    monkeypatch.setattr(sync, "_ts_now_minus_days", lambda days: f"days:{days}")
+
+    result = asyncio.run(sync.handler(sync.Input(), FakeContext()))
+
+    assert result["status"] == "completed"
+    assert client.channel_calls[0]["include_private_channels"] is True
+    assert calls["run_start"][0]["metadata"]["index_private_channels"] is True

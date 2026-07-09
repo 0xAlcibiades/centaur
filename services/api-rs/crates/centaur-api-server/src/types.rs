@@ -37,6 +37,8 @@ pub struct CreateSessionResponse {
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackThreadContext>,
 }
 
@@ -73,6 +75,19 @@ pub struct ExecuteSessionResponse {
     pub execution_id: String,
     pub thread_key: ThreadKey,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InterruptSessionExecutionRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InterruptSessionExecutionResponse {
+    pub ok: bool,
+    pub interrupted: bool,
+    pub execution_id: Option<String>,
+    pub thread_key: ThreadKey,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -78,50 +78,6 @@ Application-level model and tool secrets, such as `OPENAI_API_KEY`,
 placeholder values and [iron-proxy](https://docs.iron.sh) injects the real credentials only on approved
 outbound requests.
 
-### Optional local Codex and Claude auth
-
-The normal path uses API keys through [iron-proxy](https://docs.iron.sh). If you
-need Codex subscription auth or Claude Code subscription/card auth, import local
-CLI auth state explicitly:
-
-```bash
-bun run auth:bootstrap
-```
-
-The command writes only secret payload values to `.env.local`. Store Codex
-`CODEX_AUTH_JSON` in the configured 1Password field used by iron-proxy. Source
-`.env.local` before `just bootstrap-secrets` so the Claude Code OAuth
-refresh-token fields, when present, are copied into the separate
-`centaur-harness-auth` Secret. They are not added to `centaur-infra-env`,
-which the API consumes with `envFrom`.
-
-If local auth is missing, run the command it prints, or use:
-
-```bash
-bun run auth:bootstrap -- --login
-```
-
-That opt-in mode streams `codex login --device-auth` or
-`claude auth login`. For Claude on macOS, bootstrap imports the Claude Code
-Keychain credential and writes the refresh token for iron-proxy; on Linux, it
-imports `$CLAUDE_CONFIG_DIR/.credentials.json` or
-`~/.claude/.credentials.json`.
-
-Enable local auth only for deployments that need it:
-
-```yaml
-sandbox:
-  extraEnv:
-    CODEX_USE_LOCAL_AUTH: "true"
-    CLAUDE_USE_LOCAL_AUTH: "true"
-```
-
-The API scopes auth payloads to the matching engine: Codex auth stays in
-iron-proxy, Claude proxy pods receive Claude refresh-token material, and Amp
-pods receive neither. This is less isolated than the default [iron-proxy](https://docs.iron.sh)
-API-key path because provider CLI login state is still used instead of normal
-provider API keys.
-
 The default harness is `codex`, so `OPENAI_API_KEY` must exist in the configured
 secret source before Slack agent turns can complete. Use explicit harness
 selectors only when you want a non-default harness such as Amp or Claude Code.

@@ -5,9 +5,15 @@ Rails.application.routes.draw do
   # Can be used by load balancers and uptime monitors to verify that the app is live.
   get "up" => "rails/health#show", as: :rails_health_check
 
-  # Render dynamic PWA files from app/views/pwa/* (remember to link manifest in application.html.erb)
-  # get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
-  # get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
+  # PWA manifest + service worker, rendered from app/views/pwa/*. Served by
+  # Rails::PwaController (framework controller, no console session required) so
+  # the browser can fetch them outside an authenticated page load. Both layouts
+  # link the manifest and register the worker.
+  get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
+  get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
+  # Target of the manifest's web+centaur:// protocol handler: maps the
+  # custom-scheme URL in ?target= onto an in-app path and redirects.
+  get "launch", to: "launch#show", as: :launch
 
   # Operator console session login (cookie-based, separate from the API key auth).
   get "login", to: "sessions#new", as: :login
@@ -22,10 +28,35 @@ Rails.application.routes.draw do
   get "auth/:provider/start", to: "session_oauth#start", as: :auth_start
   get "auth/:provider/callback", to: "session_oauth#callback", as: :auth_callback
 
+  # MCP OAuth authorization server. MCP clients discover this from api-rs'
+  # OAuth protected-resource metadata and register public PKCE clients here.
+  get ".well-known/oauth-authorization-server", to: "mcp/oauth#metadata"
+  get ".well-known/openid-configuration", to: "mcp/oauth#metadata"
+  post "mcp/oauth/register", to: "mcp/oauth#register"
+  get "mcp/oauth/authorize", to: "mcp/oauth#authorize"
+  post "mcp/oauth/authorize", to: "mcp/oauth#approve"
+  post "mcp/oauth/token", to: "mcp/oauth#token"
+
   # Operator console (server-rendered HTML UI).
   root "console#principals"
   get "console/principals", to: "console#principals", as: :console_principals
+  namespace :console do
+    get  "principals/new", to: "principals#new",    as: :new_principal
+    post "principals",     to: "principals#create", as: :create_principal
+  end
   get "console/principals/:id", to: "console#principal", as: :console_principal
+  namespace :console do
+    resources :threads, only: %i[index create]
+    resources :workflows, only: %i[index show] do
+      member do
+        post :run, action: :force_start
+      end
+    end
+    # Lazily-loaded sidebar thread list (Turbo Frame src). Kept off the main
+    # page render so the unindexed cross-database sessions query does not block
+    # every console page. See ApplicationController#load_console_sidebar_threads.
+    get "sidebar_threads", to: "threads#sidebar", as: :sidebar_threads
+  end
   namespace :console do
     resources :roles, only: %i[index show new create edit update] do
       member do
@@ -38,6 +69,8 @@ Rails.application.routes.draw do
   # extra /roles and /grants path segments keep these clear of the show route above
   # and avoid clobbering the console_principal_path helper.
   namespace :console do
+    delete "principals/:id",                  to: "principals#destroy", as: :delete_principal
+    patch  "principals/:id/sandbox_access",   to: "principals#update_sandbox_access", as: :principal_sandbox_access
     post   "principals/:id/roles",            to: "principals#assign_role",   as: :principal_assign_role
     delete "principals/:id/roles/:role_id",   to: "principals#unassign_role", as: :principal_unassign_role
     post   "principals/:id/grants",           to: "principals#grant_secret",  as: :principal_grant_secret
@@ -50,6 +83,7 @@ Rails.application.routes.draw do
     resources :static_secrets, only: %i[new create edit update destroy], path: "secrets/static"
     resources :pg_dsn_secrets, only: %i[new create edit update destroy], path: "secrets/pg_dsn"
     resources :gcp_auth_secrets, only: %i[new create edit update destroy], path: "secrets/gcp_auth"
+    resources :gcp_id_token_secrets, only: %i[new create edit update destroy], path: "secrets/gcp_id_token"
     post   "secrets/:kind/:id/roles",           to: "secrets#grant_role",        as: :secret_grant_role
     delete "secrets/:kind/:id/roles/:grant_id", to: "secrets#revoke_role_grant", as: :secret_revoke_role_grant
   end
@@ -62,6 +96,24 @@ Rails.application.routes.draw do
   end
   get "console/credentials/:id", to: "console#credential", as: :console_credential
   get "console/oauth_apps", to: "console#oauth_apps", as: :console_oauth_apps
+  # User-facing list of enabled OAuth apps and their consent start links. Not
+  # admin-gated: any signed-in team member connects integrations from here.
+  get "console/integrations", to: "console/integrations#index", as: :console_integrations
+  get "console/etls", to: "console/etls#index", as: :console_etls
+  namespace :console do
+    post "etls/slack_archive_imports",
+         to: "etls#create_slack_archive_import",
+         as: :slack_archive_imports
+    post "etls/slack_archive_imports/:import_id/start",
+         to: "etls#start_slack_archive_import",
+         as: :start_slack_archive_import
+    post "etls/slack_archive_imports/:import_id/retry",
+         to: "etls#retry_slack_archive_import",
+         as: :retry_slack_archive_import
+    delete "etls/slack_archive_imports/:import_id",
+           to: "etls#delete_slack_archive_import",
+           as: :delete_slack_archive_import
+  end
   # Create/edit forms for OAuth apps. Declared before the show route so
   # /console/oauth_apps/new wins over the generic `:id` match. Named
   # `*_oauth_app_form*` so the form helpers don't collide with the read
@@ -80,6 +132,9 @@ Rails.application.routes.draw do
         post :promote
       end
     end
+    # Admin self-descope ("view as operator"): pause (admin-only) and restore
+    # admin permissions. A singular resource because it's a per-session flag.
+    resource :descope, only: %i[create destroy]
   end
 
   namespace :api do
@@ -90,6 +145,9 @@ Rails.application.routes.draw do
         collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
       end
       resources :gcp_auth_secrets, only: %i[index show create update destroy] do
+        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+      end
+      resources :gcp_id_token_secrets, only: %i[index show create update destroy] do
         collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
       end
       resources :aws_auth_secrets, only: %i[index show create update destroy] do

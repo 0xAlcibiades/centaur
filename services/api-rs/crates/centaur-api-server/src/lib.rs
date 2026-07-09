@@ -1,6 +1,10 @@
+mod api_jwt;
 pub mod client;
 mod error;
+mod mcp;
 mod routes;
+mod slack_proxy;
+mod tool_discovery;
 pub mod types;
 
 pub use centaur_session_runtime::{SandboxRuntime, SessionRuntime};
@@ -8,6 +12,10 @@ pub use error::ApiError;
 pub use routes::{
     AppState, build_router_with_app_state, build_router_with_runtime,
     build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
+};
+pub use tool_discovery::{
+    DiscoveredToolProxyFragment, ToolDiscoveryConfig, ToolDiscoveryError,
+    discover_persona_registry, discover_tool_proxy_fragment,
 };
 
 #[cfg(test)]
@@ -28,6 +36,8 @@ mod tests {
     };
     use centaur_session_runtime::SandboxRuntime;
     use centaur_session_sqlx::PgSessionStore;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde_json::{Value, json};
     use sqlx::PgPool;
     use tower::ServiceExt;
 
@@ -103,6 +113,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_decodes_slack_client_bearer_jwt_when_present() {
+        let app = build_router_with_app_state(AppState::unready());
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console",
+                "sub": "principal_123",
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+                "slack": {
+                    "upload_channels": ["C123456789"],
+                    "download_channels": ["C987654321"],
+                    "history_channels": ["C111111111"]
+                }
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            body.pointer("/slack_client_jwt/claims/sub")
+                .and_then(Value::as_str),
+            Some("principal_123")
+        );
+        assert_eq!(
+            body.pointer("/slack_client_jwt/claims/slack/upload_channels/0")
+                .and_then(Value::as_str),
+            Some("C123456789")
+        );
+        assert_eq!(
+            body.pointer("/slack_client_jwt/claims/slack/download_channels/0")
+                .and_then(Value::as_str),
+            Some("C987654321")
+        );
+        assert_eq!(
+            body.pointer("/slack_client_jwt/claims/slack/history_channels/0")
+                .and_then(Value::as_str),
+            Some("C111111111")
+        );
     }
 
     #[tokio::test]
@@ -223,6 +291,37 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_requires_bearer_before_runtime_is_ready() {
+        let app = build_router_with_app_state(AppState::unready());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::HOST, "centaur.local")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(challenge.contains("Bearer"));
+        assert!(challenge.contains(
+            "resource_metadata=\"http://centaur.local/.well-known/oauth-protected-resource/mcp\""
+        ));
     }
 
     #[tokio::test]

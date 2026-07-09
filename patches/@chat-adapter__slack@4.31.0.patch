@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22eed819d8e 100644
+index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f32ccc951 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -31,6 +31,216 @@ import {
@@ -216,10 +216,69 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
 +    type: "task_update"
 +  }));
 +}
-
+ 
  // src/cards.ts
  import {
-@@ -3452,26 +3662,251 @@ var SlackAdapter = class _SlackAdapter {
+@@ -352,6 +562,15 @@ import {
+ } from "chat";
+ var BARE_MENTION_PATTERN = /(?<![<\w/])@(\w+)/g;
+ var URL_PATTERN = /\bhttps?:\/\/[^\s<>]+/g;
++function plainTextPreservingBlocks(node) {
++  if (node.type === "root" || node.type === "blockquote") {
++    return getNodeChildren(node).map(plainTextPreservingBlocks).filter(Boolean).join(node.type === "root" ? "\n\n" : "\n");
++  }
++  if (node.type === "list" || node.type === "listItem") {
++    return getNodeChildren(node).map(plainTextPreservingBlocks).filter(Boolean).join("\n");
++  }
++  return toPlainText(node);
++}
+ var SlackFormatConverter = class extends BaseFormatConverter {
+   /**
+    * Render an AST to standard markdown. Slack accepts this directly via
+@@ -366,6 +585,17 @@ var SlackFormatConverter = class extends BaseFormatConverter {
+   toAst(mrkdwn) {
+     return parseMarkdown(slackMrkdwnToMarkdown(mrkdwn));
+   }
++  /**
++   * Extract plain text for incoming `message` events. The base implementation
++   * flattens the whole AST with mdast-util-to-string, which concatenates
++   * sibling block nodes with NO separator: `--model=fable\n\nexamine ...`
++   * became `--model=fableexamine ...`, gluing every paragraph boundary in the
++   * message. Preserve block boundaries instead — paragraphs join with a blank
++   * line, list items and blockquote lines with a newline.
++   */
++  extractPlainText(mrkdwn) {
++    return plainTextPreservingBlocks(this.toAst(mrkdwn));
++  }
+   /**
+    * Build the Slack API payload fields for a message.
+    *
+@@ -2004,7 +2234,10 @@ var SlackAdapter = class _SlackAdapter {
+       channel: event.channel,
+       threadTs
+     });
+-    const isMention = event.type === "app_mention";
++    const botMentioned = Boolean(
++      this._botUserId && typeof event.text === "string" && (event.text.includes(`<@${this._botUserId}>`) || event.text.includes(`<@${this._botUserId}|`))
++    );
++    const isMention = event.type === "app_mention" || botMentioned && (event.bot_id || event.subtype === "bot_message");
+     const factory = async () => {
+       const msg = await this.parseSlackMessage(event, threadId);
+       if (isMention) {
+@@ -2520,10 +2753,10 @@ var SlackAdapter = class _SlackAdapter {
+       formatted: this.formatConverter.toAst(text),
+       raw: event,
+       author: {
+-        userId: event.user || event.bot_id || "unknown",
++        userId: event.user || event.bot_profile?.user_id || event.bot_id || "unknown",
+         userName,
+         fullName,
+-        isBot: !!event.bot_id,
++        isBot: Boolean(event.bot_id || event.bot_profile || event.subtype === "bot_message"),
+         isMe
+       },
+       metadata: {
+@@ -3452,26 +3685,251 @@ var SlackAdapter = class _SlackAdapter {
      }
      this.logger.debug("Slack: starting stream", { channel, threadTs });
      const token = await this.getToken();
@@ -480,7 +539,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
      const sendStructuredChunk = async (chunk) => {
        if (!structuredChunksSupported) {
          return;
-@@ -3481,8 +3916,45 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3481,8 +3939,45 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
        try {
@@ -527,7 +586,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
          structuredChunksSupported = false;
          this.logger.warn(
            "Structured streaming chunk failed, falling back to text-only streaming. Ensure your Slack app manifest includes assistant_view, assistant:write scope, and @slack/web-api >= 7.14.0",
-@@ -3497,31 +3969,91 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3497,31 +3992,91 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
      };
@@ -547,7 +606,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
 +        } else {
 +          await sendStructuredChunk(chunk);
 +        }
-+      }
+       }
 +      renderer.finish();
 +      const finalCommittable = renderer.getCommittableText();
 +      const finalDelta = finalCommittable.slice(lastAppended.length);
@@ -610,7 +669,7 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
 +            error: stopError
 +          });
 +        }
-       }
++      }
 +      annotateSlackAnswerLost(error, !sourceConsumed || answerStopFailed);
 +      throw error;
      }
@@ -638,3 +697,16 @@ index 53a35e40d7dc03dea57f965325728761467ad7c7..d960b5a2daa267af4f860f787261a22e
      };
    }
    /**
+@@ -3798,10 +4353,10 @@ var SlackAdapter = class _SlackAdapter {
+       formatted: this.formatConverter.toAst(text),
+       raw: event,
+       author: {
+-        userId: event.user || event.bot_id || "unknown",
++        userId: event.user || event.bot_profile?.user_id || event.bot_id || "unknown",
+         userName,
+         fullName,
+-        isBot: !!event.bot_id,
++        isBot: Boolean(event.bot_id || event.bot_profile || event.subtype === "bot_message"),
+         isMe
+       },
+       metadata: {

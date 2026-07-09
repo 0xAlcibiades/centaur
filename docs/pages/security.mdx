@@ -145,13 +145,6 @@ A few honest caveats:
   read and write the sandbox filesystem, run shell commands, and
   call any Centaur tool their API token allows. The containment is
   at the sandbox boundary, not inside it.
-- **Local Codex/Claude auth is higher-risk opt-in state.** When
-  `CODEX_USE_LOCAL_AUTH` or `CLAUDE_USE_LOCAL_AUTH` is enabled with proxy
-  transport, provider login state is available to the selected sandbox's
-  iron-proxy sidecar instead of the sandbox container. File transport can still
-  reconstruct provider CLI login files inside the selected provider sandbox.
-  This remains different from the normal API-key path because provider
-  subscription login state is being reused.
 - **Undesirable agent behavior in general.** Network and credential
   controls limit the blast radius (real keys cannot leak, credentialed
   calls cannot be redirected) but they do not prevent the agent from

@@ -50,6 +50,54 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal({}, principal.reload.labels)
   end
 
+  test "sandbox access defaults to enabled" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-sandbox-access"))
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_predicate principal, :sandbox_repo_cache_enabled
+    assert_predicate principal, :sandbox_observability_enabled
+    assert_predicate principal, :sandbox_api_server_enabled
+  end
+
+  test "sandbox repo-cache enum syncs compatibility boolean" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-setting"))
+
+    principal.update!(sandbox_repo_cache: "public")
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal false, principal.sandbox_repo_cache_enabled
+    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+
+    principal.update!(sandbox_repo_cache_enabled: true)
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_equal true, principal.sandbox_repo_cache_enabled
+  end
+
+  test "sandbox repo-cache enum survives labels assigned in the same update" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-label-order"))
+
+    principal.update!(sandbox_repo_cache: "public", labels: { "team" => "platform" })
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal "platform", principal.labels["team"]
+    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+  end
+
+  test "sandbox repo-cache accepts pub as public alias" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-pub-alias"))
+
+    principal.update!(sandbox_repo_cache: "pub")
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+  end
+
   test "labels accepts arbitrary string map" do
     principal = Principal.create!(default_attrs(
       namespace: "acme",
@@ -57,6 +105,82 @@ class PrincipalTest < ActiveSupport::TestCase
       labels: { "env" => "prod", "team" => "platform" }
     ))
     assert_equal({ "env" => "prod", "team" => "platform" }, principal.reload.labels)
+  end
+
+  test "effective_config adds api server JWT for slack channel principals" do
+    with_env(
+      "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+      "CENTAUR_API_URL" => "http://api.internal:8080",
+      "CENTAUR_API_SERVER_PROXY_HOSTS" => nil
+    ) do
+      principal = principals(:acme_channel)
+      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+
+      config = principal.effective_config(redact_secrets: false)
+      entry = config.fetch("secrets").find do |secret|
+        secret.dig("inject", "header") == "Authorization" &&
+          secret.dig("source", "type") == "control_plane"
+      end
+
+      refute_nil entry
+      assert_equal "Bearer {{ .Value }}", entry.dig("inject", "formatter")
+      assert_includes entry.fetch("rules"), { "host" => "api.internal" }
+
+      claims = jwt_payload(entry.dig("source", "value"))
+      assert_equal "centaur-console", claims.fetch("iss")
+      assert_equal "centaur-api", claims.fetch("aud")
+      assert_equal principal.oid, claims.fetch("sub")
+      assert_equal [ "C0123456789" ], claims.dig("slack", "upload_channels")
+      assert_equal [ "C0123456789" ], claims.dig("slack", "download_channels")
+      assert_equal [ "C0123456789" ], claims.dig("slack", "history_channels")
+      assert_equal 1.hour.to_i, claims.fetch("exp") - claims.fetch("iat")
+      assert_equal ApiServer::Jwt.rotation_offset(principal),
+                   claims.fetch("iat") % ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
+    end
+  end
+
+  test "effective_config omits api server JWT when sandbox api access is disabled" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      principal.update!(
+        labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" },
+        sandbox_api_server_enabled: false
+      )
+
+      config = principal.effective_config(redact_secrets: false)
+      entry = config.fetch("secrets").find do |secret|
+        secret.dig("inject", "header") == "Authorization" &&
+          secret.dig("source", "type") == "control_plane"
+      end
+
+      assert_nil entry
+    end
+  end
+
+  test "api server JWT is deterministic inside the rotation window" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+
+      window = ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
+      boundary = 1_700_000_100 + ApiServer::Jwt.rotation_offset(principal)
+
+      first = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + 23)
+      )
+      second = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + window - 1)
+      )
+      third = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + window)
+      )
+
+      assert_equal first, second
+      refute_equal first, third
+    end
   end
 
   test "namespace is immutable after creation" do
@@ -151,6 +275,16 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal 1, transforms.length
     assert_equal "gcp_auth", transforms.first["name"]
     assert_equal({ "type" => "workload_identity" }, transforms.first.dig("config", "credentials_provider"))
+  end
+
+  test "sync_transforms emits a gcp_id_token transform per granted GcpIdTokenSecret" do
+    transforms = principal_with_grants(gcp_id_token_secrets(:acme_cloud_run)).sync_transforms
+    assert_equal 1, transforms.length
+    transform = transforms.first
+    assert_equal "gcp_id_token", transform["name"]
+    assert_equal({ "type" => "env", "var" => "CLOUD_RUN_SA_KEYFILE" }, transform.dig("config", "keyfile"))
+    assert_equal "https://my-service-abc123-uc.a.run.app", transform.dig("config", "audience")
+    assert_equal "x-serverless-authorization", transform.dig("config", "header")
   end
 
   test "sync_transforms emits an aws_auth transform per granted AwsAuthSecret" do
@@ -447,5 +581,22 @@ class PrincipalTest < ActiveSupport::TestCase
     live = principal.effective_config(redact_secrets: false)
                     .fetch("secrets").find { |s| s.dig("source", "type") == "control_plane" }
     assert_equal "s3cr3t", live.dig("source", "value")
+  end
+
+  def jwt_payload(token)
+    _header, payload, _signature = token.split(".")
+    JSON.parse(Base64.urlsafe_decode64(payload))
+  end
+
+  def with_env(values)
+    previous = values.keys.to_h { |key| [ key, ENV[key] ] }
+    values.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
+    yield
+  ensure
+    previous.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
   end
 end
