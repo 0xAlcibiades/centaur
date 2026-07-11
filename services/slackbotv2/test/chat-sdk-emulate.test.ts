@@ -2084,6 +2084,66 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('reattaches a fallback answer when the original Slack root was replaced', async () => {
+    codexApi.autoRespond = false
+    slackApi.failStreamAppendsAfter(0, 'invalid_thread_ts')
+
+    const mentionText = `<@${BOT_USER_ID}> finish this task with the attached image`
+    const original = await postUserMessage(mentionText)
+    const key = threadKey(original.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-replaced-root-fallback',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: original.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const replacement = await postUserMessage(mentionText)
+    slackApi.failRepliesWithThreadNotFound(CHANNEL_ID, original.ts)
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-replaced-root',
+          type: 'commandExecution',
+          command: 'true',
+          status: 'completed',
+          aggregatedOutput: 'done'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-replaced-root',
+      status: 'completed',
+      result_text: 'REATTACHED_FALLBACK_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    expect(await threadText(replacement.ts)).toContain('REATTACHED_FALLBACK_VISIBLE')
+    const history = await slack.conversations.history({ channel: CHANNEL_ID, limit: 100 })
+    const topLevelAnswers = (history.messages ?? []).filter(message =>
+      message.text?.includes('REATTACHED_FALLBACK_VISIBLE')
+    )
+    expect(topLevelAnswers).toHaveLength(0)
+  })
+
   it('rotates Slack stream segments before they reach the streaming age limit', async () => {
     process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
     try {

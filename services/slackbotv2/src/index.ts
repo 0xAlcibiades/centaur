@@ -103,6 +103,10 @@ type SlackAssistantAdapter = {
   setAssistantTitle?(channelId: string, threadTs: string, title: string): Promise<void>
 }
 
+type SlackFallbackAdapter = Adapter & {
+  openDM?(userId: string): Promise<string>
+}
+
 const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
@@ -1117,6 +1121,7 @@ async function renderExecutionAttempt(
       // answer from the terminal result rather than the doubled live buffer.
       const reconciled = await renderFallbackFinalAnswer(
         thread,
+        message,
         options,
         {
           afterEventId: input.afterEventId,
@@ -1207,6 +1212,7 @@ async function renderExecutionAttempt(
     }
     const fallback = await renderFallbackFinalAnswer(
       thread,
+      message,
       options,
       {
         afterEventId: input.afterEventId,
@@ -1288,6 +1294,7 @@ const FALLBACK_OPEN_MAX_ATTEMPTS = 4
  */
 async function renderFallbackFinalAnswer(
   thread: Thread,
+  message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
   source: { afterEventId: number; executionId?: string; threadId: string },
   trace?: SlackbotV2Trace,
@@ -1343,7 +1350,7 @@ async function renderFallbackFinalAnswer(
     if (replacement) {
       await thread.adapter.editMessage(thread.id, replacement.replaceMessageId, fallbackText)
     } else {
-      await thread.post(fallbackText)
+      await postSlackFallbackFinalAnswer(thread, message, fallbackText, options, trace)
     }
     traceLog(options, 'slackbotv2_render_fallback_complete', trace, {
       chars: text.length,
@@ -1369,6 +1376,161 @@ async function renderFallbackFinalAnswer(
   } finally {
     recordFallback(outcome, startedAtMs)
   }
+}
+
+async function postSlackFallbackFinalAnswer(
+  thread: Thread,
+  message: SlackbotV2ApiMessage,
+  text: string,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  const target = slackAssistantTarget(thread)
+  if (!target) throw new Error(`invalid Slack thread id: ${thread.id}`)
+
+  let threadId = thread.id
+  let threadTs = target.threadTs
+  if (!(await slackThreadExists(options, target.channel, threadTs))) {
+    const replacementTs = await findReplacementSlackThread(options, message, target)
+    if (!replacementTs) {
+      await postSlackFallbackDm(thread, message, text)
+      traceLog(options, 'slackbotv2_render_fallback_delivered_to_dm', trace, {
+        missing_thread_ts: threadTs
+      })
+      return
+    }
+    threadTs = replacementTs
+    threadId = `slack:${target.channel}:${replacementTs}`
+    traceLog(options, 'slackbotv2_render_fallback_thread_reattached', trace, {
+      original_thread_ts: target.threadTs,
+      replacement_thread_ts: replacementTs
+    })
+  }
+
+  const sent = await thread.adapter.postMessage(threadId, text).catch(async error => {
+    if (!isSlackMissingThreadError(error)) throw error
+    await postSlackFallbackDm(thread, message, text)
+    traceLog(options, 'slackbotv2_render_fallback_delivered_to_dm', trace, {
+      missing_thread_ts: threadTs
+    })
+    return null
+  })
+  if (!sent) return
+  if (slackPostedThreadTs(sent.raw) === threadTs) return
+
+  await thread.adapter.deleteMessage(threadId, sent.id).catch(() => undefined)
+  await postSlackFallbackDm(thread, message, text)
+  traceWarn(options, 'slackbotv2_render_fallback_channel_post_removed', trace, {
+    expected_thread_ts: threadTs,
+    message_id: sent.id
+  })
+}
+
+async function slackThreadExists(
+  options: SlackbotV2Options,
+  channel: string,
+  threadTs: string
+): Promise<boolean> {
+  const payload = await slackApiPayload(options, 'conversations.replies', {
+    channel,
+    inclusive: 'true',
+    limit: '1',
+    ts: threadTs
+  })
+  if (payload.ok === true) {
+    return Array.isArray(payload.messages) && payload.messages.length > 0
+  }
+  const code = stringField(payload.error)
+  if (code === 'thread_not_found' || code === 'invalid_thread_ts') return false
+  throw new Error(`Slack conversations.replies failed: ${code || 'unknown_error'}`)
+}
+
+async function findReplacementSlackThread(
+  options: SlackbotV2Options,
+  message: SlackbotV2ApiMessage,
+  target: { channel: string; threadTs: string }
+): Promise<string | null> {
+  const raw = isJsonObject(message.raw) ? message.raw : {}
+  const user = stringField(raw.user) || message.author.userId
+  const text = stringField(raw.text).trim()
+  const threadSeconds = Number(target.threadTs)
+  if (!user || !text || !Number.isFinite(threadSeconds)) return null
+
+  const payload = await slackApiPayload(options, 'conversations.history', {
+    channel: target.channel,
+    inclusive: 'true',
+    limit: '100',
+    oldest: target.threadTs,
+    latest: (threadSeconds + LATE_SLACK_FILE_PENDING_TTL_MS / 1000).toFixed(6)
+  })
+  if (payload.ok !== true || !Array.isArray(payload.messages)) return null
+
+  const candidates = payload.messages
+    .filter(isJsonObject)
+    .filter(candidate => {
+      const candidateTs = stringField(candidate.ts)
+      const candidateThreadTs = stringField(candidate.thread_ts)
+      return (
+        candidateTs !== target.threadTs &&
+        compareSlackTs(candidateTs, target.threadTs) > 0 &&
+        (!candidateThreadTs || candidateThreadTs === candidateTs) &&
+        stringField(candidate.user) === user &&
+        stringField(candidate.text).trim() === text
+      )
+    })
+    .sort((left, right) => compareSlackTs(stringField(left.ts), stringField(right.ts)))
+
+  return candidates.length === 1 ? stringField(candidates[0]?.ts) || null : null
+}
+
+async function slackApiPayload(
+  options: SlackbotV2Options,
+  method: string,
+  params: Record<string, string>
+): Promise<Record<string, unknown>> {
+  const url = new URL(method, options.slackApiUrl ?? 'https://slack.com/api/')
+  const body = new URLSearchParams(params)
+  const response = await withSlackApiTimeout(options, `Slack API ${method}`, () =>
+    (options.fetch ?? fetch)(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${options.botToken}`,
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body
+    })
+  )
+  if (!response.ok) {
+    throw new Error(`Slack API ${method} failed: ${response.status} ${response.statusText}`)
+  }
+  const payload = await response.json()
+  if (!isJsonObject(payload)) throw new Error(`Slack API ${method} returned invalid JSON`)
+  return payload
+}
+
+function slackPostedThreadTs(raw: unknown): string {
+  if (!isJsonObject(raw)) return ''
+  const postedMessage = isJsonObject(raw.message) ? raw.message : raw
+  return stringField(postedMessage.thread_ts)
+}
+
+function isSlackMissingThreadError(error: unknown): boolean {
+  const code = slackStreamErrorCode(error)
+  return code.includes('invalid_thread_ts') || code.includes('thread_not_found')
+}
+
+async function postSlackFallbackDm(
+  thread: Thread,
+  message: SlackbotV2ApiMessage,
+  text: string
+): Promise<void> {
+  const adapter = thread.adapter as SlackFallbackAdapter
+  if (!adapter.openDM) throw new Error('Slack adapter does not support direct messages')
+  const dmThreadId = await adapter.openDM(message.author.userId)
+  await adapter.postMessage(
+    dmThreadId,
+    `The original Slack thread is no longer available. Here is the completed answer:\n\n${text}`
+  )
 }
 
 function scheduleRenderObligationRecovery(
@@ -1694,6 +1856,7 @@ async function recoverRenderObligation(
       // durable, de-duplicated final answer instead of leaving it truncated.
       const reconciled = await renderFallbackFinalAnswer(
         thread,
+        obligation.message,
         options,
         {
           afterEventId: obligation.afterEventId,
@@ -1756,6 +1919,7 @@ async function recoverRenderObligation(
       }
       const fallback = await renderFallbackFinalAnswer(
         thread,
+        obligation.message,
         options,
         {
           afterEventId: obligation.afterEventId,

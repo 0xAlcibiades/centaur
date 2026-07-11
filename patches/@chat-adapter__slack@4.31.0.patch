@@ -48,7 +48,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +}
 +function isSlackStreamDeliveryError(error) {
 +  const code = slackStreamErrorCode(error);
-+  return code.includes("msg_too_long") || code.includes("msg_blocks_too_long") || code.includes("message_not_in_streaming_state");
++  return code.includes("msg_too_long") || code.includes("msg_blocks_too_long") || code.includes("message_not_in_streaming_state") || code.includes("invalid_thread_ts") || code.includes("thread_not_found");
 +}
 +function annotateSlackAnswerLost(error, lost) {
 +  if (!error || typeof error !== "object" && typeof error !== "function") {
