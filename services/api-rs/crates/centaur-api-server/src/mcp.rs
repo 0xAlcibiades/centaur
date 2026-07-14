@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::PathBuf,
+    str::FromStr,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -13,12 +14,19 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_runtime::{SessionRuntime, ToolHostCallInput};
+use centaur_session_core::{
+    HarnessType, MessageRole, SessionEvent, SessionMessageInput, ThreadKey,
+};
+use centaur_session_runtime::{
+    ExecuteSessionInput, HarnessConflictPolicy, SessionRuntime, SessionRuntimeError,
+    ToolHostCallInput,
+};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{
     ApiError,
@@ -26,6 +34,8 @@ use crate::{
     routes::{AppState, header_value},
     tool_discovery::{DiscoveredTool, ToolDiscoveryConfig, discover_tool_catalog},
 };
+
+const MCP_AGENT_MAX_DURATION_MS: u64 = 10 * 60 * 1_000;
 
 pub(crate) async fn mcp_get() -> Response {
     (
@@ -74,6 +84,39 @@ struct CentaurToolMcpArguments {
     arguments: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct McpAgentStartArguments {
+    prompt: String,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    persona_id: Option<String>,
+    #[serde(default)]
+    thread_key: Option<String>,
+    #[serde(default)]
+    idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAgentEventsArguments {
+    thread_key: String,
+    #[serde(default)]
+    execution_id: Option<String>,
+    #[serde(default)]
+    after_event_id: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAgentCancelArguments {
+    thread_key: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct McpPrincipal {
     token_id: String,
@@ -119,6 +162,7 @@ pub(crate) async fn mcp_post(
         "tools/list" => {
             ensure_mcp_scope(&principal.scopes, "mcp:tools")?;
             let mut tools = vec![mcp_whoami_tool()];
+            tools.extend(mcp_agent_tool_entries());
             tools.extend(mcp_centaur_tool_entries()?);
             json!({
                 "tools": tools,
@@ -130,6 +174,21 @@ pub(crate) async fn mcp_post(
                 .map_err(|error| ApiError::BadRequest(error.to_string()))?;
             if params.name == "centaur_whoami" {
                 mcp_whoami_result(&principal, params.arguments)?
+            } else if params.name == "centaur_agent_start" {
+                match mcp_agent_start_result(&state, &principal, params.arguments).await {
+                    Ok(result) => result,
+                    Err(error) => mcp_agent_domain_error_result(error)?,
+                }
+            } else if params.name == "centaur_agent_events" {
+                match mcp_agent_events_result(&state, &principal, params.arguments).await {
+                    Ok(result) => result,
+                    Err(error) => mcp_agent_domain_error_result(error)?,
+                }
+            } else if params.name == "centaur_agent_cancel" {
+                match mcp_agent_cancel_result(&state, &principal, params.arguments).await {
+                    Ok(result) => result,
+                    Err(error) => mcp_agent_domain_error_result(error)?,
+                }
             } else {
                 let Some(tool) = mcp_find_centaur_tool(&params.name)? else {
                     return Ok(mcp_json_error(id, -32602, "unknown tool"));
@@ -158,6 +217,96 @@ fn mcp_whoami_tool() -> Value {
             "additionalProperties": false,
         },
     })
+}
+
+fn mcp_agent_tool_entries() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "centaur_agent_start",
+            "description": "Start a durable Centaur sub-agent execution in a sandbox and return its thread_key and execution_id. Use centaur_agent_events to read progress.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Instruction to run in the sub-agent sandbox."
+                    },
+                    "harness": {
+                        "type": "string",
+                        "description": "Harness to run: codex, amp, or claudecode. New threads default to the deployment harness; existing threads keep their current harness."
+                    },
+                    "persona_id": {
+                        "type": "string",
+                        "description": "Optional Centaur persona id."
+                    },
+                    "thread_key": {
+                        "type": "string",
+                        "description": "Optional existing mcp-agent thread key returned by centaur_agent_start."
+                    },
+                    "idle_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "max_duration_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MCP_AGENT_MAX_DURATION_MS,
+                        "description": "Maximum execution duration. Defaults to 10 minutes and cannot exceed 10 minutes."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "centaur_agent_events",
+            "description": "Read durable events for a Centaur sub-agent execution.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_key"],
+                "properties": {
+                    "thread_key": {
+                        "type": "string",
+                        "description": "mcp-agent thread key returned by centaur_agent_start."
+                    },
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Optional execution id returned by centaur_agent_start."
+                    },
+                    "after_event_id": {
+                        "type": "integer",
+                        "description": "Only return events with event_id greater than this value."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "description": "Maximum events to return. Defaults to 100."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "centaur_agent_cancel",
+            "description": "Ask the active Centaur sub-agent execution for a thread to stop.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["thread_key"],
+                "properties": {
+                    "thread_key": {
+                        "type": "string",
+                        "description": "mcp-agent thread key returned by centaur_agent_start."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional cancellation reason."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+    ]
 }
 
 fn mcp_centaur_tool_entries() -> Result<Vec<Value>, ApiError> {
@@ -347,6 +496,209 @@ fn mcp_whoami_result(principal: &McpPrincipal, arguments: Value) -> Result<Value
     ))
 }
 
+async fn mcp_agent_start_result(
+    state: &AppState,
+    principal: &McpPrincipal,
+    arguments: Value,
+) -> Result<Value, ApiError> {
+    let params = serde_json::from_value::<McpAgentStartArguments>(arguments)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let prompt = params.prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return Err(ApiError::BadRequest("prompt is required".to_owned()));
+    }
+    let runtime = state.runtime()?;
+    let thread_key = match params.thread_key.as_deref() {
+        Some(thread_key) => mcp_validate_agent_thread_key(principal, thread_key)?,
+        None => mcp_generate_agent_thread_key(principal)?,
+    };
+    let harness = match params.harness.as_deref() {
+        Some(harness) if !harness.trim().is_empty() => mcp_parse_agent_harness(harness)?,
+        _ if params.thread_key.is_some() => runtime.session(&thread_key).await?.harness_type,
+        _ => runtime.default_harness(),
+    };
+    let idempotency_key = format!("mcp-agent-{}", Uuid::new_v4().simple());
+    let max_duration_ms = params.max_duration_ms.unwrap_or(MCP_AGENT_MAX_DURATION_MS);
+    if max_duration_ms > MCP_AGENT_MAX_DURATION_MS {
+        return Err(ApiError::BadRequest(format!(
+            "max_duration_ms cannot exceed {MCP_AGENT_MAX_DURATION_MS}"
+        )));
+    }
+    let metadata = json!({
+        "mcp_agent": true,
+        "mcp_principal_id": principal.principal_id,
+        "mcp_token_id": principal.token_id,
+    });
+    let session = runtime
+        .create_or_get_external_session(
+            &thread_key,
+            &harness,
+            params.persona_id.as_deref(),
+            Some(metadata.clone()),
+            HarnessConflictPolicy::Reject,
+            &principal.principal_id,
+        )
+        .await?;
+    let message_ids = runtime
+        .append_messages(
+            &thread_key,
+            &[SessionMessageInput {
+                client_message_id: Some(idempotency_key.clone()),
+                role: MessageRole::User,
+                parts: vec![json!({
+                    "type": "text",
+                    "text": prompt,
+                })],
+                metadata: metadata.clone(),
+            }],
+        )
+        .await?;
+    let input_line = serde_json::to_string(&json!({
+        "type": "user",
+        "text": prompt,
+    }))?;
+    let execution = runtime
+        .execute_session(
+            &thread_key,
+            ExecuteSessionInput {
+                idempotency_key: Some(idempotency_key),
+                metadata: Some(metadata),
+                input_lines: vec![input_line],
+                idle_timeout_ms: params.idle_timeout_ms,
+                max_duration_ms: Some(max_duration_ms),
+            },
+        )
+        .await?;
+    mcp_json_result(json!({
+        "thread_key": thread_key,
+        "execution_id": execution.execution_id,
+        "status": execution.status,
+        "harness": session.session.harness_type,
+        "harness_switched": session.harness_switched,
+        "message_ids": message_ids,
+    }))
+}
+
+async fn mcp_agent_events_result(
+    state: &AppState,
+    principal: &McpPrincipal,
+    arguments: Value,
+) -> Result<Value, ApiError> {
+    let params = serde_json::from_value::<McpAgentEventsArguments>(arguments)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let thread_key = mcp_validate_agent_thread_key(principal, &params.thread_key)?;
+    let limit = params.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 500".to_owned(),
+        ));
+    }
+    let mut events = state
+        .runtime()?
+        .list_events(
+            &thread_key,
+            params.after_event_id.unwrap_or(0),
+            params.execution_id.as_deref(),
+            limit + 1,
+        )
+        .await?;
+    let has_more = events.len() > limit as usize;
+    events.truncate(limit as usize);
+    let last_event_id = events.last().map(|event| event.event_id);
+    let terminal_status = (!has_more)
+        .then(|| mcp_terminal_status(&events, params.execution_id.as_deref()))
+        .flatten();
+    mcp_json_result(json!({
+        "thread_key": thread_key,
+        "execution_id": params.execution_id,
+        "events": events,
+        "last_event_id": last_event_id,
+        "terminal_status": terminal_status,
+        "has_more": has_more,
+    }))
+}
+
+async fn mcp_agent_cancel_result(
+    state: &AppState,
+    principal: &McpPrincipal,
+    arguments: Value,
+) -> Result<Value, ApiError> {
+    let params = serde_json::from_value::<McpAgentCancelArguments>(arguments)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let thread_key = mcp_validate_agent_thread_key(principal, &params.thread_key)?;
+    let reason = params
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Interrupted from MCP");
+    let outcome = state
+        .runtime()?
+        .interrupt_active_execution(&thread_key, reason)
+        .await?;
+    mcp_json_result(json!({
+        "thread_key": thread_key,
+        "interrupted": outcome.interrupted,
+        "execution_id": outcome.execution_id,
+    }))
+}
+
+fn mcp_parse_agent_harness(value: &str) -> Result<HarnessType, ApiError> {
+    let value = value.trim();
+    HarnessType::from_str(value)
+        .map_err(|_| ApiError::BadRequest(format!("unsupported harness {value:?}")))
+}
+
+fn mcp_generate_agent_thread_key(principal: &McpPrincipal) -> Result<ThreadKey, ApiError> {
+    ThreadKey::parse(format!(
+        "{}{}",
+        mcp_agent_thread_prefix(principal),
+        Uuid::new_v4().simple()
+    ))
+    .map_err(Into::into)
+}
+
+fn mcp_validate_agent_thread_key(
+    principal: &McpPrincipal,
+    value: &str,
+) -> Result<ThreadKey, ApiError> {
+    let thread_key = ThreadKey::parse(value.trim().to_owned())?;
+    let prefix = mcp_agent_thread_prefix(principal);
+    if !thread_key.as_str().starts_with(&prefix) {
+        return Err(ApiError::Forbidden(
+            "mcp agent thread_key does not belong to this principal".to_owned(),
+        ));
+    }
+    Ok(thread_key)
+}
+
+fn mcp_agent_thread_prefix(principal: &McpPrincipal) -> String {
+    let digest = Sha256::digest(principal.principal_id.as_bytes());
+    format!("mcp-agent:{}:", hex::encode(&digest[..12]))
+}
+
+fn mcp_terminal_status(
+    events: &[SessionEvent],
+    requested_execution_id: Option<&str>,
+) -> Option<&'static str> {
+    let execution_id = requested_execution_id.or_else(|| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| event.execution_id.as_deref())
+    })?;
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.execution_id.as_deref() == Some(execution_id))
+        .find_map(|event| match event.event_type.as_str() {
+            "session.execution_completed" => Some("completed"),
+            "session.execution_failed" => Some("failed"),
+            "session.execution_cancelled" => Some("cancelled"),
+            _ => None,
+        })
+}
+
 async fn mcp_centaur_tool_result(
     state: &AppState,
     principal: &McpPrincipal,
@@ -476,6 +828,33 @@ fn mcp_text_result(text: String, is_error: bool) -> Value {
         ],
         "isError": is_error,
     })
+}
+
+fn mcp_json_result(value: Value) -> Result<Value, ApiError> {
+    Ok(mcp_text_result(
+        serde_json::to_string_pretty(&value)?,
+        false,
+    ))
+}
+
+fn mcp_agent_domain_error_result(error: ApiError) -> Result<Value, ApiError> {
+    let is_domain_error = matches!(
+        &error,
+        ApiError::BadRequest(_) | ApiError::Forbidden(_) | ApiError::NotFound(_)
+    ) || matches!(
+        &error,
+        ApiError::Runtime(SessionRuntimeError::BadRequest(_))
+            | ApiError::Runtime(SessionRuntimeError::CapacityExceeded { .. })
+            | ApiError::Runtime(SessionRuntimeError::Store(
+                centaur_session_sqlx::SessionStoreError::NotFound { .. }
+                    | centaur_session_sqlx::SessionStoreError::HarnessConflict { .. }
+                    | centaur_session_sqlx::SessionStoreError::PersonaConflict { .. }
+            ))
+    );
+    if is_domain_error {
+        return Ok(mcp_text_result(error.to_string(), true));
+    }
+    Err(error)
 }
 
 fn authenticate_mcp_bearer(headers: &HeaderMap) -> Result<Option<McpPrincipal>, ApiError> {
@@ -885,6 +1264,81 @@ mod mcp_tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    fn test_principal(id: &str) -> McpPrincipal {
+        McpPrincipal {
+            token_id: "mcp_tok_test".to_owned(),
+            principal_id: id.to_owned(),
+            name: "Test User".to_owned(),
+            scopes: vec!["mcp:tools".to_owned()],
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn mcp_agent_tools_are_listed_as_builtin_tools() {
+        let names = mcp_agent_tool_entries()
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "centaur_agent_start",
+                "centaur_agent_events",
+                "centaur_agent_cancel"
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_agent_thread_keys_are_scoped_to_principal() {
+        let ada = test_principal("principal-ada");
+        let grace = test_principal("principal-grace");
+        let thread_key = mcp_generate_agent_thread_key(&ada).unwrap();
+
+        assert!(
+            thread_key
+                .as_str()
+                .starts_with(&mcp_agent_thread_prefix(&ada))
+        );
+        assert!(mcp_validate_agent_thread_key(&ada, thread_key.as_str()).is_ok());
+        assert!(mcp_validate_agent_thread_key(&grace, thread_key.as_str()).is_err());
+    }
+
+    #[test]
+    fn mcp_agent_harness_uses_canonical_values() {
+        assert_eq!(
+            mcp_parse_agent_harness("claudecode").unwrap(),
+            HarnessType::ClaudeCode
+        );
+        assert!(mcp_parse_agent_harness("claude-code").is_err());
+        assert!(mcp_parse_agent_harness("claude_code").is_err());
+        assert!(mcp_parse_agent_harness("unknown").is_err());
+    }
+
+    #[test]
+    fn mcp_terminal_status_uses_latest_execution_when_unscoped() {
+        let thread_key = ThreadKey::parse("mcp-agent:test:thread").unwrap();
+        let event = |event_id, execution_id: &str, event_type: &str| SessionEvent {
+            event_id,
+            thread_key: thread_key.clone(),
+            execution_id: Some(execution_id.to_owned()),
+            event_type: event_type.to_owned(),
+            payload: json!({}),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let events = vec![
+            event(1, "exe-old", "session.execution_completed"),
+            event(2, "exe-new", "session.execution_started"),
+        ];
+
+        assert_eq!(mcp_terminal_status(&events, None), None);
+        assert_eq!(
+            mcp_terminal_status(&events, Some("exe-old")),
+            Some("completed")
+        );
     }
 
     #[test]

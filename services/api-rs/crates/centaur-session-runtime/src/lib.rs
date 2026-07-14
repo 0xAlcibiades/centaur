@@ -304,6 +304,12 @@ pub enum HarnessConflictPolicy {
     Restart,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SessionPrincipalSource<'a> {
+    Derived,
+    Existing(&'a str),
+}
+
 /// Result of [`SessionRuntime::create_or_get_session`].
 #[derive(Clone, Debug)]
 pub struct CreateOrGetSessionOutcome {
@@ -841,11 +847,22 @@ impl SessionRuntime {
             .unwrap_or_default()
     }
 
+    pub fn default_harness(&self) -> HarnessType {
+        self.sandbox_runtime
+            .warm_harness
+            .clone()
+            .unwrap_or(HarnessType::Codex)
+    }
+
     pub async fn session_title(
         &self,
         thread_key: &ThreadKey,
     ) -> Result<Option<String>, SessionRuntimeError> {
         Ok(self.store.get_session_title(thread_key).await?)
+    }
+
+    pub async fn session(&self, thread_key: &ThreadKey) -> Result<Session, SessionRuntimeError> {
+        Ok(self.store.get_session(thread_key).await?)
     }
 
     fn resolve_persona_for_create(
@@ -1327,6 +1344,52 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            SessionPrincipalSource::Derived,
+        )
+        .await
+    }
+
+    pub async fn create_or_get_external_session(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_id: &str,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "external principal_id is required".to_owned(),
+            ));
+        }
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            SessionPrincipalSource::Existing(principal_id),
+        )
+        .await
+    }
+
+    async fn create_or_get_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_source: SessionPrincipalSource<'_>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1354,11 +1417,18 @@ impl SessionRuntime {
             );
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
-            let (registered_principal, desired_capabilities) =
+            let (resolved_principal, desired_capabilities) =
                 if let Some(registrar) = &self.iron_control {
-                    let principal = registrar
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
-                        .await?;
+                    let principal = match principal_source {
+                        SessionPrincipalSource::Derived => {
+                            registrar
+                                .register_session(thread_key.as_str(), Some(&session_metadata))
+                                .await?
+                        }
+                        SessionPrincipalSource::Existing(principal_id) => {
+                            registrar.get_principal(principal_id).await?
+                        }
+                    };
                     let desired_capabilities = sandbox_capabilities_from_principal(&principal);
                     (Some(principal), desired_capabilities)
                 } else {
@@ -1421,7 +1491,7 @@ impl SessionRuntime {
                     )
                     .await?;
             }
-            if let Some(principal) = registered_principal {
+            if let Some(principal) = resolved_principal {
                 // Persist the principal OID on the session row so a resumed session
                 // can recreate its sandbox after a restart without re-deriving it.
                 let session = self
@@ -3057,6 +3127,24 @@ impl SessionRuntime {
                 "orphan adoption scan found nothing adoptable"
             );
         }
+    }
+
+    pub async fn list_events(
+        &self,
+        thread_key: &ThreadKey,
+        after_event_id: i64,
+        execution_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>, SessionRuntimeError> {
+        if limit <= 0 {
+            return Err(SessionRuntimeError::BadRequest(
+                "limit must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(self
+            .store
+            .list_events_after(thread_key, after_event_id, execution_id, limit)
+            .await?)
     }
 
     async fn record_adoption_deferral(&self, execution: &SessionExecution) {
@@ -7803,8 +7891,9 @@ mod adoption_tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    use centaur_iron_control::{IronControlClient, SessionRegistrar};
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
 
@@ -8144,6 +8233,95 @@ mod adoption_tests {
             store.clone(),
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
         )
+    }
+
+    async fn spawn_external_principal_stub() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                seen.lock().unwrap().push(first_line.to_owned());
+                let (status, body) = if first_line
+                    .starts_with("GET /api/v1/principals/prn_mcp_caller ")
+                {
+                    (
+                        "200 OK",
+                        r#"{"data":{"id":"prn_mcp_caller","namespace":"default","foreign_id":"mcp-user","name":"MCP User","labels":{"centaur.sandbox_repo_cache":"public"},"sandbox_observability_enabled":false,"sandbox_api_server_enabled":false}}"#,
+                    )
+                } else {
+                    ("500 Internal Server Error", r#"{"error":"unexpected"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_session_uses_existing_principal_without_registering_thread_principal() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_external_principal_stub().await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_default".to_owned()],
+        );
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        )
+        .with_iron_control(registrar);
+        let thread_key =
+            ThreadKey::parse(format!("mcp-agent:test:{}", uuid::Uuid::new_v4())).unwrap();
+
+        let outcome = runtime
+            .create_or_get_external_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"mcp_agent": true})),
+                HarnessConflictPolicy::Reject,
+                "prn_mcp_caller",
+            )
+            .await
+            .expect("create external session");
+
+        assert_eq!(
+            outcome.session.iron_control_principal.as_deref(),
+            Some("prn_mcp_caller")
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/prn_mcp_caller HTTP/1.1"]
+        );
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
