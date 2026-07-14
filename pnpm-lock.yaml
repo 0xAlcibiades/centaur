@@ -17,6 +17,9 @@ patchedDependencies:
   '@chat-adapter/state-pg@4.31.0':
     hash: 69262b03c278ca9d4af0bed7b4e05f9d7a5a36d3d79fad31df2a85da4d349274
     path: patches/@chat-adapter__state-pg@4.31.0.patch
+  chat@4.31.0:
+    hash: 69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658
+    path: patches/chat@4.31.0.patch
 
 importers:
 
@@ -85,7 +88,7 @@ importers:
         version: 4.31.0(patch_hash=69262b03c278ca9d4af0bed7b4e05f9d7a5a36d3d79fad31df2a85da4d349274)(zod@4.4.3)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       discord.js:
         specifier: ^14.25.1
         version: 14.26.4
@@ -137,7 +140,7 @@ importers:
         version: 21.1.1
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       hono:
         specifier: ^4.12.18
         version: 4.12.25
@@ -183,7 +186,7 @@ importers:
         version: 76.0.0(graphql@17.0.0)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       hono:
         specifier: ^4.12.18
         version: 4.12.25
@@ -226,7 +229,7 @@ importers:
         version: 4.31.0(patch_hash=69262b03c278ca9d4af0bed7b4e05f9d7a5a36d3d79fad31df2a85da4d349274)(zod@4.4.3)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       hono:
         specifier: ^4.12.18
         version: 4.12.25
@@ -275,7 +278,7 @@ importers:
         version: 4.31.0(zod@4.4.3)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       dotenv:
         specifier: ^17.3.1
         version: 17.4.2
@@ -1957,7 +1960,7 @@ snapshots:
   '@chat-adapter/discord@4.31.0(patch_hash=8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       discord-api-types: 0.37.120
       discord-interactions: 4.4.0
       discord.js: 14.26.4
@@ -1973,7 +1976,7 @@ snapshots:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
       '@octokit/auth-app': 8.2.0
       '@octokit/rest': 22.0.1
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - supports-color
@@ -1983,7 +1986,7 @@ snapshots:
     dependencies:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
       '@linear/sdk': 76.0.0(graphql@17.0.0)
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - graphql
@@ -1992,7 +1995,7 @@ snapshots:
 
   '@chat-adapter/shared@4.31.0(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - supports-color
@@ -2003,7 +2006,7 @@ snapshots:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
       '@slack/socket-mode': 2.0.7
       '@slack/web-api': 7.17.0
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - bufferutil
@@ -2014,7 +2017,7 @@ snapshots:
 
   '@chat-adapter/state-memory@4.31.0(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - supports-color
@@ -2022,7 +2025,7 @@ snapshots:
 
   '@chat-adapter/state-pg@4.31.0(patch_hash=69262b03c278ca9d4af0bed7b4e05f9d7a5a36d3d79fad31df2a85da4d349274)(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
       pg: 8.21.0
     transitivePeerDependencies:
       - ai
@@ -2037,7 +2040,7 @@ snapshots:
       '@microsoft/teams.apps': 2.0.13
       '@microsoft/teams.cards': 2.0.13
       '@microsoft/teams.graph-endpoints': 2.0.13
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - debug
@@ -2734,7 +2737,7 @@ snapshots:
 
   character-entities@2.0.2: {}
 
-  chat@4.31.0(zod@4.4.3):
+  chat@4.31.0(patch_hash=69ddff60795975c673430c89c7688e6925f5128a1c4020996f953fdbde0ee658)(zod@4.4.3):
     dependencies:
       '@workflow/serde': 4.1.0-beta.2
       mdast-util-to-string: 4.0.0

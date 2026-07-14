@@ -1,0 +1,62 @@
+diff --git a/dist/index.js b/dist/index.js
+index 6af9d7fec34adeb8a7092a3ba0077d9f327a44d7..22062c519bde1d0aa5cf69fe4942b396bf2846f4 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -3425,6 +3425,12 @@ var Chat = class {
+    */
+   async handleIncomingMessage(adapter, threadId, message) {
+     setMessageAdapter(message, adapter);
++    // Some platforms deliver the same visible message more than once with
++    // progressively richer semantics. Slack, for example, can send a plain
++    // `message` callback before an `app_mention` callback with the same ts.
++    // Classify the message before deduplication so the later callback can
++    // upgrade the earlier non-mention instead of being discarded.
++    message.isMention = message.isMention || this.detectMention(adapter, message);
+     this.logger.debug("Incoming message", {
+       adapter: adapter.name,
+       threadId,
+@@ -3444,12 +3450,42 @@ var Chat = class {
+       return;
+     }
+     const dedupeKey = `dedupe:${adapter.name}:${message.id}`;
++    const priority = message.isMention ? 1 : 0;
+     const isFirstProcess = await this._stateAdapter.setIfNotExists(
+       dedupeKey,
+-      true,
++      priority,
+       this._dedupeTtlMs
+     );
+-    if (!isFirstProcess) {
++    let shouldProcess = isFirstProcess;
++    // A later mention is semantically richer than an earlier non-mention for
++    // the same platform message. Serialize only this uncommon upgrade path;
++    // ordinary first deliveries keep the single atomic set-if-absent call.
++    if (!shouldProcess && priority > 0) {
++      const dedupeLockKey = `dedupe-lock:${adapter.name}:${message.id}`;
++      let dedupeLock = null;
++      for (let attempt = 0; attempt < 40 && !dedupeLock; attempt++) {
++        dedupeLock = await this._stateAdapter.acquireLock(dedupeLockKey, 5e3);
++        if (!dedupeLock) await new Promise((resolve) => setTimeout(resolve, 25));
++      }
++      if (!dedupeLock) {
++        this.logger.warn("Unable to acquire message dedupe lock; skipping message", {
++          adapter: adapter.name,
++          messageId: message.id
++        });
++        return;
++      }
++      try {
++        const previous = await this._stateAdapter.get(dedupeKey);
++        const previousPriority = typeof previous === "number" ? previous : previous === null ? -1 : 0;
++        if (priority > previousPriority) {
++          await this._stateAdapter.set(dedupeKey, priority, this._dedupeTtlMs);
++          shouldProcess = true;
++        }
++      } finally {
++        await this._stateAdapter.releaseLock(dedupeLock);
++      }
++    }
++    if (!shouldProcess) {
+       this.logger.debug("Skipping duplicate message", {
+         adapter: adapter.name,
+         messageId: message.id

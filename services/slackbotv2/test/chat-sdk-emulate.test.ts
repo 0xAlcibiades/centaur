@@ -4348,6 +4348,79 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
   })
+
+  it('executes an allowed bot mention once regardless of Slack callback order', async () => {
+    for (const order of ['message-first', 'mention-first'] as const) {
+      bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
+      codexApi.reset()
+      slackApi.reset()
+      const posted = await postUserMessage('')
+      const messageEvent = signedSlackEvent({
+        event_id: `Ev-slackbotv2-dedupe-${order}-message`,
+        event: {
+          type: 'message',
+          app_id: 'AOTHERBOT',
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: posted.ts,
+          username: 'otherbot'
+        }
+      })
+      const mentionEvent = signedSlackEvent({
+        event_id: `Ev-slackbotv2-dedupe-${order}-mention`,
+        event: {
+          type: 'app_mention',
+          app_id: 'AOTHERBOT',
+          attachments: [
+            {
+              pretext: `<@${BOT_USER_ID}> investigate`,
+              title: ':red_circle: Validator stalled',
+              text: '*Cluster:* stg-na'
+            }
+          ],
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: posted.ts,
+          user: 'UOTHERBOT',
+          username: 'otherbot'
+        }
+      })
+      const events = order === 'message-first' ? [messageEvent, mentionEvent] : [mentionEvent, messageEvent]
+      for (const event of events) {
+        const waits: Promise<unknown>[] = []
+        const response = await bot.app.request(
+          '/api/webhooks/slack',
+          event,
+          {},
+          waitUntilContext(waits)
+        )
+        expect(response.status).toBe(200)
+        await Promise.all(waits)
+      }
+
+      expect(codexApi.appends).toHaveLength(1)
+      expect(codexApi.executes).toHaveLength(1)
+      expect(sessionMessageTexts(codexApi.appends[0]!.body.messages).join('\n')).toContain(
+        'Validator stalled'
+      )
+    }
+  })
 })
 
 function createTestBot(
