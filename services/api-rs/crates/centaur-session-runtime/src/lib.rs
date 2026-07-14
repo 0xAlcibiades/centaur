@@ -310,6 +310,20 @@ enum SessionPrincipalSource<'a> {
     Existing(&'a str),
 }
 
+fn validate_session_principal_source(
+    thread_key: &ThreadKey,
+    principal_source: SessionPrincipalSource<'_>,
+) -> Result<(), SessionRuntimeError> {
+    if matches!(principal_source, SessionPrincipalSource::Derived)
+        && thread_key.as_str().starts_with("mcp-agent:")
+    {
+        return Err(SessionRuntimeError::BadRequest(
+            "mcp-agent threads require an existing external principal".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Result of [`SessionRuntime::create_or_get_session`].
 #[derive(Clone, Debug)]
 pub struct CreateOrGetSessionOutcome {
@@ -1390,6 +1404,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_source: SessionPrincipalSource<'_>,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        validate_session_principal_source(thread_key, principal_source)?;
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1868,6 +1883,34 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        self.execute_session_with_initial_messages(thread_key, input, None)
+            .await
+    }
+
+    /// Starts an execution and uses the durable execution idempotency claim to
+    /// gate its initial messages. Retries never steer duplicate input, and a
+    /// retry can safely recover a queued execution left before message append.
+    pub async fn execute_session_with_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        messages: &[SessionMessageInput],
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        if messages.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "messages must not be empty".to_owned(),
+            ));
+        }
+        self.execute_session_with_initial_messages(thread_key, input, Some(messages))
+            .await
+    }
+
+    async fn execute_session_with_initial_messages(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        initial_messages: Option<&[SessionMessageInput]>,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
         let ExecuteSessionInput {
             idempotency_key,
             metadata,
@@ -1910,12 +1953,14 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
 
+            let requested_execution_metadata =
+                execution_metadata(metadata, idle_timeout_ms, max_duration_ms);
             let execution = self
                 .store
                 .create_execution(
                     thread_key,
                     idempotency_key.as_deref(),
-                    execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
+                    requested_execution_metadata.clone(),
                 )
                 .await?;
             span.record(
@@ -1923,6 +1968,51 @@ impl SessionRuntime {
                 execution.execution.execution_id.as_str(),
             );
             span.record("execution_id", execution.execution.execution_id.as_str());
+            if initial_messages.is_some()
+                && !execution.created
+                && execution.execution.metadata != requested_execution_metadata
+            {
+                return Err(SessionRuntimeError::BadRequest(
+                    "idempotency_key was already used with different agent inputs".to_owned(),
+                ));
+            }
+            if let Some(messages) = initial_messages {
+                if !execution.created && execution.execution.status != ExecutionStatus::Queued {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_execute_idempotent_replay",
+                        thread_key = %thread_key,
+                        execution_id = %execution.execution.execution_id,
+                        status = %execution.execution.status,
+                        "returning existing execution without appending duplicate messages"
+                    );
+                    return Ok(execution.execution);
+                }
+                // A retry may observe a queued execution if the request that
+                // inserted it crashed before persisting the prompt. Message
+                // client ids make this direct store append idempotent, and it
+                // deliberately bypasses active-execution steering.
+                if let Err(error) = self.store.append_messages(thread_key, messages).await {
+                    let error = SessionRuntimeError::Store(error);
+                    self.record_execution_failure(
+                        thread_key,
+                        &execution.execution.execution_id,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                if let Err(error) = self.store.touch_session_sandbox_activity(thread_key).await {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_sandbox_activity_touch_failed",
+                        thread_key = %thread_key,
+                        %error,
+                        "failed to touch sandbox activity after initial message append"
+                    );
+                }
+                self.spawn_session_title_generation(thread_key);
+            }
             if !execution.created && execution.execution.status != ExecutionStatus::Queued {
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
@@ -2092,6 +2182,38 @@ impl SessionRuntime {
             );
         }
         result
+    }
+
+    pub async fn execution_status(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: Option<&str>,
+    ) -> Result<Option<ExecutionStatus>, SessionRuntimeError> {
+        let latest = self.store.latest_execution_for_thread(thread_key).await?;
+        if execution_id.is_none()
+            || latest
+                .as_ref()
+                .is_some_and(|execution| Some(execution.execution_id.as_str()) == execution_id)
+        {
+            return Ok(latest.map(|execution| execution.status));
+        }
+
+        // The store intentionally exposes only the latest execution row for a
+        // thread. For an older explicitly selected execution, terminal events
+        // are also durable state and cannot be skipped by a caller's cursor.
+        let events = self
+            .store
+            .list_events_after(thread_key, 0, execution_id, i64::MAX)
+            .await?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.event_type.as_str() {
+                "session.execution_completed" => Some(ExecutionStatus::Completed),
+                "session.execution_failed" => Some(ExecutionStatus::Failed),
+                "session.execution_cancelled" => Some(ExecutionStatus::Cancelled),
+                _ => None,
+            }))
     }
 
     async fn record_execution_failure(
@@ -6682,6 +6804,28 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
+    fn derived_principals_cannot_claim_mcp_agent_threads() {
+        let mcp_thread = ThreadKey::parse("mcp-agent:principal:request").unwrap();
+        let ordinary_thread = ThreadKey::parse("slack:thread").unwrap();
+
+        assert!(
+            validate_session_principal_source(&mcp_thread, SessionPrincipalSource::Derived)
+                .is_err()
+        );
+        assert!(
+            validate_session_principal_source(
+                &mcp_thread,
+                SessionPrincipalSource::Existing("principal"),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_principal_source(&ordinary_thread, SessionPrincipalSource::Derived)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn sandbox_repo_cache_label_controls_access() {
         assert_eq!(
             sandbox_repo_cache_access_from_principal(&test_principal(
@@ -8322,6 +8466,60 @@ mod adoption_tests {
             ["GET /api/v1/principals/prn_mcp_caller HTTP/1.1"]
         );
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_status_recovers_terminal_state_for_an_older_execution() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:terminal-status-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        let terminal = store
+            .create_execution(&thread_key, Some("terminal"), json!({}))
+            .await
+            .expect("create terminal execution")
+            .execution;
+        store
+            .complete_execution(&terminal.execution_id)
+            .await
+            .expect("complete execution");
+        store
+            .append_event(
+                &thread_key,
+                Some(&terminal.execution_id),
+                "session.execution_completed",
+                json!({"execution_id": terminal.execution_id}),
+            )
+            .await
+            .expect("append terminal event");
+        let latest = store
+            .create_execution(&thread_key, Some("latest"), json!({}))
+            .await
+            .expect("create latest execution")
+            .execution;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+
+        assert_eq!(
+            runtime
+                .execution_status(&thread_key, Some(&terminal.execution_id))
+                .await
+                .expect("read execution status"),
+            Some(ExecutionStatus::Completed)
+        );
+
+        store
+            .fail_execution_if_active(&latest.execution_id, "test cleanup")
+            .await
+            .expect("clean up latest execution");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

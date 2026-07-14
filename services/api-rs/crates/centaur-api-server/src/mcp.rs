@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::{
-    HarnessType, MessageRole, SessionEvent, SessionMessageInput, ThreadKey,
+    ExecutionStatus, HarnessType, MessageRole, SessionMessageInput, ThreadKey,
 };
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SessionRuntime, SessionRuntimeError,
@@ -26,7 +26,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 use crate::{
     ApiError,
@@ -36,6 +35,7 @@ use crate::{
 };
 
 const MCP_AGENT_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
+const MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 
 pub(crate) async fn mcp_get() -> Response {
     (
@@ -87,6 +87,7 @@ struct CentaurToolMcpArguments {
 #[derive(Debug, Deserialize)]
 struct McpAgentStartArguments {
     prompt: String,
+    idempotency_key: String,
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -175,9 +176,12 @@ pub(crate) async fn mcp_post(
             if params.name == "centaur_whoami" {
                 mcp_whoami_result(&principal, params.arguments)?
             } else if params.name == "centaur_agent_start" {
+                let error_thread_key = mcp_agent_error_thread_key(&principal, &params.arguments);
                 match mcp_agent_start_result(&state, &principal, params.arguments).await {
                     Ok(result) => result,
-                    Err(error) => mcp_agent_domain_error_result(error)?,
+                    Err(error) => {
+                        mcp_agent_domain_error_result_with_thread(error, error_thread_key.as_ref())?
+                    }
                 }
             } else if params.name == "centaur_agent_events" {
                 match mcp_agent_events_result(&state, &principal, params.arguments).await {
@@ -226,11 +230,17 @@ fn mcp_agent_tool_entries() -> Vec<Value> {
             "description": "Start a durable Centaur sub-agent execution in a sandbox and return its thread_key and execution_id. Use centaur_agent_events to read progress.",
             "inputSchema": {
                 "type": "object",
-                "required": ["prompt"],
+                "required": ["prompt", "idempotency_key"],
                 "properties": {
                     "prompt": {
                         "type": "string",
                         "description": "Instruction to run in the sub-agent sandbox."
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES,
+                        "description": "Caller-generated key identifying this start request. Retrying the same key returns the same thread and execution without submitting the prompt again."
                     },
                     "harness": {
                         "type": "string",
@@ -507,27 +517,46 @@ async fn mcp_agent_start_result(
     if prompt.is_empty() {
         return Err(ApiError::BadRequest("prompt is required".to_owned()));
     }
-    let runtime = state.runtime()?;
+    let idempotency_key = params.idempotency_key.trim().to_owned();
+    if idempotency_key.is_empty() {
+        return Err(ApiError::BadRequest(
+            "idempotency_key is required".to_owned(),
+        ));
+    }
+    if idempotency_key.len() > MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "idempotency_key cannot exceed {MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES} bytes"
+        )));
+    }
+    let max_duration_ms =
+        mcp_agent_duration_options(params.idle_timeout_ms, params.max_duration_ms)?;
     let thread_key = match params.thread_key.as_deref() {
         Some(thread_key) => mcp_validate_agent_thread_key(principal, thread_key)?,
-        None => mcp_generate_agent_thread_key(principal)?,
+        None => mcp_generate_agent_thread_key(principal, &idempotency_key)?,
     };
+    let runtime = state.runtime()?;
     let harness = match params.harness.as_deref() {
         Some(harness) if !harness.trim().is_empty() => mcp_parse_agent_harness(harness)?,
         _ if params.thread_key.is_some() => runtime.session(&thread_key).await?.harness_type,
         _ => runtime.default_harness(),
     };
-    let idempotency_key = format!("mcp-agent-{}", Uuid::new_v4().simple());
-    let max_duration_ms = params.max_duration_ms.unwrap_or(MCP_AGENT_MAX_DURATION_MS);
-    if max_duration_ms > MCP_AGENT_MAX_DURATION_MS {
-        return Err(ApiError::BadRequest(format!(
-            "max_duration_ms cannot exceed {MCP_AGENT_MAX_DURATION_MS}"
-        )));
-    }
     let metadata = json!({
         "mcp_agent": true,
         "mcp_principal_id": principal.principal_id,
         "mcp_token_id": principal.token_id,
+    });
+    let request_fingerprint = mcp_agent_request_fingerprint(
+        &prompt,
+        &harness,
+        params.persona_id.as_deref(),
+        params.idle_timeout_ms,
+        max_duration_ms,
+    )?;
+    let execution_metadata = json!({
+        "mcp_agent": true,
+        "mcp_principal_id": principal.principal_id,
+        "mcp_token_id": principal.token_id,
+        "mcp_request_fingerprint": request_fingerprint,
     });
     let session = runtime
         .create_or_get_external_session(
@@ -539,11 +568,22 @@ async fn mcp_agent_start_result(
             &principal.principal_id,
         )
         .await?;
-    let message_ids = runtime
-        .append_messages(
+    let input_line = serde_json::to_string(&json!({
+        "type": "user",
+        "text": prompt,
+    }))?;
+    let execution = runtime
+        .execute_session_with_messages(
             &thread_key,
+            ExecuteSessionInput {
+                idempotency_key: Some(idempotency_key.clone()),
+                metadata: Some(execution_metadata),
+                input_lines: vec![input_line],
+                idle_timeout_ms: params.idle_timeout_ms,
+                max_duration_ms: Some(max_duration_ms),
+            },
             &[SessionMessageInput {
-                client_message_id: Some(idempotency_key.clone()),
+                client_message_id: Some(idempotency_key),
                 role: MessageRole::User,
                 parts: vec![json!({
                     "type": "text",
@@ -553,29 +593,12 @@ async fn mcp_agent_start_result(
             }],
         )
         .await?;
-    let input_line = serde_json::to_string(&json!({
-        "type": "user",
-        "text": prompt,
-    }))?;
-    let execution = runtime
-        .execute_session(
-            &thread_key,
-            ExecuteSessionInput {
-                idempotency_key: Some(idempotency_key),
-                metadata: Some(metadata),
-                input_lines: vec![input_line],
-                idle_timeout_ms: params.idle_timeout_ms,
-                max_duration_ms: Some(max_duration_ms),
-            },
-        )
-        .await?;
     mcp_json_result(json!({
         "thread_key": thread_key,
         "execution_id": execution.execution_id,
         "status": execution.status,
         "harness": session.session.harness_type,
         "harness_switched": session.harness_switched,
-        "message_ids": message_ids,
     }))
 }
 
@@ -605,9 +628,12 @@ async fn mcp_agent_events_result(
     let has_more = events.len() > limit as usize;
     events.truncate(limit as usize);
     let last_event_id = events.last().map(|event| event.event_id);
-    let terminal_status = (!has_more)
-        .then(|| mcp_terminal_status(&events, params.execution_id.as_deref()))
-        .flatten();
+    let terminal_status = mcp_terminal_status(
+        state
+            .runtime()?
+            .execution_status(&thread_key, params.execution_id.as_deref())
+            .await?,
+    );
     mcp_json_result(json!({
         "thread_key": thread_key,
         "execution_id": params.execution_id,
@@ -649,11 +675,15 @@ fn mcp_parse_agent_harness(value: &str) -> Result<HarnessType, ApiError> {
         .map_err(|_| ApiError::BadRequest(format!("unsupported harness {value:?}")))
 }
 
-fn mcp_generate_agent_thread_key(principal: &McpPrincipal) -> Result<ThreadKey, ApiError> {
+fn mcp_generate_agent_thread_key(
+    principal: &McpPrincipal,
+    idempotency_key: &str,
+) -> Result<ThreadKey, ApiError> {
+    let digest = Sha256::digest(idempotency_key.as_bytes());
     ThreadKey::parse(format!(
         "{}{}",
         mcp_agent_thread_prefix(principal),
-        Uuid::new_v4().simple()
+        hex::encode(&digest[..16])
     ))
     .map_err(Into::into)
 }
@@ -677,26 +707,73 @@ fn mcp_agent_thread_prefix(principal: &McpPrincipal) -> String {
     format!("mcp-agent:{}:", hex::encode(&digest[..12]))
 }
 
-fn mcp_terminal_status(
-    events: &[SessionEvent],
-    requested_execution_id: Option<&str>,
-) -> Option<&'static str> {
-    let execution_id = requested_execution_id.or_else(|| {
-        events
-            .iter()
-            .rev()
-            .find_map(|event| event.execution_id.as_deref())
-    })?;
-    events
-        .iter()
-        .rev()
-        .filter(|event| event.execution_id.as_deref() == Some(execution_id))
-        .find_map(|event| match event.event_type.as_str() {
-            "session.execution_completed" => Some("completed"),
-            "session.execution_failed" => Some("failed"),
-            "session.execution_cancelled" => Some("cancelled"),
-            _ => None,
-        })
+fn mcp_terminal_status(status: Option<ExecutionStatus>) -> Option<&'static str> {
+    match status {
+        Some(ExecutionStatus::Completed) => Some("completed"),
+        Some(ExecutionStatus::Failed) => Some("failed"),
+        Some(ExecutionStatus::Cancelled) => Some("cancelled"),
+        Some(ExecutionStatus::Queued | ExecutionStatus::Running) | None => None,
+    }
+}
+
+fn mcp_agent_duration_options(
+    idle_timeout_ms: Option<u64>,
+    max_duration_ms: Option<u64>,
+) -> Result<u64, ApiError> {
+    let max_duration_ms = max_duration_ms.unwrap_or(MCP_AGENT_MAX_DURATION_MS);
+    if max_duration_ms == 0 {
+        return Err(ApiError::BadRequest(
+            "max_duration_ms must be greater than zero".to_owned(),
+        ));
+    }
+    if max_duration_ms > MCP_AGENT_MAX_DURATION_MS {
+        return Err(ApiError::BadRequest(format!(
+            "max_duration_ms cannot exceed {MCP_AGENT_MAX_DURATION_MS}"
+        )));
+    }
+    if idle_timeout_ms == Some(0) {
+        return Err(ApiError::BadRequest(
+            "idle_timeout_ms must be greater than zero".to_owned(),
+        ));
+    }
+    if idle_timeout_ms.is_some_and(|idle_timeout_ms| idle_timeout_ms > max_duration_ms) {
+        return Err(ApiError::BadRequest(
+            "idle_timeout_ms must be less than or equal to max_duration_ms".to_owned(),
+        ));
+    }
+    Ok(max_duration_ms)
+}
+
+fn mcp_agent_request_fingerprint(
+    prompt: &str,
+    harness: &HarnessType,
+    persona_id: Option<&str>,
+    idle_timeout_ms: Option<u64>,
+    max_duration_ms: u64,
+) -> Result<String, ApiError> {
+    let encoded = serde_json::to_vec(&json!({
+        "prompt": prompt,
+        "harness": harness,
+        "persona_id": persona_id,
+        "idle_timeout_ms": idle_timeout_ms,
+        "max_duration_ms": max_duration_ms,
+    }))?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn mcp_agent_error_thread_key(principal: &McpPrincipal, arguments: &Value) -> Option<ThreadKey> {
+    let params = serde_json::from_value::<McpAgentStartArguments>(arguments.clone()).ok()?;
+    match params.thread_key.as_deref() {
+        Some(thread_key) => mcp_validate_agent_thread_key(principal, thread_key).ok(),
+        None => {
+            let idempotency_key = params.idempotency_key.trim();
+            (!idempotency_key.is_empty())
+                .then(|| mcp_generate_agent_thread_key(principal, idempotency_key))
+                .transpose()
+                .ok()
+                .flatten()
+        }
+    }
 }
 
 async fn mcp_centaur_tool_result(
@@ -838,6 +915,13 @@ fn mcp_json_result(value: Value) -> Result<Value, ApiError> {
 }
 
 fn mcp_agent_domain_error_result(error: ApiError) -> Result<Value, ApiError> {
+    mcp_agent_domain_error_result_with_thread(error, None)
+}
+
+fn mcp_agent_domain_error_result_with_thread(
+    error: ApiError,
+    thread_key: Option<&ThreadKey>,
+) -> Result<Value, ApiError> {
     let is_domain_error = matches!(
         &error,
         ApiError::BadRequest(_) | ApiError::Forbidden(_) | ApiError::NotFound(_)
@@ -852,6 +936,15 @@ fn mcp_agent_domain_error_result(error: ApiError) -> Result<Value, ApiError> {
             ))
     );
     if is_domain_error {
+        if let Some(thread_key) = thread_key {
+            return Ok(mcp_text_result(
+                serde_json::to_string_pretty(&json!({
+                    "error": error.to_string(),
+                    "thread_key": thread_key,
+                }))?,
+                true,
+            ));
+        }
         return Ok(mcp_text_result(error.to_string(), true));
     }
     Err(error)
@@ -1295,21 +1388,48 @@ mod mcp_tests {
             tools[0]["inputSchema"]["properties"]["max_duration_ms"]["maximum"],
             MCP_AGENT_MAX_DURATION_MS
         );
+        assert_eq!(
+            tools[0]["inputSchema"]["required"],
+            json!(["prompt", "idempotency_key"])
+        );
     }
 
     #[test]
     fn mcp_agent_thread_keys_are_scoped_to_principal() {
         let ada = test_principal("principal-ada");
         let grace = test_principal("principal-grace");
-        let thread_key = mcp_generate_agent_thread_key(&ada).unwrap();
+        let thread_key = mcp_generate_agent_thread_key(&ada, "request-1").unwrap();
 
         assert!(
             thread_key
                 .as_str()
                 .starts_with(&mcp_agent_thread_prefix(&ada))
         );
+        assert_eq!(
+            thread_key,
+            mcp_generate_agent_thread_key(&ada, "request-1").unwrap()
+        );
+        assert_ne!(
+            thread_key,
+            mcp_generate_agent_thread_key(&ada, "request-2").unwrap()
+        );
         assert!(mcp_validate_agent_thread_key(&ada, thread_key.as_str()).is_ok());
         assert!(mcp_validate_agent_thread_key(&grace, thread_key.as_str()).is_err());
+    }
+
+    #[test]
+    fn mcp_agent_errors_can_return_the_retryable_thread_key() {
+        let principal = test_principal("principal-ada");
+        let arguments = json!({
+            "prompt": "hello",
+            "idempotency_key": "request-1",
+            "max_duration_ms": 0,
+        });
+
+        assert_eq!(
+            mcp_agent_error_thread_key(&principal, &arguments),
+            Some(mcp_generate_agent_thread_key(&principal, "request-1").unwrap())
+        );
     }
 
     #[test]
@@ -1324,25 +1444,32 @@ mod mcp_tests {
     }
 
     #[test]
-    fn mcp_terminal_status_uses_latest_execution_when_unscoped() {
-        let thread_key = ThreadKey::parse("mcp-agent:test:thread").unwrap();
-        let event = |event_id, execution_id: &str, event_type: &str| SessionEvent {
-            event_id,
-            thread_key: thread_key.clone(),
-            execution_id: Some(execution_id.to_owned()),
-            event_type: event_type.to_owned(),
-            payload: json!({}),
-            created_at: OffsetDateTime::UNIX_EPOCH,
-        };
-        let events = vec![
-            event(1, "exe-old", "session.execution_completed"),
-            event(2, "exe-new", "session.execution_started"),
-        ];
-
-        assert_eq!(mcp_terminal_status(&events, None), None);
+    fn mcp_terminal_status_uses_durable_execution_status() {
         assert_eq!(
-            mcp_terminal_status(&events, Some("exe-old")),
+            mcp_terminal_status(Some(ExecutionStatus::Completed)),
             Some("completed")
+        );
+        assert_eq!(
+            mcp_terminal_status(Some(ExecutionStatus::Failed)),
+            Some("failed")
+        );
+        assert_eq!(
+            mcp_terminal_status(Some(ExecutionStatus::Cancelled)),
+            Some("cancelled")
+        );
+        assert_eq!(mcp_terminal_status(Some(ExecutionStatus::Running)), None);
+        assert_eq!(mcp_terminal_status(None), None);
+    }
+
+    #[test]
+    fn mcp_agent_durations_are_validated_before_start() {
+        assert!(mcp_agent_duration_options(Some(0), None).is_err());
+        assert!(mcp_agent_duration_options(None, Some(0)).is_err());
+        assert!(mcp_agent_duration_options(None, Some(MCP_AGENT_MAX_DURATION_MS + 1)).is_err());
+        assert!(mcp_agent_duration_options(Some(2), Some(1)).is_err());
+        assert_eq!(
+            mcp_agent_duration_options(None, None).unwrap(),
+            MCP_AGENT_MAX_DURATION_MS
         );
     }
 
