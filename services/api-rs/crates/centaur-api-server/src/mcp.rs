@@ -35,7 +35,7 @@ use crate::{
     tool_discovery::{DiscoveredTool, ToolDiscoveryConfig, discover_tool_catalog},
 };
 
-const MCP_AGENT_MAX_DURATION_MS: u64 = 10 * 60 * 1_000;
+const MCP_AGENT_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub(crate) async fn mcp_get() -> Response {
     (
@@ -252,7 +252,7 @@ fn mcp_agent_tool_entries() -> Vec<Value> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MCP_AGENT_MAX_DURATION_MS,
-                        "description": "Maximum execution duration. Defaults to 10 minutes and cannot exceed 10 minutes."
+                        "description": "Maximum execution duration. Defaults to 24 hours and cannot exceed 24 hours."
                     }
                 },
                 "additionalProperties": false
@@ -1278,8 +1278,9 @@ mod mcp_tests {
 
     #[test]
     fn mcp_agent_tools_are_listed_as_builtin_tools() {
-        let names = mcp_agent_tool_entries()
-            .into_iter()
+        let tools = mcp_agent_tool_entries();
+        let names = tools
+            .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1289,6 +1290,10 @@ mod mcp_tests {
                 "centaur_agent_events",
                 "centaur_agent_cancel"
             ]
+        );
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["max_duration_ms"]["maximum"],
+            MCP_AGENT_MAX_DURATION_MS
         );
     }
 
