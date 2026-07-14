@@ -176,12 +176,9 @@ pub(crate) async fn mcp_post(
             if params.name == "centaur_whoami" {
                 mcp_whoami_result(&principal, params.arguments)?
             } else if params.name == "centaur_agent_start" {
-                let error_thread_key = mcp_agent_error_thread_key(&principal, &params.arguments);
                 match mcp_agent_start_result(&state, &principal, params.arguments).await {
                     Ok(result) => result,
-                    Err(error) => {
-                        mcp_agent_domain_error_result_with_thread(error, error_thread_key.as_ref())?
-                    }
+                    Err(error) => mcp_agent_domain_error_result(error)?,
                 }
             } else if params.name == "centaur_agent_events" {
                 match mcp_agent_events_result(&state, &principal, params.arguments).await {
@@ -761,21 +758,6 @@ fn mcp_agent_request_fingerprint(
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-fn mcp_agent_error_thread_key(principal: &McpPrincipal, arguments: &Value) -> Option<ThreadKey> {
-    let params = serde_json::from_value::<McpAgentStartArguments>(arguments.clone()).ok()?;
-    match params.thread_key.as_deref() {
-        Some(thread_key) => mcp_validate_agent_thread_key(principal, thread_key).ok(),
-        None => {
-            let idempotency_key = params.idempotency_key.trim();
-            (!idempotency_key.is_empty())
-                .then(|| mcp_generate_agent_thread_key(principal, idempotency_key))
-                .transpose()
-                .ok()
-                .flatten()
-        }
-    }
-}
-
 async fn mcp_centaur_tool_result(
     state: &AppState,
     principal: &McpPrincipal,
@@ -915,13 +897,6 @@ fn mcp_json_result(value: Value) -> Result<Value, ApiError> {
 }
 
 fn mcp_agent_domain_error_result(error: ApiError) -> Result<Value, ApiError> {
-    mcp_agent_domain_error_result_with_thread(error, None)
-}
-
-fn mcp_agent_domain_error_result_with_thread(
-    error: ApiError,
-    thread_key: Option<&ThreadKey>,
-) -> Result<Value, ApiError> {
     let is_domain_error = matches!(
         &error,
         ApiError::BadRequest(_) | ApiError::Forbidden(_) | ApiError::NotFound(_)
@@ -936,15 +911,6 @@ fn mcp_agent_domain_error_result_with_thread(
             ))
     );
     if is_domain_error {
-        if let Some(thread_key) = thread_key {
-            return Ok(mcp_text_result(
-                serde_json::to_string_pretty(&json!({
-                    "error": error.to_string(),
-                    "thread_key": thread_key,
-                }))?,
-                true,
-            ));
-        }
         return Ok(mcp_text_result(error.to_string(), true));
     }
     Err(error)
@@ -1415,21 +1381,6 @@ mod mcp_tests {
         );
         assert!(mcp_validate_agent_thread_key(&ada, thread_key.as_str()).is_ok());
         assert!(mcp_validate_agent_thread_key(&grace, thread_key.as_str()).is_err());
-    }
-
-    #[test]
-    fn mcp_agent_errors_can_return_the_retryable_thread_key() {
-        let principal = test_principal("principal-ada");
-        let arguments = json!({
-            "prompt": "hello",
-            "idempotency_key": "request-1",
-            "max_duration_ms": 0,
-        });
-
-        assert_eq!(
-            mcp_agent_error_thread_key(&principal, &arguments),
-            Some(mcp_generate_agent_thread_key(&principal, "request-1").unwrap())
-        );
     }
 
     #[test]
