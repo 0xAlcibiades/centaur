@@ -133,6 +133,8 @@ export type SlackbotV2Options = {
    * harness config files (see console-session-link.ts).
    */
   harnessDefaultModels?: Record<string, string>
+  /** Deployment-configured default Codex reasoning effort. */
+  codexDefaultEffort?: string
   /**
    * Backoff delays between in-process retries of a Slack handoff after a
    * retryable session API failure. Slack's own webhook redelivery cannot

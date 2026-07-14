@@ -264,7 +264,8 @@ sandbox:
   harnessEngine: codex
   # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here (the
   # harness default-model overrides) are also mirrored into slackbotv2 and the
-  # Console so their model displays match what sandboxes actually run.
+  # Console so their model displays match what sandboxes actually run. The
+  # Codex reasoning-effort override is mirrored into slackbotv2 as well.
   extraEnv: {}
   stateVolume:
     enabled: false

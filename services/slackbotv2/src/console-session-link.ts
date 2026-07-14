@@ -35,6 +35,25 @@ const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
       : undefined
 }
 
+const BAKED_CODEX_EFFORT =
+  typeof (codexConfig as { model_reasoning_effort?: unknown }).model_reasoning_effort === 'string'
+    ? (codexConfig as { model_reasoning_effort: string }).model_reasoning_effort
+    : undefined
+const BAKED_CODEX_SPEED =
+  typeof (codexConfig as { service_tier?: unknown }).service_tier === 'string'
+    ? (codexConfig as { service_tier: string }).service_tier
+    : undefined
+
+const CODEX_EFFORT_DISPLAY_NAMES: Record<string, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max'
+}
+
 /** Slack mrkdwn requires `&`, `<`, `>` to be escaped in free text. */
 function escapeSlackMrkdwn(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -98,24 +117,34 @@ export type SlackContextBlock = {
 }
 
 /**
- * Builds the "Open chat in Console · {MODEL} · {Harness}" context block, or
+ * Builds the "Open chat in Console · {Harness} · {MODEL}" context block, or
  * undefined when no Console base URL is configured (a bare "Open chat in
  * Console" with no link is pointless, so the whole block is skipped). The
- * model id is uppercased for display.
+ * model id is uppercased for display. Codex also includes the effective
+ * reasoning effort and service tier (speed).
  */
 export function buildConsoleSessionContextBlock(params: {
   consoleBaseUrl: string | null | undefined
   threadKey: string
   harnessType?: string | null
   model?: string | null
+  effort?: string | null
 }): SlackContextBlock | undefined {
   const url = consoleSessionUrl(params.consoleBaseUrl, params.threadKey)
   if (!url) return undefined
   const segments = [`<${url}|Open chat in Console>`]
-  const model = params.model?.trim()
-  if (model) segments.push(escapeSlackMrkdwn(model.toUpperCase()))
+  const harnessKey = params.harnessType?.trim().toLowerCase()
   const harness = harnessDisplayName(params.harnessType)
   if (harness) segments.push(escapeSlackMrkdwn(harness))
+  const model = params.model?.trim()
+  if (model) segments.push(escapeSlackMrkdwn(model.toUpperCase()))
+  if (harnessKey === 'codex') {
+    const effort = params.effort?.trim() || BAKED_CODEX_EFFORT
+    if (effort) {
+      segments.push(escapeSlackMrkdwn(CODEX_EFFORT_DISPLAY_NAMES[effort.toLowerCase()] ?? titleCase(effort)))
+    }
+    if (BAKED_CODEX_SPEED) segments.push(escapeSlackMrkdwn(titleCase(BAKED_CODEX_SPEED)))
+  }
   // Middot (U+00B7) with a space on each side, matching the bot's other
   // context lines.
   return {

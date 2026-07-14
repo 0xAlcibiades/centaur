@@ -40,6 +40,7 @@ const options: SlackbotV2Options = {
     ...(optionalEnv('CLAUDE_MODEL') ? { claudecode: optionalEnv('CLAUDE_MODEL')! } : {}),
     ...(optionalEnv('CODEX_MODEL') ? { codex: optionalEnv('CODEX_MODEL')! } : {})
   },
+  codexDefaultEffort: optionalEnv('CODEX_MODEL_REASONING_EFFORT'),
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
   postgresUrl:

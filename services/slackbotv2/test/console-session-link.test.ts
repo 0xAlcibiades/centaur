@@ -85,12 +85,13 @@ describe('consoleSessionUrl', () => {
 })
 
 describe('buildConsoleSessionContextBlock', () => {
-  test('builds a context block with uppercased model then harness, middot separated', () => {
+  test('builds codex context as harness, model, effort, and speed', () => {
     const block = buildConsoleSessionContextBlock({
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'slack:C123:1700000000.000100',
       harnessType: 'codex',
-      model: 'gpt-5.2'
+      model: 'gpt-5.2',
+      effort: 'xhigh'
     })
     expect(block).toEqual({
       type: 'context',
@@ -98,10 +99,22 @@ describe('buildConsoleSessionContextBlock', () => {
         {
           type: 'mrkdwn',
           text:
-            '<https://console.centaur.dev/console/threads?thread=slack%3AC123%3A1700000000.000100|Open chat in Console> · GPT-5.2 · Codex'
+            '<https://console.centaur.dev/console/threads?thread=slack%3AC123%3A1700000000.000100|Open chat in Console> · Codex · GPT-5.2 · XHigh · Fast'
         }
       ]
     })
+  })
+
+  test('uses the baked codex effort when no per-turn or deployment override is provided', () => {
+    const block = buildConsoleSessionContextBlock({
+      consoleBaseUrl: 'https://console.centaur.dev',
+      threadKey: 'slack:C1:1',
+      harnessType: 'codex',
+      model: 'gpt-5.6-sol'
+    })
+    expect(block?.elements[0]?.text).toContain(
+      `· Codex · GPT-5.6-SOL · ${(codexConfig as { model_reasoning_effort: string }).model_reasoning_effort.replace(/^./, character => character.toUpperCase())} · Fast`
+    )
   })
 
   test('omits the model segment when no model is provided', () => {

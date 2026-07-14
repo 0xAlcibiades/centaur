@@ -771,7 +771,8 @@ async function syncThreadMessageToSession(
         consoleBaseUrl: input.options.consolePublicUrl,
         threadKey: thread.id,
         harnessType: effectiveHarnessType,
-        model: effectiveModel
+        model: effectiveModel,
+        effort: overrides.reasoning ?? input.options.codexDefaultEffort
       })
     : undefined
   if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
