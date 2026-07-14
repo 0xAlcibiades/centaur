@@ -10,7 +10,7 @@ module Mcp
     skip_before_action :require_active_account, only: %i[metadata register authorize token]
     skip_forgery_protection only: %i[register token]
 
-    ACCESS_TOKEN_TTL_SECONDS = 2.hours.to_i
+    ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i
 
     # The shared role seeded onto new console-user principals. Admins attach
     # tool secrets to this role to define what every MCP user gets by default.
