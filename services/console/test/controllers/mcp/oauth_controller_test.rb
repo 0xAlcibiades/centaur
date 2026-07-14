@@ -10,11 +10,13 @@ module Mcp
       @saved_env = {
         "CENTAUR_JWT_SIGNING_SECRET" => ENV["CENTAUR_JWT_SIGNING_SECRET"],
         "CENTAUR_MCP_PUBLIC_URL" => ENV["CENTAUR_MCP_PUBLIC_URL"],
-        "CENTAUR_CONSOLE_PUBLIC_URL" => ENV["CENTAUR_CONSOLE_PUBLIC_URL"]
+        "CENTAUR_CONSOLE_PUBLIC_URL" => ENV["CENTAUR_CONSOLE_PUBLIC_URL"],
+        "CENTAUR_MCP_ACCESS_TOKEN_TTL_SECONDS" => ENV["CENTAUR_MCP_ACCESS_TOKEN_TTL_SECONDS"]
       }
       ENV["CENTAUR_JWT_SIGNING_SECRET"] = "test-secret"
       ENV["CENTAUR_MCP_PUBLIC_URL"] = "http://localhost:3000/mcp"
       ENV["CENTAUR_CONSOLE_PUBLIC_URL"] = "http://www.example.com"
+      ENV.delete("CENTAUR_MCP_ACCESS_TOKEN_TTL_SECONDS")
     end
 
     teardown do
@@ -162,6 +164,7 @@ module Mcp
       assert_response :ok
       body = JSON.parse(response.body)
       assert_equal "Bearer", body.fetch("token_type")
+      assert_equal 2.hours.to_i, body.fetch("expires_in")
       assert_equal "mcp:tools", body.fetch("scope")
       assert_match(/\Amcprt_/, body.fetch("refresh_token"))
 
@@ -171,6 +174,7 @@ module Mcp
       assert_equal stored_code.principal.oid, jwt_payload.fetch("principal_id")
       assert_equal @operator.email, jwt_payload.fetch("email")
       assert_equal "mcp:tools", jwt_payload.fetch("scope")
+      assert_equal 2.hours.to_i, jwt_payload.fetch("exp") - jwt_payload.fetch("iat")
     end
 
     test "authorization approval seeds new console principals with the user-mcp role" do

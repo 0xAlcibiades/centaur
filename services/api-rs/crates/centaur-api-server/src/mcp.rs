@@ -34,7 +34,7 @@ use crate::{
     tool_discovery::{DiscoveredTool, ToolDiscoveryConfig, discover_tool_catalog},
 };
 
-const MCP_AGENT_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
+const MCP_AGENT_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const MCP_AGENT_IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 
 pub(crate) async fn mcp_get() -> Response {
@@ -259,7 +259,7 @@ fn mcp_agent_tool_entries() -> Vec<Value> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MCP_AGENT_MAX_DURATION_MS,
-                        "description": "Maximum execution duration. Defaults to 24 hours and cannot exceed 24 hours."
+                        "description": "Maximum execution duration. Defaults to 1 hour and cannot exceed 1 hour."
                     }
                 },
                 "additionalProperties": false
