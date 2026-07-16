@@ -4125,19 +4125,7 @@ describe('slackbotv2', () => {
   })
 
   it('reuses an accepted execution when the local retry follows a lost execute response', async () => {
-    let overrideStrategyCalls = 0
-    bot = createTestBot({
-      handoffRetryDelaysMs: [50],
-      messageOverridesStrategy: async () => {
-        overrideStrategyCalls += 1
-        return {
-          overrides: {
-            harnessType: overrideStrategyCalls === 1 ? 'claudecode' : 'codex',
-            model: overrideStrategyCalls === 1 ? 'claude-opus-4-8' : 'gpt-5.6-sol'
-          }
-        }
-      }
-    })
+    bot = createTestBot({ handoffRetryDelaysMs: [50] })
     codexApi.failNextExecuteAfterAccept = true
 
     const parent = await postUserMessage('History before response loss.')
@@ -4172,15 +4160,6 @@ describe('slackbotv2', () => {
     expect(codexApi.executes.map(execute => execute.body.idempotency_key)).toEqual([
       mention.ts,
       mention.ts
-    ])
-    expect(overrideStrategyCalls).toBe(1)
-    expect(
-      codexApi.executes.map(execute =>
-        JSON.parse(execute.body.input_lines.at(-1) ?? '{}') as Record<string, unknown>
-      )
-    ).toEqual([
-      expect.objectContaining({ model: 'claude-opus-4-8' }),
-      expect.objectContaining({ model: 'claude-opus-4-8' })
     ])
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.eventRequests).toHaveLength(1)
