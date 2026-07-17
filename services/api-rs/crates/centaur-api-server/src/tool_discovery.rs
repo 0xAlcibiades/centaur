@@ -613,6 +613,8 @@ struct HttpSecret {
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -733,6 +735,8 @@ fn parse_secret(
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: Vec::new(),
+            paths: Vec::new(),
             replacer: name,
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -785,6 +789,13 @@ fn parse_http_secret(
              iron-proxy"
         )));
     }
+    let http_methods = optional_string_array(table.get("http_methods"))?.unwrap_or_default();
+    let paths = optional_string_array(table.get("paths"))?.unwrap_or_default();
+    if paths.iter().any(|path| !path.starts_with('/')) {
+        return Err(ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} 'paths' entries must start with '/'"
+        )));
+    }
     let mode = optional_str(table, "mode").unwrap_or("replace");
     match mode {
         "replace" => {
@@ -804,6 +815,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -839,6 +852,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: Vec::new(),
                 match_path: false,
@@ -1080,25 +1095,31 @@ fn fragment_from_secrets(secrets: Vec<ToolSecret>) -> Result<ProxyFragment, Tool
 
 fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, ToolDiscoveryError> {
     let mut grouped =
-        BTreeMap::<HttpSecretKey, (BTreeSet<String>, BTreeMap<String, String>)>::new();
+        BTreeMap::<HttpSecretKey, (BTreeSet<HttpSecretRule>, BTreeMap<String, String>)>::new();
     for secret in secrets {
         let ToolSecret::Http(secret) = secret else {
             continue;
         };
         let entry = grouped.entry(HttpSecretKey::from(secret)).or_default();
-        entry.0.extend(secret.hosts.iter().cloned());
+        entry
+            .0
+            .extend(secret.hosts.iter().map(|host| HttpSecretRule {
+                host: host.clone(),
+                http_methods: secret.http_methods.clone(),
+                paths: secret.paths.clone(),
+            }));
         merge_tool_labels(&mut entry.1, &secret.labels);
     }
     if grouped.is_empty() {
         return Ok(None);
     }
     let mut entries = Vec::new();
-    for (key, (hosts, labels)) in grouped {
+    for (key, (rules, labels)) in grouped {
         let mut extra = BTreeMap::new();
         let mut entry = Secret {
             id: Some(key.name.clone()),
             source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
-            rules: host_rules(hosts)?,
+            rules: http_secret_rules(rules)?,
             ..Default::default()
         };
         entry.extra.insert("labels".to_owned(), yaml_value(labels)?);
@@ -1140,6 +1161,13 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         },
         ..Default::default()
     }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HttpSecretRule {
+    host: String,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1453,6 +1481,24 @@ fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryEr
         .collect()
 }
 
+fn http_secret_rules(
+    rules: BTreeSet<HttpSecretRule>,
+) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            let mut value = BTreeMap::from([("host".to_owned(), yaml_string(&rule.host))]);
+            if !rule.http_methods.is_empty() {
+                value.insert("http_methods".to_owned(), yaml_value(rule.http_methods)?);
+            }
+            if !rule.paths.is_empty() {
+                value.insert("paths".to_owned(), yaml_value(rule.paths)?);
+            }
+            yaml_value(value)
+        })
+        .collect()
+}
+
 fn host_rules_set(hosts: &[String]) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     host_rules(hosts.iter().cloned().collect())
 }
@@ -1664,7 +1710,7 @@ secrets = [{type = "http", name = "BASE_TOKEN", match_headers = ["Authorization"
 description = "overlay alpha"
 
 [tool.centaur]
-secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"]}]
+secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"], http_methods = ["POST"], paths = ["/v1/search"]}]
 "#,
         );
         write_tool(
@@ -1687,6 +1733,11 @@ secrets = [
         let secrets = discovered.fragment.transforms[0].config.secrets.clone();
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].id.as_deref(), Some("OVERLAY_TOKEN"));
+        assert_eq!(
+            secrets[0].rules[0]["http_methods"][0].as_str(),
+            Some("POST")
+        );
+        assert_eq!(secrets[0].rules[0]["paths"][0].as_str(), Some("/v1/search"));
         let labels = secrets[0]
             .extra
             .get("labels")

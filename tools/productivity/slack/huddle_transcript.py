@@ -30,15 +30,18 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 
-# Slack marks each spoken turn with a bold ` [mm:ss]: ` between the speaker and their words — how far
-# into the call the turn happened. Long huddles use `[h:mm:ss]`.
+# Current payloads expose canonical ``lines`` entries. Older workspaces also emitted rich-text
+# blocks, where Slack marks each spoken turn with a bold ` [mm:ss]: ` between the speaker and words.
 _STAMP = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
 
 _PAGE = 1000  # turns per page; long huddles paginate
-_MAX_PAGES = 60  # ~60k turns — a backstop against a pathological response, never hit by a real huddle
+_MAX_PAGES = (
+    60  # ~60k turns — a backstop against a pathological response, never hit by a real huddle
+)
 
 # The failures that mean "the human must sign in again", as opposed to "this code is wrong". Only
 # these set ``needs_reauth``; everything else is a bug and should read like one.
@@ -60,32 +63,136 @@ class HuddleTranscriptError(RuntimeError):
         super().__init__(str(self.payload))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A fixed credentialed API call must not carry its headers through a redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 # ── parsing (pure) ──────────────────────────────────────────────────────────────────────────────
+
+
+def _transcription(files_info: dict) -> dict | None:
+    file = files_info.get("file")
+    if not isinstance(file, dict):
+        return None
+    transcription = file.get("huddle_transcription")
+    return transcription if isinstance(transcription, dict) else None
+
+
+def _format_timestamp(value: object) -> str | None:
+    if isinstance(value, str):
+        candidate = value.strip().strip("[]")
+        if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", candidate):
+            return candidate
+    if isinstance(value, bool):
+        return None
+    try:
+        milliseconds = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if milliseconds < 0:
+        return None
+    seconds = milliseconds // 1000
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _line_segments(transcription: dict) -> list[dict]:
+    lines = transcription.get("lines")
+    if not isinstance(lines, list):
+        return []
+    out: list[dict] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            raise HuddleTranscriptError("Slack returned a malformed huddle transcript line")
+        text = line.get("contents", line.get("text"))
+        if text is None:
+            continue
+        if not isinstance(text, str):
+            raise HuddleTranscriptError("Slack returned non-text huddle transcript contents")
+        said = text.strip()
+        if not said:
+            continue
+        user_id = line.get("user_id", line.get("speaker_id"))
+        if not isinstance(user_id, str) or not user_id:
+            user_id = None
+        at = _format_timestamp(line.get("start_time_ms", line.get("start_time")))
+        out.append({"user_id": user_id, "at": at, "text": said})
+    return out
+
+
+def _rich_text_sections(value: object) -> list[dict]:
+    """Normalize both direct and list-wrapped Slack rich-text block shapes."""
+    if isinstance(value, list):
+        out: list[dict] = []
+        for item in value:
+            out.extend(_rich_text_sections(item))
+        return out
+    if not isinstance(value, dict):
+        return []
+    if value.get("type") == "rich_text_section":
+        return [value]
+    return _rich_text_sections(value.get("elements"))
+
+
+def _raw_turn_count(files_info: dict) -> int | None:
+    """Count unfiltered Slack entries so noise/empty turns cannot end pagination early."""
+    transcription = _transcription(files_info)
+    if transcription is None:
+        return None
+    lines = transcription.get("lines")
+    if isinstance(lines, list) and lines:
+        return len(lines)
+    blocks = transcription.get("blocks")
+    if isinstance(lines, list) or isinstance(blocks, (dict, list)):
+        return len(_rich_text_sections(blocks))
+    return None
 
 
 def parse_segments(files_info: dict) -> list[dict]:
     """The transcript as ordered turns: ``{"user_id", "at", "text"}``.
 
-    Slack returns it as one ``rich_text`` block whose elements are a ``rich_text_section`` per spoken
-    turn. Each section carries a ``user`` element (the speaker's id), a **bold** ``text`` element
-    holding the ` [mm:ss]: ` mark, and one or more plain ``text`` elements with the words.
+    Slack's canonical payload is ``huddle_transcription.lines[]`` with ``user_id``,
+    ``start_time_ms``, and ``contents``. The rich-text representation emitted by older workspaces is
+    retained as a fallback: each section carries a ``user`` element, a bold timestamp marker, and
+    one or more text elements with the words.
 
     Speakers stay as **Slack ids, never names**. An id round-trips to a real mention and cannot drift;
     a name resolved at parse time silently rots when someone changes their display name.
     """
-    block = ((files_info.get("file") or {}).get("huddle_transcription") or {}).get("blocks") or {}
+    transcription = _transcription(files_info)
+    if transcription is None:
+        return []
+    line_segments = _line_segments(transcription)
+    if line_segments:
+        return line_segments
+
     out: list[dict] = []
-    for section in block.get("elements", []):
-        if section.get("type") != "rich_text_section":
-            continue
+    for section in _rich_text_sections(transcription.get("blocks")):
         user_id: str | None = None
         at: str | None = None
         words: list[str] = []
-        for element in section.get("elements", []):
+        elements = section.get("elements")
+        if not isinstance(elements, list):
+            continue
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
             if element.get("type") == "user":
-                user_id = element.get("user_id")
+                candidate = element.get("user_id")
+                user_id = candidate if isinstance(candidate, str) else None
             elif element.get("type") == "text":
                 text = element.get("text", "")
+                if not isinstance(text, str):
+                    raise HuddleTranscriptError("Slack returned non-text rich transcript contents")
                 stamp = _STAMP.search(text)
                 # The bold element that *is* a timestamp is the marker, not speech. A bold word inside
                 # the speech itself carries no [mm:ss] and must survive.
@@ -150,10 +257,26 @@ def _call(host: str, token: str, cookie: str, **params: str) -> dict:
         headers={"Authorization": f"Bearer {token}", "Cookie": cookie},
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _OPENER.open(request, timeout=60) as response:
             body = json.load(response)
-    except OSError as exc:  # network/TLS, not Slack saying no
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.load(exc)
+        except (UnicodeDecodeError, ValueError):
+            raise HuddleTranscriptError(
+                "Slack returned an HTTP error", status_code=exc.code
+            ) from exc
+        if not isinstance(body, dict) or body.get("ok"):
+            raise HuddleTranscriptError(
+                "Slack returned an HTTP error", status_code=exc.code
+            ) from exc
+    except urllib.error.URLError as exc:  # network/TLS, not Slack saying no
         raise HuddleTranscriptError(f"could not reach {host}", cause=str(exc)) from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HuddleTranscriptError("Slack returned invalid JSON") from exc
+
+    if not isinstance(body, dict):
+        raise HuddleTranscriptError("Slack returned a non-object response")
 
     if not body.get("ok"):
         error = body.get("error")
@@ -182,6 +305,7 @@ def fetch(file_id: str, *, host: str, token: str, cookie: str) -> dict:
     the turn. Callers that need the structure can call :func:`parse_segments` themselves.
     """
     segments: list[dict] = []
+    seen_pages: set[str] = set()
     for page in range(1, _MAX_PAGES + 1):
         body = _call(
             host,
@@ -192,10 +316,36 @@ def fetch(file_id: str, *, host: str, token: str, cookie: str) -> dict:
             page=str(page),
             count=str(_PAGE),
         )
+        transcription = _transcription(body)
+        raw_count = _raw_turn_count(body)
+        if transcription is None or raw_count is None:
+            raise HuddleTranscriptError(
+                "Slack returned no huddle transcription; the file may not be a transcript or it "
+                "may not be ready",
+                file_id=file_id,
+            )
+        fingerprint = json.dumps(transcription, sort_keys=True, separators=(",", ":"))
+        if fingerprint in seen_pages:
+            raise HuddleTranscriptError(
+                "Slack transcript pagination did not advance", file_id=file_id, page=page
+            )
+        seen_pages.add(fingerprint)
         chunk = parse_segments(body)
         segments += chunk
-        if len(chunk) < _PAGE:  # a short page is the last page — also the no-pagination case
+        # Slack's undocumented transcript pagination uses the raw entry count. Parsed turns are the
+        # wrong signal because valid pages can contain empty/noise entries that we intentionally drop.
+        # A response larger than the requested page size means Slack returned the complete payload.
+        if raw_count != _PAGE:
             break
+    else:
+        raise HuddleTranscriptError(
+            "Slack transcript exceeded the pagination safety limit", file_id=file_id
+        )
+    if not segments:
+        raise HuddleTranscriptError(
+            "Slack returned an empty huddle transcription; it may not be ready",
+            file_id=file_id,
+        )
     return {
         "file_id": file_id,
         "speakers": speakers(segments),

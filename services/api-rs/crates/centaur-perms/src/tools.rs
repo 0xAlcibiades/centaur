@@ -93,6 +93,8 @@ pub struct HttpSecret {
     pub secret_ref: String,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
+    pub http_methods: Vec<String>,
+    pub paths: Vec<String>,
     // replace mode
     pub replacer: String,
     pub match_headers: Vec<String>,
@@ -429,6 +431,8 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             secret_ref: s.to_owned(),
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: vec![],
+            paths: vec![],
             replacer: s.to_owned(),
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -511,6 +515,11 @@ fn parse_http(
              unscoped in iron-proxy"
         ),
     };
+    let http_methods = http_rule_str_array(table.get("http_methods"), name, "http_methods")?;
+    let paths = http_rule_str_array(table.get("paths"), name, "paths")?;
+    if paths.iter().any(|path| !path.starts_with('/')) {
+        bail!("HTTP secret {name:?} 'paths' entries must start with '/'");
+    }
 
     match mode {
         SecretMode::Replace => {
@@ -539,6 +548,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -575,6 +586,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: vec![],
                 match_path: false,
@@ -1052,6 +1065,28 @@ fn non_empty_str_array(value: Option<&Value>) -> Option<Vec<String>> {
         out.push(s.to_owned());
     }
     Some(out)
+}
+
+/// An optional HTTP request-rule array. A malformed scope must fail closed:
+/// treating it as absent would widen the credential to every request on its hosts.
+fn http_rule_str_array(value: Option<&Value>, name: &str, key: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(vec![]);
+    };
+    let array = value.as_array().ok_or_else(|| {
+        eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
+    })?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
+                })
+        })
+        .collect()
 }
 
 fn validate_gcp_id_token_header(value: String) -> Result<String> {

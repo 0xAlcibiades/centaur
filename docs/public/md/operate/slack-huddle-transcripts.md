@@ -21,7 +21,7 @@ Centaur's Slack tool can read them, given a **user web session**.
 The Slack *web client* reads transcripts perfectly well. It calls `files.info` with
 `include_transcription=true` against the **workspace host** (`<workspace>.slack.com` — never
 `slack.com`), authenticated by a user web session: an `xoxc` token paired with the `d` cookie.
-The tool replays exactly that call.
+The tool sends the equivalent authenticated `files.info` request.
 
 This is not a scope escalation and not a permission bypass. A user session sees precisely what that
 user could already read by opening the huddle in their own Slack client. If they cannot see the
@@ -55,14 +55,15 @@ Two optional secrets. Without them every other Slack method works exactly as bef
 | `SLACK_WEB_TOKEN` | The `xoxc` token from a signed-in Slack web session |
 | `SLACK_WEB_COOKIE` | The paired `d` cookie (`d=xoxd-…`) |
 
-Both are declared as header-injected HTTP secrets scoped to `*.slack.com`, so **the sandbox holds
-placeholders and never the real session** — iron-proxy swaps in the true values at the network
-boundary, and only for Slack hosts.
+Both are declared as header-replaced HTTP secrets scoped to `POST /api/files.info` on
+`*.slack.com`, so **the sandbox holds placeholders and never the real session** — iron-proxy swaps
+in the true values at the network boundary only for that read-only Slack endpoint.
 
 :::warning[Scope these to a service account, not to a person]
-A user web session carries **that user's full Slack visibility**, including their DMs. Mint it from an
-account whose visibility you are content for agents to inherit. This is the same trust decision as
-`SLACK_SEARCH_TOKEN`, but the blast radius is larger, so make it deliberately.
+The underlying web session carries **that user's full Slack visibility**, including their DMs. The
+proxy limits these placeholders to `files.info`, but that endpoint can still return huddle
+transcripts and other files the account can see, including files from DMs. Mint the session from an
+account whose file visibility you are content for agents to inherit.
 :::
 
 ### Obtaining them

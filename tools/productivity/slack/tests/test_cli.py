@@ -1,4 +1,5 @@
 import base64
+import json
 import sys
 import types
 from pathlib import Path
@@ -582,3 +583,52 @@ def test_thread_direct_calls_direct_client(monkeypatch) -> None:
             },
         )
     ]
+
+
+def test_huddle_transcript_prints_verbatim_text(monkeypatch) -> None:
+    payload = {
+        "file_id": "F123",
+        "speakers": ["U1"],
+        "turns": 1,
+        "text": "<@U1> [0:01]: [red]literal markup[/red]",
+    }
+    fake_client = types.SimpleNamespace(
+        _client=lambda: types.SimpleNamespace(get_huddle_transcript=lambda file_id: payload)
+    )
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(app, ["huddle-transcript", "F123"])
+
+    assert result.exit_code == 0
+    assert result.stdout == "1 turns, 1 speakers\n<@U1> [0:01]: [red]literal markup[/red]\n"
+
+
+def test_huddle_transcript_json_is_machine_readable(monkeypatch) -> None:
+    payload = {"file_id": "F123", "speakers": ["U1"], "turns": 1, "text": "hello"}
+    fake_client = types.SimpleNamespace(
+        _client=lambda: types.SimpleNamespace(get_huddle_transcript=lambda file_id: payload)
+    )
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(app, ["huddle-transcript", "F123", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == payload
+
+
+def test_huddle_transcript_errors_go_to_stderr(monkeypatch) -> None:
+    from slack.huddle_transcript import HuddleTranscriptError
+
+    def fail(file_id):
+        raise HuddleTranscriptError("refresh", needs_reauth=True)
+
+    fake_client = types.SimpleNamespace(
+        _client=lambda: types.SimpleNamespace(get_huddle_transcript=fail)
+    )
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(app, ["huddle-transcript", "F123"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["needs_reauth"] is True

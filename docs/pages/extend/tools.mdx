@@ -91,6 +91,8 @@ Each entry in `secrets` declares one credential the tool can request with
   request the placeholder is allowed to appear. At least one is required.
 - `hosts` is the upstream allowlist for this secret. iron-proxy will only
   inject the real value on requests to these hosts.
+- `http_methods` and `paths` optionally narrow that allowlist to specific HTTP
+  methods and URL paths. Use them for high-authority credentials that serve one endpoint.
 
 Use `optional_secrets` for credentials the tool can run without.
 

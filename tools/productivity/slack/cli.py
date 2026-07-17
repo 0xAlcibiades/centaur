@@ -1717,18 +1717,14 @@ def huddle_transcript(
         result = _client().get_huddle_transcript(file_id)
     except Exception as exc:
         payload = getattr(exc, "payload", {"error": str(exc)})
-        console.print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
-        # A lapsed session is not a bug in this command — say which it is, so a caller (or an agent)
-        # can tell "sign in again" apart from "this is broken".
-        if payload.get("needs_reauth"):
-            console.print("[yellow]The Slack web session needs refreshing.[/]")
+        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, default=str), err=True)
         raise typer.Exit(1) from exc
 
     if as_json:
-        console.print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False, default=str))
         return
-    console.print(f"[bold]{result['turns']}[/] turns, {len(result['speakers'])} speakers")
-    console.print(result["text"])
+    typer.echo(f"{result['turns']} turns, {len(result['speakers'])} speakers")
+    typer.echo(result["text"])
 
 
 if __name__ == "__main__":

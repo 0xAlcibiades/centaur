@@ -156,10 +156,11 @@ class SlackClient:
         """
         if self._workspace_host_cache is None:
             url = (self._client.auth_test().data or {}).get("url", "")
-            host = urlparse(url).hostname
-            if not host:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host.endswith(".slack.com"):
                 raise huddle_transcript.HuddleTranscriptError(
-                    "could not determine the workspace host from auth.test"
+                    "auth.test returned an invalid Slack workspace URL"
                 )
             self._workspace_host_cache = host
         return self._workspace_host_cache
@@ -2788,5 +2789,5 @@ def get_user_profile(*args, **kwargs):
     return _client().get_user_profile(*args, **kwargs)
 
 
-def get_huddle_transcript(*args, **kwargs):
-    return _client().get_huddle_transcript(*args, **kwargs)
+def get_huddle_transcript(file_id: str) -> dict:
+    return _client().get_huddle_transcript(file_id)

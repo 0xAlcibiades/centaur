@@ -50,7 +50,7 @@ fn secret_type_routes_by_oid_prefix() {
 #[test]
 fn parses_http_replace_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["POST"], paths = ["/api/files.info"]}"#),
         &[],
     )
     .unwrap();
@@ -63,6 +63,19 @@ fn parses_http_replace_secret() {
     assert_eq!(http.replacer, "SLACK_BOT_TOKEN");
     assert_eq!(http.match_headers, vec!["Authorization".to_owned()]);
     assert_eq!(http.hosts, vec!["slack.com".to_owned()]);
+    assert_eq!(http.http_methods, vec!["POST".to_owned()]);
+    assert_eq!(http.paths, vec!["/api/files.info".to_owned()]);
+}
+
+#[test]
+fn rejects_malformed_http_rule_scopes() {
+    for raw in [
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = "POST"}"#,
+        r#"{type = "http", name = "TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = [""]}"#,
+    ] {
+        let error = tools::parse_secret(&entry(raw), &[]).unwrap_err();
+        assert!(error.to_string().contains("array of non-empty strings"));
+    }
 }
 
 #[test]
@@ -426,7 +439,7 @@ fn legacy_string_shim_is_replace_secret() {
 fn translates_http_replace_to_static_input() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["POST"], paths = ["/api/files.info"]}"#),
             &[],
         )
         .unwrap(),
@@ -448,6 +461,8 @@ fn translates_http_replace_to_static_input() {
     );
     assert_eq!(input.rules.len(), 1);
     assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(input.rules[0].http_methods, vec!["POST".to_owned()]);
+    assert_eq!(input.rules[0].paths, vec!["/api/files.info".to_owned()]);
 }
 
 #[test]
@@ -913,6 +928,20 @@ fn real_slack_tool_parses_and_translates() {
         ),
         "expected the SLACK_BOT_TOKEN static secret"
     );
+    for name in ["SLACK_WEB_TOKEN", "SLACK_WEB_COOKIE"] {
+        let secret = out
+            .inputs
+            .iter()
+            .find_map(|input| match input {
+                SecretInput::Static(secret) if secret.name == name => Some(secret),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected the {name} static secret"));
+        assert_eq!(secret.rules.len(), 1);
+        assert_eq!(secret.rules[0].host.as_deref(), Some("*.slack.com"));
+        assert_eq!(secret.rules[0].http_methods, ["POST"]);
+        assert_eq!(secret.rules[0].paths, ["/api/files.info"]);
+    }
 }
 
 #[test]
