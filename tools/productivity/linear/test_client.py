@@ -88,6 +88,31 @@ def test_update_issue_merges_success_into_issue_fields():
     assert updated["success"] is True
 
 
+def test_update_project_lead_changes_only_project_lead():
+    client = RecordingLinearClient(
+        {
+            "projectUpdate": {
+                "success": True,
+                "project": {
+                    "id": "project-1",
+                    "name": "Tetra",
+                    "lead": {"id": "user-1", "name": "Vijith"},
+                },
+            }
+        }
+    )
+
+    updated = client.update_project_lead("project-1", "user-1")
+
+    assert updated["success"] is True
+    assert updated["lead"]["name"] == "Vijith"
+    assert client.calls[0]["variables"] == {
+        "id": "project-1",
+        "input": {"leadId": "user-1"},
+    }
+    assert "issueUpdate" not in client.calls[0]["query"]
+
+
 def test_add_comment_merges_success_into_comment_fields():
     client = RecordingLinearClient(
         {"commentCreate": {"success": True, "comment": {"id": "comment-1", "body": "hi"}}}
@@ -104,6 +129,7 @@ def test_mutations_surface_failure():
         {
             "issueCreate": {"success": False, "issue": None},
             "issueUpdate": {"success": False, "issue": None},
+            "projectUpdate": {"success": False, "project": None},
             "commentCreate": {"success": False, "comment": None},
         }
     )
@@ -111,4 +137,5 @@ def test_mutations_surface_failure():
     # Callers (e.g. workflow helpers) key on result["success"] is False.
     assert client.create_issue("Test", team_id="team-1") == {"success": False}
     assert client.update_issue("ENG-1", title="New title") == {"success": False}
+    assert client.update_project_lead("project-1", "user-1") == {"success": False}
     assert client.add_comment("ENG-1", "hello") == {"success": False}

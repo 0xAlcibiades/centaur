@@ -499,6 +499,52 @@ def project_detail(
     console.print(f"\n[dim]{result.get('url')}[/]")
 
 
+@app.command("update-project-lead")
+def update_project_lead(
+    project_name: str = typer.Argument(..., help="Project name (unique partial match supported)"),
+    lead: str = typer.Option(..., "--lead", help="New project lead name, email, or 'me'"),
+):
+    """Change only a project's lead; issue assignees are not modified."""
+    client = get_client()
+
+    project_matches = [
+        project
+        for project in client.projects()
+        if project_name.lower() in project.get("name", "").lower()
+    ]
+    if len(project_matches) != 1:
+        console.print(
+            f"[red]Project '{project_name}' matched {len(project_matches)} projects; provide a unique name.[/]"
+        )
+        raise typer.Exit(1)
+
+    if lead.lower() == "me":
+        lead_match = client.me()
+    else:
+        normalized_lead = lead.casefold()
+        lead_matches = [
+            user
+            for user in client.users()
+            if normalized_lead == str(user.get("email", "")).casefold()
+            or normalized_lead == str(user.get("name", "")).casefold()
+        ]
+        if len(lead_matches) != 1:
+            console.print(
+                f"[red]Lead '{lead}' matched {len(lead_matches)} users; provide an exact name or email.[/]"
+            )
+            raise typer.Exit(1)
+        lead_match = lead_matches[0]
+
+    result = client.update_project_lead(project_matches[0]["id"], lead_match["id"])
+    require_mutation_success(result, "project lead update")
+
+    console.print(
+        f"[green]Updated project lead:[/] [bold]{result.get('name')}[/] → "
+        f"{result.get('lead', {}).get('name', '')}"
+    )
+    console.print(f"[dim]{result.get('url')}[/]")
+
+
 @app.command()
 def cycles(
     team: str = typer.Option(None, "--team", "-t", help="Filter by team key"),

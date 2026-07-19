@@ -33,9 +33,7 @@ if "centaur_sdk" not in sys.modules:
     sdk_mod.Table = Table
     sys.modules["centaur_sdk"] = sdk_mod
 
-spec = importlib.util.spec_from_file_location(
-    "linear_cli", Path(__file__).with_name("cli.py")
-)
+spec = importlib.util.spec_from_file_location("linear_cli", Path(__file__).with_name("cli.py"))
 assert spec and spec.loader
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
@@ -47,6 +45,26 @@ class FakeClient:
 
     def labels(self, team_key: str | None = None) -> list[dict[str, Any]]:
         return self._labels
+
+
+class FakeProjectLeadClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def projects(self) -> list[dict[str, Any]]:
+        return [{"id": "project-1", "name": "Tetra"}]
+
+    def users(self) -> list[dict[str, Any]]:
+        return [{"id": "user-1", "name": "Vijith", "email": "vijith@tempo.xyz"}]
+
+    def update_project_lead(self, project_id: str, lead_id: str) -> dict[str, Any]:
+        self.calls.append((project_id, lead_id))
+        return {
+            "success": True,
+            "name": "Tetra",
+            "url": "https://linear.app/tempoxyz/project/tetra",
+            "lead": {"id": lead_id, "name": "Vijith"},
+        }
 
 
 def _run_labels(monkeypatch, labels: list[dict[str, Any]]):
@@ -78,3 +96,16 @@ def test_labels_handles_missing_team_key(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert ("org", "loose") in RECORDED_ROWS
+
+
+def test_update_project_lead_does_not_update_issues(monkeypatch):
+    from typer.testing import CliRunner
+
+    client = FakeProjectLeadClient()
+    monkeypatch.setattr(cli, "get_client", lambda: client)
+
+    result = CliRunner().invoke(cli.app, ["update-project-lead", "Tetra", "--lead", "Vijith"])
+
+    assert result.exit_code == 0, result.output
+    assert client.calls == [("project-1", "user-1")]
+    assert "Updated project lead" in result.output

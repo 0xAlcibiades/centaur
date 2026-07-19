@@ -180,6 +180,19 @@ class LinearClient(LinearReadonlyClient):
         result = self._query(mutation, {"id": issue_id, "input": input_data})
         return self._mutation_result(result, "issueUpdate")
 
+    def update_project_lead(self, project_id: str, lead_id: str) -> dict[str, Any]:
+        """Set a project's lead without changing any issue assignees."""
+        mutation = """
+        mutation ProjectUpdateLead($id: String!, $input: ProjectUpdateInput!) {
+            projectUpdate(id: $id, input: $input) {
+                success
+                project { id name url lead { id name email } }
+            }
+        }
+        """
+        result = self._query(mutation, {"id": project_id, "input": {"leadId": lead_id}})
+        return self._mutation_result(result, "projectUpdate", "project")
+
     def add_comment(self, issue_id: str, body: str) -> dict[str, Any]:
         """Add a comment to an issue."""
         mutation = """
