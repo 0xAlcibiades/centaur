@@ -6,6 +6,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import repo_cache_watch
@@ -57,6 +58,17 @@ def _commit(repo_path: Path, content: str) -> str:
 
 
 class RepoCacheWatchTest(unittest.TestCase):
+    def test_publish_reload_generation_replaces_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "state" / "generation"
+            with mock.patch.dict(
+                "os.environ", {"CENTAUR_RELOAD_GENERATION_FILE": str(marker)}
+            ):
+                repo_cache_watch._publish_reload_generation("first")
+                self.assertEqual(marker.read_text(), "first")
+                repo_cache_watch._publish_reload_generation("second")
+                self.assertEqual(marker.read_text(), "second")
+
     def test_fingerprint_uses_repo_cache_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

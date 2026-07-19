@@ -12,6 +12,7 @@ import sys
 import time
 
 TOOLS_METADATA_NAME = ".centaur-tools-source.json"
+DEFAULT_RELOAD_GENERATION_FILE = Path("/tmp/centaur-repo-cache-generation")
 
 
 def _split_paths(value: str) -> list[Path]:
@@ -109,6 +110,23 @@ def _refresh_tools() -> int:
         return 1
 
 
+def _publish_reload_generation(fingerprint: str | None) -> None:
+    if fingerprint is None:
+        return
+    path = Path(
+        os.environ.get(
+            "CENTAUR_RELOAD_GENERATION_FILE", str(DEFAULT_RELOAD_GENERATION_FILE)
+        )
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f"{path.suffix}.tmp")
+        temporary.write_text(fingerprint)
+        temporary.replace(path)
+    except OSError as exc:
+        print(f"warning: failed to publish reload generation at {path}: {exc}", file=sys.stderr)
+
+
 def _refresh_if_changed(
     tool_dirs: list[Path],
     applied_fingerprint: str | None,
@@ -135,11 +153,14 @@ def watch_repo_cache(tool_dirs: list[Path]) -> int:
 
     interval = _env_float("CENTAUR_TOOLS_RELOAD_INTERVAL_SECONDS", 10.0)
     applied_fingerprint = _repo_cache_fingerprint(tool_dirs)
+    _publish_reload_generation(applied_fingerprint)
     print("repo-cache tool auto-reload watcher started", file=sys.stderr)
 
     while True:
         time.sleep(interval)
-        applied_fingerprint, _ = _refresh_if_changed(tool_dirs, applied_fingerprint)
+        applied_fingerprint, refreshed = _refresh_if_changed(tool_dirs, applied_fingerprint)
+        if refreshed:
+            _publish_reload_generation(applied_fingerprint)
 
 
 def main() -> int:

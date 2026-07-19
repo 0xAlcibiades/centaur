@@ -1,5 +1,7 @@
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
@@ -126,6 +128,8 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
     // thread start (the app-server protocol has no per-turn provider), so this
     // lets a later conflicting override be surfaced rather than silently dropped.
     let mut thread_provider: Option<String> = None;
+    let mut force_fresh_thread = false;
+    let mut reload_generation = ReloadGeneration::from_env();
     let (command_tx, command_rx) = mpsc::channel();
     let (active_turn_tx, active_turn_rx) = mpsc::channel();
     let turn_active = Arc::new(AtomicBool::new(false));
@@ -196,6 +200,15 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 let traceparent = trace_context.effective_traceparent();
                 turn_active.store(true, Ordering::SeqCst);
                 let result = (|| -> Result<()> {
+                    if reload_generation.changed() {
+                        codex = None;
+                        thread_id = None;
+                        thread_provider = None;
+                        force_fresh_thread = true;
+                        eprintln!(
+                            "repo-cache generation changed; restarting Codex with refreshed skills"
+                        );
+                    }
                     if codex.is_none() {
                         otel::configure_codex_otel_for_startup(&trace_context)?;
                         let mut child = CodexJsonRpcChild::spawn()?;
@@ -216,6 +229,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                         &mut request_id,
                         &mut thread_id,
                         &mut thread_provider,
+                        &mut force_fresh_thread,
                         input,
                         client_user_message_id,
                         (model, model_provider),
@@ -296,6 +310,7 @@ fn run_codex_user_turn<W: Write>(
     request_id: &mut i64,
     thread_id: &mut Option<String>,
     thread_provider: &mut Option<String>,
+    force_fresh_thread: &mut bool,
     input: Vec<UserInput>,
     client_user_message_id: Option<String>,
     model_and_provider: (Option<String>, String),
@@ -311,8 +326,10 @@ fn run_codex_user_turn<W: Write>(
             stdout,
             request_id,
             &model_provider,
+            *force_fresh_thread,
             traceparent,
         )?);
+        *force_fresh_thread = false;
         *thread_provider = Some(model_provider.clone());
     } else if let (Some(requested), Some(pinned)) =
         (requested_provider.as_deref(), thread_provider.as_deref())
@@ -408,13 +425,14 @@ fn start_or_resume_thread<W: Write>(
     stdout: &mut W,
     request_id: &mut i64,
     model_provider: &str,
+    force_fresh_thread: bool,
     traceparent: Option<&str>,
 ) -> Result<String> {
     let cwd = env::current_dir()?.display().to_string();
     let resume = env::var("CODEX_CONTINUE_THREAD_ID")
         .or_else(|_| env::var("AMP_CONTINUE_THREAD_ID"))
         .unwrap_or_default();
-    let (method, params) = if resume.trim().is_empty() {
+    let (method, params) = if force_fresh_thread || resume.trim().is_empty() {
         (
             "thread/start",
             json!({
@@ -448,6 +466,38 @@ fn start_or_resume_thread<W: Write>(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| HarnessServerError::Protocol(format!("{method} response missing thread.id")))
+}
+
+struct ReloadGeneration {
+    path: PathBuf,
+    applied: Option<String>,
+}
+
+impl ReloadGeneration {
+    fn from_env() -> Self {
+        let path = env::var_os("CENTAUR_RELOAD_GENERATION_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/centaur-repo-cache-generation"));
+        let applied = read_reload_generation(&path);
+        Self { path, applied }
+    }
+
+    fn changed(&mut self) -> bool {
+        let Some(current) = read_reload_generation(&self.path) else {
+            return false;
+        };
+        match self.applied.replace(current.clone()) {
+            Some(applied) => applied != current,
+            None => false,
+        }
+    }
+}
+
+fn read_reload_generation(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 struct CodexJsonRpcChild {
@@ -921,6 +971,7 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // A non-empty explicit provider override (the `--bedrock` blocks `provider`
     // field) short-circuits before any env/model heuristic, so these assertions
@@ -947,6 +998,30 @@ mod tests {
             codex.model_provider_for(Some("   "), Some("vendor/model")),
             "openrouter"
         );
+    }
+
+    #[test]
+    fn reload_generation_changes_only_after_baseline_moves() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "centaur-reload-generation-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&path, "first").expect("write first generation");
+        let mut generation = ReloadGeneration {
+            path: path.clone(),
+            applied: read_reload_generation(&path),
+        };
+
+        assert!(!generation.changed());
+        fs::write(&path, "second").expect("write second generation");
+        assert!(generation.changed());
+        assert!(!generation.changed());
+
+        fs::remove_file(path).expect("remove generation marker");
     }
 
     fn turn_started() -> Value {
