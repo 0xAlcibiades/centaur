@@ -447,8 +447,8 @@ def create_project(
     """Create a project, or reuse an exact-name project in the same team.
 
     Examples:
-        linear create-project "Upshift" --team INT
-        linear create-project "Upshift" --team INT --json
+        linear create-project "Customer Integration" --team INT
+        linear create-project "Customer Integration" --team INT --json
     """
     client = get_client()
     try:
