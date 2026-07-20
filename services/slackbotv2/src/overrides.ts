@@ -20,12 +20,20 @@
  * shortcuts imply the codex harness.
  */
 
-export type MessageOverrides = {
-  cleanedText: string
+/**
+ * A resolved bundle of harness knobs (harness + model/provider/reasoning), all
+ * optional. Shared by the inline flag parser and per-channel defaults so both
+ * speak the same vocabulary.
+ */
+export type HarnessOverrides = {
   harnessType?: string
   model?: string
   provider?: string
   reasoning?: string
+}
+
+export type MessageOverrides = HarnessOverrides & {
+  cleanedText: string
 }
 
 // Flag name -> HarnessType wire value (serde lowercase of the Rust enum).
@@ -62,6 +70,37 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
     ])
   )
 
+const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex'])
+const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
+const STRATEGY_REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+])
+
+const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
+  'claude-fable-5': 'claudecode',
+  'claude-haiku-4-5': 'claudecode',
+  'claude-opus-4-8': 'claudecode',
+  'claude-sonnet-4-6': 'claudecode',
+  'claude-sonnet-5': 'claudecode',
+  deep: 'amp',
+  fast: 'amp',
+  'gpt-5.4': 'codex',
+  'gpt-5.4-mini': 'codex',
+  'gpt-5.4-nano': 'codex',
+  'gpt-5.4-pro': 'codex',
+  'gpt-5.5': 'codex',
+  'gpt-5.5-pro': 'codex',
+  'gpt-5.6-luna': 'codex',
+  'gpt-5.6-sol': 'codex',
+  'gpt-5.6-terra': 'codex'
+}
+
 // Values are one horizontal-whitespace-delimited token; a newline after the
 // value starts the user's prompt, not part of the model/reasoning value.
 const MODEL_VALUE_SEPARATOR = String.raw`(?:[^\S\r\n]*=[^\S\r\n]*|[^\S\r\n]+)`
@@ -91,7 +130,8 @@ const REASONING_EFFORTS: Record<string, string> = {
   hi: 'high',
   xhigh: 'xhigh',
   xhi: 'xhigh',
-  'x-high': 'xhigh'
+  'x-high': 'xhigh',
+  max: 'max'
 }
 
 export function extractMessageOverrides(text: string): MessageOverrides {
@@ -147,6 +187,106 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     provider,
     reasoning
   }
+}
+
+export function validateStrategyOverrides(
+  raw: {
+    harness?: unknown
+    model?: unknown
+    provider?: unknown
+    reasoning?: unknown
+  } | null | undefined
+): HarnessOverrides {
+  if (!raw || typeof raw !== 'object') return {}
+  let harnessType: string | undefined
+  let model: string | undefined
+  let provider: string | undefined
+  let reasoning: string | undefined
+
+  const harnessRaw = cleanString(raw.harness)
+  if (harnessRaw) {
+    const normalized = harnessRaw.toLowerCase()
+    if (!STRATEGY_HARNESSES.has(normalized)) return {}
+    harnessType = normalized
+  }
+
+  const providerRaw = cleanString(raw.provider)
+  if (providerRaw) {
+    const normalized = providerRaw.toLowerCase()
+    if (!STRATEGY_PROVIDERS.has(normalized)) return {}
+    provider = normalized
+    if (harnessType && harnessType !== 'codex') return {}
+    harnessType = 'codex'
+  }
+
+  const modelRaw = cleanString(raw.model)
+  if (modelRaw) {
+    const modelHarness = STRATEGY_MODEL_HARNESSES[modelRaw.toLowerCase()]
+    if (!modelHarness) return {}
+    if (harnessType && harnessType !== modelHarness) return {}
+    model = modelRaw.toLowerCase()
+    harnessType = modelHarness
+  }
+
+  const reasoningRaw = cleanString(raw.reasoning)
+  if (reasoningRaw) {
+    const normalized = reasoningRaw.toLowerCase()
+    if (!STRATEGY_REASONING_EFFORTS.has(normalized)) return {}
+    reasoning = harnessType === undefined || harnessType === 'codex' ? normalized : undefined
+  }
+
+  return { harnessType, model, provider, reasoning }
+}
+
+/**
+ * Object-shaped counterpart to {@link extractMessageOverrides}: normalizes a
+ * `{ harness, model, provider, reasoning }` config through the same vocabulary
+ * as the flag parser (harness/provider/model aliases; a provider implies its
+ * harness, like `--bedrock`). Fields are independent; unrecognized harness /
+ * provider / reasoning values are reported via `onError` and dropped.
+ */
+export function normalizeHarnessOverrides(
+  raw: { harness?: unknown; model?: unknown; provider?: unknown; reasoning?: unknown },
+  onError?: (message: string) => void
+): HarnessOverrides {
+  let harnessType: string | undefined
+  let model: string | undefined
+  let provider: string | undefined
+  let reasoning: string | undefined
+
+  const harnessRaw = cleanString(raw.harness)
+  if (harnessRaw) {
+    harnessType = HARNESS_FLAGS[harnessRaw.toLowerCase()]
+    if (!harnessType) onError?.(`unknown harness "${harnessRaw}"`)
+  }
+
+  const providerRaw = cleanString(raw.provider)
+  if (providerRaw) {
+    const mapping = PROVIDER_FLAGS[providerRaw.toLowerCase()]
+    if (mapping) {
+      provider = mapping.provider
+      harnessType ??= mapping.harnessType // a provider implies its harness, like --bedrock
+    } else {
+      onError?.(`unknown provider "${providerRaw}"`)
+    }
+  }
+
+  const modelRaw = cleanString(raw.model)
+  if (modelRaw) model = CLAUDE_MODEL_ALIASES[modelRaw.toLowerCase()] ?? modelRaw
+
+  const reasoningRaw = cleanString(raw.reasoning)
+  if (reasoningRaw) {
+    reasoning = REASONING_EFFORTS[reasoningRaw.toLowerCase()]
+    if (!reasoning) onError?.(`unknown reasoning effort "${reasoningRaw}"`)
+  }
+
+  return { harnessType, model, provider, reasoning }
+}
+
+function cleanString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
 }
 
 function flagPattern(flag: string): RegExp {

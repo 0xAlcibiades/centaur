@@ -102,6 +102,14 @@ module ApplicationHelper
     distance_of_time_in_words(started_at, finished_at)
   end
 
+  def secret_option_label(secret)
+    primary = secret.try(:name).presence || secret.foreign_id.presence || secret.oid
+    identifier = secret.foreign_id.presence || secret.oid
+    details = [ (identifier unless identifier == primary), secret.namespace ].compact_blank
+
+    details.any? ? "#{primary} (#{details.join(", ")})" : primary
+  end
+
   def console_icon(name, classes: "size-4")
     case name
     when "arrow-up"
@@ -179,12 +187,19 @@ module ApplicationHelper
       outline_icon(classes, "M12 4.5v15m7.5-7.5h-15")
     when "chevron-right"
       outline_icon(classes, "m8.25 4.5 7.5 7.5-7.5 7.5")
+    when "check"
+      outline_icon(classes, "m4.5 12.75 6 6 9-13.5")
     when "x-mark"
       outline_icon(classes, "M6 18 18 6M6 6l12 12")
     when "shield-check"
       outline_icon(
         classes,
         "M12 3.75 19.5 6v5.25c0 4.207-2.765 8.04-7.5 9-4.735-.96-7.5-4.793-7.5-9V6L12 3.75Zm3.75 6-4.5 4.5-2.25-2.25"
+      )
+    when "share"
+      outline_icon(
+        classes,
+        "M12 16.5V3m0 0L7.5 7.5M12 3l4.5 4.5M6.75 10.5h-.75A2.25 2.25 0 0 0 3.75 12.75v6A2.25 2.25 0 0 0 6 21h12a2.25 2.25 0 0 0 2.25-2.25v-6A2.25 2.25 0 0 0 18 10.5h-.75"
       )
     when "slack"
       tag.svg(
@@ -218,6 +233,8 @@ module ApplicationHelper
         classes,
         "M9.75 10.5a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0ZM4.5 18.75a6.75 6.75 0 0 1 13.5 0M18 8.25a3 3 0 0 1 0 6M19.5 18.75a5.25 5.25 0 0 0-2.25-4.307"
       )
+    when "menu"
+      outline_icon(classes, "M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5")
     end
   end
 

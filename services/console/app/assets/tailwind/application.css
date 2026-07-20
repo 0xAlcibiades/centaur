@@ -44,8 +44,11 @@
     @apply mt-1 text-sm text-zinc-500;
   }
 
+  /* Stacks the title over its action buttons on narrow screens so long action
+     labels (e.g. "Add Principal" + "Cancel") stay fully on-screen; reverts to
+     the title/actions row from the sm breakpoint up. */
   .console-page-header {
-    @apply mb-6 flex min-h-11 items-start justify-between gap-4;
+    @apply mb-6 flex min-h-11 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4;
   }
 
   .console-page-heading {

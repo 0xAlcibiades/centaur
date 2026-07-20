@@ -13,30 +13,34 @@ class Principal < ApplicationRecord
   has_many :proxies, dependent: :nullify
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
+  has_many :slack_channel_permissions, dependent: :destroy
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
   has_many :mcp_oauth_authorization_codes, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   belongs_to :created_by, class_name: "User"
 
+  accepts_nested_attributes_for :slack_channel_permissions,
+                                allow_destroy: true,
+                                reject_if: :reject_slack_channel_permission_attributes?
+
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
-  before_validation :apply_sandbox_repo_cache_setting
-  after_save :clear_sandbox_repo_cache_setting
+  before_validation :apply_sandbox_repo_cache_label
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
+  SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
+  SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validates :foreign_id, uniqueness: { scope: :namespace, allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
+  validates :sandbox_repo_cache, inclusion: { in: SANDBOX_REPO_CACHE_VALUES }
 
   # Stand-in for an inline secret value in redacted config: effective_config
   # reports that a control_plane source carries a value without revealing it.
   REDACTED = "[redacted]".freeze
-  SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
   SLACK_CHANNEL_ID_LABEL = "slack_channel_id".freeze
-  SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
-  SANDBOX_REPO_CACHE_ALIASES = { "pub" => "public" }.freeze
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
 
   # The config of a principal with no effective grants; also what an unassigned
@@ -132,24 +136,48 @@ class Principal < ApplicationRecord
     redact_secrets ? self.class.redact_live_secrets(config) : config
   end
 
-  def sandbox_repo_cache
-    raw = labels.to_h[SANDBOX_REPO_CACHE_LABEL].to_s.strip.downcase
-    raw = SANDBOX_REPO_CACHE_ALIASES.fetch(raw, raw)
-    SANDBOX_REPO_CACHE_VALUES.include?(raw) ? raw : (sandbox_repo_cache_enabled? ? "all" : "none")
+  def apply_default_sandbox_capabilities!(supplied = {})
+    return unless new_record?
+
+    defaults = SystemSetting.current.principal_defaults
+    unless supplied_key?(supplied, :sandbox_repo_cache)
+      self.sandbox_repo_cache = defaults[:sandbox_repo_cache]
+    end
+    unless supplied_key?(supplied, :sandbox_observability_enabled)
+      self.sandbox_observability_enabled = defaults[:sandbox_observability_enabled]
+    end
+    unless supplied_key?(supplied, :sandbox_api_server_enabled)
+      self.sandbox_api_server_enabled = defaults[:sandbox_api_server_enabled]
+    end
   end
 
-  def sandbox_repo_cache=(value)
-    normalized = value.to_s.strip.downcase
-    normalized = SANDBOX_REPO_CACHE_ALIASES.fetch(normalized, normalized)
-    normalized = "none" unless SANDBOX_REPO_CACHE_VALUES.include?(normalized)
-    @sandbox_repo_cache_setting = normalized
-    apply_sandbox_repo_cache_setting
+  def labels_with_sandbox_capabilities
+    labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache)
   end
 
-  def sandbox_repo_cache_enabled=(value)
-    enabled = ActiveModel::Type::Boolean.new.cast(value)
-    super(enabled)
-    self.labels = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => (enabled ? "all" : "none"))
+  def slack_channel_permissions_payload
+    permissions = if association(:slack_channel_permissions).loaded?
+      slack_channel_permissions.sort_by { |permission| [ permission.channel_id, permission.id ] }
+    else
+      slack_channel_permissions.ordered
+    end
+    permissions.map(&:as_permission_json)
+  end
+
+  def slack_upload_channel_ids
+    slack_channel_ids_for(:upload_enabled)
+  end
+
+  def slack_download_channel_ids
+    slack_channel_ids_for(:download_enabled)
+  end
+
+  def slack_history_channel_ids
+    slack_channel_ids_for(:history_enabled)
+  end
+
+  def slack_jwt_channel_ids
+    (slack_upload_channel_ids + slack_download_channel_ids + slack_history_channel_ids).uniq
   end
 
   def self.bump_sync_config_cache_versions(ids)
@@ -189,14 +217,16 @@ class Principal < ApplicationRecord
     PrincipalCredentialReconciliation.new.apply_for_principal(self)
   end
 
-  def apply_sandbox_repo_cache_setting
-    return if @sandbox_repo_cache_setting.blank?
-    self.labels = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => @sandbox_repo_cache_setting)
-    self[:sandbox_repo_cache_enabled] = @sandbox_repo_cache_setting == "all"
+  def apply_sandbox_repo_cache_label
+    self[:labels] = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache)
   end
 
-  def clear_sandbox_repo_cache_setting
-    @sandbox_repo_cache_setting = nil
+  def supplied_key?(attributes, key)
+    attributes.key?(key) || attributes.key?(key.to_s)
+  end
+
+  def reject_slack_channel_permission_attributes?(attributes)
+    attributes["channel_id"].blank?
   end
 
   # The credentials actually delivered to the proxy, grouped by type, after
@@ -236,8 +266,7 @@ class Principal < ApplicationRecord
   def api_server_jwt_secret
     return nil unless sandbox_api_server_enabled?
 
-    channel_id = labels.to_h[SLACK_CHANNEL_ID_LABEL].to_s.strip
-    return nil unless channel_id.match?(SLACK_CHANNEL_ID_FORMAT)
+    return nil if slack_jwt_channel_ids.empty?
 
     token = ApiServer::Jwt.encode_for_principal(self)
     return nil if token.blank?
@@ -252,13 +281,14 @@ class Principal < ApplicationRecord
     }
   end
 
+  def slack_channel_ids_for(permission)
+    slack_channel_permissions.where(permission => true).ordered.pluck(:channel_id)
+  end
+
   def api_server_hosts
     configured = ENV["CENTAUR_API_SERVER_PROXY_HOSTS"].to_s.split(",")
     from_url = self.class.host_from_url(ENV["CENTAUR_API_URL"])
-    (configured + [ from_url, "centaur-api-rs", "api" ])
-      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
-      .reject(&:blank?)
-      .uniq
+    self.class.normalize_hosts(configured + [ from_url ])
   end
 
   def proxy_transforms_for(served)
@@ -277,6 +307,15 @@ class Principal < ApplicationRecord
     URI.parse(value.to_s).host
   rescue URI::InvalidURIError
     nil
+  end
+
+  # Canonical form for hosts used in iron-proxy injection rules, so rule
+  # matching never hinges on case, whitespace, or a trailing dot.
+  def self.normalize_hosts(hosts)
+    Array(hosts)
+      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
+      .reject(&:blank?)
+      .uniq
   end
 
   # Cross-type conflict resolution. The wire protocol applies the `secrets` array
@@ -402,7 +441,9 @@ class Principal < ApplicationRecord
   end
 
   def sync_config_fields_changed?
-    previous_changes.key?("name") || previous_changes.key?("labels")
+    previous_changes.key?("name") ||
+      previous_changes.key?("labels") ||
+      previous_changes.key?("sandbox_api_server_enabled")
   end
 
   def bump_own_sync_config_cache_version

@@ -21,7 +21,8 @@ use centaur_sandbox_manager::{
     WarmPoolManager, WarmSandboxSpecFactory,
 };
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities as SessionSandboxCapabilities,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole,
+    SandboxCapabilities as SessionSandboxCapabilities,
     SandboxRepoCacheAccess as SessionRepoCacheAccess, Session, SessionEvent, SessionExecution,
     SessionMessageInput, ThreadKey,
 };
@@ -67,13 +68,10 @@ const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
-/// Executions are queued only between `create_execution` and the
-/// running transition a few statements later in `execute_session`, so a
-/// healthy row spends milliseconds in that state. An adoption scan racing a
-/// live `execute_session` (another control plane mid-rollout, or this
-/// process's own request handler) must not fail a young queued row it
-/// happens to observe in that window.
-const QUEUED_ORPHAN_GRACE: Duration = Duration::from_secs(120);
+/// A live execution can briefly have no sandbox while it moves from queued
+/// through warm-sandbox assignment. A periodic adoption scan must not fail a
+/// young row it observes in that window.
+const PRE_SANDBOX_ORPHAN_GRACE: Duration = Duration::from_secs(120);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const PUBLIC_REPO_CACHE_SUBPATH: &str = "public";
@@ -2955,19 +2953,19 @@ impl SessionRuntime {
             loop {
                 ticker.tick().await;
                 runtime
-                    .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+                    .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
                     .await;
             }
         });
     }
 
-    /// One pass over all active executions. `queued_grace` is the minimum
-    /// age before a queued row is treated as orphaned; `None` fails queued
-    /// rows immediately and is only correct when no re-scan will follow.
+    /// One pass over all active executions. `pre_sandbox_grace` is the
+    /// minimum age before a row awaiting sandbox assignment is treated as
+    /// orphaned; `None` is only correct when no re-scan will follow.
     async fn run_orphan_adoption_scan(
         &self,
         state: &mut OrphanAdoptionState,
-        queued_grace: Option<Duration>,
+        pre_sandbox_grace: Option<Duration>,
     ) {
         let executions = match self.store.list_active_executions_with_ownership().await {
             Ok(executions) => executions,
@@ -3010,7 +3008,7 @@ impl SessionRuntime {
             }
             let record_deferral = !state.deferred.contains(&execution_id);
             match self
-                .adopt_orphaned_execution(&candidate.execution, record_deferral, queued_grace)
+                .adopt_orphaned_execution(&candidate.execution, record_deferral, pre_sandbox_grace)
                 .await
             {
                 Ok(OrphanAdoption::Adopted) => adopted += 1,
@@ -3085,7 +3083,7 @@ impl SessionRuntime {
         &self,
         execution: &SessionExecution,
         record_deferral: bool,
-        queued_grace: Option<Duration>,
+        pre_sandbox_grace: Option<Duration>,
     ) -> Result<OrphanAdoption, SessionRuntimeError> {
         let thread_key = &execution.thread_key;
         let execution_id = execution.execution_id.as_str();
@@ -3095,7 +3093,7 @@ impl SessionRuntime {
             // On a periodic scan, young queued rows are skipped instead of
             // failed: they are most likely a live execute_session observed
             // mid-transition, and a later tick revisits them.
-            if let Some(grace) = queued_grace {
+            if let Some(grace) = pre_sandbox_grace {
                 let age = SystemTime::now()
                     .duration_since(SystemTime::from(execution.created_at))
                     .unwrap_or_default();
@@ -3122,6 +3120,21 @@ impl SessionRuntime {
         }
         let session = self.store.get_session(thread_key).await?;
         let Some(sandbox_id) = session.sandbox_id.as_deref() else {
+            let running_since = execution.started_at.unwrap_or(execution.created_at);
+            let running_age = SystemTime::now()
+                .duration_since(SystemTime::from(running_since))
+                .unwrap_or_default();
+            if pre_sandbox_grace.is_some_and(|grace| running_age < grace) {
+                debug!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_skipped",
+                    thread_key = %thread_key,
+                    execution_id,
+                    age_ms = duration_millis_u64(running_age),
+                    "skipping young running execution awaiting sandbox assignment"
+                );
+                return Ok(OrphanAdoption::Skipped);
+            }
             self.fail_orphaned_execution(
                 thread_key,
                 execution_id,
@@ -5468,7 +5481,7 @@ fn sandbox_repo_cache_access_from_principal(
         Some(value) if value == "all" => SessionRepoCacheAccess::All,
         Some(value) if value == "public" => SessionRepoCacheAccess::Public,
         Some(_) => SessionRepoCacheAccess::None,
-        None => SessionRepoCacheAccess::from_legacy_enabled(principal.sandbox_repo_cache_enabled),
+        None => SessionRepoCacheAccess::None,
     }
 }
 
@@ -6086,8 +6099,34 @@ fn input_line_with_session_context(
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
     }
+    prepend_chat_surface_note(map, thread_key);
     merge_session_context(map, session_context_for_thread(thread_key));
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_owned())
+}
+
+/// Prepend a terse chat-surface note to a user turn's content so the agent always
+/// knows which platform (Slack/Discord) and destination it is operating on.
+///
+/// The static system prompt is platform-neutral, so this per-turn line is the
+/// agent's authoritative signal for where its reply and uploads land. It is added
+/// only to `user` turns whose content is an array of message parts and whose
+/// thread key resolves to a known chat destination; every other shape is left
+/// untouched.
+fn prepend_chat_surface_note(map: &mut serde_json::Map<String, Value>, thread_key: &ThreadKey) {
+    if map.get("type").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    let Some(destination) = thread_key.chat_destination() else {
+        return;
+    };
+    let Some(Value::Array(content)) = map.get_mut("message").and_then(|m| m.get_mut("content"))
+    else {
+        return;
+    };
+    content.insert(
+        0,
+        json!({ "type": "text", "text": destination.context_line() }),
+    );
 }
 
 fn merge_session_context(
@@ -6108,42 +6147,84 @@ fn merge_session_context(
     }
 }
 
+/// Build the structured per-turn session context for a thread, mirroring the
+/// `/api/session` response shape (`{ platform, <slack|discord|linear|github>: { .. } }`).
+///
+/// Resolved from the same [`ChatDestination`] the session-context route uses, so
+/// the structured context the agent sees in its input is consistent with what
+/// tools read back from the API. Returns `None` for non-platform threads (e.g.
+/// `api:` keys), which carry no chat destination and get no `session_context`.
 fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let slack = slack_context_for_thread(thread_key)?;
+    let destination = thread_key.chat_destination()?;
     let mut context = serde_json::Map::new();
-    context.insert("platform".to_owned(), Value::String("slack".to_owned()));
-    context.insert("slack".to_owned(), Value::Object(slack));
-    Some(context)
-}
-
-fn slack_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let parts = thread_key.as_str().split(':').collect::<Vec<_>>();
-    let (team_id, channel_id, thread_ts) = match parts.as_slice() {
-        ["slack", channel_id, thread_ts] => (None, *channel_id, *thread_ts),
-        ["slack", team_id, channel_id, thread_ts] => (Some(*team_id), *channel_id, *thread_ts),
-        [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
-            (None, *channel_id, *thread_ts)
-        }
-        _ => return None,
-    };
-    if channel_id.is_empty() || thread_ts.is_empty() {
-        return None;
-    }
-
-    let mut slack = serde_json::Map::new();
-    if let Some(team_id) = team_id.filter(|value| !value.is_empty()) {
-        slack.insert("team_id".to_owned(), Value::String(team_id.to_owned()));
-    }
-    slack.insert(
-        "channel_id".to_owned(),
-        Value::String(channel_id.to_owned()),
+    context.insert(
+        "platform".to_owned(),
+        Value::String(destination.platform().to_owned()),
     );
-    slack.insert("thread_ts".to_owned(), Value::String(thread_ts.to_owned()));
-    Some(slack)
-}
-
-fn is_slack_conversation_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+    let (platform_key, block) = match destination {
+        ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        } => {
+            let mut slack = serde_json::Map::new();
+            slack.insert("channel_id".to_owned(), Value::String(channel_id));
+            slack.insert("thread_ts".to_owned(), Value::String(thread_ts));
+            ("slack", slack)
+        }
+        ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+        } => {
+            let mut discord = serde_json::Map::new();
+            discord.insert("guild_id".to_owned(), Value::String(guild_id));
+            discord.insert("channel_id".to_owned(), Value::String(channel_id));
+            if let Some(thread_id) = thread_id {
+                discord.insert("thread_id".to_owned(), Value::String(thread_id));
+            }
+            ("discord", discord)
+        }
+        ChatDestination::Linear {
+            issue_id,
+            comment_id,
+            agent_session_id,
+        } => {
+            let mut linear = serde_json::Map::new();
+            linear.insert("issue_id".to_owned(), Value::String(issue_id));
+            if let Some(comment_id) = comment_id {
+                linear.insert("comment_id".to_owned(), Value::String(comment_id));
+            }
+            if let Some(agent_session_id) = agent_session_id {
+                linear.insert(
+                    "agent_session_id".to_owned(),
+                    Value::String(agent_session_id),
+                );
+            }
+            ("linear", linear)
+        }
+        ChatDestination::Github {
+            owner,
+            repo,
+            number,
+            kind,
+            review_comment_id,
+        } => {
+            let mut github = serde_json::Map::new();
+            github.insert("owner".to_owned(), Value::String(owner));
+            github.insert("repo".to_owned(), Value::String(repo));
+            github.insert("number".to_owned(), Value::Number(number.into()));
+            github.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+            if let Some(review_comment_id) = review_comment_id {
+                github.insert(
+                    "review_comment_id".to_owned(),
+                    Value::Number(review_comment_id.into()),
+                );
+            }
+            ("github", github)
+        }
+    };
+    context.insert(platform_key.to_owned(), Value::Object(block));
+    Some(context)
 }
 
 fn steering_input_lines(
@@ -6582,17 +6663,9 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
-    fn sandbox_repo_cache_label_overrides_legacy_boolean() {
+    fn sandbox_repo_cache_label_controls_access() {
         assert_eq!(
             sandbox_repo_cache_access_from_principal(&test_principal(
-                true,
-                std::collections::BTreeMap::new()
-            )),
-            SessionRepoCacheAccess::All
-        );
-        assert_eq!(
-            sandbox_repo_cache_access_from_principal(&test_principal(
-                false,
                 std::collections::BTreeMap::new()
             )),
             SessionRepoCacheAccess::None
@@ -6600,7 +6673,6 @@ mod tests {
         for value in ["none", "private", "bogus"] {
             assert_eq!(
                 sandbox_repo_cache_access_from_principal(&test_principal(
-                    true,
                     std::collections::BTreeMap::from([(
                         SANDBOX_REPO_CACHE_LABEL.to_owned(),
                         value.to_owned(),
@@ -6611,7 +6683,6 @@ mod tests {
         }
         assert_eq!(
             sandbox_repo_cache_access_from_principal(&test_principal(
-                true,
                 std::collections::BTreeMap::from([(
                     SANDBOX_REPO_CACHE_LABEL.to_owned(),
                     "public".to_owned(),
@@ -6621,7 +6692,6 @@ mod tests {
         );
         assert_eq!(
             sandbox_repo_cache_access_from_principal(&test_principal(
-                false,
                 std::collections::BTreeMap::from([(
                     SANDBOX_REPO_CACHE_LABEL.to_owned(),
                     "all".to_owned(),
@@ -6743,7 +6813,6 @@ mod tests {
     }
 
     fn test_principal(
-        sandbox_repo_cache_enabled: bool,
         labels: std::collections::BTreeMap<String, String>,
     ) -> centaur_iron_control::Principal {
         centaur_iron_control::Principal {
@@ -6752,7 +6821,6 @@ mod tests {
             foreign_id: Some("slack-channel-t-c".to_owned()),
             name: "Test".to_owned(),
             labels,
-            sandbox_repo_cache_enabled,
             sandbox_observability_enabled: true,
             sandbox_api_server_enabled: true,
         }
@@ -7658,12 +7726,64 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(value["session_context"]["platform"], "slack");
-        assert_eq!(value["session_context"]["slack"]["team_id"], "T123");
         assert_eq!(value["session_context"]["slack"]["channel_id"], "C123");
         assert_eq!(
             value["session_context"]["slack"]["thread_ts"],
             "1780000000.000000"
         );
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_discord_thread_context() {
+        let thread_key = ThreadKey::parse("discord:111:222:333").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "discord");
+        assert_eq!(value["session_context"]["discord"]["guild_id"], "111");
+        assert_eq!(value["session_context"]["discord"]["channel_id"], "222");
+        assert_eq!(value["session_context"]["discord"]["thread_id"], "333");
+        assert!(value["session_context"].get("slack").is_none());
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_linear_thread_context() {
+        let thread_key = ThreadKey::parse("linear:ISSUE:s:SESS").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "linear");
+        assert_eq!(value["session_context"]["linear"]["issue_id"], "ISSUE");
+        assert_eq!(
+            value["session_context"]["linear"]["agent_session_id"],
+            "SESS"
+        );
+        // No comment in this key, so the optional field is omitted entirely.
+        assert!(
+            value["session_context"]["linear"]
+                .get("comment_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_github_thread_context() {
+        let thread_key = ThreadKey::parse("github:0xSplits/centaur:704:rc:99").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "github");
+        assert_eq!(value["session_context"]["github"]["owner"], "0xSplits");
+        assert_eq!(value["session_context"]["github"]["repo"], "centaur");
+        assert_eq!(value["session_context"]["github"]["number"], 704);
+        assert_eq!(value["session_context"]["github"]["kind"], "pr");
+        assert_eq!(value["session_context"]["github"]["review_comment_id"], 99);
     }
 
     #[test]
@@ -7711,6 +7831,103 @@ mod tests {
             input_line_with_session_context(&thread_key, &trace, "raw"),
             "raw"
         );
+    }
+
+    #[test]
+    fn input_line_prepends_discord_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("discord:111:222:333").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        // The note is prepended ahead of the original parts, which are preserved.
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("Discord"));
+        assert!(note.contains("222"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_prepends_slack_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("slack:C123:123.456").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        assert!(content[0]["text"].as_str().unwrap().contains("Slack"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_prepends_linear_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("linear:ISSUE:s:SESS").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("Linear"));
+        assert!(note.contains("ISSUE"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_prepends_github_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("github:0xSplits/centaur:issue:12").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("GitHub"));
+        assert!(note.contains("0xSplits/centaur#12"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_leaves_content_untouched_without_a_chat_destination() {
+        // A non-platform thread key resolves to no destination, so nothing is added.
+        let thread_key = ThreadKey::parse("cli:test").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "hi");
     }
 
     #[test]
@@ -8066,11 +8283,13 @@ mod adoption_tests {
         execution_id
     }
 
-    /// Ages an execution row past `QUEUED_ORPHAN_GRACE` so adoption treats it
+    /// Ages an execution row past `PRE_SANDBOX_ORPHAN_GRACE` so adoption treats it
     /// as a genuine orphan instead of a young row racing a live execute.
     async fn backdate_execution(store: &PgSessionStore, execution_id: &str, seconds: f64) {
         let result = sqlx::query(
-            "update session_executions set created_at = created_at - make_interval(secs => $2) \
+            "update session_executions \
+             set created_at = created_at - make_interval(secs => $2), \
+                 started_at = started_at - make_interval(secs => $2) \
              where execution_id = $1",
         )
         .bind(execution_id)
@@ -9238,7 +9457,7 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn periodic_scan_skips_young_queued_executions_until_grace_passes() {
+    async fn periodic_scan_skips_young_pre_sandbox_executions_until_grace_passes() {
         let Some(store) = test_store().await else {
             return;
         };
@@ -9251,7 +9470,7 @@ mod adoption_tests {
         let runtime = runtime_with(&store, backend.clone());
         let mut state = OrphanAdoptionState::default();
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
 
         // A queued row younger than the grace window may belong to a live
@@ -9277,9 +9496,32 @@ mod adoption_tests {
         // Once the row ages past the grace window, a later tick fails it.
         backdate_execution(&store, &execution_id, 300.0).await;
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
         wait_for_event(&store, &thread_key, "session.execution_failed").await;
+
+        // A newly running execution can still be waiting for its warm
+        // sandbox assignment. It gets the same periodic grace, but is failed
+        // if it remains unassigned after the grace window.
+        let running_thread =
+            ThreadKey::parse(format!("test:adopt-young-running-{}", uuid::Uuid::new_v4())).unwrap();
+        let running_execution = orphaned_execution(&store, &running_thread, None, true).await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
+            .await;
+        assert!(
+            events(&store, &running_thread)
+                .await
+                .iter()
+                .all(|event| event.event_type != "session.execution_failed"),
+            "young running execution must survive sandbox assignment"
+        );
+
+        backdate_execution(&store, &running_execution, 300.0).await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
+            .await;
+        wait_for_event(&store, &running_thread, "session.execution_failed").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9356,10 +9598,10 @@ mod adoption_tests {
         // silently: no deferral event, no sandbox status probe.
         let mut state = OrphanAdoptionState::default();
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
 
         let all = events(&store, &thread_key).await;
@@ -9432,10 +9674,10 @@ mod adoption_tests {
         // deferral event only once.
         let mut state = OrphanAdoptionState::default();
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
         let all = events(&store, &thread_key).await;
         let deferrals = all
@@ -9452,7 +9694,7 @@ mod adoption_tests {
             .await
             .expect("release lease");
         runtime
-            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
             .await;
         wait_for_event(&store, &thread_key, "session.execution_completed").await;
     }

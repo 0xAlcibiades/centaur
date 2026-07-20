@@ -84,6 +84,8 @@ class RegisteredWorkflow:
     input_cls: type | None
     webhooks: Any
     schedule: Any
+    principal: Any = None
+    agent_defaults: dict[str, Any] | None = None
 
 
 def workflow_dirs() -> list[Path]:
@@ -142,6 +144,9 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
     handler = getattr(module, "handler", None)
     if not isinstance(workflow_name, str) or not callable(handler):
         return None
+    agent_defaults = getattr(module, "AGENT_DEFAULTS", None)
+    if not isinstance(agent_defaults, dict):
+        agent_defaults = None
     return RegisteredWorkflow(
         workflow_name=workflow_name,
         source_path=str(path),
@@ -149,6 +154,8 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
         input_cls=getattr(module, "Input", None),
         webhooks=getattr(module, "WEBHOOKS", None),
         schedule=getattr(module, "SCHEDULE", None),
+        principal=getattr(module, "WORKFLOW_PRINCIPAL", None),
+        agent_defaults=agent_defaults,
     )
 
 
@@ -321,6 +328,11 @@ def normalize_schedule(workflow: RegisteredWorkflow) -> dict[str, Any] | None:
     return schedule
 
 
+def normalize_principal(workflow: RegisteredWorkflow) -> bool | None:
+    raw = workflow.principal
+    return raw if isinstance(raw, bool) and raw else None
+
+
 async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any]:
     workflows = discover_workflows()
     workflow_name = str(message.get("workflow_name") or "")
@@ -335,6 +347,7 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
         task_id=str(message.get("task_id") or ""),
         workflow_name=workflow_name,
         pool=pool,
+        agent_defaults=registered.agent_defaults,
     )
     previous_metric_rpc = metrics.get_metric_rpc()
     metrics.set_metric_rpc(rpc)
@@ -369,6 +382,7 @@ def discovery_payload() -> dict[str, Any]:
                 "source_path": workflow.source_path,
                 "webhooks": normalize_webhooks(workflow),
                 "schedule": normalize_schedule(workflow),
+                "principal": normalize_principal(workflow),
             }
             for workflow in workflows.values()
         ],

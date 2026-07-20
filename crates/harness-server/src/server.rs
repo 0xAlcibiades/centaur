@@ -20,6 +20,9 @@ use codex_app_server_protocol::{
     ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
     TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
 };
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -668,23 +671,93 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
 }
 
 fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Vec<UserInput> {
-    let display_path = path.display();
     if is_image || mime_type.is_some_and(|value| value.starts_with("image/")) {
+        // Model providers reject images past their per-image caps (Bedrock/mantle
+        // and the Anthropic API cap at ~5 MB / 8000 px) and nothing upstream of
+        // the model downscales, so a large pasted screenshot or photo fails the
+        // turn at validation. Normalize oversized images here — the single choke
+        // point every attachment path funnels through — before handing the model
+        // a LocalImage. Best-effort: the original file is used unchanged if the
+        // image is already within limits or re-encoding fails for any reason.
+        let path = downscale_oversized_image(path);
         return vec![
             UserInput::Text {
-                text: format!("[Attached image saved to {display_path}]"),
+                text: format!("[Attached image saved to {}]", path.display()),
                 text_elements: Vec::new(),
             },
             UserInput::LocalImage {
-                path: path.to_path_buf(),
+                path: path.clone(),
                 detail: None,
             },
         ];
     }
     vec![UserInput::Text {
-        text: format!("[Attached file saved to {display_path}]"),
+        text: format!("[Attached file saved to {}]", path.display()),
         text_elements: Vec::new(),
     }]
+}
+
+/// Longest edge (px) oversized images are downscaled to before the model sees
+/// them. 1568 px is the Anthropic-recommended max before their API downscales
+/// server-side, and stays well under Bedrock/mantle's 8000 px hard cap.
+const MAX_IMAGE_EDGE: u32 = 1568;
+/// Byte budget above which an image is re-encoded even when its dimensions are
+/// already small. Kept safely under mantle's ~5 MB per-image cap.
+const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// JPEG quality for re-encoded images — ample for model vision while keeping
+/// re-encoded output comfortably under the byte cap.
+const DOWNSCALE_JPEG_QUALITY: u8 = 80;
+
+/// Downscale an image that exceeds the model provider's caps, returning the path
+/// to feed the model. Best-effort: on any failure (unknown/unsupported format,
+/// decode or I/O error) the original path is returned unchanged, so a
+/// normalization miss never breaks a turn that would otherwise succeed.
+fn downscale_oversized_image(path: &Path) -> PathBuf {
+    match try_downscale_oversized_image(path) {
+        Ok(Some(scaled)) => scaled,
+        Ok(None) => path.to_path_buf(),
+        Err(error) => {
+            eprintln!(
+                "harness image downscale skipped for {}: {error}",
+                path.display()
+            );
+            path.to_path_buf()
+        }
+    }
+}
+
+/// Returns `Ok(Some(new_path))` when the image was downscaled/re-encoded,
+/// `Ok(None)` when it was already within limits, and `Err` on any decode/encode
+/// failure (handled as best-effort by the caller).
+fn try_downscale_oversized_image(path: &Path) -> std::result::Result<Option<PathBuf>, ImageError> {
+    let byte_len = std::fs::metadata(path)?.len();
+    let (width, height) = image::image_dimensions(path)?;
+    if byte_len <= MAX_IMAGE_BYTES && width.max(height) <= MAX_IMAGE_EDGE {
+        return Ok(None);
+    }
+
+    let decoded = image::open(path)?;
+    let resized = if width.max(height) > MAX_IMAGE_EDGE {
+        // `resize` preserves aspect ratio and only ever shrinks here, since we
+        // pass the original long edge cap as the bounding box.
+        decoded.resize(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE, FilterType::Triangle)
+    } else {
+        decoded
+    };
+
+    // Re-encode as JPEG (which drops alpha) so the byte cap is met even for
+    // photo-like PNGs whose lossless re-encode could stay over the limit.
+    let mut encoded = Vec::new();
+    let encoder = JpegEncoder::new_with_quality(&mut encoded, DOWNSCALE_JPEG_QUALITY);
+    DynamicImage::ImageRgb8(resized.to_rgb8()).write_with_encoder(encoder)?;
+
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let scaled_path = path.with_file_name(format!("{stem}-scaled-{}.jpg", Uuid::new_v4().simple()));
+    std::fs::write(&scaled_path, &encoded)?;
+    Ok(Some(scaled_path))
 }
 
 fn write_base64_upload(data_base64: &str, name: &str, mime_type: Option<&str>) -> Result<PathBuf> {
@@ -1593,6 +1666,47 @@ mod tests {
             env::set_var("CENTAUR_UPLOADS_DIR", &path);
         }
         path
+    }
+
+    fn write_gradient_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+        let mut img = image::RgbImage::new(width, height);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        let path = dir.join(name);
+        img.save(&path).expect("write test png");
+        path
+    }
+
+    #[test]
+    fn downscales_image_past_the_edge_cap() {
+        let dir = temp_upload_dir();
+        let original = write_gradient_png(&dir, "big.png", 3000, 2000);
+
+        let scaled = downscale_oversized_image(&original);
+
+        assert_ne!(
+            scaled, original,
+            "oversized image should be re-encoded to a new path"
+        );
+        assert_eq!(scaled.extension().and_then(|e| e.to_str()), Some("jpg"));
+        let (width, height) = image::image_dimensions(&scaled).expect("scaled image decodes");
+        assert_eq!(
+            width.max(height),
+            MAX_IMAGE_EDGE,
+            "long edge clamped to cap"
+        );
+        image::open(&scaled).expect("scaled file is a valid image");
+    }
+
+    #[test]
+    fn leaves_within_limit_image_untouched() {
+        let dir = temp_upload_dir();
+        let original = write_gradient_png(&dir, "small.png", 320, 240);
+
+        let same = downscale_oversized_image(&original);
+
+        assert_eq!(same, original, "within-limit image is returned unchanged");
     }
 
     #[test]

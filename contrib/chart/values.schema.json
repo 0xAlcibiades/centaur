@@ -267,6 +267,7 @@
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
+        "workflowHostSandbox": { "type": "boolean" },
         "etl": {
           "type": "object",
           "properties": {
@@ -332,7 +333,8 @@
               "properties": {
                 "enabled": { "type": "boolean" },
                 "intervalSeconds": { "type": "integer" },
-                "maxWindowSeconds": { "type": "integer" }
+                "maxWindowSeconds": { "type": "integer" },
+                "batchSize": { "type": "integer", "minimum": 1 }
               }
             }
           }

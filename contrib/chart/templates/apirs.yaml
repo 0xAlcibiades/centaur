@@ -96,6 +96,7 @@
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_ENABLED" "value" (dig "companyContextDocuments" "enabled" true $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE" "value" (dig "companyContextDocuments" "batchSize" 50 $apiRsEtl))
 -}}
 {{- $apiRsEtlPassthroughNames := list -}}
 {{- range $env := $apiRsEtlEnv -}}
@@ -190,6 +191,7 @@ spec:
 {{- end }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 8 }}
+        centaur.ai/observability-enabled: "true"
     spec:
       terminationGracePeriodSeconds: {{ .Values.apiRs.terminationGracePeriodSeconds }}
       automountServiceAccountToken: true
@@ -246,6 +248,10 @@ spec:
 {{- if $sandboxWorkflowDirs }}
             - name: KUBERNETES_WORKFLOW_DIRS
               value: {{ $sandboxWorkflowDirs | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_HOST_SANDBOX") }}
+            - name: WORKFLOW_HOST_SANDBOX
+              value: {{ .Values.apiRs.workflowHostSandbox | quote }}
 {{- end }}
 {{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_ENABLE_MODE") }}
             - name: WORKFLOW_ENABLE_MODE

@@ -45,9 +45,9 @@ class PrincipalTest < ActiveSupport::TestCase
     assert other.valid?
   end
 
-  test "labels defaults to empty hash" do
+  test "labels include sandbox repo-cache projection by default" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-labels"))
-    assert_equal({}, principal.reload.labels)
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.reload.labels)
   end
 
   test "sandbox access defaults to enabled" do
@@ -55,26 +55,29 @@ class PrincipalTest < ActiveSupport::TestCase
     principal.reload
 
     assert_equal "all", principal.sandbox_repo_cache
-    assert_predicate principal, :sandbox_repo_cache_enabled
     assert_predicate principal, :sandbox_observability_enabled
     assert_predicate principal, :sandbox_api_server_enabled
   end
 
-  test "sandbox repo-cache enum syncs compatibility boolean" do
+  test "default sandbox repo-cache overwrites explicit label assignment" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-explicit-repo-cache-label"))
+
+    principal.apply_default_sandbox_capabilities!
+    principal.assign_attributes(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" })
+    principal.save!
+
+    assert_equal "all", principal.reload.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache stores canonical enum value" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-setting"))
 
     principal.update!(sandbox_repo_cache: "public")
     principal.reload
 
     assert_equal "public", principal.sandbox_repo_cache
-    assert_equal false, principal.sandbox_repo_cache_enabled
     assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
-
-    principal.update!(sandbox_repo_cache_enabled: true)
-    principal.reload
-
-    assert_equal "all", principal.sandbox_repo_cache
-    assert_equal true, principal.sandbox_repo_cache_enabled
   end
 
   test "sandbox repo-cache enum survives labels assigned in the same update" do
@@ -88,14 +91,35 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
   end
 
-  test "sandbox repo-cache accepts pub as public alias" do
-    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-pub-alias"))
+  test "sandbox repo-cache overwrites label with canonical value" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-label"))
 
-    principal.update!(sandbox_repo_cache: "pub")
+    principal.update!(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "public" })
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache param takes precedence over conflicting label" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-param-wins"))
+
+    principal.update!(
+      sandbox_repo_cache: "public",
+      labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" }
+    )
     principal.reload
 
     assert_equal "public", principal.sandbox_repo_cache
-    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "public" }, principal.labels)
+  end
+
+  test "sandbox repo-cache rejects invalid enum values" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-invalid"))
+    principal.sandbox_repo_cache = "pub"
+
+    assert_not principal.valid?
+    assert_includes principal.errors[:sandbox_repo_cache], "is not included in the list"
   end
 
   test "labels accepts arbitrary string map" do
@@ -104,17 +128,39 @@ class PrincipalTest < ActiveSupport::TestCase
       foreign_id: "C-labels",
       labels: { "env" => "prod", "team" => "platform" }
     ))
-    assert_equal({ "env" => "prod", "team" => "platform" }, principal.reload.labels)
+    assert_equal(
+      {
+        "env" => "prod",
+        "team" => "platform",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
   end
 
-  test "effective_config adds api server JWT for slack channel principals" do
+  test "effective_config adds api server JWT from Slack channel permission rows" do
     with_env(
       "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
       "CENTAUR_API_URL" => "http://api.internal:8080",
       "CENTAUR_API_SERVER_PROXY_HOSTS" => nil
     ) do
       principal = principals(:acme_channel)
-      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        channel_name: "general",
+        upload_enabled: true,
+        download_enabled: false,
+        history_enabled: true
+      )
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "G9876543210",
+        channel_name: "private",
+        upload_enabled: false,
+        download_enabled: true,
+        history_enabled: false
+      )
 
       config = principal.effective_config(redact_secrets: false)
       entry = config.fetch("secrets").find do |secret|
@@ -124,14 +170,14 @@ class PrincipalTest < ActiveSupport::TestCase
 
       refute_nil entry
       assert_equal "Bearer {{ .Value }}", entry.dig("inject", "formatter")
-      assert_includes entry.fetch("rules"), { "host" => "api.internal" }
+      assert_equal [ { "host" => "api.internal" } ], entry.fetch("rules")
 
       claims = jwt_payload(entry.dig("source", "value"))
       assert_equal "centaur-console", claims.fetch("iss")
       assert_equal "centaur-api", claims.fetch("aud")
       assert_equal principal.oid, claims.fetch("sub")
       assert_equal [ "C0123456789" ], claims.dig("slack", "upload_channels")
-      assert_equal [ "C0123456789" ], claims.dig("slack", "download_channels")
+      assert_equal [ "G9876543210" ], claims.dig("slack", "download_channels")
       assert_equal [ "C0123456789" ], claims.dig("slack", "history_channels")
       assert_equal 1.hour.to_i, claims.fetch("exp") - claims.fetch("iat")
       assert_equal ApiServer::Jwt.rotation_offset(principal),
@@ -139,12 +185,49 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
+  test "effective_config does not fall back to slack channel label" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+
+      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+  end
+
+  test "clearing slack channel permissions revokes slack access" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = Principal.create!(
+        default_attrs(
+          namespace: "acme",
+          foreign_id: "C-clear-slack-permissions"
+        )
+      )
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        upload_enabled: true,
+        download_enabled: true,
+        history_enabled: true
+      )
+      assert_not_nil ApiServer::Jwt.encode_for_principal(principal)
+
+      SlackChannelPermission.replace_for_principal!(principal, [])
+
+      assert_empty principal.slack_channel_permissions.reload
+      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+  end
+
   test "effective_config omits api server JWT when sandbox api access is disabled" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
       principal.update!(
-        labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" },
         sandbox_api_server_enabled: false
+      )
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        upload_enabled: true
       )
 
       config = principal.effective_config(redact_secrets: false)
@@ -160,7 +243,11 @@ class PrincipalTest < ActiveSupport::TestCase
   test "api server JWT is deterministic inside the rotation window" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
-      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        upload_enabled: true
+      )
 
       window = ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
       boundary = 1_700_000_100 + ApiServer::Jwt.rotation_offset(principal)
@@ -200,7 +287,13 @@ class PrincipalTest < ActiveSupport::TestCase
   test "labels remain mutable after creation" do
     principal = principals(:acme_channel)
     principal.update!(labels: { "changed" => "yes" })
-    assert_equal({ "changed" => "yes" }, principal.reload.labels)
+    assert_equal(
+      {
+        "changed" => "yes",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
   end
 
   test "name is editable after creation" do

@@ -25,7 +25,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # ── Python deps ──────────────────────────────────────────────────────────────
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip3 install --break-system-packages --no-compile \
+    pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
+    && pip3 install --break-system-packages --no-compile \
     python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
@@ -35,17 +36,19 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     google-api-python-client>=2.100.0 \
     google-auth-httplib2>=0.2.0 \
     google-auth-oauthlib>=1.2.0 \
+    "google-cloud-bigquery>=3.25.0" \
     feedparser>=6.0.0 \
     httplib2>=0.20.0 \
     httpx>=0.28.0 \
     opentelemetry-proto==1.42.1 \
+    "psycopg[binary]>=3.2.0" \
     pysocks>=1.7.1 \
     rich>=13.0.0 \
     slack-sdk==3.39.0 \
     tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
-# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI (single layer, cached) ─────────────
+# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -57,7 +60,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
       | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      | tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli google-cloud-cli \
+    && gcloud --version >/dev/null \
+    && bq version >/dev/null \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -65,7 +74,7 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.154
-ARG CODEX_VERSION=0.139.0
+ARG CODEX_VERSION=0.144.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
@@ -214,11 +223,14 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
     npx -y skills add vercel-labs/agent-browser
+# git-branch configures each writable clone with the publishing GitHub account.
+# A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
 RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
     && git config --global --add safe.directory '*' \
+    && git config --global user.useConfigOnly true \
     && git config --global user.name "pseudolabel" \
     && git config --global user.email "sudolabel@safeon.de"
 

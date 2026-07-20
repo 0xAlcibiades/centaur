@@ -106,6 +106,18 @@ console:
   # When set, the slackbotv2 deployment also links the first assistant message
   # in a Slack thread to the Console session view; leave empty to omit the link.
   publicUrl: ""
+  # Break-glass email/password login. Disable when console is reachable from
+  # the public internet and SSO is configured.
+  passwordLoginEnabled: true
+  # When enabled, every authenticated Console user can browse conversations
+  # originating in public Slack channels. Private channels and DMs remain
+  # owner-only. Requires apiRs.etl.slack.enabled so channel privacy is synced;
+  # visibility fails closed without that catalog. Individual chats can still
+  # be shared by their owner from the Threads UI.
+  publicSlackThreadsEnabled: false
+  # Optional SSO admission policy. When non-empty, only identities whose email
+  # domain matches this list can sign in through Google or Slack.
+  ssoEmailDomains: []
   image:
     repository: centaur-console
     tag: latest
@@ -360,6 +372,7 @@ apiRs:
   # Workflow enablement policy. Production defaults to all workflows enabled.
   # Set workflowEnableMode: allowlist in staging and list allowed workflow names
   # in workflowAllowedNames as a comma/whitespace-separated string.
+  workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
@@ -399,6 +412,7 @@ apiRs:
       enabled: true
       intervalSeconds: 14400
       maxWindowSeconds: 21600
+      batchSize: 50
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
@@ -462,6 +476,32 @@ slackbotv2:
   mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  # Per-channel default harness / model / provider / reasoning, keyed by Slack
+  # conversation id (the C…/G…/D… id). Each value is an object of optional
+  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # the inline Slack flags (harness: claude|codex|amp, provider: bedrock|meta,
+  # model accepts Claude aliases like opus). A model is only meaningful within a
+  # harness, so name the harness alongside it. Applied when a message in that
+  # channel carries no explicit/sticky per-thread flag, below such a flag and
+  # above the deployment/baked harness default, and forwarded onto the harness
+  # input line so it takes effect. reasoning only affects the codex harness.
+  # Example:
+  #   channelDefaults:
+  #     C0ENG: { harness: claude, model: opus, reasoning: high }
+  #     C0TRIAGE: { reasoning: low }
+  channelDefaults: {}
+  # Message overrides strategy for Slack message text. "flags" keeps the legacy
+  # deterministic --model/--claude/-rsn strategy. "llm" asks a small model for
+  # normalized overrides, allowing natural language requests such as
+  # "use max effort and the sol model". In llm mode,
+  # set OPENAI_API_KEY in the shared secret or provide
+  # SLACKBOTV2_MESSAGE_OVERRIDES_OPENAI_API_KEY via extraEnv.
+  messageOverridesStrategy:
+    mode: flags
+    model: gpt-5.4-nano
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 1500
+    maxOutputTokens: 300
   metrics:
     # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
     # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
@@ -626,10 +666,11 @@ networkPolicy:
   # on clusters whose API server endpoint already listens on 443.
   apiServerPort: 6443
   # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
-  # namespace. api-rs needs this to export its own spans; sandboxes get their
-  # equivalent per-sandbox rule from api-rs, derived from the OTLP endpoint in
-  # sandbox.extraEnv. The collector's own namespace must also admit ingress
-  # from this namespace's pods.
+  # namespace. The policy selects only pods labeled
+  # centaur.ai/observability-enabled=true, matching observabilityEgress. api-rs
+  # always receives that label; sandboxes and proxy pods receive it only when
+  # their principal has observability enabled. The collector's own namespace
+  # must also admit ingress from this namespace's pods.
   otlpEgress:
     enabled: false
     # kubernetes.io/metadata.name of the collector's namespace, e.g. "laminar".

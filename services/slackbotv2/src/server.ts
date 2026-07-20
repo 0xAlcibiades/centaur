@@ -1,9 +1,19 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
+import { parseChannelDefaults } from './channel-defaults'
+import {
+  createFlagMessageOverridesStrategy,
+  createOpenAiMessageOverridesStrategy
+} from './message-overrides-strategy'
 
 const port = numberEnv('PORT', 3002)
 const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
 const botToken = requiredEnv('SLACK_BOT_TOKEN')
 const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
+const messageOverridesStrategyMode = messageOverridesStrategyModeEnv(
+  'SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY'
+)
+const messageOverridesStrategyApiKey =
+  optionalEnv('SLACKBOTV2_MESSAGE_OVERRIDES_OPENAI_API_KEY') ?? optionalEnv('OPENAI_API_KEY')
 
 // Default to info: the chat adapter logs entire raw Slack webhook bodies at
 // debug, and JSON-serializing those multi-hundred-KB payloads on the hot path
@@ -31,6 +41,9 @@ const options: SlackbotV2Options = {
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
+  channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
+    consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
+  ),
   consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
   // Same env vars deployers use to override the sandbox harness model
@@ -42,6 +55,7 @@ const options: SlackbotV2Options = {
   },
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
+  messageOverridesStrategy: createMessageOverridesStrategy(),
   postgresUrl:
     optionalEnv('SLACKBOTV2_DATABASE_URL') ??
     optionalEnv('DATABASE_URL') ??
@@ -71,6 +85,9 @@ console.log(
     event: 'slackbotv2_started',
     service: 'slackbotv2',
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
+    message_overrides_strategy: messageOverridesStrategyMode,
+    message_overrides_strategy_enabled:
+      messageOverridesStrategyMode !== 'llm' || Boolean(messageOverridesStrategyApiKey),
     port: server.port,
     api_url: apiUrl
   })
@@ -103,6 +120,28 @@ function booleanEnv(name: string, fallback: boolean): boolean {
   if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) return true
   if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) return false
   throw new Error(`${name} must be a boolean`)
+}
+
+function messageOverridesStrategyModeEnv(name: string): 'flags' | 'llm' {
+  const value = optionalEnv(name)?.toLowerCase()
+  if (!value) return 'flags'
+  if (value === 'flags' || value === 'llm') return value
+  throw new Error(`${name} must be "flags" or "llm"`)
+}
+
+function createMessageOverridesStrategy(): SlackbotV2Options['messageOverridesStrategy'] {
+  if (messageOverridesStrategyMode !== 'llm') return createFlagMessageOverridesStrategy()
+  if (!messageOverridesStrategyApiKey) {
+    return async () => ({ overrides: {} })
+  }
+  return createOpenAiMessageOverridesStrategy({
+    apiKey: messageOverridesStrategyApiKey,
+    baseUrl: optionalEnv('SLACKBOTV2_MESSAGE_OVERRIDES_OPENAI_BASE_URL'),
+    logger: consoleLogger,
+    maxOutputTokens: optionalNumberEnv('SLACKBOTV2_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS'),
+    model: stringEnv('SLACKBOTV2_MESSAGE_OVERRIDES_MODEL', 'gpt-5.4-nano'),
+    timeoutMs: optionalNumberEnv('SLACKBOTV2_MESSAGE_OVERRIDES_TIMEOUT_MS')
+  })
 }
 
 function optionalNumberEnv(name: string): number | undefined {

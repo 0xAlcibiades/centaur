@@ -116,8 +116,9 @@ def search(
 ):
     """Search messages in bot-accessible channels.
 
-    Searches across all channels the bot is a member of. Results are ranked by
-    relevance (exact phrase matches score higher). Use --channels to limit scope.
+    Searches across Slack native search first, then scans channel history through
+    the Centaur API server proxy. Results are ranked by relevance (exact phrase
+    matches score higher). Use --channels to limit scope.
 
     Note: Only searches channels where the bot is a member. To search more channels,
     invite the bot to those channels first.
@@ -164,8 +165,8 @@ def search(
         console.print(table)
 
 
-@app.command()
-def channel(
+@app.command("channel-direct")
+def channel_direct(
     name: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
     limit: int = typer.Option(50, "--limit", "-n", help="Max messages"),
     full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
@@ -192,14 +193,14 @@ def channel(
     ),
     json_output: bool = typer.Option(False, "--json", help="Output full page metadata as JSON"),
 ):
-    """Get recent messages from a channel or a bounded history window."""
+    """Get recent messages from a channel directly with the Slack SDK."""
     import sys
 
     from .client import get_channel_history_page
 
     if not allow_name_resolution and not _channel_arg_is_id(name):
         stderr_console.print(
-            "[red]Error: slack channel requires an explicit Slack channel ID like C1234567890. "
+            "[red]Error: slack channel-direct requires an explicit Slack channel ID like C1234567890. "
             "Pass --allow-name-resolution to resolve a channel name intentionally.[/]"
         )
         raise typer.Exit(1)
@@ -246,8 +247,8 @@ def channel(
         console.print(f"[green]{msg['user']}[/]{thread_info}: {text}")
 
 
-@app.command("channel-proxy")
-def channel_proxy(
+@app.command("channel")
+def channel(
     channel_id: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
     limit: int = typer.Option(50, "--limit", "-n", help="Max messages"),
     cursor: str = typer.Option(None, "--cursor", help="Slack pagination cursor for the next page"),
@@ -361,7 +362,7 @@ def thread(
     """
     import sys
 
-    from .client import get_thread_replies_proxy
+    from .client import get_thread_replies_page, get_thread_replies_proxy
 
     channel_id, thread_ts = _parse_thread_ref(permalink)
 
@@ -375,9 +376,20 @@ def thread(
             latest=latest,
             inclusive=inclusive,
         )
-    except (RuntimeError, ValueError) as e:
-        stderr_console.print(f"[red]Error: {e}[/]")
-        raise typer.Exit(1) from e
+    except (RuntimeError, ValueError):
+        try:
+            page = get_thread_replies_page(
+                channel_id,
+                thread_ts,
+                limit=limit,
+                cursor=cursor,
+                oldest=oldest,
+                latest=latest,
+                inclusive=inclusive,
+            )
+        except (RuntimeError, ValueError) as direct_error:
+            stderr_console.print(f"[red]Error: {direct_error}[/]")
+            raise typer.Exit(1) from direct_error
 
     messages = page.get("messages", [])
 
@@ -545,8 +557,63 @@ def sync_history(
     console.print(f"[dim]sync_state={json.dumps(result['sync_state'], ensure_ascii=False)}[/]")
 
 
-@app.command()
+def _render_channels(results: list[dict], title: str, include_access: bool = False) -> None:
+    """Render a Slack channel list."""
+    if not results:
+        console.print("[yellow]No channels found.[/]")
+        raise typer.Exit()
+
+    table = Table(title=title)
+    table.add_column("Name", style="cyan", max_width=25)
+    table.add_column("Members", style="green", justify="right", max_width=8)
+    if include_access:
+        table.add_column("Access", style="magenta", max_width=12)
+    table.add_column("Purpose", style="white", max_width=50)
+
+    for ch in results:
+        priv = "[dim]🔒[/]" if ch["is_private"] else ""
+        purpose = (ch["purpose"] or ch["topic"] or "")[:50]
+        row = [f"#{ch['name']}{priv}", str(ch["member_count"])]
+        if include_access:
+            access = "".join(
+                label
+                for label, enabled in [
+                    ("h", ch.get("can_read_history")),
+                    ("u", ch.get("can_upload")),
+                    ("d", ch.get("can_download")),
+                ]
+                if enabled
+            )
+            row.append(access or "-")
+        row.append(purpose)
+        table.add_row(*row)
+
+    console.print(table)
+
+
+@app.command("channels")
 def channels(
+    limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
+    query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
+    bot_member_only: bool = typer.Option(
+        False,
+        "--bot-member-only",
+        help="Only list JWT-authorized channels with history access",
+    ),
+):
+    """List Slack channels authorized by the Centaur API server proxy JWT."""
+    from .client import list_channels_proxy
+
+    results = list_channels_proxy(limit=limit, history_only=bot_member_only)
+
+    if query:
+        results = [c for c in results if query.lower() in c["name"].lower()]
+
+    _render_channels(results, f"Channels ({len(results)})", include_access=True)
+
+
+@app.command("channels-direct")
+def channels_direct(
     limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
     query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
     bot_member_only: bool = typer.Option(
@@ -555,7 +622,7 @@ def channels(
         help="Only list channels the bot can actually read history from",
     ),
 ):
-    """List all Slack channels."""
+    """List Slack channels directly with the Slack SDK."""
     from .client import list_bot_channels, list_channels
 
     if bot_member_only:
@@ -566,35 +633,69 @@ def channels(
     if query:
         results = [c for c in results if query.lower() in c["name"].lower()]
 
-    if not results:
-        console.print("[yellow]No channels found.[/]")
+    _render_channels(results, f"Channels ({len(results)})")
+
+
+def _render_channel_members(channel: str, members: list[dict], emails_only: bool) -> None:
+    if not members:
+        console.print("[yellow]No members found.[/]")
         raise typer.Exit()
 
-    table = Table(title=f"Channels ({len(results)})")
-    table.add_column("Name", style="cyan", max_width=25)
-    table.add_column("Members", style="green", justify="right", max_width=8)
-    table.add_column("Purpose", style="white", max_width=50)
+    if emails_only:
+        for m in members:
+            if m.get("email"):
+                console.print(m["email"])
+        return
 
-    for ch in results:
-        priv = "[dim]🔒[/]" if ch["is_private"] else ""
-        purpose = (ch["purpose"] or ch["topic"] or "")[:50]
-        table.add_row(f"#{ch['name']}{priv}", str(ch["member_count"]), purpose)
+    table = Table(title=f"#{channel} Members ({len(members)})")
+    table.add_column("Name", style="cyan", max_width=20)
+    table.add_column("Real Name", style="white", max_width=25)
+    table.add_column("Email", style="green", max_width=35)
+
+    for m in members:
+        table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
 
     console.print(table)
 
 
+@app.command("channel-members-proxy")
 @app.command("channel-members")
 def channel_members_cmd(
+    channel_id: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
+    limit: int = typer.Option(1000, "--limit", "-n", help="Max members"),
+    emails_only: bool = typer.Option(
+        False, "--emails", "-e", help="Output only email addresses (one per line)"
+    ),
+):
+    """List members of a Slack channel through the Centaur API server proxy.
+
+    Examples:
+        slack channel-members C1234567890
+        slack channel-members C1234567890 --emails
+    """
+    from .client import get_channel_members_proxy
+
+    try:
+        members = get_channel_members_proxy(channel_id, limit=limit)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    _render_channel_members(channel_id, members, emails_only)
+
+
+@app.command("channel-members-direct")
+def channel_members_direct_cmd(
     channel: str = typer.Argument(..., help="Channel name (without #) or channel ID"),
     emails_only: bool = typer.Option(
         False, "--emails", "-e", help="Output only email addresses (one per line)"
     ),
 ):
-    """List all members of a Slack channel.
+    """List all members of a Slack channel directly with the Slack SDK.
 
     Examples:
-        slack channel-members eng-ai
-        slack channel-members eng-ai --emails
+        slack channel-members-direct eng-ai
+        slack channel-members-direct eng-ai --emails
     """
     from .client import get_channel_members
 
@@ -604,24 +705,7 @@ def channel_members_cmd(
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
 
-    if not members:
-        console.print("[yellow]No members found.[/]")
-        raise typer.Exit()
-
-    if emails_only:
-        for m in members:
-            if m.get("email"):
-                console.print(m["email"])
-    else:
-        table = Table(title=f"#{channel} Members ({len(members)})")
-        table.add_column("Name", style="cyan", max_width=20)
-        table.add_column("Real Name", style="white", max_width=25)
-        table.add_column("Email", style="green", max_width=35)
-
-        for m in members:
-            table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
-
-        console.print(table)
+    _render_channel_members(channel, members, emails_only)
 
 
 @app.command()
@@ -904,23 +988,68 @@ def usergroup_update(
 
 @app.command("search-files")
 def search_files_cmd(
+    channel_id: str = typer.Argument(..., help="Slack channel ID to search"),
     query: str = typer.Argument(..., help="Search query for files"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
 ):
-    """Search files shared across the workspace.
+    """Search files shared in a Slack channel.
 
     Examples:
-        slack search-files "quarterly report"
-        slack search-files "architecture diagram" -n 10
+        slack search-files C123456789 "quarterly report"
+        slack search-files C123456789 "architecture diagram" -n 10
     """
     from .client import search_files
 
     try:
-        results = search_files(query, max_results=limit)
+        results = search_files(channel_id, query, max_results=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
 
+    _print_file_search_results(query, results)
+
+
+@app.command("search-files-direct")
+def search_files_direct_cmd(
+    query: str = typer.Argument(..., help="Search query for files"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+):
+    """Search files by calling Slack files.list directly.
+
+    Examples:
+        slack search-files-direct "quarterly report"
+        slack search-files-direct "architecture diagram" -n 10
+    """
+    from .client import search_files_direct
+
+    try:
+        results = search_files_direct(query, max_results=limit)
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    _print_file_search_results(query, results)
+
+
+def _format_file_size(size: object) -> str:
+    try:
+        size_bytes = int(size or 0)
+    except (TypeError, ValueError):
+        return str(size)
+    if size_bytes >= 1_000_000:
+        return f"{size_bytes / 1_000_000:.1f}MB"
+    if size_bytes >= 1_000:
+        return f"{size_bytes / 1_000:.0f}KB"
+    return f"{size_bytes}B"
+
+
+def _format_file_info_value(key: str, value: object) -> str:
+    if key == "size":
+        return _format_file_size(value)
+    return str(value)
+
+
+def _print_file_search_results(query: str, results: list[dict]) -> None:
     if not results:
         console.print("[yellow]No files found.[/]")
         raise typer.Exit()
@@ -932,15 +1061,54 @@ def search_files_cmd(
     table.add_column("Size", style="dim", justify="right", max_width=10)
 
     for f in results:
-        size = f["size"]
-        if size > 1_000_000:
-            size_str = f"{size / 1_000_000:.1f}MB"
-        elif size > 1000:
-            size_str = f"{size / 1000:.0f}KB"
-        else:
-            size_str = f"{size}B"
-        table.add_row(f["name"], f["filetype"], f["user"], size_str)
+        table.add_row(f["name"], f["filetype"], f["user"], _format_file_size(f["size"]))
 
+    console.print(table)
+
+
+@app.command("file-info-proxy")
+@app.command("file-info")
+def file_info(
+    file_id: str = typer.Argument(..., help="Slack file ID, e.g. F1234567890"),
+    channel_id: str = typer.Argument(
+        ..., help="Slack channel/conversation ID that the file is shared in"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output raw metadata as JSON"),
+):
+    """Fetch Slack file metadata through the Centaur API server Slack proxy."""
+    import sys
+
+    from .client import file_info_proxy
+
+    try:
+        result = file_info_proxy(file_id=file_id, channel_id=channel_id)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error fetching Slack file info: {e}[/]")
+        raise typer.Exit(1) from e
+
+    if json_output:
+        print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
+
+    file = result.get("file", {})
+    table = Table(title=f"Slack File {result.get('file_id') or file_id}")
+    table.add_column("Field", style="cyan", max_width=18)
+    table.add_column("Value", style="white", max_width=90)
+    for key in [
+        "id",
+        "name",
+        "title",
+        "mimetype",
+        "filetype",
+        "size",
+        "user",
+        "created",
+        "permalink",
+        "url_private",
+    ]:
+        value = file.get(key)
+        if value not in (None, "", []):
+            table.add_row(key, _format_file_info_value(key, value))
     console.print(table)
 
 
@@ -1087,8 +1255,9 @@ def files(
     else:
         console.print(f"[bold]Files ({len(files_list)})[/]\n")
         for f in files_list:
-            size_kb = f["size"] / 1024
-            console.print(f"[cyan]{f['name']}[/] ({f['filetype']}, {size_kb:.1f} KB)")
+            console.print(
+                f"[cyan]{f['name']}[/] ({f['filetype']}, {_format_file_size(f['size'])})"
+            )
             console.print(f"  [dim]{f['url_private']}[/]")
 
 

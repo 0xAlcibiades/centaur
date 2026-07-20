@@ -3,7 +3,7 @@ require "test_helper"
 module Oauth
   # Covers the consent flow end to end: /oauth/:slug/start builds the IdP redirect
   # and binds the browser; /oauth/:slug/callback exchanges the code, upserts a
-  # BrokerCredential, and renders an iron-control result page. The IdP is faked by
+  # BrokerCredential, and renders a console result page. The IdP is faked by
   # swapping the controller's exchange_client_factory for a client wrapped around
   # an HTTP double returning a canned token response.
   class FlowsControllerTest < ActionDispatch::IntegrationTest
@@ -22,6 +22,8 @@ module Oauth
       oauth_apps(:acme_github).update!(client_secret: "github-secret")
       oauth_apps(:acme_attio).update!(client_secret: "attio-secret")
       oauth_apps(:acme_linear).update!(client_secret: "linear-secret")
+      @user = users(:member_user)
+      sign_in @user
       clear_enqueued_jobs
     end
 
@@ -75,6 +77,33 @@ module Oauth
       }.merge(overrides).to_json
     end
 
+    def slack_bot_token_body(**overrides)
+      {
+        ok: true,
+        access_token: "xoxb-non-rotating-bot",
+        token_type: "bot",
+        scope: "commands,chat:write",
+        bot_user_id: "U0BOTUSER",
+        app_id: "A0APP",
+        team: { id: "TACME", name: "Acme" }
+      }.merge(overrides).to_json
+    end
+
+    def slack_static_user_token_body
+      slack_token_body(
+        access_token: "xoxb-non-rotating-bot",
+        refresh_token: nil,
+        expires_in: nil,
+        authed_user: {
+          id: "USTATIC",
+          user: "static-grace",
+          access_token: "xoxp-non-rotating-user",
+          scope: "chat:write",
+          token_type: "user"
+        }
+      )
+    end
+
     def github_token_body(scope: "repo,read:user", **overrides)
       {
         access_token: "gho-user-token",
@@ -102,6 +131,10 @@ module Oauth
 
     def sign_in(user)
       post login_url, params: { email: user.email, password: "password123456" }
+    end
+
+    def sign_out
+      delete logout_url
     end
 
     # Runs /start and returns the state extracted from the IdP redirect (the flow
@@ -210,19 +243,23 @@ module Oauth
       assert_includes scopes, "write"
     end
 
-    test "start works without any session" do
+    test "start redirects signed-out users to login" do
+      sign_out
+
       get oauth_start_url(slug: "google")
+
       assert_response :redirect
+      assert_redirected_to login_path
       assert_nil session[:user_id]
     end
 
-    test "start works with a pending console session" do
+    test "start redirects pending console users to the pending page" do
       sign_in users(:pending_user)
 
       get oauth_start_url(slug: "google")
 
       assert_response :redirect
-      assert_equal "accounts.google.com", URI.parse(response.location).host
+      assert_redirected_to pending_path
     end
 
     test "start 404s an unknown slug" do
@@ -273,7 +310,7 @@ module Oauth
       assert_equal "AT", cred.access_token
       assert_equal "RT", cred.refresh_token
       assert cred.next_attempt_at.present?
-      assert_nil cred.created_by
+      assert_equal @user, cred.created_by
     end
 
     test "callback happy path supports Slack user tokens" do
@@ -296,9 +333,56 @@ module Oauth
       assert_equal %w[chat:write], cred.scopes
       assert_equal "xoxe.xoxp-1-user", cred.access_token
       assert_equal "xoxe-1-refresh", cred.refresh_token
+      assert cred.next_attempt_at.present?
       assert_equal "TACME", cred.labels["slack_team_id"]
       assert_equal [ "slack.com" ], cred.static_secret.rules.map(&:host)
       assert_equal "Slack – grace token", cred.static_secret.name
+    end
+
+    test "callback happy path supports non-rotating Slack user tokens" do
+      state = start_flow(slug: "slack", scopes: "chat:write")
+      stub_exchange(status: 200, body: slack_static_user_token_body)
+
+      assert_difference -> { BrokerCredential.count } => 1 do
+        get oauth_callback_url(slug: "slack"), params: { state: state, code: "auth-code" }
+      end
+      assert_redirected_to console_integrations_path
+
+      app = oauth_apps(:acme_slack)
+      cred = BrokerCredential.find_by(oauth_app: app, provider_subject: "USTATIC")
+      assert_equal "Slack – static-grace", cred.name
+      assert_equal %w[chat:write], cred.scopes
+      assert_equal "xoxp-non-rotating-user", cred.access_token
+      assert_nil cred.refresh_token
+      assert_nil cred.expires_at
+      assert_nil cred.next_attempt_at
+      refute_includes BrokerCredential.refreshable, cred
+    end
+
+    test "callback happy path supports non-rotating Slack bot tokens" do
+      state = start_flow(slug: "slack", scopes: "chat:write")
+      stub_exchange(status: 200, body: slack_bot_token_body)
+
+      assert_difference -> { BrokerCredential.count } => 1 do
+        get oauth_callback_url(slug: "slack"), params: { state: state, code: "auth-code" }
+      end
+      assert_redirected_to console_integrations_path
+
+      app = oauth_apps(:acme_slack)
+      cred = BrokerCredential.find_by(oauth_app: app, provider_subject: "U0BOTUSER")
+      assert_equal "acme", cred.namespace
+      assert_equal "slack-slack-u0botuser", cred.foreign_id
+      assert_equal "Slack – Acme", cred.name
+      assert_equal "https://slack.com/api/oauth.v2.access", cred.token_endpoint
+      assert_nil cred.provider_email
+      assert_equal %w[commands chat:write], cred.scopes
+      assert_equal "xoxb-non-rotating-bot", cred.access_token
+      assert_nil cred.refresh_token
+      assert_nil cred.expires_at
+      assert_nil cred.next_attempt_at
+      assert_equal "TACME", cred.labels["slack_team_id"]
+      assert_equal [ "slack.com" ], cred.static_secret.rules.map(&:host)
+      refute_includes BrokerCredential.refreshable, cred
     end
 
     test "callback happy path supports Attio workspace tokens" do
@@ -400,7 +484,7 @@ module Oauth
       assert_equal cred, secret.broker_credential # first-class link to the credential
       assert_equal cred.namespace, secret.namespace
       assert_nil secret.foreign_id # found by association, so no collidable foreign_id
-      assert_nil secret.created_by # the unauthenticated flow has no operator
+      assert_nil secret.created_by # the wrapping secret is not owned by an operator
       assert_equal({ "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }, secret.inject_config)
       assert_equal "token_broker", secret.source.source_type
       assert_equal cred.oid, secret.source.config["credential_id"]
@@ -463,20 +547,31 @@ module Oauth
       assert_select "a.btn-secondary[href=?]", "http://www.example.com/oauth/slack/start", text: "Reconnect"
     end
 
-    test "callback works with a disabled console session" do
+    test "callback redirects signed-out users to login and mints nothing" do
+      state = start_flow
+      sign_out
+      stub_exchange(status: 200, body: token_body)
+
+      assert_no_difference -> { BrokerCredential.count } do
+        get oauth_callback_url(slug: "google"), params: { state: state, code: "auth-code" }
+      end
+
+      assert_redirected_to login_path
+      assert_nil session[:user_id]
+    end
+
+    test "callback rejects a disabled console session before minting" do
       user = users(:member_user)
-      sign_in user
       state = start_flow
       user.update!(status: :disabled)
       stub_exchange(status: 200, body: token_body)
 
-      assert_difference -> { BrokerCredential.count }, 1 do
+      assert_no_difference -> { BrokerCredential.count } do
         get oauth_callback_url(slug: "google"), params: { state: state, code: "auth-code" }
       end
 
-      assert_redirected_to console_integrations_path
-      assert_match(/connected/, flash[:notice])
-      assert_equal user.id, session[:user_id]
+      assert_redirected_to login_path
+      assert_nil session[:user_id]
     end
 
     test "re-consent for the same account updates the existing credential and revives a dead one" do

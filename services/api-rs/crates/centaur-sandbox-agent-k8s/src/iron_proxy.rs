@@ -50,6 +50,7 @@ const PROXY_LOG_LEVEL: &str = "info";
 // DSN. These are the deploy-level env vars iron-proxy reads for that listener.
 const PG_LISTENER_PORT: u16 = 5432;
 const CENTAUR_POSTGRES_DSN_ENV: &str = "CENTAUR_POSTGRES_DSN";
+const CENTAUR_CONSOLE_URL_ENV: &str = "CENTAUR_CONSOLE_URL";
 const PG_LISTEN_ENV: &str = "IRON_PROXY_PG_LISTEN";
 const PG_CLIENT_USER_ENV: &str = "IRON_PROXY_PG_CLIENT_USER";
 const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
@@ -123,6 +124,7 @@ pub(crate) struct ResolvedIronProxy {
     proxy_host: String,
     proxy_pod_name: String,
     proxy_port: u16,
+    console_url: String,
     // iron-control principal OID this sandbox's proxy binds to.
     principal_id: String,
     // The single Postgres listener the proxy multiplexes all upstreams through,
@@ -276,7 +278,7 @@ impl AgentSandboxBackend {
         let Some(principal_id) = principal_id else {
             return Ok(None);
         };
-        let pg = self.resolved_pg();
+        let pg = self.resolved_pg_for_recreation(Some(&sandbox));
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
         let observability_enabled = sandbox_observability_enabled(&sandbox, &self.config.container_name)
             .unwrap_or_else(|| {
@@ -319,6 +321,12 @@ impl AgentSandboxBackend {
             proxy_host: iron_proxy_service_name(id),
             proxy_pod_name: new_iron_proxy_pod_name(id),
             proxy_port: PROXY_TUNNEL_PORT,
+            console_url: self
+                .config
+                .iron_control
+                .as_ref()
+                .map(|settings| settings.control_url.clone())
+                .unwrap_or_default(),
             principal_id,
             pg,
             replace_placeholders,
@@ -587,7 +595,7 @@ impl AgentSandboxBackend {
             Err(err) if is_not_found(&err) => None,
             Err(err) => return Err(map_kube_error("get sandbox for iron-proxy repair", err)),
         };
-        let pg = self.resolved_pg_for_repair(sandbox.as_ref());
+        let pg = self.resolved_pg_for_recreation(sandbox.as_ref());
         let principal_id = principal_id.to_owned();
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
         let observability_enabled = sandbox
@@ -644,7 +652,12 @@ impl AgentSandboxBackend {
             })
     }
 
-    fn resolved_pg_for_repair(&self, sandbox: Option<&crate::crd::Sandbox>) -> Option<ResolvedPg> {
+    /// Reuse the Postgres client credential already stored on an existing
+    /// sandbox: recreating only its proxy does not update the sandbox pod spec.
+    fn resolved_pg_for_recreation(
+        &self,
+        sandbox: Option<&crate::crd::Sandbox>,
+    ) -> Option<ResolvedPg> {
         let fallback = self.resolved_pg()?;
         sandbox
             .and_then(|sandbox| {
@@ -1114,6 +1127,9 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
             pg.user, pg.password, resolved.proxy_host, pg.port,
         );
         set_missing_env(spec, CENTAUR_POSTGRES_DSN_ENV, &value);
+    }
+    if !resolved.console_url.is_empty() {
+        set_missing_env(spec, CENTAUR_CONSOLE_URL_ENV, &resolved.console_url);
     }
 }
 
@@ -1939,6 +1955,7 @@ mod tests {
             proxy_host: "asbx-test-iron-proxy".to_owned(),
             proxy_pod_name: "asbx-test-iron-proxy-1".to_owned(),
             proxy_port: 8080,
+            console_url: "http://console:3000".to_owned(),
             principal_id: "principal".to_owned(),
             pg: None,
             replace_placeholders: BTreeMap::new(),
@@ -2292,9 +2309,18 @@ mod tests {
     }
 
     #[test]
-    fn pg_repair_reuses_credentials_from_existing_sandbox_dsn() {
-        let pg = pg_from_sandbox_dsn(
-            "postgresql://pg-user-original:pg-password-original@asbx-test-iron-proxy:5432",
+    fn pg_recreation_reuses_credentials_from_existing_sandbox_dsn() {
+        let dsn = "postgresql://pg-user-original:pg-password-original@asbx-test-iron-proxy:5432";
+        let sandbox = crate::build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test").env(CENTAUR_POSTGRES_DSN_ENV, dsn),
+            &crate::AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+
+        let pg = pg_from_sandbox_env(
+            &sandbox,
+            crate::DEFAULT_CONTAINER_NAME,
             "0.0.0.0:5432",
             5432,
         )
@@ -2307,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_repair_ignores_unparseable_sandbox_dsn() {
+    fn pg_recreation_ignores_unparseable_sandbox_dsn() {
         assert!(pg_from_sandbox_dsn("not-a-postgres-dsn", "0.0.0.0:5432", 5432).is_none());
         assert!(pg_from_sandbox_dsn("postgresql://@host:5432", "0.0.0.0:5432", 5432).is_none());
     }
@@ -2641,5 +2667,21 @@ mod tests {
                 "{name} should contain the OTLP endpoint host: {value}"
             );
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_adds_console_url() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest");
+        let mut resolved = resolved();
+        resolved.console_url = "http://console:3000/".to_owned();
+
+        apply_proxy_env(&mut spec, &resolved);
+
+        let value = spec
+            .env
+            .iter()
+            .find(|env| env.name == CENTAUR_CONSOLE_URL_ENV)
+            .map(|env| env.value.as_str());
+        assert_eq!(value, Some("http://console:3000/"));
     }
 }

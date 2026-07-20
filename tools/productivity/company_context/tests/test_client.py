@@ -748,7 +748,7 @@ def test_search_dm_conversations_queries_projection(monkeypatch):
         ],
     }
     query, args = fake.fetch_calls[0]
-    assert "FROM slack_dm_conversation_context_documents" in query
+    assert "FROM slack_private_conversation_context_documents" in query
     assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
     assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
     assert "LIMIT $3" in query
@@ -831,7 +831,7 @@ def test_search_dms_queries_bm25_and_returns_compact_results(monkeypatch):
         ],
     }
     query, args = fake.fetch_calls[0]
-    assert "FROM slack_dm_context_documents" in query
+    assert "FROM slack_private_context_documents" in query
     assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
     assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
     assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3::text)" in query
@@ -843,6 +843,22 @@ def test_search_dms_queries_bm25_and_returns_compact_results(monkeypatch):
     assert "centaur.slack_team_id" not in query
     assert args == ("launch plan", "launch", "plan", "D123", None, None, 5)
     assert fake.closed is True
+
+
+def test_private_channel_documents_use_private_access_scope():
+    summary = company_context_client._dm_document_summary(
+        {
+            "document_id": "slack_dm:T_HOME:G123:1770000000.000000",
+            "conversation_id": "G123",
+            "conversation_type": "private_channel",
+            "message_ts": "1770000000.000000",
+            "title": "Slack private channel: #leadership",
+            "metadata": {"channel_name": "leadership"},
+        }
+    )
+
+    assert summary["source_type"] == "slack_private_channel"
+    assert summary["access_scope"] == "slack_private_channel"
 
 
 def test_search_dms_applies_occurred_at_filters(monkeypatch):
@@ -1071,8 +1087,8 @@ def test_latest_date_counts_slack_dm_projection_tables(monkeypatch):
         "latest_occurred_at": "2026-05-10T10:00:00+00:00",
     }
     assert len(fake.fetchrow_calls) == 2
-    assert "FROM slack_dm_context_documents" in fake.fetchrow_calls[0][0]
-    assert "FROM slack_dm_conversation_context_documents" in fake.fetchrow_calls[1][0]
+    assert "FROM slack_private_context_documents" in fake.fetchrow_calls[0][0]
+    assert "FROM slack_private_conversation_context_documents" in fake.fetchrow_calls[1][0]
     assert fake.closed is True
 
 
@@ -1102,8 +1118,37 @@ def test_latest_date_can_filter_slack_dm_messages_by_conversation_type(monkeypat
     assert result["latest_date"] == "2026-05-09T15:30:00+00:00"
     assert len(fake.fetchrow_calls) == 1
     query, args = fake.fetchrow_calls[0]
-    assert "FROM slack_dm_context_documents" in query
+    assert "FROM slack_private_context_documents" in query
     assert args == ("im",)
+    assert fake.closed is True
+
+
+def test_latest_date_can_filter_private_channel_messages(monkeypatch):
+    fake = _FakeConnection(
+        fetchrow_rows=[
+            {
+                "latest_date": dt.datetime(2026, 5, 9, 15, 30, tzinfo=dt.UTC),
+                "latest_source_updated_at": dt.datetime(2026, 5, 9, 15, 30, tzinfo=dt.UTC),
+                "latest_occurred_at": dt.datetime(2026, 5, 8, 14, 0, tzinfo=dt.UTC),
+                "document_count": 12,
+            },
+        ]
+    )
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").latest_date(
+        source="slack_dm",
+        source_type="slack_private_channel",
+    )
+
+    assert result["document_count"] == 12
+    query, args = fake.fetchrow_calls[0]
+    assert "FROM slack_private_context_documents" in query
+    assert args == ("private_channel",)
     assert fake.closed is True
 
 

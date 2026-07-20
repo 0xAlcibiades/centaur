@@ -9,21 +9,17 @@ module Oauth
   # BrokerCredential linked to the OauthApp, then sends the user back to the
   # console Integrations page (or renders a result page on failure).
   #
-  # Deliberately unauthenticated -- a team member connects an integration by
-  # clicking a well-known link; there is no external app to integrate with, so
-  # there is no return_to or user key. Safety comes from: a credential is only
-  # minted after a successful consent + code exchange, and re-consent for the
-  # same (app, provider account) upserts the existing credential. All
-  # provider-specific behavior comes from the strategy (Oauth::Providers), which
-  # is derived from the app.
+  # Authenticated console consent flow. A team member connects an integration by
+  # clicking a console link; a credential is only minted after an active console
+  # session, successful consent, and code exchange. Re-consent for the same (app,
+  # provider account) upserts the existing credential. All provider-specific
+  # behavior comes from the strategy (Oauth::Providers), which is derived from
+  # the app.
   #
   # SECURITY: never logs the code, tokens, client_secret, or response bodies --
   # only oids and error codes, like the rest of the Broker/Oauth subsystem.
   class FlowsController < ApplicationController
     layout "auth"
-
-    skip_before_action :require_login
-    skip_before_action :require_active_account
 
     # The message_verifier purpose binding the signed state to this flow, the
     # state/cookie lifetime, and the encrypted cookie that ties a callback back to
@@ -87,6 +83,7 @@ module Oauth
       end
 
       result = exchange_code(params[:code], flow["code_verifier"])
+      validate_provider_result!(result)
       identity = @provider.identity_from(result, client_id: @app.client_id)
       @credential = upsert_credential(state, result, identity)
       enqueue_identity_enrichment(@credential)
@@ -151,23 +148,22 @@ module Oauth
         code: code.to_s,
         redirect_uri: oauth_callback_redirect_uri(@app.slug),
         code_verifier: code_verifier.to_s,
-        require_refresh_token: @provider.refreshable?
+        require_refresh_token: provider_requires_refresh_token?
       )
     end
 
     # Upserts one credential per (app, provider account). A new record gets its
-    # identity/endpoint fixed (and an auto-generated external_user_key, since the
-    # flow has no caller-supplied user); every consent (re)applies the rotating
-    # blob, including the freshly-exchanged access token so the credential is live
-    # immediately, and revives a dead credential.
+    # identity/endpoint fixed (and an auto-generated external_user_key); every
+    # consent (re)applies the rotating blob, including the freshly-exchanged
+    # access token so the credential is live immediately, and revives a dead
+    # credential.
     def upsert_credential(state, result, identity)
       BrokerCredential.transaction do
         credential = BrokerCredential.find_or_initialize_by(oauth_app: @app, provider_subject: identity[:subject])
-        # When the consenting browser carries a signed-in console session,
-        # remember which user connected this account. The Integrations page
-        # matches on it, so the card flips to "Connected" even when the
-        # provider account's email differs from the console login email.
-        # Never overwritten: the first linked user keeps the credential.
+        # Remember which user connected this account. The Integrations page
+        # matches on it, so the card flips to "Connected" even when the provider
+        # account's email differs from the console login email. Never
+        # overwritten: the first linked user keeps the credential.
         credential.created_by ||= current_user
         if credential.new_record?
           credential.namespace = @app.credential_namespace
@@ -178,7 +174,7 @@ module Oauth
         end
 
         now = Time.current
-        expires_in = result.expires_in&.positive? ? result.expires_in : BrokerCredential::DEFAULT_EXPIRES_IN_SECONDS
+        refreshable_result = provider_refreshable_result?(result)
         credential.assign_attributes(
           provider_email: identity[:email],
           # Store exactly what the IdP granted, so the refresh POST re-requests it.
@@ -186,15 +182,38 @@ module Oauth
           labels: credential_labels(credential, identity),
           refresh_token: result.refresh_token,
           access_token: result.access_token,
-          expires_at: now + expires_in,
+          expires_at: credential_expires_at(result, now: now, refreshable_result: refreshable_result),
           last_refresh: now,
           failure_count: 0, dead: false, dead_reason: nil
         )
-        credential.next_attempt_at = @provider.refreshable? ? credential.compute_next_attempt_at(now: now) : nil
+        credential.next_attempt_at = refreshable_result ? credential.compute_next_attempt_at(now: now) : nil
         credential.save!
         ensure_wrapping_secret(credential)
         credential
       end
+    end
+
+    def validate_provider_result!(result)
+      @provider.validate_result!(result) if @provider.respond_to?(:validate_result!)
+    end
+
+    def provider_requires_refresh_token?
+      return @provider.require_refresh_token? if @provider.respond_to?(:require_refresh_token?)
+
+      @provider.refreshable?
+    end
+
+    def provider_refreshable_result?(result)
+      return @provider.refreshable_result?(result) if @provider.respond_to?(:refreshable_result?)
+
+      @provider.refreshable?
+    end
+
+    def credential_expires_at(result, now:, refreshable_result:)
+      return now + result.expires_in if result.expires_in&.positive?
+      return nil unless refreshable_result
+
+      now + BrokerCredential::DEFAULT_EXPIRES_IN_SECONDS
     end
 
     def granted_scopes(result, state)

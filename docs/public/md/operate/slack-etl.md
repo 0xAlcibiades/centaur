@@ -58,6 +58,27 @@ visible to that token. It does not sync DMs or Slackbot-only live thread events.
 Private channel rows are protected by RLS: `centaur_readonly` sees public
 channel data and the channel in `centaur.slack_channel_id`.
 
+### User-scoped private-channel ingestion
+
+The console's Slack OAuth flow can ingest private channels through the same
+user-scoped pipeline used for DMs. Add `groups:read` and `groups:history` to the
+Slack OAuth app's allowed user scopes and have existing users consent again.
+DM-only credentials continue syncing DMs while credentials with the new scopes
+also request `private_channel` conversations.
+
+Every 10 minutes the console worker fans out across healthy Slack broker
+credentials. Each credential lists the private channels visible to that user,
+reads channel history, and fetches the complete `conversations.members` list.
+Messages are deduplicated by Slack conversation and message timestamp when
+multiple credentials can see the same channel.
+
+User-scoped private channels are stored with DMs and MPIMs in the neutral
+`slack_private_sync_*` and `slack_private_*_context_documents` tables rather than
+`company_context_documents`. RLS checks `(team_id, channel_id, user_id)` against
+the reconciled membership list. A successful sync marks members omitted from
+Slack's complete member list inactive; a partial or truncated member list is
+never applied.
+
 ## Enable the schedules
 
 Set `apiRs.etl.slack.enabled=true` in Helm values. The chart renders the
@@ -89,10 +110,11 @@ apiRs:
 | `SLACK_RETENTION_ENABLED` | `true` | Allows the `slack_retention` schedule to run when at least one Slack retention TTL is positive. |
 | `SLACK_RETENTION_INTERVAL_MINUTES` | `60` | How often to prune Slack retention-managed rows. |
 | `SLACK_ETL_RETENTION_DAYS` | `0` | Deletes Slack ETL messages, derived Slack documents, and terminal ETL run/job rows older than this many days. `0` disables ETL retention. |
-| `SLACK_DM_RETENTION_DAYS` | `0` | Deletes Slack DM messages, stale empty DM conversations, and terminal DM run/job rows older than this many days. `0` disables DM retention. |
+| `SLACK_DM_RETENTION_DAYS` | `0` | Deletes user-scoped private Slack messages, stale empty conversations, and terminal run/job rows older than this many days. `0` disables retention. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `true` | Enables projection from Slack sync rows into company context documents. |
-| `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `14400` | How often to project changed Slack rows into documents. |
-| `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `21600` | Maximum source `updated_at` window projected by one company context documents run. |
+| `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `14400` | How often the coordinator claims stale projection scopes. |
+| `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `21600` | Maximum source `updated_at` window claimed for one scope before it advances its watermark. |
+| `COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE` | `50` | Maximum changed source rows processed by one per-scope child workflow. |
 
 Example exclusion list:
 
@@ -262,7 +284,7 @@ setting alerts.
 | Channels are all skipped | Check `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` for broad globs. |
 | Checkpoints show `missing_scope` or `not_allowed_token_type` | Add the missing Slack OAuth scope or use the expected user-token class. |
 | Backfill jobs keep failing | Inspect `slack_sync_backfill_jobs.last_error` and the corresponding `slack_sync_runs` row. |
-| Documents lag behind messages | Check the `company_context_documents` workflow status and `company_context_projection_lag_seconds`. |
+| Documents lag behind messages | Check `company_context_projection_checkpoints` for an expired lease or old watermark, then inspect the per-scope `company_context_documents` child workflow and `company_context_projection_lag_seconds`. |
 
 Keep the ETL token scoped to the channels and workspace data you actually want
 agents to retrieve. Synced rows and projected documents are deployment-wide
