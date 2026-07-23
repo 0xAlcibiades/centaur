@@ -23,6 +23,7 @@ import {
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
+import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
 import claudeSettings from '../../../harness/claude/settings.json'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -579,6 +580,116 @@ describe('slackbotv2', () => {
         model: 'claude-fable-5'
       })
     )
+  })
+
+  it('keeps a top-level harness flag pinned when the LLM strategy guesses another harness', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let strategyRequestCount = 0
+    bot = createTestBot({
+      defaultHarnessType: 'claudecode',
+      messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        fetch: (async () => {
+          strategyRequestCount += 1
+          return Response.json({
+            output: [
+              {
+                content: [
+                  {
+                    text: JSON.stringify({
+                      // Model the production false positive: an ordinary
+                      // follow-up is classified as a different harness.
+                      harness: strategyRequestCount === 1 ? 'codex' : null,
+                      model: strategyRequestCount === 1 ? 'gpt-5.6-sol' : null,
+                      provider: strategyRequestCount === 1 ? 'responses' : null,
+                      reasoning: strategyRequestCount === 1 ? 'high' : null
+                    })
+                  }
+                ]
+              }
+            ]
+          })
+        }) as unknown as typeof fetch,
+        model: 'gpt-5.4-nano'
+      }),
+      state: sharedState
+    })
+
+    const sendMention = async (threadTs: string | undefined, text: string, eventId: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, threadTs)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: threadTs,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      return mention
+    }
+
+    const nanocodexRoot = await sendMention(
+      undefined,
+      '--nanocodex --subagents start with the native harness',
+      'Ev-slackbotv2-nanocodex-opt-in'
+    )
+    await sendMention(
+      nanocodexRoot.ts,
+      'continue without another flag',
+      'Ev-slackbotv2-nanocodex-sticky'
+    )
+
+    const defaultRoot = await sendMention(
+      undefined,
+      'use the configured default',
+      'Ev-slackbotv2-default-after-nanocodex'
+    )
+
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual([
+      'nanocodex',
+      'nanocodex',
+      'claudecode'
+    ])
+    expect(codexApi.creates[0]!.body.on_harness_conflict).toBe('restart')
+    expect(codexApi.creates[2]!.body.on_harness_conflict).toBeUndefined()
+    // The explicit flag bypasses the deployed LLM strategy. Only the two
+    // unflagged messages consult it.
+    expect(strategyRequestCount).toBe(2)
+    expect(JSON.stringify(codexApi.executes[0]!.body)).not.toContain('--nanocodex')
+    expect(JSON.stringify(codexApi.executes[0]!.body)).toContain('--subagents')
+    expect(JSON.stringify(codexApi.executes[0]!.body)).toContain(
+      'start with the native harness'
+    )
+    const followUpInput = JSON.parse(
+      codexApi.executes[1]!.body.input_lines.at(-1)!
+    ) as Record<string, unknown>
+    expect(followUpInput.model).toBeUndefined()
+    expect(followUpInput.provider).toBeUndefined()
+    // Reasoning remains a per-turn setting; only the sticky harness/model/
+    // provider selection is protected by the root flag.
+    expect(followUpInput.reasoning).toBe('high')
+
+    const nanocodexState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(nanocodexRoot.ts)}`
+    )
+    const defaultState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(defaultRoot.ts)}`
+    )
+    expect(nanocodexState?.harnessType).toBe('nanocodex')
+    expect(defaultState?.harnessType).toBeUndefined()
   })
 
   it('appends an Open-session-in-Console context block to the first assistant message only', async () => {

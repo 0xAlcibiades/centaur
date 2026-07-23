@@ -18,7 +18,7 @@ import { fetchSlackThreadReplies } from '@chat-adapter/slack/api'
 import { createPostgresState } from '@chat-adapter/state-pg'
 import pg from 'pg'
 import {
-  codexAppServerToChatSdkStream,
+  harnessToChatSdkStream,
   EMPTY_FINAL_ANSWER_TEXT,
   type CodexAppServerToChatStreamOptions,
   type ChatSDKStreamChunk,
@@ -52,7 +52,7 @@ import {
   type SlackContextBlock
 } from './console-session-link'
 import { resolveChannelDefault } from './channel-defaults'
-import { type HarnessOverrides } from './overrides'
+import { extractMessageOverrides, type HarnessOverrides } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import {
   isAllowedSlackMessage,
@@ -196,6 +196,10 @@ function stickyThreadOverrideUpdate(
     if (!overrides.model) update.model = null
   }
   return Object.keys(update).length > 0 ? update : undefined
+}
+
+function hasStickyThreadOverride(overrides: StickyThreadOverrides): boolean {
+  return Boolean(overrides.harnessType || overrides.model || overrides.provider)
 }
 
 function resolveStickyThreadOverrides(
@@ -904,6 +908,9 @@ async function syncThreadMessageToSession(
 
   const serializeStartedAtMs = nowMs()
   const serializedMessage = await serializeMessage(message, input.options)
+  // Inspect the original text before the strategy strips recognized flags.
+  // This is the authority for whether a sticky thread selection may change.
+  const explicitOverrides = extractMessageOverrides(serializedMessage.text)
   const messageOverrides =
     input.resolvedMessageOverrides ??
     (input.resolvedMessageOverrides = await messageOverridesForText(
@@ -915,7 +922,23 @@ async function syncThreadMessageToSession(
     setMessageText(serializedMessage, messageOverrides.cleanedText)
   }
   const overrides = messageOverrides.overrides
-  const stickyOverridesUpdate = stickyThreadOverrideUpdate(overrides)
+  const requestedStickyOverrides = stickyThreadOverrideUpdate(overrides)
+  // Once a thread is pinned, only another explicit flag may move it. The LLM
+  // strategy can still infer per-turn reasoning, but a false-positive harness,
+  // model, or provider selection must not replace --claude/--amp/--codex/
+  // --nanocodex state.
+  const preserveStickyOverrides = Boolean(
+    requestedStickyOverrides &&
+      hasStickyThreadOverride(state) &&
+      !hasStickyThreadOverride(explicitOverrides)
+  )
+  const stickyOverridesUpdate = preserveStickyOverrides ? undefined : requestedStickyOverrides
+  if (preserveStickyOverrides) {
+    traceLog(input.options, 'slackbotv2_forward_sticky_overrides_preserved', trace, {
+      pinned_harness_type: state.harnessType,
+      requested_harness_type: requestedStickyOverrides?.harnessType
+    })
+  }
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
   // Slack-only "Open chat in Console" link on the FIRST assistant message in
   // a thread (the reply to the first message that starts an execution). The
@@ -1527,7 +1550,7 @@ async function renderFallbackFinalAnswer(
     const fallback = new SlackRenderFallback()
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
-        codexAppServerToChatSdkStream(
+        harnessToChatSdkStream(
           fallback.collectSource(stream),
           fallbackRendererOptions(options)
         )
@@ -2310,7 +2333,7 @@ async function renderExecutionStream(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
-            codexAppServerToChatSdkStream(
+            harnessToChatSdkStream(
               stream,
               rendererOptions(thread, options, capture, trace)
             ),
@@ -2365,7 +2388,7 @@ async function renderRecoveredExecutionStream(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
-            codexAppServerToChatSdkStream(
+            harnessToChatSdkStream(
               stream,
               rendererOptions(thread, options, capture, trace)
             ),
@@ -2416,7 +2439,7 @@ async function renderPlainTextExecutionStream(
   try {
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
-        codexAppServerToChatSdkStream(
+        harnessToChatSdkStream(
           fallback.collectSource(stream),
           rendererOptions(thread, options, undefined, trace)
         )
