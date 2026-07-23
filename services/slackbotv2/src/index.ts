@@ -152,6 +152,8 @@ const LATE_SLACK_FILE_IDLE_POLL_MS = 500
 const LATE_SLACK_FILE_MESSAGE_TEXT = 'Late Slack file attachment for the previous message.'
 const SLACK_BLOCK_ACTION_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000
 const SLACK_BLOCK_ACTION_LEASE_TTL_MS = 60 * 1000
+const GITHUB_PULL_REQUEST_URL_PATTERN =
+  /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/i
 
 type PendingLateSlackFileMention = {
   channel: string
@@ -337,16 +339,20 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   // app_mention events. Alertmanager uses attachment.pretext, so inspect rich
   // payloads after Chat SDK has verified the webhook and before executing.
   chat.onNewMessage(/^.*$/s, async (thread, message) => {
-    if (!slackRichTextMentionsUser(message.raw, options.botUserId)) return
+    const richMention = slackRichTextMentionsUser(message.raw, options.botUserId)
+    const prRegistration = slackMessageHasPullRequest(message)
+    if (!richMention && !prRegistration) return
     if (!(await isAllowedSlackMessage(message, options, logger))) return
+    // PR registrations use the durable mention index, while append mode ensures
+    // the marker never starts an agent execution.
     message.isMention = true
     await handleSlackMessageHandoff(thread, message, {
-      assistantStatusRequested: true,
-      mode: 'execute',
+      assistantStatusRequested: richMention,
+      mode: richMention ? 'execute' : 'append',
       options,
       state,
       subscribe: true,
-      trigger: 'new_mention'
+      trigger: richMention ? 'new_mention' : 'pr_registration'
     })
   })
 
@@ -3015,6 +3021,15 @@ function isSlackThreadReply(message: ChatMessage): boolean {
   const threadTs = typeof item.thread_ts === 'string' ? item.thread_ts : ''
   const ts = typeof item.ts === 'string' ? item.ts : message.id
   return Boolean(threadTs && ts && threadTs !== ts)
+}
+
+function slackMessageHasPullRequest(message: ChatMessage): boolean {
+  if (GITHUB_PULL_REQUEST_URL_PATTERN.test(message.text)) return true
+  return Boolean(
+    serializeMessageLinks(message.links, message.raw)?.some(link =>
+      GITHUB_PULL_REQUEST_URL_PATTERN.test(link.url)
+    )
+  )
 }
 
 async function collectSlackThreadContext(
