@@ -30,6 +30,7 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--claude-code review this').harnessType).toBe('claudecode')
     expect(extractMessageOverrides('--amp review this').harnessType).toBe('amp')
     expect(extractMessageOverrides('--codex review this').harnessType).toBe('codex')
+    expect(extractMessageOverrides('--nanocodex review this').harnessType).toBe('nanocodex')
   })
 
   test('parses harness flag anywhere in the message', () => {
@@ -347,6 +348,12 @@ describe('validateStrategyOverrides', () => {
   })
 
   test('canonical strategy model ids imply their compatible harness', () => {
+    expect(validateStrategyOverrides({ model: 'claude-opus-4-7' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-7',
+      provider: undefined,
+      reasoning: undefined
+    })
     expect(
       validateStrategyOverrides({
         model: 'claude-opus-4-8'
@@ -491,6 +498,66 @@ describe('messageOverridesForText strategy invocation', () => {
         trace
       )
     ).resolves.toEqual({ overrides: {} })
+  })
+
+  test('handles --nanocodex deterministically before the OpenAI strategy', async () => {
+    let requestCount = 0
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async () => {
+        requestCount += 1
+        throw new Error('the explicit flag must not call the strategy model')
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(strategy({ text: '--nanocodex review this' })).resolves.toEqual({
+      cleanedText: 'review this',
+      overrides: {
+        harnessType: 'nanocodex',
+        model: undefined,
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    expect(requestCount).toBe(0)
+  })
+
+  test('allows the OpenAI strategy to select nanocodex from natural language', async () => {
+    let requestBody: Record<string, unknown> | undefined
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return Response.json({
+          output: [
+            {
+              content: [
+                {
+                  text: JSON.stringify({
+                    harness: 'nanocodex',
+                    model: null,
+                    provider: null,
+                    reasoning: null
+                  })
+                }
+              ]
+            }
+          ]
+        })
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(strategy({ text: 'use nanocodex for this' })).resolves.toEqual({
+      overrides: {
+        harnessType: 'nanocodex',
+        model: undefined,
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    expect(JSON.stringify(requestBody)).toContain('nanocodex')
   })
 })
 
