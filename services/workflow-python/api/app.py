@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 
-_ACTIVE_RPC: ContextVar[Any | None] = ContextVar("centaur_workflow_active_rpc", default=None)
+_ACTIVE_RPC: ContextVar[Any | None] = ContextVar(
+    "centaur_workflow_active_rpc", default=None
+)
+DEFAULT_TOOL_TIMEOUT_SECONDS = 300
+MAX_TOOL_TIMEOUT_SECONDS = 3_600
 
 
 def bind_context_rpc(rpc: Any) -> Token[Any | None]:
@@ -47,6 +51,7 @@ async def call_tool_shim(
     tool: str,
     method: str,
     args: dict[str, Any],
+    timeout_seconds: int,
 ) -> Any:
     proc = await asyncio.create_subprocess_exec(
         tool_shim,
@@ -57,7 +62,16 @@ async def call_tool_shim(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_seconds
+        )
+    except TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(
+            f"centaur-tools call {tool}.{method} timed out after {timeout_seconds}s"
+        ) from exc
     text = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
     if proc.returncode != 0:
@@ -77,10 +91,15 @@ class WorkflowToolManager:
         tool: str,
         method: str,
         args: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: int | None = None,
     ) -> Any:
+        timeout_seconds = normalize_tool_timeout(timeout_seconds)
         tool_shim = resolve_tool_shim()
         if tool_shim is not None:
-            return await call_tool_shim(tool_shim, tool, method, args or {})
+            return await call_tool_shim(
+                tool_shim, tool, method, args or {}, timeout_seconds
+            )
         if self._rpc is not None:
             return await self._rpc.request(
                 {
@@ -88,6 +107,7 @@ class WorkflowToolManager:
                     "tool": tool,
                     "method": method,
                     "args": args or {},
+                    "timeout_seconds": timeout_seconds,
                 }
             )
         raise RuntimeError(
@@ -99,8 +119,24 @@ class WorkflowToolManager:
         tool: str,
         method: str,
         args: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: int | None = None,
     ) -> Any:
-        return await self.call_tool_raw(tool, method, args)
+        return await self.call_tool_raw(
+            tool, method, args, timeout_seconds=timeout_seconds
+        )
+
+
+def normalize_tool_timeout(timeout_seconds: int | None) -> int:
+    if timeout_seconds is None:
+        return DEFAULT_TOOL_TIMEOUT_SECONDS
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
+        raise TypeError("timeout_seconds must be an integer")
+    if not 1 <= timeout_seconds <= MAX_TOOL_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout_seconds must be between 1 and {MAX_TOOL_TIMEOUT_SECONDS}"
+        )
+    return timeout_seconds
 
 
 def get_tool_manager() -> WorkflowToolManager:
@@ -115,7 +151,9 @@ class WorkflowToolMethod:
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if args and kwargs:
-            raise TypeError("tool method calls accept either one dict positional arg or keywords")
+            raise TypeError(
+                "tool method calls accept either one dict positional arg or keywords"
+            )
         if not args:
             payload = kwargs
         elif len(args) == 1 and isinstance(args[0], dict):

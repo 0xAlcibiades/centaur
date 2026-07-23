@@ -14,7 +14,9 @@ from unittest.mock import patch
 def load_workflow_host():
     module_path = Path(__file__).resolve().parents[1] / "workflow_host.py"
     sys.path.insert(0, str(module_path.parent))
-    spec = importlib.util.spec_from_file_location("workflow_host_under_test", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "workflow_host_under_test", module_path
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -156,6 +158,25 @@ class WorkflowHostTests(unittest.TestCase):
             {"tool": "demo", "method": "method", "args": {"x": 1}, "via": "rpc"},
         )
 
+    def test_call_tool_forwards_bounded_timeout(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        from api import app as workflow_app
+
+        with patch.object(workflow_app, "resolve_tool_shim", return_value=None):
+            asyncio.run(ctx.call_tool("demo", "method", {"x": 1}, timeout_seconds=45))
+
+        self.assertEqual(rpc.requests[-1]["timeout_seconds"], 45)
+        with self.assertRaises(ValueError):
+            asyncio.run(ctx.call_tool("demo", "method", {"x": 1}, timeout_seconds=0))
+
     def test_run_agent_accepts_positional_step_name_with_text(self) -> None:
         host = load_workflow_host()
         rpc = RequestRpc()
@@ -255,7 +276,9 @@ class WorkflowHostTests(unittest.TestCase):
         fake_asyncpg = types.SimpleNamespace(create_pool=create_pool)
 
         with (
-            patch.dict(os.environ, {"DATABASE_URL": "postgresql://example/db"}, clear=False),
+            patch.dict(
+                os.environ, {"DATABASE_URL": "postgresql://example/db"}, clear=False
+            ),
             patch.dict(sys.modules, {"asyncpg": fake_asyncpg}),
             patch.object(host.asyncio, "sleep", sleep),
         ):

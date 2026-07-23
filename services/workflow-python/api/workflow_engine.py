@@ -5,7 +5,12 @@ import datetime as dt
 import inspect
 from typing import Any
 
-from api.app import WorkflowToolManager, WorkflowTools, bind_context_rpc, reset_context_rpc
+from api.app import (
+    WorkflowToolManager,
+    WorkflowTools,
+    bind_context_rpc,
+    reset_context_rpc,
+)
 
 
 @dataclasses.dataclass
@@ -109,14 +114,20 @@ class WorkflowContext:
             args.setdefault("text", text)
         return await self._rpc.request({"type": "ctx.agent_turn", "args": args})
 
-    async def run_agent(self, *args: Any, text: str | None = None, **kwargs: Any) -> Any:
+    async def run_agent(
+        self, *args: Any, text: str | None = None, **kwargs: Any
+    ) -> Any:
         if args:
             kwargs.setdefault("name", args[0])
             if len(args) > 1:
-                raise TypeError("run_agent accepts at most one positional name argument")
+                raise TypeError(
+                    "run_agent accepts at most one positional name argument"
+                )
         return await self.agent_turn(text, **kwargs)
 
-    async def start_agent(self, *args: Any, text: str | None = None, **kwargs: Any) -> Any:
+    async def start_agent(
+        self, *args: Any, text: str | None = None, **kwargs: Any
+    ) -> Any:
         return await self.run_agent(*args, text=text, **kwargs)
 
     async def start_workflow(
@@ -136,8 +147,17 @@ class WorkflowContext:
             request["idempotency_key"] = idempotency_key
         return await self._rpc.request(request)
 
-    async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
-        return await WorkflowToolManager(self._rpc).call_tool_raw(tool, method, args or {})
+    async def call_tool(
+        self,
+        tool: str,
+        method: str,
+        args: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> Any:
+        return await WorkflowToolManager(self._rpc).call_tool_raw(
+            tool, method, args or {}, timeout_seconds=timeout_seconds
+        )
 
     async def post_to_slack(self, channel: str, text: str, **kwargs: Any) -> Any:
         return await self._rpc.request(
