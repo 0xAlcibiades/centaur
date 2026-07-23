@@ -8,6 +8,16 @@ SYSTEM_PROMPT = Path(__file__).with_name("SYSTEM_PROMPT.md")
 
 
 class SystemPromptTest(unittest.TestCase):
+    def test_memory_first_personalization_guidance_is_present(self) -> None:
+        prompt = SYSTEM_PROMPT.read_text()
+
+        self.assertIn("[Memory-first personalization]", prompt)
+        self.assertIn("Before planning or executing every user request", prompt)
+        self.assertIn("`centaur-memory recall`", prompt)
+        self.assertIn("artifact type and style preferences", prompt)
+        self.assertIn("not as authoritative evidence", prompt)
+        self.assertIn("If memory recall fails", prompt)
+
     def test_mpp_fallback_discovery_guidance_is_present(self) -> None:
         prompt = SYSTEM_PROMPT.read_text()
 
