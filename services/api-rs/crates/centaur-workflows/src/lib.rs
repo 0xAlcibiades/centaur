@@ -8,8 +8,8 @@ use std::{
 };
 
 use absurd::{
-    Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy, SpawnOptions, StepHandle,
-    TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
+    CancellationPolicy, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
+    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
 };
 use centaur_iron_control::{IdentityInput, IronControlClient, IronControlError, slugify};
 use centaur_sandbox_core::SandboxSpec;
@@ -45,6 +45,9 @@ pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const WORKFLOW_TOOL_TIMEOUT_SECS_ENV: &str = "WORKFLOW_TOOL_TIMEOUT_SECS";
+const DEFAULT_WORKFLOW_TOOL_TIMEOUT_SECS: u64 = 300;
+const MAX_WORKFLOW_TOOL_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
@@ -474,6 +477,18 @@ pub struct RegisteredWorkflowSchedule {
     pub enabled: bool,
     #[serde(default)]
     pub no_delivery: bool,
+    #[serde(default)]
+    pub overlap_policy: WorkflowScheduleOverlapPolicy,
+    #[serde(default)]
+    pub max_duration_seconds: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowScheduleOverlapPolicy {
+    #[default]
+    Allow,
+    Skip,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1438,6 +1453,31 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
     }
     let enabled = schedule_bool(object.get("enabled"), true);
     let no_delivery = schedule_bool(object.get("no_delivery"), false);
+    let overlap_policy = match object
+        .get("overlap_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("allow")
+        .trim()
+    {
+        "allow" => WorkflowScheduleOverlapPolicy::Allow,
+        "skip" => WorkflowScheduleOverlapPolicy::Skip,
+        value => {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflow schedule {schedule_id:?} has invalid overlap_policy {value:?}"
+            )));
+        }
+    };
+    let max_duration_seconds = match object.get("max_duration_seconds") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64() {
+            Some(seconds) if seconds > 0 => Some(seconds),
+            _ => {
+                return Err(WorkflowRuntimeError::BadRequest(format!(
+                    "workflow schedule {schedule_id:?} max_duration_seconds must be a positive integer"
+                )));
+            }
+        },
+    };
     let timezone = object
         .get("timezone")
         .and_then(Value::as_str)
@@ -1478,6 +1518,8 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
         input,
         enabled,
         no_delivery,
+        overlap_policy,
+        max_duration_seconds,
     })
 }
 
@@ -2362,12 +2404,37 @@ async fn run_schedule_tick(
         schedule.schedule_id,
         input.scheduled_at.to_rfc3339()
     );
-    let target_client = match workflow_queue_class(&schedule.workflow_name) {
+    let queue_class = workflow_queue_class(&schedule.workflow_name);
+    let target_client = match queue_class {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
         WorkflowQueueClass::Etl => &workflow_clients.etl,
         WorkflowQueueClass::EtlBackfill => &workflow_clients.etl_backfill,
     };
+    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
+        .map_err(absurd_error)?;
+    if schedule.overlap_policy == WorkflowScheduleOverlapPolicy::Skip
+        && has_active_workflow_task(
+            target_client,
+            queue_name_for_class(queue_class),
+            &schedule.workflow_name,
+        )
+        .await
+        .map_err(absurd_error)?
+    {
+        spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
+            .await
+            .map_err(absurd_error)?;
+        return Ok(json!({
+            "schedule_id": schedule.schedule_id,
+            "workflow_name": schedule.workflow_name,
+            "scheduled_at": input.scheduled_at.to_rfc3339(),
+            "fire_key": fire_key,
+            "skipped": true,
+            "reason": "overlap",
+            "next_run_at": next_run_at.to_rfc3339(),
+        }));
+    }
     let workflow_spawn = target_client
         .spawn(
             WORKFLOW_TASK,
@@ -2378,12 +2445,16 @@ async fn run_schedule_tick(
             },
             SpawnOptions {
                 idempotency_key: Some(fire_key.clone()),
+                cancellation: schedule.max_duration_seconds.map(|max_duration| {
+                    CancellationPolicy {
+                        max_duration: Some(max_duration),
+                        max_delay: None,
+                    }
+                }),
                 ..SpawnOptions::default()
             },
         )
         .await?;
-    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
-        .map_err(absurd_error)?;
     spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
         .await
         .map_err(absurd_error)?;
@@ -2397,6 +2468,29 @@ async fn run_schedule_tick(
         "workflow_created": workflow_spawn.created,
         "next_run_at": next_run_at.to_rfc3339(),
     }))
+}
+
+async fn has_active_workflow_task(
+    client: &Client,
+    queue_name: &str,
+    workflow_name: &str,
+) -> Result<bool, WorkflowRuntimeError> {
+    let (task_table, _) = absurd_queue_tables(queue_name)?;
+    let row = sqlx::query(&format!(
+        r#"
+        select 1
+        from {task_table} t
+        where t.task_name = $1
+          and t.params->>'workflow_name' = $2
+          and t.state not in {ABSURD_TERMINAL_TASK_STATES}
+        limit 1
+        "#,
+    ))
+    .bind(WORKFLOW_TASK)
+    .bind(workflow_name)
+    .fetch_optional(client.pool())
+    .await?;
+    Ok(row.is_some())
 }
 
 async fn ensure_schedule_tick(
@@ -3670,6 +3764,27 @@ fn run_time_now_tool() -> ToolResult {
     }
 }
 
+fn workflow_tool_timeout(message: &Value) -> Result<Duration, WorkflowRuntimeError> {
+    let seconds = if let Some(value) = message.get("timeout_seconds") {
+        value.as_u64().ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.call_tool timeout_seconds must be a positive integer".to_owned(),
+            )
+        })?
+    } else {
+        env::var(WORKFLOW_TOOL_TIMEOUT_SECS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WORKFLOW_TOOL_TIMEOUT_SECS)
+    };
+    if !(1..=MAX_WORKFLOW_TOOL_TIMEOUT_SECS).contains(&seconds) {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "ctx.call_tool timeout_seconds must be between 1 and {MAX_WORKFLOW_TOOL_TIMEOUT_SECS}"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRuntimeError> {
     let tool = message
         .get("tool")
@@ -3700,7 +3815,11 @@ async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRun
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/tools/{tool}/{method}");
     let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-    let request = reqwest::Client::new().post(&url).json(&args);
+    let request = reqwest::Client::builder()
+        .timeout(workflow_tool_timeout(message)?)
+        .build()?
+        .post(&url)
+        .json(&args);
     let response = request.send().await?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
@@ -4156,6 +4275,19 @@ mod tests {
     }
 
     #[test]
+    fn workflow_tool_timeout_accepts_bounded_per_call_override() {
+        assert_eq!(
+            workflow_tool_timeout(&json!({"timeout_seconds": 42})).unwrap(),
+            Duration::from_secs(42)
+        );
+        assert!(workflow_tool_timeout(&json!({"timeout_seconds": 0})).is_err());
+        assert!(
+            workflow_tool_timeout(&json!({"timeout_seconds": MAX_WORKFLOW_TOOL_TIMEOUT_SECS + 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn normalizes_interval_schedule_with_delivery_metadata() {
         let schedule = normalize_schedule(json!({
             "workflow_name": "slack_sync",
@@ -4170,12 +4302,48 @@ mod tests {
         assert!(schedule.enabled);
         assert!(schedule.no_delivery);
         assert_eq!(
+            schedule.overlap_policy,
+            WorkflowScheduleOverlapPolicy::Allow
+        );
+        assert_eq!(schedule.max_duration_seconds, None);
+        assert_eq!(
             schedule.input.pointer("/metadata/source"),
             Some(&json!("workflow_schedule"))
         );
         assert_eq!(
             schedule.input.pointer("/metadata/no_delivery"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn normalizes_schedule_execution_bounds() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "pr_status_monitor",
+            "schedule_id": "pr_status_monitor",
+            "cron": "* 9-21 * * *",
+            "overlap_policy": "skip",
+            "max_duration_seconds": 55,
+        }))
+        .unwrap();
+
+        assert_eq!(schedule.overlap_policy, WorkflowScheduleOverlapPolicy::Skip);
+        assert_eq!(schedule.max_duration_seconds, Some(55));
+        assert!(
+            normalize_schedule(json!({
+                "workflow_name": "invalid_overlap",
+                "interval_seconds": 60,
+                "overlap_policy": "queue",
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_schedule(json!({
+                "workflow_name": "invalid_duration",
+                "interval_seconds": 60,
+                "max_duration_seconds": 0,
+            }))
+            .is_err()
         );
     }
 
