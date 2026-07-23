@@ -287,6 +287,69 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(1)
   })
 
+  it('durably registers human PR pings and subscribes for acknowledgement', async () => {
+    const parent = await postUserMessage('Review thread context.')
+    const prText =
+      '@reviewer <https://github.com/example/repository/pull/42|example/repository#42>'
+    const prMessage = await postUserMessage(prText, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-pr-registration',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: prMessage.ts,
+          thread_ts: parent.ts,
+          text: prText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.appends[0]!.threadKey).toBe(threadKey(parent.ts))
+    expect(codexApi.appends[0]!.body.messages[0]?.metadata).toEqual(
+      expect.objectContaining({ is_mention: true, source: 'slackbotv2' })
+    )
+
+    const ack = await postUserMessage('ack', parent.ts)
+    const ackWaits: Promise<unknown>[] = []
+    const ackResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-pr-ack',
+        event: {
+          type: 'message',
+          user: 'U_REVIEWER',
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: ack.ts,
+          thread_ts: parent.ts,
+          text: 'ack'
+        }
+      }),
+      {},
+      waitUntilContext(ackWaits)
+    )
+
+    expect(ackResponse.status).toBe(200)
+    await Promise.all(ackWaits)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(2)
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual(['ack'])
+    expect(codexApi.appends[1]!.body.messages[0]?.metadata).toEqual(
+      expect.objectContaining({ is_mention: false, source: 'slackbotv2' })
+    )
+  })
+
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
     const parent = await postUserMessage('The deploy context is above.')
     const firstMention = await postUserMessage(
