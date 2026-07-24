@@ -85,7 +85,7 @@ const STRATEGY_REASONING_EFFORTS = new Set([
 ])
 
 const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
-  'anthropic/claude-opus-5-fast': 'codex',
+  'claude-opus-5-fast': 'claudecode',
   'claude-fable-5': 'claudecode',
   'claude-haiku-4-5': 'claudecode',
   'claude-opus-4-7': 'claudecode',
