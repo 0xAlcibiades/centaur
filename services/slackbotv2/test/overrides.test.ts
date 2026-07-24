@@ -348,6 +348,12 @@ describe('validateStrategyOverrides', () => {
   })
 
   test('canonical strategy model ids imply their compatible harness', () => {
+    expect(validateStrategyOverrides({ model: 'anthropic/claude-opus-5-fast' })).toEqual({
+      harnessType: 'codex',
+      model: 'anthropic/claude-opus-5-fast',
+      provider: undefined,
+      reasoning: undefined
+    })
     expect(validateStrategyOverrides({ model: 'claude-opus-4-7' })).toEqual({
       harnessType: 'claudecode',
       model: 'claude-opus-4-7',
