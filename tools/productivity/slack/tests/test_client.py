@@ -1182,6 +1182,32 @@ def test_get_thread_replies_page_uses_bounded_default() -> None:
     assert result["continuation_available"] is False
 
 
+def test_get_thread_replies_page_can_skip_user_cache() -> None:
+    client, fake_web_client = _make_client()
+
+    def fail_user_cache():
+        raise AssertionError("user cache should not be loaded")
+
+    client._get_user_cache = fail_user_cache  # type: ignore[method-assign]
+    fake_web_client.reply_pages = [
+        {
+            "messages": [
+                {"user": "U1", "text": "ACK", "ts": "100.000001"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+    ]
+
+    result = client.get_thread_replies_page(
+        "C123",
+        "100.000000",
+        resolve_users=False,
+    )
+
+    assert result["messages"][0]["text"] == "ACK"
+    assert result["messages"][0]["user_id"] == "U1"
+
+
 def test_dump_channel_with_threads_limits_thread_expansion() -> None:
     client, fake_web_client = _make_client()
     client._get_user_cache = lambda: {}  # type: ignore[method-assign]

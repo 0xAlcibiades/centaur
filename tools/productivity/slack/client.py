@@ -1311,9 +1311,10 @@ class SlackClient:
         oldest: str | int | float | None = None,
         latest: str | int | float | None = None,
         inclusive: bool = True,
+        resolve_users: bool = True,
     ) -> dict[str, Any]:
         """Fetch a resumable page of thread replies for ETL-style sync jobs."""
-        user_cache = self._get_user_cache()
+        user_cache = self._get_user_cache() if resolve_users else {}
         channel_id = self._resolve_channel(channel)
         normalized_oldest = self._normalize_ts(oldest)
         normalized_latest = self._normalize_ts(latest)
