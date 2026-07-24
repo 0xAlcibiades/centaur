@@ -4520,6 +4520,7 @@ fn first_token_latency(
 struct StdoutPumpState {
     final_answer_text_by_execution: HashMap<String, String>,
     first_token_recorded_by_execution: HashSet<String>,
+    root_thread_id_by_execution: HashMap<String, String>,
     turn_execution_by_id: HashMap<String, String>,
     item_execution_by_id: HashMap<String, String>,
     tool_call_by_id: HashMap<String, ToolCallLabels>,
@@ -4537,6 +4538,7 @@ impl StdoutPumpState {
         };
 
         if let Some(known_execution_id) = self.known_execution_for_value(&value) {
+            self.remember_root_thread_id(&value, &known_execution_id);
             if active_execution_id == Some(known_execution_id.as_str()) {
                 self.remember_value_execution(&value, &known_execution_id);
                 return Some(known_execution_id);
@@ -4556,12 +4558,17 @@ impl StdoutPumpState {
         }
 
         let active_execution_id = active_execution_id?;
+        self.remember_root_thread_id(&value, active_execution_id);
         self.remember_value_execution(&value, active_execution_id);
         Some(active_execution_id.to_owned())
     }
 
     fn observe(&mut self, execution_id: &str, line: &str) -> Option<TerminalOutput> {
         let value: Value = serde_json::from_str(line).ok()?;
+        self.remember_root_thread_id(&value, execution_id);
+        if !self.is_root_thread_event(execution_id, &value) {
+            return None;
+        }
         if let Some(update) = output_line_final_answer_text(&value) {
             let text = self
                 .final_answer_text_by_execution
@@ -4596,6 +4603,9 @@ impl StdoutPumpState {
         let Some(value) = value else {
             return false;
         };
+        if !self.is_root_thread_event(execution_id, value) {
+            return false;
+        }
         if output_line_final_answer_text(value).is_some() {
             return true;
         }
@@ -4616,6 +4626,7 @@ impl StdoutPumpState {
     fn forget(&mut self, execution_id: &str) {
         self.final_answer_text_by_execution.remove(execution_id);
         self.first_token_recorded_by_execution.remove(execution_id);
+        self.root_thread_id_by_execution.remove(execution_id);
         let tool_ids_to_forget = self
             .item_execution_by_id
             .iter()
@@ -4685,6 +4696,20 @@ impl StdoutPumpState {
             self.item_execution_by_id
                 .insert(item_id, execution_id.to_owned());
         }
+    }
+
+    fn remember_root_thread_id(&mut self, value: &Value, execution_id: &str) {
+        if let Some(thread_id) = root_thread_id_from_output(value) {
+            self.root_thread_id_by_execution
+                .entry(execution_id.to_owned())
+                .or_insert(thread_id);
+        }
+    }
+
+    fn is_root_thread_event(&self, execution_id: &str, value: &Value) -> bool {
+        self.root_thread_id_by_execution
+            .get(execution_id)
+            .is_none_or(|thread_id| output_belongs_to_thread(value, thread_id))
     }
 }
 
@@ -6546,6 +6571,11 @@ fn is_transient_steering_startup_error(error: &SessionRuntimeError) -> bool {
 
 fn harness_thread_id_from_output_line(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
+    root_thread_id_from_output(&value)
+}
+
+fn root_thread_id_from_output(value: &Value) -> Option<String> {
+    let method = value.get("method").and_then(Value::as_str);
     let event_type = value.get("type").and_then(Value::as_str);
     if event_type == Some("run.started") {
         return value
@@ -6554,6 +6584,9 @@ fn harness_thread_id_from_output_line(line: &str) -> Option<String> {
             .map(str::trim)
             .filter(|request_id| !request_id.is_empty())
             .map(ToOwned::to_owned);
+    }
+    if method == Some("thread/started") {
+        return string_at_path(value, &["params", "thread", "id"]);
     }
     if event_type != Some("thread.started") {
         return None;
@@ -6565,6 +6598,18 @@ fn harness_thread_id_from_output_line(line: &str) -> Option<String> {
         .map(str::trim)
         .filter(|thread_id| !thread_id.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn output_belongs_to_thread(value: &Value, root_thread_id: &str) -> bool {
+    let event_thread_id = [
+        &["thread_id"][..],
+        &["threadId"][..],
+        &["params", "threadId"][..],
+        &["params", "thread", "id"][..],
+    ]
+    .into_iter()
+    .find_map(|path| string_at_path(value, path));
+    event_thread_id.is_none_or(|thread_id| thread_id == root_thread_id)
 }
 
 fn validate_input_lines(lines: &[String]) -> Result<(), SessionRuntimeError> {
@@ -6767,11 +6812,21 @@ fn max_duration_from_execution(execution: &SessionExecution) -> Option<Duration>
 /// returning the first terminal outcome (with its accumulated final answer)
 /// if the recorded history already contains the end of the turn.
 fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
+    let mut root_thread_id = None;
     let mut final_answer_text = String::new();
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if root_thread_id.is_none() {
+            root_thread_id = root_thread_id_from_output(&value);
+        }
+        if root_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| !output_belongs_to_thread(&value, thread_id))
+        {
+            continue;
+        }
         if let Some(update) = output_line_final_answer_text(&value) {
             match update {
                 FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
@@ -7740,6 +7795,52 @@ mod tests {
     }
 
     #[test]
+    fn stdout_state_waits_for_root_turn_after_subagent_completion() {
+        let lines = [
+            r#"{"method":"thread/started","params":{"thread":{"id":"root-thread"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"root-turn"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"id":"child-answer","type":"agentMessage","phase":"final_answer","text":"Child answer."}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"id":"root-answer","type":"agentMessage","phase":"final_answer","text":"Root answer."}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed"}}}"#,
+        ];
+        let mut state = StdoutPumpState::default();
+
+        for line in &lines[..5] {
+            assert_eq!(
+                state.execution_for_line(Some("exe-1"), line),
+                Some("exe-1".to_owned())
+            );
+            assert_eq!(state.observe("exe-1", line), None);
+        }
+        let child_only = lines[..5]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_output_from_lines(&child_only), None);
+
+        assert_eq!(
+            state.execution_for_line(Some("exe-1"), lines[5]),
+            Some("exe-1".to_owned())
+        );
+        assert_eq!(state.observe("exe-1", lines[5]), None);
+        assert_eq!(
+            state.execution_for_line(Some("exe-1"), lines[6]),
+            Some("exe-1".to_owned())
+        );
+        let expected = Some(TerminalOutput::Completed {
+            reason: "turn_completed",
+            result_text: Some("Root answer.".to_owned()),
+        });
+        assert_eq!(state.observe("exe-1", lines[6]), expected);
+        assert_eq!(
+            terminal_output_from_lines(&lines.map(str::to_owned)),
+            expected
+        );
+    }
+
+    #[test]
     fn steering_input_lines_forward_only_user_messages() {
         let thread_key = ThreadKey::parse("cli:test-steering").unwrap();
         let messages = vec![
@@ -7782,6 +7883,12 @@ mod tests {
                 r#"{"type":"thread.started","threadId":"codex-thread-2"}"#
             ),
             Some("codex-thread-2".to_owned())
+        );
+        assert_eq!(
+            harness_thread_id_from_output_line(
+                r#"{"method":"thread/started","params":{"thread":{"id":"codex-thread-3"}}}"#
+            ),
+            Some("codex-thread-3".to_owned())
         );
         assert_eq!(
             harness_thread_id_from_output_line(r#"{"type":"turn.started","turn_id":"turn-1"}"#),
