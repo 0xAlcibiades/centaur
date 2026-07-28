@@ -27,8 +27,14 @@
   <div class="space-y-5 text-sm">
     <div>
       <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requester</div>
-      <div class="text-zinc-100"><%= @permission_request.requesting_slack_channel_id %></div>
-      <div class="mt-1 text-xs text-zinc-500"><%= @permission_request.requesting_principal&.name.presence || @permission_request.requesting_principal_id %></div>
+      <% if @permission_request.requesting_principal %>
+        <%= link_to @permission_request.requesting_principal.name.presence || @permission_request.requesting_principal.oid,
+                    console_principal_path(@permission_request.requesting_principal.oid),
+                    class: "text-zinc-100 underline decoration-zinc-600 underline-offset-4 hover:text-white hover:decoration-zinc-300" %>
+      <% else %>
+        <div class="text-zinc-100"><%= @permission_request.requesting_principal_id %></div>
+      <% end %>
+      <div class="mt-1 text-xs text-zinc-500"><%= @permission_request.requesting_slack_channel_id %></div>
     </div>
 
     <div>

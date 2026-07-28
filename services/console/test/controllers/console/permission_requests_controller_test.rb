@@ -36,6 +36,17 @@ module Console
       assert_redirected_to console_threads_path
     end
 
+    test "show links to requesting principal" do
+      sign_in users(:acme_admin)
+
+      get console_permission_request_url(@permission_request.oid)
+
+      assert_response :ok
+      assert_select "a[href=?]", console_principal_path(principals(:acme_channel).oid),
+                    text: principals(:acme_channel).oid
+      assert_select "div", text: "C0123456789"
+    end
+
     test "approve records decision and enqueues Slack updates without granting permissions" do
       sign_in users(:acme_admin)
 

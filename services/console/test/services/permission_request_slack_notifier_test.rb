@@ -25,8 +25,24 @@ class PermissionRequestSlackNotifierTest < ActiveSupport::TestCase
 
     text = PermissionRequestSlackNotifier.approver_notification_text(permission_request, "https://console.test/request")
 
+    assert_includes text, "Requester: <#C0123456789>"
     assert_includes text, "Request:\n```Please authorize Gmail.```"
     assert_includes text, "Review in Console: <https://console.test/request|Open request>"
+  end
+
+  test "decided approver notification links requester channel" do
+    permission_request = PermissionRequest.new(
+      kind: PermissionRequest::TEXT_KIND,
+      requesting_slack_channel_id: "C0123456789",
+      metadata: { "request" => "Please authorize Gmail." },
+      status: "approved",
+      decided_by: users(:acme_admin),
+      decided_at: Time.utc(2026, 7, 28, 20, 0, 0)
+    )
+
+    text = PermissionRequestSlackNotifier.decided_approver_notification_text(permission_request)
+
+    assert_includes text, "Requester: <#C0123456789>"
   end
 
   test "code block formatting prevents embedded triple backtick breakout" do

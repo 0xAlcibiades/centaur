@@ -61,7 +61,7 @@ class PermissionRequestSlackNotifier
   def self.approver_notification_text(permission_request, review_url)
     [
       "*Permission Request*",
-      "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
+      "Requester: #{slack_channel_link(permission_request.requesting_slack_channel_id)}",
       "Request:",
       slack_code_block(permission_request.text_request),
       "Review in Console: <#{review_url}|Open request>"
@@ -71,7 +71,7 @@ class PermissionRequestSlackNotifier
   def self.decided_approver_notification_text(permission_request)
     [
       "*Permission Request #{permission_request.decision_label}*",
-      "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
+      "Requester: #{slack_channel_link(permission_request.requesting_slack_channel_id)}",
       "Request:",
       slack_code_block(permission_request.text_request),
       "Decision: #{permission_request.decision_label} by #{slack_escape(permission_request.decided_by.email)} at #{permission_request.decided_at.utc.iso8601}"
@@ -143,4 +143,12 @@ class PermissionRequestSlackNotifier
     "```#{slack_escape(value).gsub("```", "` ` `")}```"
   end
   private_class_method :slack_code_block
+
+  def self.slack_channel_link(channel_id)
+    value = channel_id.to_s.strip.upcase
+    return slack_escape(channel_id) unless value.match?(Principal::SLACK_CHANNEL_ID_FORMAT)
+
+    "<##{value}>"
+  end
+  private_class_method :slack_channel_link
 end
