@@ -86,6 +86,24 @@ module Api
         assert_equal "pending", request.approver_notification_status
       end
 
+      test "normalizes lowercased Slack channel principal foreign id" do
+        Principal.where(id: @proxy.principal_id).update_all(foreign_id: "c0bcqmckjpm")
+        @proxy.association(:principal).reset
+
+        with_permission_request_env do
+          assert_difference -> { PermissionRequest.count }, 1 do
+            post "/api/v1/sandbox/permission_requests",
+                 params: text_body.to_json,
+                 headers: auth_headers(token_for(@proxy))
+          end
+        end
+
+        assert_response :created
+        request = PermissionRequest.last
+        assert_equal "C0BCQMCKJPM", request.requesting_slack_channel_id
+        assert_equal "C0BCQMCKJPM", json_body.dig("data", "requesting_slack_channel_id")
+      end
+
       private
 
       def text_body

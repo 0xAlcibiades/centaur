@@ -103,7 +103,7 @@ class PermissionRequest < ApplicationRecord
   def requesting_principal_is_slack_channel
     return if requesting_principal.nil?
     return if requesting_principal.labels["kind"] == "slack_channel" &&
-              requesting_principal.foreign_id == requesting_slack_channel_id
+              requesting_principal.foreign_id.to_s.casecmp?(requesting_slack_channel_id.to_s)
 
     errors.add(:requesting_principal, "must be a Slack channel principal")
   end
