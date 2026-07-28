@@ -3,6 +3,7 @@ acme_channel:
   foreign_id: C0123456789
   labels:
     kind: slack_channel
+    slack_channel_id: C0123456789
     team: platform
     centaur.sandbox_repo_cache: all
   created_by: acme_admin

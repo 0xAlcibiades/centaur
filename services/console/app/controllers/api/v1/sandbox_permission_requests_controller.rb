@@ -35,7 +35,7 @@ module Api
       end
 
       def requesting_slack_channel_id(principal)
-        principal.labels[Principal::SLACK_CHANNEL_ID_LABEL].presence || principal.foreign_id
+        principal.labels[Principal::SLACK_CHANNEL_ID_LABEL]
       end
 
       def normalized_slack_channel_id(channel_id)

@@ -69,7 +69,7 @@ class PermissionRequestTest < ActiveSupport::TestCase
       kind: PermissionRequest::TEXT_KIND,
       requesting_principal: @principal,
       requesting_proxy: @proxy,
-      requesting_slack_channel_id: @principal.foreign_id,
+      requesting_slack_channel_id: @principal.labels.fetch(Principal::SLACK_CHANNEL_ID_LABEL),
       metadata: { "request" => "Please authorize Gmail." }
     }.merge(overrides))
   end

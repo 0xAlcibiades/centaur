@@ -45,6 +45,7 @@ module Api
           {
             "kind" => "slack_channel",
             "team" => "platform",
+            Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789",
             Principal::SANDBOX_REPO_CACHE_LABEL => "all"
           },
           data["labels"]
