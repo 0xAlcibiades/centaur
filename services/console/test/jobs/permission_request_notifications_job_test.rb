@@ -3,12 +3,12 @@ require "test_helper"
 class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
   setup do
     @permission_request = PermissionRequest.create!(
-      kind: PermissionRequest::SLACK_CHANNELS_KIND,
+      kind: PermissionRequest::SLACK_KIND,
       requesting_principal: principals(:acme_channel),
       requesting_proxy: proxies(:acme_proxy),
       requesting_slack_channel_id: "C0123456789",
       requesting_slack_thread_ts: "170.123",
-      requested_channel_ids: [ "C1111111111" ]
+      metadata: { "requested_channel_ids" => [ "C1111111111" ] }
     )
   end
 

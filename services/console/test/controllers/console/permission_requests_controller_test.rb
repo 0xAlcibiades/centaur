@@ -6,12 +6,12 @@ module Console
 
     setup do
       @permission_request = PermissionRequest.create!(
-        kind: PermissionRequest::SLACK_CHANNELS_KIND,
+        kind: PermissionRequest::SLACK_KIND,
         requesting_principal: principals(:acme_channel),
         requesting_proxy: proxies(:acme_proxy),
         requesting_slack_channel_id: "C0123456789",
         requesting_slack_thread_ts: "170.123",
-        requested_channel_ids: [ "C1111111111" ],
+        metadata: { "requested_channel_ids" => [ "C1111111111" ] },
         approver_notification_channel_id: "CAPPROVERS",
         approver_notification_message_ts: "171.1"
       )
@@ -94,13 +94,13 @@ module Console
       end
     end
 
-    test "service approval records decision without granting Slack permissions" do
-      service_request = PermissionRequest.create!(
-        kind: PermissionRequest::SERVICES_KIND,
+    test "text approval records decision without granting Slack permissions" do
+      text_request = PermissionRequest.create!(
+        kind: PermissionRequest::TEXT_KIND,
         requesting_principal: principals(:acme_channel),
         requesting_proxy: proxies(:acme_proxy),
         requesting_slack_channel_id: "C0123456789",
-        request_text: "Please authorize Gmail.",
+        metadata: { "request" => "Please authorize Gmail." },
         approver_notification_channel_id: "CAPPROVERS",
         approver_notification_message_ts: "171.2"
       )
@@ -108,11 +108,11 @@ module Console
 
       assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
         assert_no_difference -> { principals(:acme_channel).slack_channel_permissions.count } do
-          post approve_console_permission_request_url(service_request.oid)
+          post approve_console_permission_request_url(text_request.oid)
         end
       end
 
-      assert service_request.reload.approved?
+      assert text_request.reload.approved?
     end
 
     private

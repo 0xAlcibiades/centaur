@@ -2,10 +2,38 @@ class PermissionRequest < ApplicationRecord
   oid_prefix "preq"
 
   STATUSES = %w[pending approved denied].freeze
-  KINDS = %w[slack_channels services].freeze
+  KINDS = %w[slack text].freeze
   NOTIFICATION_STATUSES = %w[pending sent skipped failed].freeze
-  SLACK_CHANNELS_KIND = "slack_channels".freeze
-  SERVICES_KIND = "services".freeze
+  SLACK_KIND = "slack".freeze
+  TEXT_KIND = "text".freeze
+  SLACK_METADATA_SCHEMA = JSONSchemer.schema({
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => [ "requested_channel_ids" ],
+    "properties" => {
+      "requested_channel_ids" => {
+        "type" => "array",
+        "minItems" => 1,
+        "uniqueItems" => true,
+        "items" => {
+          "type" => "string",
+          "pattern" => "^[CDG][A-Z0-9]{8,}$"
+        }
+      }
+    }
+  })
+  TEXT_METADATA_SCHEMA = JSONSchemer.schema({
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => [ "request" ],
+    "properties" => {
+      "request" => { "type" => "string", "minLength" => 1 }
+    }
+  })
+  METADATA_SCHEMAS = {
+    SLACK_KIND => SLACK_METADATA_SCHEMA,
+    TEXT_KIND => TEXT_METADATA_SCHEMA
+  }.freeze
 
   belongs_to :requesting_principal, class_name: "Principal", optional: true
   belongs_to :requesting_proxy, class_name: "Proxy", optional: true
@@ -41,17 +69,25 @@ class PermissionRequest < ApplicationRecord
     status == "denied"
   end
 
-  def slack_channels?
-    kind == SLACK_CHANNELS_KIND
+  def slack?
+    kind == SLACK_KIND
   end
 
-  def services?
-    kind == SERVICES_KIND
+  def text?
+    kind == TEXT_KIND
+  end
+
+  def requested_channel_ids
+    Array(metadata["requested_channel_ids"])
+  end
+
+  def text_request
+    metadata["request"].to_s
   end
 
   def approve!(by:)
     transition!("approved", by: by) do
-      grant_requested_slack_channels! if slack_channels?
+      grant_requested_slack_channels! if slack?
     end
   end
 
@@ -202,8 +238,7 @@ class PermissionRequest < ApplicationRecord
 
   def normalize_request_payload
     self.requesting_slack_channel_id = requesting_slack_channel_id.to_s.strip.upcase
-    self.requested_channel_ids = normalize_strings(requested_channel_ids).map(&:upcase).uniq
-    self.request_text = request_text.to_s.strip.presence
+    self.metadata = normalize_metadata
   end
 
   def normalize_strings(values)
@@ -213,18 +248,35 @@ class PermissionRequest < ApplicationRecord
       .uniq
   end
 
-  def request_payload_matches_kind
+  def normalize_metadata
+    return {} if metadata.nil?
+    return metadata unless metadata.is_a?(Hash)
+
+    values = metadata.stringify_keys
     case kind
-    when SLACK_CHANNELS_KIND
-      errors.add(:requested_channel_ids, "must include at least one channel ID") if requested_channel_ids.blank?
-      errors.add(:request_text, "must be blank for Slack channel requests") if request_text.present?
-      requested_channel_ids.each do |channel_id|
-        next if channel_id.match?(Principal::SLACK_CHANNEL_ID_FORMAT)
-        errors.add(:requested_channel_ids, "#{channel_id} is not a valid Slack channel ID")
-      end
-    when SERVICES_KIND
-      errors.add(:request_text, "must include the requested service permissions") if request_text.blank?
-      errors.add(:requested_channel_ids, "must be empty for service requests") if requested_channel_ids.present?
+    when SLACK_KIND
+      values.merge("requested_channel_ids" => normalize_strings(values["requested_channel_ids"]).map(&:upcase).uniq)
+    when TEXT_KIND
+      return values unless values.key?("request")
+
+      values.merge("request" => values["request"].to_s.strip)
+    else
+      values
+    end
+  end
+
+  def request_payload_matches_kind
+    unless metadata.is_a?(Hash)
+      errors.add(:metadata, "must be a hash")
+      return
+    end
+
+    schema = METADATA_SCHEMAS[kind]
+    return unless schema
+
+    schema.validate(metadata).each do |err|
+      pointer = err["data_pointer"].presence || "(root)"
+      errors.add(:metadata, "#{pointer} #{err["error"]}")
     end
   end
 

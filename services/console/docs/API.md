@@ -1139,39 +1139,44 @@ Slack channel request:
 ```json
 {
   "data": {
-    "kind": "slack_channels",
+    "kind": "slack",
     "requesting_slack_thread_ts": "1700000000.000000",
-    "requested_channel_ids": ["C0123456789", "G0123456789"]
+    "metadata": {
+      "requested_channel_ids": ["C0123456789", "G0123456789"]
+    }
   }
 }
 ```
 
-Service request:
+Text request:
 
 ```json
 {
   "data": {
-    "kind": "services",
+    "kind": "text",
     "requesting_slack_thread_ts": "1700000000.000000",
-    "request": "Please authorize Gmail and Google Drive for customer follow-up."
+    "metadata": {
+      "request": "Please authorize Gmail and Google Drive for customer follow-up."
+    }
   }
 }
 ```
 
-Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service requests carry freeform `request` text describing what the agent wants authorized. Service approvals are recorded and announced, but do not mutate grants or credentials.
+Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. `metadata` is validated with JSON Schema based on `kind`. Slack approvals grant upload, download, and history access to `metadata.requested_channel_ids`. Text approvals record and announce the decision, but do not mutate grants or credentials.
 
 ```json
 {
   "data": {
     "id": "preq_...",
     "status": "pending",
-    "kind": "slack_channels",
+    "kind": "slack",
     "requesting_principal_id": "prn_...",
     "requesting_proxy_id": "prx_...",
     "requesting_slack_channel_id": "C0123456789",
     "requesting_slack_thread_ts": "1700000000.000000",
-    "requested_channel_ids": ["C1111111111"],
-    "request": null,
+    "metadata": {
+      "requested_channel_ids": ["C1111111111"]
+    },
     "created_at": "2026-07-28T16:56:52Z",
     "updated_at": "2026-07-28T16:56:52Z"
   }

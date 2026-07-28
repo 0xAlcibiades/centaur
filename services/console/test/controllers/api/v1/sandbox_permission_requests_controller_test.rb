@@ -79,13 +79,12 @@ module Api
       test "rejects invalid request shape" do
         with_permission_request_env do
           post "/api/v1/sandbox/permission_requests",
-               params: { data: { kind: "slack_channels", requested_channel_ids: [] } }.to_json,
+               params: { data: { kind: "slack", metadata: { requested_channel_ids: [] } } }.to_json,
                headers: auth_headers(token_for(@proxy))
         end
 
         assert_response :unprocessable_entity
-        assert_includes json_body.dig("error", "details", "requested_channel_ids"),
-                        "must include at least one channel ID"
+        assert json_body.dig("error", "details", "metadata").any? { |message| message.include?("less than: 1") }
       end
 
       test "rejects request when permission request Slack is not configured" do
@@ -136,8 +135,10 @@ module Api
             post "/api/v1/sandbox/permission_requests",
                  params: {
                    data: {
-                     kind: "services",
-                     request: "Please authorize Gmail and Google Drive for customer follow-up."
+                     kind: "text",
+                     metadata: {
+                       request: "Please authorize Gmail and Google Drive for customer follow-up."
+                     }
                    }
                  }.to_json,
                  headers: auth_headers(token_for(@proxy))
@@ -146,15 +147,21 @@ module Api
 
         assert_response :created
         request = PermissionRequest.last
-        assert_equal PermissionRequest::SERVICES_KIND, request.kind
-        assert_equal "Please authorize Gmail and Google Drive for customer follow-up.", request.request_text
+        assert_equal PermissionRequest::TEXT_KIND, request.kind
+        assert_equal({ "request" => "Please authorize Gmail and Google Drive for customer follow-up." }, request.metadata)
         assert_empty request.requested_channel_ids
       end
 
       private
 
       def slack_body
-        { data: { kind: "slack_channels", requesting_slack_thread_ts: "170.123", requested_channel_ids: [ "C1111111111" ] } }
+        {
+          data: {
+            kind: "slack",
+            requesting_slack_thread_ts: "170.123",
+            metadata: { requested_channel_ids: [ "C1111111111" ] }
+          }
+        }
       end
 
       def auth_headers(token)

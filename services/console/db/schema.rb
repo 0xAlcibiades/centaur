@@ -280,8 +280,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
     t.datetime "decided_at"
     t.bigint "decided_by_id"
     t.string "kind", null: false
-    t.jsonb "requested_channel_ids", default: [], null: false
-    t.text "request_text"
+    t.jsonb "metadata", default: {}, null: false
     t.string "requester_outcome_message_ts"
     t.datetime "requester_outcome_notification_attempted_at"
     t.datetime "requester_outcome_notification_delivered_at"

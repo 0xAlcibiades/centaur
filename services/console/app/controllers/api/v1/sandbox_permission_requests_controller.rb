@@ -22,9 +22,7 @@ module Api
       def permission_request_attributes(principal)
         attrs = data_params.permit(
           :kind,
-          :request,
-          :requesting_slack_thread_ts,
-          requested_channel_ids: []
+          :requesting_slack_thread_ts
         )
         {
           kind: attrs.require(:kind),
@@ -32,8 +30,7 @@ module Api
           requesting_proxy: current_proxy,
           requesting_slack_channel_id: principal.foreign_id,
           requesting_slack_thread_ts: attrs[:requesting_slack_thread_ts],
-          requested_channel_ids: attrs[:requested_channel_ids],
-          request_text: attrs[:request]
+          metadata: metadata_params
         }
       end
 
@@ -52,8 +49,7 @@ module Api
           requesting_proxy_id: permission_request.requesting_proxy.oid,
           requesting_slack_channel_id: permission_request.requesting_slack_channel_id,
           requesting_slack_thread_ts: permission_request.requesting_slack_thread_ts,
-          requested_channel_ids: permission_request.requested_channel_ids,
-          request: permission_request.request_text,
+          metadata: permission_request.metadata,
           approver_notification_status: permission_request.approver_notification_status,
           created_at: permission_request.created_at,
           updated_at: permission_request.updated_at
@@ -71,6 +67,15 @@ module Api
       def render_record_invalid(error)
         render_error(status: :unprocessable_entity, message: "validation failed",
                      details: error.record.errors.as_json)
+      end
+
+      def metadata_params
+        metadata = data_params[:metadata]
+        return {} if metadata.blank?
+        return metadata.to_unsafe_h if metadata.respond_to?(:to_unsafe_h)
+        return metadata if metadata.is_a?(Hash)
+
+        metadata
       end
     end
   end

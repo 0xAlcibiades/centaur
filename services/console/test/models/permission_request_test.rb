@@ -8,36 +8,44 @@ class PermissionRequestTest < ActiveSupport::TestCase
 
   test "normalizes Slack channel request channel IDs" do
     request = build_request(
-      requested_channel_ids: [ " c0123456789 ", "C0123456789", "g9876543210" ]
+      metadata: { "requested_channel_ids" => [ " c0123456789 ", "C0123456789", "g9876543210" ] }
     )
 
     assert request.valid?
     assert_equal %w[C0123456789 G9876543210], request.requested_channel_ids
+    assert_equal({ "requested_channel_ids" => %w[C0123456789 G9876543210] }, request.metadata)
   end
 
-  test "normalizes freeform service request text" do
+  test "normalizes text request metadata" do
     request = build_request(
-      kind: PermissionRequest::SERVICES_KIND,
-      requested_channel_ids: [],
-      request_text: "  Please authorize Google Drive for quarterly reporting.  "
+      kind: PermissionRequest::TEXT_KIND,
+      metadata: { "request" => "  Please authorize Google Drive for quarterly reporting.  " }
     )
 
     assert request.valid?
-    assert_equal "Please authorize Google Drive for quarterly reporting.", request.request_text
+    assert_equal "Please authorize Google Drive for quarterly reporting.", request.text_request
+    assert_equal({ "request" => "Please authorize Google Drive for quarterly reporting." }, request.metadata)
   end
 
   test "rejects Slack channel request without requested channels" do
-    request = build_request(requested_channel_ids: [])
+    request = build_request(metadata: { "requested_channel_ids" => [] })
 
     assert_not request.valid?
-    assert_includes request.errors[:requested_channel_ids], "must include at least one channel ID"
+    assert request.errors[:metadata].any? { |message| message.include?("less than: 1") }
   end
 
-  test "rejects service request without request text" do
-    request = build_request(kind: PermissionRequest::SERVICES_KIND, requested_channel_ids: [])
+  test "rejects text request without request text" do
+    request = build_request(kind: PermissionRequest::TEXT_KIND, metadata: {})
 
     assert_not request.valid?
-    assert_includes request.errors[:request_text], "must include the requested service permissions"
+    assert request.errors[:metadata].any? { |message| message.include?("missing required properties: request") }
+  end
+
+  test "rejects metadata keys that do not belong to the request kind" do
+    request = build_request(metadata: { "requested_channel_ids" => [ "C0123456789" ], "request" => "extra" })
+
+    assert_not request.valid?
+    assert request.errors[:metadata].any? { |message| message.include?("disallowed additional property") }
   end
 
   test "rejects non Slack channel principal" do
@@ -53,7 +61,7 @@ class PermissionRequestTest < ActiveSupport::TestCase
   end
 
   test "approve grants requested Slack channel permissions" do
-    request = build_request(requested_channel_ids: [ "C1111111111", "G2222222222" ])
+    request = build_request(metadata: { "requested_channel_ids" => [ "C1111111111", "G2222222222" ] })
     request.save!
 
     assert_difference -> { @principal.slack_channel_permissions.count }, 2 do
@@ -83,11 +91,10 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_equal users(:acme_admin), request.reload.decided_by
   end
 
-  test "deny records decision without granting service permissions" do
+  test "deny records decision without granting text permissions" do
     request = build_request(
-      kind: PermissionRequest::SERVICES_KIND,
-      requested_channel_ids: [],
-      request_text: "Please authorize Calendar access."
+      kind: PermissionRequest::TEXT_KIND,
+      metadata: { "request" => "Please authorize Calendar access." }
     )
     request.save!
 
@@ -116,12 +123,11 @@ class PermissionRequestTest < ActiveSupport::TestCase
 
   def build_request(overrides = {})
     PermissionRequest.new({
-      kind: PermissionRequest::SLACK_CHANNELS_KIND,
+      kind: PermissionRequest::SLACK_KIND,
       requesting_principal: @principal,
       requesting_proxy: @proxy,
       requesting_slack_channel_id: @principal.foreign_id,
-      requested_channel_ids: [ "C0123456789" ],
-      request_text: nil
+      metadata: { "requested_channel_ids" => [ "C0123456789" ] }
     }.merge(overrides))
   end
 end
