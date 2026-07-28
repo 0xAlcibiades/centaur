@@ -1158,7 +1158,7 @@ Service request:
 }
 ```
 
-Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are limited to known service identifiers, are recorded and announced, and do not mutate grants or credentials.
+Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service requests carry freeform text describing what the agent wants authorized. Service approvals are recorded and announced, but do not mutate grants or credentials.
 
 ```json
 {

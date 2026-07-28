@@ -15,26 +15,15 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_equal %w[C0123456789 G9876543210], request.requested_channel_ids
   end
 
-  test "normalizes service request names" do
+  test "normalizes freeform service request text" do
     request = build_request(
       kind: PermissionRequest::SERVICES_KIND,
       requested_channel_ids: [],
-      services: [ " gmail ", "gmail", "Google Drive" ]
+      services: [ " gmail ", "gmail", "Google Drive", "<!channel>" ]
     )
 
     assert request.valid?
-    assert_equal [ "gmail", "google_drive" ], request.services
-  end
-
-  test "rejects unknown or mention-like service request names" do
-    request = build_request(
-      kind: PermissionRequest::SERVICES_KIND,
-      requested_channel_ids: [],
-      services: [ "<!channel>" ]
-    )
-
-    assert_not request.valid?
-    assert_includes request.errors[:services], "contains unknown service identifiers: <!channel>"
+    assert_equal [ "gmail", "Google Drive", "<!channel>" ], request.services
   end
 
   test "rejects Slack channel request without requested channels" do

@@ -6,14 +6,6 @@ class PermissionRequest < ApplicationRecord
   NOTIFICATION_STATUSES = %w[pending sent skipped failed].freeze
   SLACK_CHANNELS_KIND = "slack_channels".freeze
   SERVICES_KIND = "services".freeze
-  SERVICE_ALIASES = {
-    "calendar" => "google_calendar",
-    "drive" => "google_drive",
-    "google" => "google",
-    "google_calendar" => "google_calendar",
-    "google_drive" => "google_drive"
-  }.freeze
-  SERVICE_IDENTIFIERS = (Oauth::Providers.keys + %w[gmail google_calendar google_drive]).uniq.sort.freeze
 
   belongs_to :requesting_principal, class_name: "Principal", optional: true
   belongs_to :requesting_proxy, class_name: "Proxy", optional: true
@@ -211,14 +203,7 @@ class PermissionRequest < ApplicationRecord
   def normalize_request_payload
     self.requesting_slack_channel_id = requesting_slack_channel_id.to_s.strip.upcase
     self.requested_channel_ids = normalize_strings(requested_channel_ids).map(&:upcase).uniq
-    self.services = normalize_services(services)
-  end
-
-  def normalize_services(values)
-    normalize_strings(values).map do |value|
-      normalized = value.downcase.tr(" -", "__").squeeze("_")
-      SERVICE_ALIASES.fetch(normalized, normalized)
-    end.uniq
+    self.services = normalize_strings(services)
   end
 
   def normalize_strings(values)
@@ -240,10 +225,6 @@ class PermissionRequest < ApplicationRecord
     when SERVICES_KIND
       errors.add(:services, "must include at least one service") if services.blank?
       errors.add(:requested_channel_ids, "must be empty for service requests") if requested_channel_ids.present?
-      unknown = services - SERVICE_IDENTIFIERS
-      if unknown.any?
-        errors.add(:services, "contains unknown service identifiers: #{unknown.join(", ")}")
-      end
     end
   end
 
