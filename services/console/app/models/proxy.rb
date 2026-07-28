@@ -4,6 +4,7 @@ class Proxy < ApplicationRecord
   TOKEN_PREFIX = "iprx_".freeze
   TOKEN_FORMAT = /\Aiprx_[0-9a-f]{64}\z/
   SANDBOX_ENTITLEMENTS_PATH_PATTERN = "/api/v1/sandbox/*".freeze
+  SANDBOX_PERMISSION_REQUESTS_PATH = "/api/v1/sandbox/permission_requests".freeze
 
   attr_readonly :bearer_token_hash
   attr_accessor :token

@@ -76,8 +76,13 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     refute_nil entry
     assert_equal "Bearer {{ .Value }}", entry.dig("inject", "formatter")
     assert_equal(
-      { "host" => "centaur-console", "methods" => [ "GET" ], "paths" => [ Proxy::SANDBOX_ENTITLEMENTS_PATH_PATTERN ] },
-      entry.fetch("rules").first
+      [
+        { "host" => "centaur-console", "methods" => [ "GET" ],
+          "paths" => [ Proxy::SANDBOX_ENTITLEMENTS_PATH_PATTERN ] },
+        { "host" => "centaur-console", "methods" => [ "POST" ],
+          "paths" => [ Proxy::SANDBOX_PERMISSION_REQUESTS_PATH ] }
+      ],
+      entry.fetch("rules")
     )
 
     claims = jwt_payload(entry.dig("source", "value"))

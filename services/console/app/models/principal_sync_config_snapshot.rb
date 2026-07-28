@@ -221,12 +221,20 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   def self.sandbox_entitlements_secret_for_proxy(proxy, hosts:)
     rules = Principal.normalize_hosts(hosts)
       .map do |host|
-        {
-          "host" => host,
-          "methods" => [ "GET" ],
-          "paths" => [ Proxy::SANDBOX_ENTITLEMENTS_PATH_PATTERN ]
-        }
+        [
+          {
+            "host" => host,
+            "methods" => [ "GET" ],
+            "paths" => [ Proxy::SANDBOX_ENTITLEMENTS_PATH_PATTERN ]
+          },
+          {
+            "host" => host,
+            "methods" => [ "POST" ],
+            "paths" => [ Proxy::SANDBOX_PERMISSION_REQUESTS_PATH ]
+          }
+        ]
       end
+      .flatten
     return nil if rules.empty?
 
     token = SandboxEntitlements::Jwt.encode_for_proxy(proxy)
