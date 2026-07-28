@@ -266,22 +266,42 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   end
 
   create_table "permission_requests", force: :cascade do |t|
+    t.datetime "approver_decision_update_attempted_at"
+    t.datetime "approver_decision_update_delivered_at"
+    t.text "approver_decision_update_last_error"
+    t.string "approver_decision_update_status", default: "pending", null: false
+    t.datetime "approver_notification_attempted_at"
     t.string "approver_notification_channel_id"
+    t.datetime "approver_notification_delivered_at"
+    t.text "approver_notification_last_error"
     t.string "approver_notification_message_ts"
+    t.string "approver_notification_status", default: "pending", null: false
     t.datetime "created_at", null: false
     t.datetime "decided_at"
     t.bigint "decided_by_id"
     t.string "kind", null: false
     t.jsonb "requested_channel_ids", default: [], null: false
-    t.bigint "requesting_principal_id", null: false
-    t.bigint "requesting_proxy_id", null: false
+    t.string "requester_outcome_message_ts"
+    t.datetime "requester_outcome_notification_attempted_at"
+    t.datetime "requester_outcome_notification_delivered_at"
+    t.text "requester_outcome_notification_last_error"
+    t.string "requester_outcome_notification_status", default: "pending", null: false
+    t.bigint "requesting_principal_id"
+    t.string "requesting_principal_name"
+    t.string "requesting_principal_oid", null: false
+    t.bigint "requesting_proxy_id"
+    t.string "requesting_proxy_name", null: false
+    t.string "requesting_proxy_oid", null: false
     t.string "requesting_slack_channel_id", null: false
     t.string "requesting_slack_thread_ts"
     t.jsonb "services", default: [], null: false
     t.string "status", default: "pending", null: false
     t.datetime "updated_at", null: false
+    t.index ["approver_decision_update_status"], name: "index_permission_requests_on_approver_decision_update_status"
+    t.index ["approver_notification_status"], name: "index_permission_requests_on_approver_notification_status"
     t.index ["decided_by_id"], name: "index_permission_requests_on_decided_by_id"
     t.index ["kind"], name: "index_permission_requests_on_kind"
+    t.index ["requester_outcome_notification_status"], name: "idx_permission_requests_on_requester_outcome_status"
     t.index ["requesting_principal_id"], name: "index_permission_requests_on_requesting_principal_id"
     t.index ["requesting_proxy_id"], name: "index_permission_requests_on_requesting_proxy_id"
     t.index ["requesting_slack_channel_id"], name: "index_permission_requests_on_requesting_slack_channel_id"
@@ -524,8 +544,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   add_foreign_key "mcp_oauth_refresh_tokens", "users"
   add_foreign_key "oauth_apps", "users", column: "created_by_id"
   add_foreign_key "oauth_token_secrets", "users", column: "created_by_id"
-  add_foreign_key "permission_requests", "principals", column: "requesting_principal_id"
-  add_foreign_key "permission_requests", "proxies", column: "requesting_proxy_id"
   add_foreign_key "permission_requests", "users", column: "decided_by_id"
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"
   add_foreign_key "principal_roles", "principals"

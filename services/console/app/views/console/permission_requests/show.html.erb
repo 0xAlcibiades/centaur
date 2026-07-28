@@ -1,7 +1,9 @@
 <% content_for :title, "Permission Request #{@permission_request.oid} - Centaur Console" %>
 
 <div class="mb-8">
-  <a href="<%= console_principal_path(@permission_request.requesting_principal.oid) %>" class="back-link">&larr; back to principal</a>
+  <% if @permission_request.requesting_principal %>
+    <a href="<%= console_principal_path(@permission_request.requesting_principal.oid) %>" class="back-link">&larr; back to principal</a>
+  <% end %>
   <div class="mt-2 flex flex-wrap items-center gap-3">
     <h1 class="page-title">Permission Request</h1>
     <span class="resource-badge"><%= @permission_request.status.titleize %></span>
@@ -36,14 +38,24 @@
       <div>
         <dt class="text-xs uppercase tracking-wider text-zinc-500">Principal</dt>
         <dd class="mt-1 text-sm text-zinc-100">
-          <%= link_to @permission_request.requesting_principal.oid,
-                      console_principal_path(@permission_request.requesting_principal.oid),
-                      class: "console-link" %>
+          <% if @permission_request.requesting_principal %>
+            <%= link_to @permission_request.requesting_principal.oid,
+                        console_principal_path(@permission_request.requesting_principal.oid),
+                        class: "console-link" %>
+          <% else %>
+            <%= @permission_request.requesting_principal_oid %>
+          <% end %>
+          <% if @permission_request.requesting_principal_name.present? %>
+            <span class="text-zinc-500">(<%= @permission_request.requesting_principal_name %>)</span>
+          <% end %>
         </dd>
       </div>
       <div>
         <dt class="text-xs uppercase tracking-wider text-zinc-500">Proxy</dt>
-        <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.requesting_proxy.name %></dd>
+        <dd class="mt-1 text-sm text-zinc-100">
+          <%= @permission_request.requesting_proxy_name %>
+          <span class="text-zinc-500">(<%= @permission_request.requesting_proxy_oid %>)</span>
+        </dd>
       </div>
       <div>
         <dt class="text-xs uppercase tracking-wider text-zinc-500">Slack Channel</dt>

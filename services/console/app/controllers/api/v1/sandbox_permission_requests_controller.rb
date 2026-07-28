@@ -4,24 +4,16 @@ module Api
       include ApiSandboxAuthentication
 
       rescue_from ActiveRecord::RecordInvalid, with: :render_record_invalid
-      rescue_from PermissionRequestSlackNotifier::SlackApiError, with: :render_slack_error
 
       def create
         principal = current_proxy.principal
         permission_request = PermissionRequest.create!(permission_request_attributes(principal))
-        notification = PermissionRequestSlackNotifier.post_approver_notification(
-          permission_request,
+        PermissionRequestApproverNotificationJob.perform_later(
+          permission_request.id,
           console_permission_request_url(permission_request.oid)
-        )
-        permission_request.update!(
-          approver_notification_channel_id: notification.channel_id,
-          approver_notification_message_ts: notification.message_ts
         )
 
         render status: :created, json: { data: permission_request_payload(permission_request) }
-      rescue PermissionRequestSlackNotifier::SlackApiError
-        permission_request&.destroy
-        raise
       end
 
       private
@@ -55,6 +47,7 @@ module Api
           requesting_slack_thread_ts: permission_request.requesting_slack_thread_ts,
           requested_channel_ids: permission_request.requested_channel_ids,
           services: permission_request.services,
+          approver_notification_status: permission_request.approver_notification_status,
           created_at: permission_request.created_at,
           updated_at: permission_request.updated_at
         }
@@ -71,10 +64,6 @@ module Api
       def render_record_invalid(error)
         render_error(status: :unprocessable_entity, message: "validation failed",
                      details: error.record.errors.as_json)
-      end
-
-      def render_slack_error(error)
-        render_error(status: :bad_gateway, message: error.message)
       end
     end
   end

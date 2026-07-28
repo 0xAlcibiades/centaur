@@ -1132,7 +1132,7 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 
 `POST /api/v1/sandbox/permission_requests`
 
-Creates a permission request for the principal authenticated by the same sandbox entitlement JWT used by `GET /api/v1/sandbox/permissions`. The token must match an assigned proxy and principal. The authenticated principal must be a Slack channel principal because approvals are announced back to Slack.
+Creates a permission request for the principal authenticated by the same sandbox entitlement JWT used by `GET /api/v1/sandbox/permissions`. The token must match an assigned proxy and principal. The authenticated principal must be a Slack channel principal because decisions are announced back to Slack.
 
 Slack channel request:
 
@@ -1158,7 +1158,7 @@ Service request:
 }
 ```
 
-Returns `201` with the created pending request. Console posts an approver notification to `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` with a normal link to the admin approval page. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are recorded and announced, but do not mutate grants or credentials.
+Returns `201` with the created pending request. Console enqueues Slack delivery jobs for approver notifications and decision outcomes. If `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` is unset, approver-channel notifications are skipped and the request remains reviewable in Console. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are limited to known service identifiers, are recorded and announced, and do not mutate grants or credentials.
 
 ```json
 {

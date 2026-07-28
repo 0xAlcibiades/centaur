@@ -9,8 +9,14 @@ class PermissionRequestSlackNotifier
   READ_TIMEOUT_SECONDS = 5
   WRITE_TIMEOUT_SECONDS = 2
 
+  def self.approver_notifications_enabled?
+    approver_channel_id.present?
+  end
+
   def self.post_approver_notification(permission_request, review_url)
     channel_id = approver_channel_id
+    raise SlackApiError, "permission request approval channel is not configured" if channel_id.blank?
+
     payload = slack_api(
       "chat.postMessage",
       {
@@ -20,14 +26,14 @@ class PermissionRequestSlackNotifier
         unfurl_media: false
       }
     )
-    Result.new(channel_id: channel_id, message_ts: payload.fetch("ts"))
+    Result.new(channel_id: channel_id, message_ts: payload.fetch("ts").to_s)
   end
 
   def self.update_approver_notification(permission_request)
     return unless permission_request.approver_notification_channel_id.present? &&
                   permission_request.approver_notification_message_ts.present?
 
-    slack_api(
+    payload = slack_api(
       "chat.update",
       {
         channel: permission_request.approver_notification_channel_id,
@@ -37,6 +43,7 @@ class PermissionRequestSlackNotifier
         unfurl_media: false
       }
     )
+    Result.new(channel_id: permission_request.approver_notification_channel_id, message_ts: payload.fetch("ts").to_s)
   end
 
   def self.post_requester_outcome(permission_request)
@@ -47,13 +54,14 @@ class PermissionRequestSlackNotifier
       unfurl_media: false
     }
     body[:thread_ts] = permission_request.requesting_slack_thread_ts if permission_request.requesting_slack_thread_ts.present?
-    slack_api("chat.postMessage", body)
+    payload = slack_api("chat.postMessage", body)
+    Result.new(channel_id: permission_request.requesting_slack_channel_id, message_ts: payload.fetch("ts").to_s)
   end
 
   def self.approver_notification_text(permission_request, review_url)
     [
       "*Permission Request:* #{request_summary(permission_request)}",
-      "Requester: #{permission_request.requesting_slack_channel_id}",
+      "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
       "Review in Console: <#{review_url}|Open request>"
     ].join("\n")
   end
@@ -61,8 +69,8 @@ class PermissionRequestSlackNotifier
   def self.decided_approver_notification_text(permission_request)
     [
       "*Permission Request #{permission_request.decision_label}:* #{request_summary(permission_request)}",
-      "Requester: #{permission_request.requesting_slack_channel_id}",
-      "Decision: #{permission_request.decision_label} by #{permission_request.decided_by.email} at #{permission_request.decided_at.utc.iso8601}"
+      "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
+      "Decision: #{permission_request.decision_label} by #{slack_escape(permission_request.decided_by.email)} at #{permission_request.decided_at.utc.iso8601}"
     ].join("\n")
   end
 
@@ -70,9 +78,9 @@ class PermissionRequestSlackNotifier
     case permission_request.status
     when "approved"
       if permission_request.slack_channels?
-        "Permission request approved. Channel access has been granted for #{permission_request.requested_channel_ids.join(", ")}."
+        "Permission request approved. Channel access has been granted for #{slack_list(permission_request.requested_channel_ids)}."
       else
-        "Permission request approved. Service authorization was approved for #{permission_request.services.join(", ")}."
+        "Permission request approved. Service authorization was approved for #{slack_list(permission_request.services)}."
       end
     when "denied"
       "Permission request denied for #{request_summary(permission_request)}."
@@ -83,17 +91,14 @@ class PermissionRequestSlackNotifier
 
   def self.request_summary(permission_request)
     if permission_request.slack_channels?
-      "Slack channels #{permission_request.requested_channel_ids.join(", ")}"
+      "Slack channels #{slack_list(permission_request.requested_channel_ids)}"
     else
-      "services #{permission_request.services.join(", ")}"
+      "services #{slack_list(permission_request.services)}"
     end
   end
 
   def self.approver_channel_id
-    channel_id = ENV["CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID"].to_s.strip
-    raise SlackApiError, "CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID is not configured" if channel_id.blank?
-
-    channel_id
+    ENV["CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID"].to_s.strip
   end
 
   def self.slack_api(method, body)
@@ -117,6 +122,10 @@ class PermissionRequestSlackNotifier
     payload
   rescue JSON::ParserError
     raise SlackApiError, "Slack API response was not JSON"
+  rescue StandardError => e
+    raise if e.is_a?(SlackApiError)
+
+    raise SlackApiError, "Slack API request failed: #{e.class}"
   end
   private_class_method :slack_api
 
@@ -124,4 +133,17 @@ class PermissionRequestSlackNotifier
     (ENV["SLACK_API_URL"].presence || DEFAULT_API_URL).to_s.delete_suffix("/")
   end
   private_class_method :slack_api_url
+
+  def self.slack_list(values)
+    Array(values).map { |value| slack_escape(value) }.join(", ")
+  end
+  private_class_method :slack_list
+
+  def self.slack_escape(value)
+    value.to_s
+      .gsub("&", "&amp;")
+      .gsub("<", "&lt;")
+      .gsub(">", "&gt;")
+  end
+  private_class_method :slack_escape
 end

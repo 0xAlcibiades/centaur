@@ -3,8 +3,15 @@ require "test_helper"
 module Api
   module V1
     class SandboxPermissionRequestsControllerTest < ActionDispatch::IntegrationTest
+      include ActiveJob::TestHelper
+
       setup do
         @proxy = proxies(:acme_proxy)
+      end
+
+      teardown do
+        clear_enqueued_jobs
+        clear_performed_jobs
       end
 
       test "rejects requests without a sandbox token" do
@@ -81,14 +88,10 @@ module Api
                         "must include at least one channel ID"
       end
 
-      test "surfaces missing approver Slack configuration" do
+      test "creates request even when approver Slack channel is not configured" do
         with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
-          with_singleton_method(
-            PermissionRequestSlackNotifier,
-            :post_approver_notification,
-            ->(_request, _url) { raise PermissionRequestSlackNotifier::SlackApiError, "approver channel missing" }
-          ) do
-            assert_no_difference -> { PermissionRequest.count } do
+          assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
+            assert_difference -> { PermissionRequest.count }, 1 do
               post "/api/v1/sandbox/permission_requests",
                    params: slack_body.to_json,
                    headers: auth_headers(token_for(@proxy))
@@ -96,19 +99,13 @@ module Api
           end
         end
 
-        assert_response :bad_gateway
-        assert_equal "approver channel missing", json_body.dig("error", "message")
+        assert_response :created
+        assert_equal "pending", PermissionRequest.last.approver_notification_status
       end
 
-      test "creates Slack channel permission request and notifies approvers" do
-        calls = []
-        notifier = lambda do |request, url|
-          calls << [ request, url ]
-          PermissionRequestSlackNotifier::Result.new(channel_id: "CAPPROVERS", message_ts: "171.1")
-        end
-
+      test "creates Slack channel permission request and enqueues approver notification" do
         with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret", "CENTAUR_CONSOLE_PUBLIC_URL" => "https://console.test") do
-          with_singleton_method(PermissionRequestSlackNotifier, :post_approver_notification, notifier) do
+          assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             assert_difference -> { PermissionRequest.count }, 1 do
               post "/api/v1/sandbox/permission_requests",
                    params: slack_body.to_json,
@@ -125,16 +122,12 @@ module Api
         assert_equal @proxy, request.requesting_proxy
         assert_equal "C0123456789", request.requesting_slack_channel_id
         assert_equal [ "C1111111111" ], request.requested_channel_ids
-        assert_equal "CAPPROVERS", request.approver_notification_channel_id
-        assert_equal "171.1", request.approver_notification_message_ts
-        assert_equal "https://console.test/console/permission_requests/#{request.oid}", calls.sole.second
+        assert_equal "pending", request.approver_notification_status
       end
 
       test "creates service permission request" do
-        notifier = ->(_request, _url) { PermissionRequestSlackNotifier::Result.new(channel_id: "CAPPROVERS", message_ts: "171.1") }
-
         with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
-          with_singleton_method(PermissionRequestSlackNotifier, :post_approver_notification, notifier) do
+          assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             post "/api/v1/sandbox/permission_requests",
                  params: { data: { kind: "services", services: [ "gmail", "calendar" ] } }.to_json,
                  headers: auth_headers(token_for(@proxy))
@@ -144,7 +137,7 @@ module Api
         assert_response :created
         request = PermissionRequest.last
         assert_equal PermissionRequest::SERVICES_KIND, request.kind
-        assert_equal %w[gmail calendar], request.services
+        assert_equal %w[gmail google_calendar], request.services
         assert_empty request.requested_channel_ids
       end
 
@@ -180,15 +173,6 @@ module Api
 
       def json_body
         JSON.parse(response.body)
-      end
-
-      def with_singleton_method(target, method_name, implementation)
-        singleton = class << target; self; end
-        original = target.method(method_name)
-        singleton.define_method(method_name, implementation)
-        yield
-      ensure
-        singleton.define_method(method_name, original)
       end
 
       def with_env(values)
