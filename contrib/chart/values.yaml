@@ -154,6 +154,11 @@ console:
   # worker. Keep this aligned with the Console OAuth app users authorize.
   slackDmSync:
     oauthAppSlug: slack
+  # Sandbox permission request notifications. Set approvalChannelId to the
+  # Slack channel ID where Console posts admin review links. Leave empty to
+  # disable permission-request creation.
+  permissionRequests:
+    approvalChannelId: ""
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale

@@ -29,6 +29,12 @@
             "oauthAppSlug": { "type": "string" }
           }
         },
+        "permissionRequests": {
+          "type": "object",
+          "properties": {
+            "approvalChannelId": { "type": "string" }
+          }
+        },
         "service": {
           "type": "object",
           "properties": {

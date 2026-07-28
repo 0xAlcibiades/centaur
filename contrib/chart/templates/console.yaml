@@ -128,6 +128,10 @@ spec:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sSLACK_BOT_TOKEN" $prefix }}
                   optional: true
+{{- with $console.permissionRequests.approvalChannelId }}
+            - name: CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID
+              value: {{ . | quote }}
+{{- end }}
 {{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" }}
 {{- if hasKey $.Values.sandbox.extraEnv $name }}
             # Mirror the deployer's harness default-model override

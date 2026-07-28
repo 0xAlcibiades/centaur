@@ -131,6 +131,16 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sCENTAUR_JWT_SIGNING_SECRET" $prefix }}
+            - name: CENTAUR_CONSOLE_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sSLACK_BOT_TOKEN" $prefix }}
+                  optional: true
+{{- with $console.permissionRequests.approvalChannelId }}
+            - name: CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID
+              value: {{ . | quote }}
+{{- end }}
 {{- if $console.publicUrl }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}
