@@ -14,7 +14,11 @@ import {
   type Thread
 } from 'chat'
 import { createSlackAdapter } from '@chat-adapter/slack'
-import { fetchSlackThreadReplies } from '@chat-adapter/slack/api'
+import {
+  assertSlackOk,
+  callSlackApi,
+  fetchSlackThreadReplies
+} from '@chat-adapter/slack/api'
 import { createPostgresState } from '@chat-adapter/state-pg'
 import pg from 'pg'
 import {
@@ -35,6 +39,7 @@ import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
   dispatchSlackBlockAction,
+  fetchWithTimeout,
   forwardToSessionApi,
   harnessRestartPreamble,
   interruptSessionExecution,
@@ -44,6 +49,7 @@ import {
   serializeMessageLinks,
   serializeMessage,
   sessionStreamError,
+  slackApiTimeoutMs,
   withSlackApiTimeout
 } from './session-api'
 import {
@@ -405,6 +411,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           }
         })
       })
+      const channelCreatedJoinTask = response.ok && options.autoJoinCreatedChannels === true
+        ? joinSlackChannelCreatedEvent(rawBody, options)
+        : null
+      if (channelCreatedJoinTask) waitUntil(c, channelCreatedJoinTask)
       if (awaitHandoff && response.ok) {
         const waitStartedAtMs = nowMs()
         const waitFields = {
@@ -624,6 +634,92 @@ function slackWebhookEventType(rawBody: string): string {
   const event = payload.event
   if (isJsonObject(event)) return stringValue(event.type) ?? 'unknown'
   return stringValue(payload.type) ?? 'unknown'
+}
+
+function slackChannelCreatedJoinInput(rawBody: string): {
+  channelId: string
+  channelName?: string
+  eventId?: string
+  teamId?: string
+} | null {
+  const payload = slackWebhookPayload(rawBody)
+  if (!payload || payload.type !== 'event_callback') return null
+  const event = slackWebhookEvent(payload)
+  if (!event || stringValue(event.type) !== 'channel_created') return null
+  const channel = isJsonObject(event.channel) ? event.channel : undefined
+  const channelId = stringValue(channel?.id) ?? stringValue(event.channel)
+  if (!channelId) return null
+  return {
+    channelId,
+    channelName: stringValue(channel?.name),
+    eventId: stringValue(payload.event_id),
+    teamId: slackEventTeamId(payload, event) || undefined
+  }
+}
+
+function joinSlackChannelCreatedEvent(
+  rawBody: string,
+  options: SlackbotV2Options
+): Promise<void> | null {
+  const input = slackChannelCreatedJoinInput(rawBody)
+  if (!input) return null
+
+  return (async () => {
+    const startedAtMs = nowMs()
+    const fields = {
+      channel_id: input.channelId,
+      channel_name: input.channelName,
+      slack_event_id: input.eventId,
+      team_id: input.teamId
+    }
+    traceLog(options, 'slackbotv2_channel_created_join_started', undefined, fields)
+    try {
+      const result = await joinSlackChannel(input.channelId, options)
+      traceLog(options, 'slackbotv2_channel_created_join_complete', undefined, {
+        ...fields,
+        already_joined: result.alreadyJoined,
+        phase_ms: elapsedMs(startedAtMs)
+      })
+    } catch (error) {
+      traceWarn(options, 'slackbotv2_channel_created_join_failed', undefined, {
+        ...fields,
+        error: errorMessage(error),
+        phase_ms: elapsedMs(startedAtMs)
+      })
+    }
+  })()
+}
+
+async function joinSlackChannel(
+  channelId: string,
+  options: SlackbotV2Options
+): Promise<{ alreadyJoined: boolean }> {
+  const fetchFn = options.fetch ?? fetch
+  const timeoutFetch = Object.assign(
+    (input: RequestInfo | URL, init?: RequestInit) =>
+      fetchWithTimeout(
+        fetchFn,
+        input,
+        init ?? {},
+        slackApiTimeoutMs(options),
+        'Slack API conversations.join'
+      ),
+    { preconnect: fetch.preconnect }
+  )
+  const payload = await callSlackApi(
+    'conversations.join',
+    { channel: channelId },
+    {
+      apiUrl: options.slackApiUrl,
+      fetch: timeoutFetch,
+      token: options.botToken
+    }
+  )
+  const alreadyJoined =
+    stringValue(payload.warning) === 'already_in_channel'
+    || payload.response_metadata?.warnings?.includes('already_in_channel') === true
+  assertSlackOk('conversations.join', payload)
+  return { alreadyJoined }
 }
 
 function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPayload {
