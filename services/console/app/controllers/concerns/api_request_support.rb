@@ -17,6 +17,10 @@ module ApiRequestSupport
     header.sub(/\ABearer\s+/, "").presence
   end
 
+  def data_params
+    params.require(:data)
+  end
+
   def render_error(status:, message:, details: nil)
     body = { error: { message: message } }
     body[:error][:details] = details if details

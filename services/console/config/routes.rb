@@ -73,6 +73,12 @@ Rails.application.routes.draw do
     end
     delete "slack_channel_permissions/:slack_channel_permission_id", to: "slack_channel_permissions#destroy",
            as: :slack_channel_permission
+    resources :permission_requests, only: %i[show] do
+      member do
+        post :approve
+        post :deny
+      end
+    end
   end
   # Role assignments and direct grants managed from the principal detail page. The
   # extra /roles and /grants path segments keep these clear of the show route above
@@ -221,6 +227,7 @@ Rails.application.routes.draw do
       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
       get "sandbox/permissions", to: "sandbox_permissions#show"
       get "sandbox/oauth_apps", to: "sandbox_oauth_apps#index"
+      post "sandbox/permission_requests", to: "sandbox_permission_requests#create"
     end
   end
 

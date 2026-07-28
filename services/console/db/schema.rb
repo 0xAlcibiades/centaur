@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -265,6 +265,29 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
     t.index ["namespace", "foreign_id"], name: "index_oauth_token_secrets_on_namespace_and_foreign_id", unique: true
   end
 
+  create_table "permission_requests", force: :cascade do |t|
+    t.string "approver_notification_channel_id"
+    t.string "approver_notification_message_ts"
+    t.datetime "created_at", null: false
+    t.datetime "decided_at"
+    t.bigint "decided_by_id"
+    t.string "kind", null: false
+    t.jsonb "requested_channel_ids", default: [], null: false
+    t.bigint "requesting_principal_id", null: false
+    t.bigint "requesting_proxy_id", null: false
+    t.string "requesting_slack_channel_id", null: false
+    t.string "requesting_slack_thread_ts"
+    t.jsonb "services", default: [], null: false
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["decided_by_id"], name: "index_permission_requests_on_decided_by_id"
+    t.index ["kind"], name: "index_permission_requests_on_kind"
+    t.index ["requesting_principal_id"], name: "index_permission_requests_on_requesting_principal_id"
+    t.index ["requesting_proxy_id"], name: "index_permission_requests_on_requesting_proxy_id"
+    t.index ["requesting_slack_channel_id"], name: "index_permission_requests_on_requesting_slack_channel_id"
+    t.index ["status"], name: "index_permission_requests_on_status"
+  end
+
   create_table "pg_dsn_secrets", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "created_by_id", null: false
@@ -501,6 +524,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
   add_foreign_key "mcp_oauth_refresh_tokens", "users"
   add_foreign_key "oauth_apps", "users", column: "created_by_id"
   add_foreign_key "oauth_token_secrets", "users", column: "created_by_id"
+  add_foreign_key "permission_requests", "principals", column: "requesting_principal_id"
+  add_foreign_key "permission_requests", "proxies", column: "requesting_proxy_id"
+  add_foreign_key "permission_requests", "users", column: "decided_by_id"
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"
   add_foreign_key "principal_roles", "principals"
   add_foreign_key "principal_roles", "roles"

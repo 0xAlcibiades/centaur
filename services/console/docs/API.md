@@ -1128,6 +1128,56 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 }
 ```
 
+### Sandbox Permission Requests
+
+`POST /api/v1/sandbox/permission_requests`
+
+Creates a permission request for the principal authenticated by the same sandbox entitlement JWT used by `GET /api/v1/sandbox/permissions`. The token must match an assigned proxy and principal. The authenticated principal must be a Slack channel principal because approvals are announced back to Slack.
+
+Slack channel request:
+
+```json
+{
+  "data": {
+    "kind": "slack_channels",
+    "requesting_slack_thread_ts": "1700000000.000000",
+    "requested_channel_ids": ["C0123456789", "G0123456789"]
+  }
+}
+```
+
+Service request:
+
+```json
+{
+  "data": {
+    "kind": "services",
+    "requesting_slack_thread_ts": "1700000000.000000",
+    "services": ["gmail", "google drive"]
+  }
+}
+```
+
+Returns `201` with the created pending request. Console posts an approver notification to `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` with a normal link to the admin approval page. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are recorded and announced, but do not mutate grants or credentials.
+
+```json
+{
+  "data": {
+    "id": "preq_...",
+    "status": "pending",
+    "kind": "slack_channels",
+    "requesting_principal_id": "prn_...",
+    "requesting_proxy_id": "prx_...",
+    "requesting_slack_channel_id": "C0123456789",
+    "requesting_slack_thread_ts": "1700000000.000000",
+    "requested_channel_ids": ["C1111111111"],
+    "services": [],
+    "created_at": "2026-07-28T16:56:52Z",
+    "updated_at": "2026-07-28T16:56:52Z"
+  }
+}
+```
+
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).

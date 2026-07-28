@@ -1,0 +1,107 @@
+<% content_for :title, "Permission Request #{@permission_request.oid} - Centaur Console" %>
+
+<div class="mb-8">
+  <a href="<%= console_principal_path(@permission_request.requesting_principal.oid) %>" class="back-link">&larr; back to principal</a>
+  <div class="mt-2 flex flex-wrap items-center gap-3">
+    <h1 class="page-title">Permission Request</h1>
+    <span class="resource-badge"><%= @permission_request.status.titleize %></span>
+    <% if @permission_request.pending? %>
+      <div class="ml-auto flex flex-wrap items-center gap-2">
+        <%= button_to "Approve",
+                      approve_console_permission_request_path(@permission_request.oid),
+                      method: :post,
+                      class: "btn-primary" %>
+        <%= button_to "Deny",
+                      deny_console_permission_request_path(@permission_request.oid),
+                      method: :post,
+                      class: "btn-secondary" %>
+      </div>
+    <% end %>
+  </div>
+  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+    <span class="text-centaur-400 glow"><%= @permission_request.oid %></span>
+    <span class="text-zinc-600">&middot;</span>
+    <span class="rounded bg-ink-700 px-2 py-0.5 text-xs text-zinc-400"><%= @permission_request.kind.humanize %></span>
+    <span class="text-zinc-600">&middot;</span>
+    <span class="text-zinc-400">created <%= time_ago_in_words(@permission_request.created_at) %> ago</span>
+  </div>
+</div>
+
+<section class="mb-8">
+  <div class="mb-4">
+    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requester</h2>
+  </div>
+  <div class="console-panel p-5">
+    <dl class="grid gap-4 sm:grid-cols-2">
+      <div>
+        <dt class="text-xs uppercase tracking-wider text-zinc-500">Principal</dt>
+        <dd class="mt-1 text-sm text-zinc-100">
+          <%= link_to @permission_request.requesting_principal.oid,
+                      console_principal_path(@permission_request.requesting_principal.oid),
+                      class: "console-link" %>
+        </dd>
+      </div>
+      <div>
+        <dt class="text-xs uppercase tracking-wider text-zinc-500">Proxy</dt>
+        <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.requesting_proxy.name %></dd>
+      </div>
+      <div>
+        <dt class="text-xs uppercase tracking-wider text-zinc-500">Slack Channel</dt>
+        <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.requesting_slack_channel_id %></dd>
+      </div>
+      <div>
+        <dt class="text-xs uppercase tracking-wider text-zinc-500">Slack Thread</dt>
+        <dd class="mt-1 text-sm text-zinc-100">
+          <%= @permission_request.requesting_slack_thread_ts.presence || "none" %>
+        </dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+<section class="mb-8">
+  <div class="mb-4">
+    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requested Access</h2>
+  </div>
+  <div class="console-panel p-5">
+    <% if @permission_request.slack_channels? %>
+      <div class="flex flex-wrap gap-2">
+        <% @permission_request.requested_channel_ids.each do |channel_id| %>
+          <span class="label-chip"><%= channel_id %></span>
+        <% end %>
+      </div>
+    <% else %>
+      <div class="flex flex-wrap gap-2">
+        <% @permission_request.services.each do |service| %>
+          <span class="label-chip"><%= service %></span>
+        <% end %>
+      </div>
+    <% end %>
+  </div>
+</section>
+
+<section>
+  <div class="mb-4">
+    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Decision</h2>
+  </div>
+  <div class="console-panel p-5">
+    <% if @permission_request.pending? %>
+      <div class="text-sm text-zinc-400">No decision yet.</div>
+    <% else %>
+      <dl class="grid gap-4 sm:grid-cols-2">
+        <div>
+          <dt class="text-xs uppercase tracking-wider text-zinc-500">Status</dt>
+          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.status.titleize %></dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wider text-zinc-500">Decided By</dt>
+          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.decided_by.email %></dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wider text-zinc-500">Decided At</dt>
+          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.decided_at.utc.iso8601 %></dd>
+        </div>
+      </dl>
+    <% end %>
+  </div>
+</section>
