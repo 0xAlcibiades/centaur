@@ -6,16 +6,6 @@ class PermissionRequestTest < ActiveSupport::TestCase
     @principal = @proxy.principal
   end
 
-  test "normalizes Slack channel request channel IDs" do
-    request = build_request(
-      metadata: { "requested_channel_ids" => [ " c0123456789 ", "C0123456789", "g9876543210" ] }
-    )
-
-    assert request.valid?
-    assert_equal %w[C0123456789 G9876543210], request.requested_channel_ids
-    assert_equal({ "requested_channel_ids" => %w[C0123456789 G9876543210] }, request.metadata)
-  end
-
   test "normalizes text request metadata" do
     request = build_request(
       kind: PermissionRequest::TEXT_KIND,
@@ -27,11 +17,11 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_equal({ "request" => "Please authorize Google Drive for quarterly reporting." }, request.metadata)
   end
 
-  test "rejects Slack channel request without requested channels" do
-    request = build_request(metadata: { "requested_channel_ids" => [] })
+  test "rejects non text request kind" do
+    request = build_request(kind: "slack")
 
     assert_not request.valid?
-    assert request.errors[:metadata].any? { |message| message.include?("less than: 1") }
+    assert_includes request.errors[:kind], "is not included in the list"
   end
 
   test "rejects text request without request text" do
@@ -42,7 +32,7 @@ class PermissionRequestTest < ActiveSupport::TestCase
   end
 
   test "rejects metadata keys that do not belong to the request kind" do
-    request = build_request(metadata: { "requested_channel_ids" => [ "C0123456789" ], "request" => "extra" })
+    request = build_request(metadata: { "request" => "Please authorize Gmail.", "requested_channel_ids" => [ "C0123456789" ] })
 
     assert_not request.valid?
     assert request.errors[:metadata].any? { |message| message.include?("disallowed additional property") }
@@ -60,24 +50,17 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_includes request.errors[:requesting_principal], "must be a Slack channel principal"
   end
 
-  test "approve grants requested Slack channel permissions" do
-    request = build_request(metadata: { "requested_channel_ids" => [ "C1111111111", "G2222222222" ] })
+  test "approve records decision without granting permissions" do
+    request = build_request
     request.save!
 
-    assert_difference -> { @principal.slack_channel_permissions.count }, 2 do
+    assert_no_difference -> { @principal.slack_channel_permissions.count } do
       assert request.approve!(by: users(:acme_admin))
     end
 
     assert request.reload.approved?
     assert_equal users(:acme_admin), request.decided_by
     assert_not_nil request.decided_at
-    rows = @principal.slack_channel_permissions.order(:channel_id).where(channel_id: %w[C1111111111 G2222222222])
-    assert_equal 2, rows.count
-    rows.each do |permission|
-      assert permission.upload_enabled
-      assert permission.download_enabled
-      assert permission.history_enabled
-    end
   end
 
   test "approve is idempotent once decided" do
@@ -123,11 +106,11 @@ class PermissionRequestTest < ActiveSupport::TestCase
 
   def build_request(overrides = {})
     PermissionRequest.new({
-      kind: PermissionRequest::SLACK_KIND,
+      kind: PermissionRequest::TEXT_KIND,
       requesting_principal: @principal,
       requesting_proxy: @proxy,
       requesting_slack_channel_id: @principal.foreign_id,
-      metadata: { "requested_channel_ids" => [ "C0123456789" ] }
+      metadata: { "request" => "Please authorize Gmail." }
     }.merge(overrides))
   end
 end

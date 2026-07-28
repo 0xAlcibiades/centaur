@@ -15,7 +15,7 @@ module Api
       end
 
       test "rejects requests without a sandbox token" do
-        post "/api/v1/sandbox/permission_requests", params: slack_body.to_json, headers: json_headers
+        post "/api/v1/sandbox/permission_requests", params: text_body.to_json, headers: json_headers
 
         assert_response :unauthorized
         assert_equal "invalid or missing sandbox token", json_body.dig("error", "message")
@@ -24,7 +24,7 @@ module Api
       test "rejects invalid sandbox token" do
         with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
           post "/api/v1/sandbox/permission_requests",
-               params: slack_body.to_json,
+               params: text_body.to_json,
                headers: auth_headers("not-a-jwt")
         end
 
@@ -37,7 +37,7 @@ module Api
           token = token_for(@proxy)
           @proxy.update!(principal: principals(:acme_user_bob))
           post "/api/v1/sandbox/permission_requests",
-               params: slack_body.to_json,
+               params: text_body.to_json,
                headers: auth_headers(token)
         end
 
@@ -55,7 +55,7 @@ module Api
 
         with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
           post "/api/v1/sandbox/permission_requests",
-               params: slack_body.to_json,
+               params: text_body.to_json,
                headers: auth_headers(token)
         end
 
@@ -67,7 +67,7 @@ module Api
 
         with_permission_request_env do
           post "/api/v1/sandbox/permission_requests",
-               params: slack_body.to_json,
+               params: text_body.to_json,
                headers: auth_headers(token_for(proxy))
         end
 
@@ -76,15 +76,28 @@ module Api
                         "must be a Slack channel principal"
       end
 
-      test "rejects invalid request shape" do
+      test "rejects unsupported request kind" do
         with_permission_request_env do
           post "/api/v1/sandbox/permission_requests",
-               params: { data: { kind: "slack", metadata: { requested_channel_ids: [] } } }.to_json,
+               params: { data: { kind: "slack", metadata: { requested_channel_ids: [ "C1111111111" ] } } }.to_json,
                headers: auth_headers(token_for(@proxy))
         end
 
         assert_response :unprocessable_entity
-        assert json_body.dig("error", "details", "metadata").any? { |message| message.include?("less than: 1") }
+        assert_includes json_body.dig("error", "details", "kind"), "is not included in the list"
+      end
+
+      test "rejects invalid request shape" do
+        with_permission_request_env do
+          post "/api/v1/sandbox/permission_requests",
+               params: { data: { kind: "text", metadata: {} } }.to_json,
+               headers: auth_headers(token_for(@proxy))
+        end
+
+        assert_response :unprocessable_entity
+        assert json_body.dig("error", "details", "metadata").any? do |message|
+          message.include?("missing required properties: request")
+        end
       end
 
       test "rejects request when permission request Slack is not configured" do
@@ -97,7 +110,7 @@ module Api
           assert_no_enqueued_jobs only: PermissionRequestApproverNotificationJob do
             assert_no_difference -> { PermissionRequest.count } do
               post "/api/v1/sandbox/permission_requests",
-                   params: slack_body.to_json,
+                   params: text_body.to_json,
                    headers: auth_headers(token_for(@proxy))
             end
           end
@@ -107,12 +120,12 @@ module Api
         assert_equal "permission requests are not configured", json_body.dig("error", "message")
       end
 
-      test "creates Slack channel permission request and enqueues approver notification" do
+      test "creates text permission request and enqueues approver notification" do
         with_permission_request_env("CENTAUR_CONSOLE_PUBLIC_URL" => "https://console.test") do
           assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             assert_difference -> { PermissionRequest.count }, 1 do
               post "/api/v1/sandbox/permission_requests",
-                   params: slack_body.to_json,
+                   params: text_body.to_json,
                    headers: auth_headers(token_for(@proxy))
             end
           end
@@ -125,11 +138,11 @@ module Api
         assert_equal @proxy.principal, request.requesting_principal
         assert_equal @proxy, request.requesting_proxy
         assert_equal "C0123456789", request.requesting_slack_channel_id
-        assert_equal [ "C1111111111" ], request.requested_channel_ids
+        assert_equal({ "request" => "Please authorize Gmail." }, request.metadata)
         assert_equal "pending", request.approver_notification_status
       end
 
-      test "creates service permission request" do
+      test "creates text permission request with arbitrary request text" do
         with_permission_request_env do
           assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             post "/api/v1/sandbox/permission_requests",
@@ -149,17 +162,16 @@ module Api
         request = PermissionRequest.last
         assert_equal PermissionRequest::TEXT_KIND, request.kind
         assert_equal({ "request" => "Please authorize Gmail and Google Drive for customer follow-up." }, request.metadata)
-        assert_empty request.requested_channel_ids
       end
 
       private
 
-      def slack_body
+      def text_body
         {
           data: {
-            kind: "slack",
+            kind: "text",
             requesting_slack_thread_ts: "170.123",
-            metadata: { requested_channel_ids: [ "C1111111111" ] }
+            metadata: { request: "Please authorize Gmail." }
           }
         }
       end

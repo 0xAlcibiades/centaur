@@ -1134,20 +1134,6 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 
 Creates a permission request for the principal authenticated by the same sandbox entitlement JWT used by `GET /api/v1/sandbox/permissions`. The token must match an assigned proxy and principal. The authenticated principal must be a Slack channel principal because decisions are announced back to Slack.
 
-Slack channel request:
-
-```json
-{
-  "data": {
-    "kind": "slack",
-    "requesting_slack_thread_ts": "1700000000.000000",
-    "metadata": {
-      "requested_channel_ids": ["C0123456789", "G0123456789"]
-    }
-  }
-}
-```
-
 Text request:
 
 ```json
@@ -1162,20 +1148,20 @@ Text request:
 }
 ```
 
-Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. `metadata` is validated with JSON Schema based on `kind`. Slack approvals grant upload, download, and history access to `metadata.requested_channel_ids`. Text approvals record and announce the decision, but do not mutate grants or credentials.
+Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. `metadata` is validated with JSON Schema based on `kind`. For now, only `kind: "text"` is supported. Approvals record and announce the decision, but do not mutate grants or credentials.
 
 ```json
 {
   "data": {
     "id": "preq_...",
     "status": "pending",
-    "kind": "slack",
+    "kind": "text",
     "requesting_principal_id": "prn_...",
     "requesting_proxy_id": "prx_...",
     "requesting_slack_channel_id": "C0123456789",
     "requesting_slack_thread_ts": "1700000000.000000",
     "metadata": {
-      "requested_channel_ids": ["C1111111111"]
+      "request": "Please authorize Gmail and Google Drive for customer follow-up."
     },
     "created_at": "2026-07-28T16:56:52Z",
     "updated_at": "2026-07-28T16:56:52Z"

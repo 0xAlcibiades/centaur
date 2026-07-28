@@ -77,11 +77,7 @@ class PermissionRequestSlackNotifier
   def self.requester_outcome_text(permission_request)
     case permission_request.status
     when "approved"
-      if permission_request.slack?
-        "Permission request approved. Channel access has been granted for #{slack_list(permission_request.requested_channel_ids)}."
-      else
-        "Permission request approved for: #{slack_escape(permission_request.text_request)}"
-      end
+      "Permission request approved for: #{slack_escape(permission_request.text_request)}"
     when "denied"
       "Permission request denied for #{request_summary(permission_request)}."
     else
@@ -90,11 +86,7 @@ class PermissionRequestSlackNotifier
   end
 
   def self.request_summary(permission_request)
-    if permission_request.slack?
-      "Slack channels #{slack_list(permission_request.requested_channel_ids)}"
-    else
-      "request: #{slack_escape(permission_request.text_request)}"
-    end
+    "request: #{slack_escape(permission_request.text_request)}"
   end
 
   def self.approver_channel_id

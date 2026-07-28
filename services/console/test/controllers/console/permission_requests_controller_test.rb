@@ -6,12 +6,12 @@ module Console
 
     setup do
       @permission_request = PermissionRequest.create!(
-        kind: PermissionRequest::SLACK_KIND,
+        kind: PermissionRequest::TEXT_KIND,
         requesting_principal: principals(:acme_channel),
         requesting_proxy: proxies(:acme_proxy),
         requesting_slack_channel_id: "C0123456789",
         requesting_slack_thread_ts: "170.123",
-        metadata: { "requested_channel_ids" => [ "C1111111111" ] },
+        metadata: { "request" => "Please authorize Gmail." },
         approver_notification_channel_id: "CAPPROVERS",
         approver_notification_message_ts: "171.1"
       )
@@ -36,11 +36,11 @@ module Console
       assert_redirected_to console_threads_path
     end
 
-    test "approve grants Slack permissions and enqueues Slack updates" do
+    test "approve records decision and enqueues Slack updates without granting permissions" do
       sign_in users(:acme_admin)
 
       assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
-        assert_difference -> { principals(:acme_channel).slack_channel_permissions.count }, 1 do
+        assert_no_difference -> { principals(:acme_channel).slack_channel_permissions.count } do
           post approve_console_permission_request_url(@permission_request.oid)
         end
       end
@@ -49,10 +49,6 @@ module Console
       assert_equal "Permission request approved.", flash[:notice]
       assert @permission_request.reload.approved?
       assert_equal users(:acme_admin), @permission_request.decided_by
-      permission = principals(:acme_channel).slack_channel_permissions.find_by!(channel_id: "C1111111111")
-      assert permission.upload_enabled
-      assert permission.download_enabled
-      assert permission.history_enabled
     end
 
     test "denies request and enqueues Slack updates without granting permissions" do
@@ -94,7 +90,7 @@ module Console
       end
     end
 
-    test "text approval records decision without granting Slack permissions" do
+    test "another text approval records decision without granting Slack permissions" do
       text_request = PermissionRequest.create!(
         kind: PermissionRequest::TEXT_KIND,
         requesting_principal: principals(:acme_channel),

@@ -2,26 +2,9 @@ class PermissionRequest < ApplicationRecord
   oid_prefix "preq"
 
   STATUSES = %w[pending approved denied].freeze
-  KINDS = %w[slack text].freeze
+  KINDS = %w[text].freeze
   NOTIFICATION_STATUSES = %w[pending sent skipped failed].freeze
-  SLACK_KIND = "slack".freeze
   TEXT_KIND = "text".freeze
-  SLACK_METADATA_SCHEMA = JSONSchemer.schema({
-    "type" => "object",
-    "additionalProperties" => false,
-    "required" => [ "requested_channel_ids" ],
-    "properties" => {
-      "requested_channel_ids" => {
-        "type" => "array",
-        "minItems" => 1,
-        "uniqueItems" => true,
-        "items" => {
-          "type" => "string",
-          "pattern" => "^[CDG][A-Z0-9]{8,}$"
-        }
-      }
-    }
-  })
   TEXT_METADATA_SCHEMA = JSONSchemer.schema({
     "type" => "object",
     "additionalProperties" => false,
@@ -31,7 +14,6 @@ class PermissionRequest < ApplicationRecord
     }
   })
   METADATA_SCHEMAS = {
-    SLACK_KIND => SLACK_METADATA_SCHEMA,
     TEXT_KIND => TEXT_METADATA_SCHEMA
   }.freeze
 
@@ -69,16 +51,8 @@ class PermissionRequest < ApplicationRecord
     status == "denied"
   end
 
-  def slack?
-    kind == SLACK_KIND
-  end
-
   def text?
     kind == TEXT_KIND
-  end
-
-  def requested_channel_ids
-    Array(metadata["requested_channel_ids"])
   end
 
   def text_request
@@ -86,9 +60,7 @@ class PermissionRequest < ApplicationRecord
   end
 
   def approve!(by:)
-    transition!("approved", by: by) do
-      grant_requested_slack_channels! if slack?
-    end
+    transition!("approved", by: by)
   end
 
   def deny!(by:)
@@ -195,32 +167,6 @@ class PermissionRequest < ApplicationRecord
     changed
   end
 
-  def grant_requested_slack_channels!
-    unless requesting_principal
-      errors.add(:requesting_principal, "is no longer available")
-      raise ActiveRecord::RecordInvalid, self
-    end
-
-    now = Time.current
-    rows = requested_channel_ids.map do |channel_id|
-      {
-        principal_id: requesting_principal.id,
-        channel_id: channel_id,
-        upload_enabled: true,
-        download_enabled: true,
-        history_enabled: true,
-        created_at: now,
-        updated_at: now
-      }
-    end
-    SlackChannelPermission.insert_all(rows, unique_by: :idx_slack_permissions_unique_principal_channel) if rows.any?
-    SlackChannelPermission
-      .where(principal_id: requesting_principal.id, channel_id: requested_channel_ids)
-      .update_all(upload_enabled: true, download_enabled: true, history_enabled: true, updated_at: now)
-    requesting_principal.reset_slack_channel_permissions_cache!
-    Principal.bump_sync_config_cache_versions([ requesting_principal.id ])
-  end
-
   def copy_requesting_audit_fields
     if requesting_principal
       self.requesting_principal_oid ||= requesting_principal.oid
@@ -241,21 +187,12 @@ class PermissionRequest < ApplicationRecord
     self.metadata = normalize_metadata
   end
 
-  def normalize_strings(values)
-    Array(values)
-      .map { |value| value.to_s.strip }
-      .reject(&:blank?)
-      .uniq
-  end
-
   def normalize_metadata
     return {} if metadata.nil?
     return metadata unless metadata.is_a?(Hash)
 
     values = metadata.stringify_keys
     case kind
-    when SLACK_KIND
-      values.merge("requested_channel_ids" => normalize_strings(values["requested_channel_ids"]).map(&:upcase).uniq)
     when TEXT_KIND
       return values unless values.key?("request")
 

@@ -76,17 +76,9 @@
     <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requested Access</h2>
   </div>
   <div class="console-panel p-5">
-    <% if @permission_request.slack? %>
-      <div class="flex flex-wrap gap-2">
-        <% @permission_request.requested_channel_ids.each do |channel_id| %>
-          <span class="label-chip"><%= channel_id %></span>
-        <% end %>
-      </div>
-    <% else %>
-      <div class="whitespace-pre-wrap text-sm text-zinc-100">
-        <%= @permission_request.text_request %>
-      </div>
-    <% end %>
+    <div class="whitespace-pre-wrap text-sm text-zinc-100">
+      <%= @permission_request.text_request %>
+    </div>
   </div>
 </section>
 
