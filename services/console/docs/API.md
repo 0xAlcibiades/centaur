@@ -1158,7 +1158,7 @@ Service request:
 }
 ```
 
-Returns `201` with the created pending request. Console enqueues Slack delivery jobs for approver notifications and decision outcomes. If `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` is unset, approver-channel notifications are skipped and the request remains reviewable in Console. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are limited to known service identifiers, are recorded and announced, and do not mutate grants or credentials.
+Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service approvals are limited to known service identifiers, are recorded and announced, and do not mutate grants or credentials.
 
 ```json
 {

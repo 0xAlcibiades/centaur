@@ -9,8 +9,8 @@ class PermissionRequestSlackNotifier
   READ_TIMEOUT_SECONDS = 5
   WRITE_TIMEOUT_SECONDS = 2
 
-  def self.approver_notifications_enabled?
-    approver_channel_id.present?
+  def self.permission_requests_enabled?
+    approver_channel_id.present? && slack_bot_token.present?
   end
 
   def self.post_approver_notification(permission_request, review_url)
@@ -102,7 +102,7 @@ class PermissionRequestSlackNotifier
   end
 
   def self.slack_api(method, body)
-    token = ENV["CENTAUR_CONSOLE_SLACK_BOT_TOKEN"].presence || ENV["SLACK_BOT_TOKEN"].presence
+    token = slack_bot_token
     raise SlackApiError, "SLACK_BOT_TOKEN is not configured" if token.blank?
 
     response = HttpClient.new(
@@ -133,6 +133,11 @@ class PermissionRequestSlackNotifier
     (ENV["SLACK_API_URL"].presence || DEFAULT_API_URL).to_s.delete_suffix("/")
   end
   private_class_method :slack_api_url
+
+  def self.slack_bot_token
+    ENV["CENTAUR_CONSOLE_SLACK_BOT_TOKEN"].presence || ENV["SLACK_BOT_TOKEN"].presence
+  end
+  private_class_method :slack_bot_token
 
   def self.slack_list(values)
     Array(values).map { |value| slack_escape(value) }.join(", ")

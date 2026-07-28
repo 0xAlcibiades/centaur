@@ -12,23 +12,11 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     )
   end
 
-  test "approver notification is skipped when approval channel is not configured" do
-    with_env("CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID" => nil) do
-      PermissionRequestApproverNotificationJob.perform_now(@permission_request.id, "https://console.test/request")
-    end
-
-    assert_equal "skipped", @permission_request.reload.approver_notification_status
-    assert_nil @permission_request.approver_notification_channel_id
-    assert_nil @permission_request.approver_notification_message_ts
-  end
-
   test "approver notification records Slack message metadata" do
     result = PermissionRequestSlackNotifier::Result.new(channel_id: "CAPPROVERS", message_ts: "171.1")
 
-    PermissionRequestSlackNotifier.stub(:approver_notifications_enabled?, true) do
-      PermissionRequestSlackNotifier.stub(:post_approver_notification, result) do
-        PermissionRequestApproverNotificationJob.perform_now(@permission_request.id, "https://console.test/request")
-      end
+    PermissionRequestSlackNotifier.stub(:post_approver_notification, result) do
+      PermissionRequestApproverNotificationJob.perform_now(@permission_request.id, "https://console.test/request")
     end
 
     assert_equal "sent", @permission_request.reload.approver_notification_status
@@ -40,11 +28,9 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
   test "approver notification failure is persisted before retry" do
     error = PermissionRequestSlackNotifier::SlackApiError.new("timeout")
 
-    PermissionRequestSlackNotifier.stub(:approver_notifications_enabled?, true) do
-      PermissionRequestSlackNotifier.stub(:post_approver_notification, ->(_request, _url) { raise error }) do
-        assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
-          PermissionRequestApproverNotificationJob.perform_now(@permission_request.id, "https://console.test/request")
-        end
+    PermissionRequestSlackNotifier.stub(:post_approver_notification, ->(_request, _url) { raise error }) do
+      assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
+        PermissionRequestApproverNotificationJob.perform_now(@permission_request.id, "https://console.test/request")
       end
     end
 
@@ -133,15 +119,5 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     end
 
     assert_equal "sent", @permission_request.reload.requester_outcome_notification_status
-  end
-
-  private
-
-  def with_env(values)
-    previous = values.keys.to_h { |key| [ key, ENV[key] ] }
-    values.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-    yield
-  ensure
-    previous.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
   end
 end

@@ -4,6 +4,7 @@ module Api
       include ApiSandboxAuthentication
 
       rescue_from ActiveRecord::RecordInvalid, with: :render_record_invalid
+      before_action :ensure_permission_requests_enabled!
 
       def create
         principal = current_proxy.principal
@@ -34,6 +35,12 @@ module Api
           requested_channel_ids: attrs[:requested_channel_ids],
           services: attrs[:services]
         }
+      end
+
+      def ensure_permission_requests_enabled!
+        return if PermissionRequestSlackNotifier.permission_requests_enabled?
+
+        render_error(status: :service_unavailable, message: "permission requests are not configured")
       end
 
       def permission_request_payload(permission_request)

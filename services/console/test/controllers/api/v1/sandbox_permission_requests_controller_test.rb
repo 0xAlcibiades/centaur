@@ -65,7 +65,7 @@ module Api
       test "rejects non Slack channel principal" do
         proxy = proxies(:globex_proxy)
 
-        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+        with_permission_request_env do
           post "/api/v1/sandbox/permission_requests",
                params: slack_body.to_json,
                headers: auth_headers(token_for(proxy))
@@ -77,7 +77,7 @@ module Api
       end
 
       test "rejects invalid request shape" do
-        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+        with_permission_request_env do
           post "/api/v1/sandbox/permission_requests",
                params: { data: { kind: "slack_channels", requested_channel_ids: [] } }.to_json,
                headers: auth_headers(token_for(@proxy))
@@ -88,10 +88,15 @@ module Api
                         "must include at least one channel ID"
       end
 
-      test "creates request even when approver Slack channel is not configured" do
-        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
-          assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
-            assert_difference -> { PermissionRequest.count }, 1 do
+      test "rejects request when permission request Slack is not configured" do
+        with_env(
+          "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+          "CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID" => nil,
+          "CENTAUR_CONSOLE_SLACK_BOT_TOKEN" => nil,
+          "SLACK_BOT_TOKEN" => nil
+        ) do
+          assert_no_enqueued_jobs only: PermissionRequestApproverNotificationJob do
+            assert_no_difference -> { PermissionRequest.count } do
               post "/api/v1/sandbox/permission_requests",
                    params: slack_body.to_json,
                    headers: auth_headers(token_for(@proxy))
@@ -99,12 +104,12 @@ module Api
           end
         end
 
-        assert_response :created
-        assert_equal "pending", PermissionRequest.last.approver_notification_status
+        assert_response :service_unavailable
+        assert_equal "permission requests are not configured", json_body.dig("error", "message")
       end
 
       test "creates Slack channel permission request and enqueues approver notification" do
-        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret", "CENTAUR_CONSOLE_PUBLIC_URL" => "https://console.test") do
+        with_permission_request_env("CENTAUR_CONSOLE_PUBLIC_URL" => "https://console.test") do
           assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             assert_difference -> { PermissionRequest.count }, 1 do
               post "/api/v1/sandbox/permission_requests",
@@ -126,7 +131,7 @@ module Api
       end
 
       test "creates service permission request" do
-        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+        with_permission_request_env do
           assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             post "/api/v1/sandbox/permission_requests",
                  params: { data: { kind: "services", services: [ "gmail", "calendar" ] } }.to_json,
@@ -173,6 +178,14 @@ module Api
 
       def json_body
         JSON.parse(response.body)
+      end
+
+      def with_permission_request_env(values = {})
+        with_env({
+          "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+          "CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID" => "CAPPROVERS",
+          "CENTAUR_CONSOLE_SLACK_BOT_TOKEN" => "xoxb-test-token"
+        }.merge(values)) { yield }
       end
 
       def with_env(values)
