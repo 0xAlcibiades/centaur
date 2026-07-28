@@ -10,7 +10,7 @@ class PermissionRequest < ApplicationRecord
     "additionalProperties" => false,
     "required" => [ "request" ],
     "properties" => {
-      "request" => { "type" => "string", "minLength" => 1 }
+      "request" => { "type" => "string", "pattern" => "\\S" }
     }
   })
   METADATA_SCHEMAS = {
@@ -20,8 +20,6 @@ class PermissionRequest < ApplicationRecord
   belongs_to :requesting_principal, class_name: "Principal", optional: true
   belongs_to :requesting_proxy, class_name: "Proxy", optional: true
   belongs_to :decided_by, class_name: "User", optional: true
-
-  before_validation :normalize_request_payload
 
   validates :status, inclusion: { in: STATUSES }
   validates :kind, inclusion: { in: KINDS }
@@ -85,26 +83,6 @@ class PermissionRequest < ApplicationRecord
       changed = true
     end
     changed
-  end
-
-  def normalize_request_payload
-    self.requesting_slack_channel_id = requesting_slack_channel_id.to_s.strip.upcase
-    self.metadata = normalize_metadata
-  end
-
-  def normalize_metadata
-    return {} if metadata.nil?
-    return metadata unless metadata.is_a?(Hash)
-
-    values = metadata.stringify_keys
-    case kind
-    when TEXT_KIND
-      return values unless values.key?("request")
-
-      values.merge("request" => values["request"].to_s.strip)
-    else
-      values
-    end
   end
 
   def request_payload_matches_kind

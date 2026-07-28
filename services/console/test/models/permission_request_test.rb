@@ -6,15 +6,22 @@ class PermissionRequestTest < ActiveSupport::TestCase
     @principal = @proxy.principal
   end
 
-  test "normalizes text request metadata" do
+  test "preserves text request metadata" do
     request = build_request(
       kind: PermissionRequest::TEXT_KIND,
       metadata: { "request" => "  Please authorize Google Drive for quarterly reporting.  " }
     )
 
     assert request.valid?
-    assert_equal "Please authorize Google Drive for quarterly reporting.", request.text_request
-    assert_equal({ "request" => "Please authorize Google Drive for quarterly reporting." }, request.metadata)
+    assert_equal "  Please authorize Google Drive for quarterly reporting.  ", request.text_request
+    assert_equal({ "request" => "  Please authorize Google Drive for quarterly reporting.  " }, request.metadata)
+  end
+
+  test "rejects text request with only whitespace" do
+    request = build_request(kind: PermissionRequest::TEXT_KIND, metadata: { "request" => "   " })
+
+    assert_not request.valid?
+    assert request.errors[:metadata].any? { |message| message.include?("pattern") }
   end
 
   test "rejects text request without request text" do
