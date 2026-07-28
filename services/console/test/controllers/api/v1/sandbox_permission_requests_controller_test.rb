@@ -123,14 +123,6 @@ module Api
           "CENTAUR_CONSOLE_SLACK_BOT_TOKEN" => "xoxb-test-token"
         }.merge(values)) { yield }
       end
-
-      def with_env(values)
-        previous = values.keys.to_h { |key| [ key, ENV[key] ] }
-        values.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-        yield
-      ensure
-        previous.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-      end
     end
   end
 end
