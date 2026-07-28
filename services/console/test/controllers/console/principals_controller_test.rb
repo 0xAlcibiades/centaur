@@ -127,14 +127,12 @@ module Console
         [
           {
             "channel_id" => "C0123456789",
-            "channel_name" => nil,
             "upload_enabled" => true,
             "download_enabled" => false,
             "history_enabled" => true
           },
           {
             "channel_id" => "G9876543210",
-            "channel_name" => nil,
             "upload_enabled" => false,
             "download_enabled" => true,
             "history_enabled" => false
@@ -144,12 +142,41 @@ module Console
       )
     end
 
-    test "update_slack_channel_permissions clears stale channel names when changing channels" do
+    test "update_slack_channel_permissions persists flag changes without a channel id" do
+      principal = principals(:acme_user_bob)
+      permission = principal.slack_channel_permissions.create!(
+        channel_id: "C0123456789",
+        upload_enabled: true,
+        download_enabled: true,
+        history_enabled: true
+      )
+
+      patch console_principal_slack_channel_permissions_url(principal.oid),
+            params: {
+              principal: {
+                slack_channel_permissions_attributes: {
+                  "0" => {
+                    id: permission.id,
+                    upload_enabled: "0",
+                    download_enabled: "1",
+                    history_enabled: "0"
+                  }
+                }
+              }
+            }
+
+      assert_redirected_to console_principal_path(principal.oid)
+      permission.reload
+      assert_not permission.upload_enabled
+      assert_predicate permission, :download_enabled
+      assert_not permission.history_enabled
+    end
+
+    test "update_slack_channel_permissions rejects channel id changes" do
       principal = principals(:acme_user_bob)
       permission = SlackChannelPermission.create!(
         principal: principal,
         channel_id: "C0123456789",
-        channel_name: "old-channel",
         upload_enabled: true,
         download_enabled: true,
         history_enabled: true
@@ -162,7 +189,6 @@ module Console
                   "0" => {
                     id: permission.id,
                     channel_id: "G9876543210",
-                    channel_name: "",
                     upload_enabled: "1",
                     download_enabled: "1",
                     history_enabled: "1"
@@ -172,9 +198,8 @@ module Console
             }
 
       assert_redirected_to console_principal_path(principal.oid)
-      permission.reload
-      assert_equal "G9876543210", permission.channel_id
-      assert_nil permission.channel_name
+      assert_equal "Slack channels cannot be changed after creation.", flash[:alert]
+      assert_equal "C0123456789", permission.reload.channel_id
     end
 
     test "destroy deletes the principal and dependent access records" do

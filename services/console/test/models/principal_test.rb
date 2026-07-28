@@ -138,6 +138,102 @@ class PrincipalTest < ActiveSupport::TestCase
     )
   end
 
+  test "effective Slack permissions merge direct and role rows deterministically" do
+    principal = principals(:acme_channel)
+    role = roles(:acme_infra)
+    SlackChannelPermission.create!(
+      principal: principal,
+      channel_id: "C0123456789",
+      upload_enabled: true
+    )
+    SlackChannelPermission.create!(
+      role: role,
+      channel_id: "C0123456789",
+      download_enabled: true
+    )
+    SlackChannelPermission.create!(
+      role: role,
+      channel_id: "G9876543210",
+      history_enabled: true
+    )
+
+    assert_equal(
+      [
+        {
+          "channel_id" => "C0123456789",
+          "upload_enabled" => true,
+          "download_enabled" => true,
+          "history_enabled" => false
+        },
+        {
+          "channel_id" => "G9876543210",
+          "upload_enabled" => false,
+          "download_enabled" => false,
+          "history_enabled" => true
+        }
+      ],
+      principal.effective_slack_channel_permissions_payload
+    )
+    assert_equal [ "C0123456789" ], principal.slack_upload_channel_ids
+    assert_equal [ "C0123456789" ], principal.slack_download_channel_ids
+    assert_equal [ "G9876543210" ], principal.slack_history_channel_ids
+  end
+
+  test "unsaved principals do not load role-owned Slack permissions" do
+    roles(:acme_infra).slack_channel_permissions.create!(
+      channel_id: "G9876543210",
+      history_enabled: true
+    )
+    principal = Principal.new
+    principal.slack_channel_permissions.build(
+      channel_id: "C0123456789",
+      upload_enabled: true
+    )
+
+    assert_equal [ "C0123456789" ],
+                 principal.effective_slack_channel_permissions_payload.pluck("channel_id")
+  end
+
+  test "api server JWT derives all Slack claims from one effective payload" do
+    principal = principals(:acme_channel)
+    calls = 0
+    payload = [
+      {
+        "channel_id" => "C0123456789",
+        "upload_enabled" => true,
+        "download_enabled" => true,
+        "history_enabled" => false
+      }
+    ]
+    original = principal.method(:effective_slack_channel_permissions_payload)
+    principal.define_singleton_method(:effective_slack_channel_permissions_payload) do
+      calls += 1
+      payload
+    end
+
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      assert_not_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+    assert_equal 1, calls
+  ensure
+    principal&.define_singleton_method(:effective_slack_channel_permissions_payload, original) if original
+  end
+
+  test "api server JWT includes inherited role Slack permissions" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      roles(:acme_infra).slack_channel_permissions.create!(
+        channel_id: "C0123456789",
+        upload_enabled: true,
+        history_enabled: true
+      )
+
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal [ "C0123456789" ], claims.dig("slack", "upload_channels")
+      assert_equal [ "C0123456789" ], claims.dig("slack", "history_channels")
+    end
+  end
+
   test "api server JWT does not fall back to slack channel label" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
@@ -320,5 +416,10 @@ class PrincipalTest < ActiveSupport::TestCase
     previous.each do |key, value|
       value.nil? ? ENV.delete(key) : ENV[key] = value
     end
+  end
+
+  def jwt_payload(token)
+    _header, payload, _signature = token.split(".")
+    JSON.parse(Base64.urlsafe_decode64(payload))
   end
 end

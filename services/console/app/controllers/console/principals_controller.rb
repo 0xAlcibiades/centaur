@@ -49,6 +49,10 @@ module Console
       redirect_to console_principal_path(@principal.oid), notice: "Updated Slack channel permissions."
     rescue ActiveRecord::RecordInvalid => e
       redirect_to console_principal_path(@principal.oid), alert: e.record.errors.full_messages.to_sentence
+    rescue ActiveRecord::ReadonlyAttributeError
+      redirect_to console_principal_path(@principal.oid), alert: "Slack channels cannot be changed after creation."
+    rescue ActiveRecord::RecordNotUnique
+      redirect_to console_principal_path(@principal.oid), alert: "Each Slack channel can only be selected once."
     end
 
     def assign_role
@@ -111,7 +115,6 @@ module Console
         slack_channel_permissions_attributes: %i[
           id
           channel_id
-          channel_name
           upload_enabled
           download_enabled
           history_enabled

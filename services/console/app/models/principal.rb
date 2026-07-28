@@ -117,20 +117,44 @@ class Principal < ApplicationRecord
     permissions.map(&:as_permission_json)
   end
 
+  def effective_slack_channel_permissions_payload
+    merged_slack_channel_permissions(effective_slack_channel_permissions)
+  end
+
+  def inherited_slack_channel_permissions_payload
+    permissions = if loaded_role_slack_channel_permissions?
+      roles.flat_map { |role| role.slack_channel_permissions.to_a }
+    else
+      SlackChannelPermission.where(role_id: role_ids)
+    end
+    merged_slack_channel_permissions(permissions)
+  end
+
   def slack_upload_channel_ids
-    slack_channel_ids_for(:upload_enabled)
+    slack_channel_ids_by_permission.fetch(:upload)
   end
 
   def slack_download_channel_ids
-    slack_channel_ids_for(:download_enabled)
+    slack_channel_ids_by_permission.fetch(:download)
   end
 
   def slack_history_channel_ids
-    slack_channel_ids_for(:history_enabled)
+    slack_channel_ids_by_permission.fetch(:history)
   end
 
   def slack_jwt_channel_ids
-    (slack_upload_channel_ids + slack_download_channel_ids + slack_history_channel_ids).uniq
+    slack_channel_ids_by_permission.values.flatten.uniq
+  end
+
+  def slack_channel_ids_by_permission
+    effective_slack_channel_permissions_payload.each_with_object(
+      { upload: [], download: [], history: [] }
+    ) do |row, channels|
+      channel_id = row.fetch("channel_id")
+      channels[:upload] << channel_id if row.fetch("upload_enabled")
+      channels[:download] << channel_id if row.fetch("download_enabled")
+      channels[:history] << channel_id if row.fetch("history_enabled")
+    end
   end
 
   def self.bump_sync_config_cache_versions(ids)
@@ -186,11 +210,43 @@ class Principal < ApplicationRecord
   end
 
   def reject_slack_channel_permission_attributes?(attributes)
-    attributes["channel_id"].blank?
+    attributes["id"].blank? && attributes["channel_id"].blank?
   end
 
-  def slack_channel_ids_for(permission)
-    slack_channel_permissions.where(permission => true).ordered.pluck(:channel_id)
+  def effective_slack_channel_permissions
+    return slack_channel_permissions.to_a unless persisted?
+
+    if association(:slack_channel_permissions).loaded? && loaded_role_slack_channel_permissions?
+      return slack_channel_permissions.to_a + roles.flat_map { |role| role.slack_channel_permissions.to_a }
+    end
+
+    direct = SlackChannelPermission.where(principal_id: id)
+    role_permissions = SlackChannelPermission.where(role_id: role_ids)
+    direct.or(role_permissions)
+  end
+
+  def loaded_role_slack_channel_permissions?
+    association(:roles).loaded? &&
+      roles.all? { |role| role.association(:slack_channel_permissions).loaded? }
+  end
+
+  def merged_slack_channel_permissions(permissions)
+    ordered = permissions.sort_by do |permission|
+      [ permission.principal_id.present? ? 0 : 1, permission.role_id || 0, permission.id || 0 ]
+    end
+
+    ordered.each_with_object({}) do |permission, by_channel|
+      channel_id = permission.channel_id.to_s.strip.upcase
+      row = by_channel[channel_id] ||= {
+        "channel_id" => channel_id,
+        "upload_enabled" => false,
+        "download_enabled" => false,
+        "history_enabled" => false
+      }
+      row["upload_enabled"] ||= permission.upload_enabled
+      row["download_enabled"] ||= permission.download_enabled
+      row["history_enabled"] ||= permission.history_enabled
+    end.values.sort_by { |row| row.fetch("channel_id") }
   end
 
   def self.host_from_url(value)
