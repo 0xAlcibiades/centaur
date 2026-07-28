@@ -83,10 +83,8 @@
         <% end %>
       </div>
     <% else %>
-      <div class="flex flex-wrap gap-2">
-        <% @permission_request.services.each do |service| %>
-          <span class="label-chip"><%= service %></span>
-        <% end %>
+      <div class="whitespace-pre-wrap text-sm text-zinc-100">
+        <%= @permission_request.request_text %>
       </div>
     <% end %>
   </div>

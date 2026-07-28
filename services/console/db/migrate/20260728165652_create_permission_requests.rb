@@ -12,7 +12,7 @@ class CreatePermissionRequests < ActiveRecord::Migration[8.1]
       t.string :requesting_slack_channel_id, null: false
       t.string :requesting_slack_thread_ts
       t.jsonb :requested_channel_ids, null: false, default: []
-      t.jsonb :services, null: false, default: []
+      t.text :request_text
       t.string :approver_notification_status, null: false, default: "pending"
       t.string :approver_notification_channel_id
       t.string :approver_notification_message_ts

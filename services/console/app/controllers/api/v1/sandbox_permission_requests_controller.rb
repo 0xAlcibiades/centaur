@@ -22,9 +22,9 @@ module Api
       def permission_request_attributes(principal)
         attrs = data_params.permit(
           :kind,
+          :request,
           :requesting_slack_thread_ts,
-          requested_channel_ids: [],
-          services: []
+          requested_channel_ids: []
         )
         {
           kind: attrs.require(:kind),
@@ -33,7 +33,7 @@ module Api
           requesting_slack_channel_id: principal.foreign_id,
           requesting_slack_thread_ts: attrs[:requesting_slack_thread_ts],
           requested_channel_ids: attrs[:requested_channel_ids],
-          services: attrs[:services]
+          request_text: attrs[:request]
         }
       end
 
@@ -53,7 +53,7 @@ module Api
           requesting_slack_channel_id: permission_request.requesting_slack_channel_id,
           requesting_slack_thread_ts: permission_request.requesting_slack_thread_ts,
           requested_channel_ids: permission_request.requested_channel_ids,
-          services: permission_request.services,
+          request: permission_request.request_text,
           approver_notification_status: permission_request.approver_notification_status,
           created_at: permission_request.created_at,
           updated_at: permission_request.updated_at

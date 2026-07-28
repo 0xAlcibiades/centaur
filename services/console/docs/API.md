@@ -1153,12 +1153,12 @@ Service request:
   "data": {
     "kind": "services",
     "requesting_slack_thread_ts": "1700000000.000000",
-    "services": ["gmail", "google drive"]
+    "request": "Please authorize Gmail and Google Drive for customer follow-up."
   }
 }
 ```
 
-Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service requests carry freeform text describing what the agent wants authorized. Service approvals are recorded and announced, but do not mutate grants or credentials.
+Returns `201` with the created pending request. Console requires `CENTAUR_CONSOLE_PERMISSION_REQUEST_APPROVAL_CHANNEL_ID` and a Slack bot token before accepting requests, then enqueues Slack delivery jobs for approver notifications and decision outcomes. Slack channel approvals grant upload, download, and history access to the requested channels. Service requests carry freeform `request` text describing what the agent wants authorized. Service approvals are recorded and announced, but do not mutate grants or credentials.
 
 ```json
 {
@@ -1171,7 +1171,7 @@ Returns `201` with the created pending request. Console requires `CENTAUR_CONSOL
     "requesting_slack_channel_id": "C0123456789",
     "requesting_slack_thread_ts": "1700000000.000000",
     "requested_channel_ids": ["C1111111111"],
-    "services": [],
+    "request": null,
     "created_at": "2026-07-28T16:56:52Z",
     "updated_at": "2026-07-28T16:56:52Z"
   }

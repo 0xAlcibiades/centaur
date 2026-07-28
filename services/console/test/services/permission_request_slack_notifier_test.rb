@@ -5,7 +5,7 @@ class PermissionRequestSlackNotifierTest < ActiveSupport::TestCase
     permission_request = PermissionRequest.new(
       kind: PermissionRequest::SERVICES_KIND,
       requesting_slack_channel_id: "C0123456789",
-      services: [ "<!channel>", "safe&sound" ],
+      request_text: "Please authorize <!channel> and safe&sound.",
       status: "approved"
     )
 

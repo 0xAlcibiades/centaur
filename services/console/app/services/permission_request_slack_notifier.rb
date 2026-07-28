@@ -80,7 +80,7 @@ class PermissionRequestSlackNotifier
       if permission_request.slack_channels?
         "Permission request approved. Channel access has been granted for #{slack_list(permission_request.requested_channel_ids)}."
       else
-        "Permission request approved. Service authorization was approved for #{slack_list(permission_request.services)}."
+        "Permission request approved. Service authorization was approved for: #{slack_escape(permission_request.request_text)}"
       end
     when "denied"
       "Permission request denied for #{request_summary(permission_request)}."
@@ -93,7 +93,7 @@ class PermissionRequestSlackNotifier
     if permission_request.slack_channels?
       "Slack channels #{slack_list(permission_request.requested_channel_ids)}"
     else
-      "services #{slack_list(permission_request.services)}"
+      "service request: #{slack_escape(permission_request.request_text)}"
     end
   end
 

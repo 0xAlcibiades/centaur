@@ -100,7 +100,7 @@ module Console
         requesting_principal: principals(:acme_channel),
         requesting_proxy: proxies(:acme_proxy),
         requesting_slack_channel_id: "C0123456789",
-        services: [ "gmail" ],
+        request_text: "Please authorize Gmail.",
         approver_notification_channel_id: "CAPPROVERS",
         approver_notification_message_ts: "171.2"
       )

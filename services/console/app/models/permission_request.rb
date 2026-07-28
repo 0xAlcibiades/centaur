@@ -203,7 +203,7 @@ class PermissionRequest < ApplicationRecord
   def normalize_request_payload
     self.requesting_slack_channel_id = requesting_slack_channel_id.to_s.strip.upcase
     self.requested_channel_ids = normalize_strings(requested_channel_ids).map(&:upcase).uniq
-    self.services = normalize_strings(services)
+    self.request_text = request_text.to_s.strip.presence
   end
 
   def normalize_strings(values)
@@ -217,13 +217,13 @@ class PermissionRequest < ApplicationRecord
     case kind
     when SLACK_CHANNELS_KIND
       errors.add(:requested_channel_ids, "must include at least one channel ID") if requested_channel_ids.blank?
-      errors.add(:services, "must be empty for Slack channel requests") if services.present?
+      errors.add(:request_text, "must be blank for Slack channel requests") if request_text.present?
       requested_channel_ids.each do |channel_id|
         next if channel_id.match?(Principal::SLACK_CHANNEL_ID_FORMAT)
         errors.add(:requested_channel_ids, "#{channel_id} is not a valid Slack channel ID")
       end
     when SERVICES_KIND
-      errors.add(:services, "must include at least one service") if services.blank?
+      errors.add(:request_text, "must include the requested service permissions") if request_text.blank?
       errors.add(:requested_channel_ids, "must be empty for service requests") if requested_channel_ids.present?
     end
   end

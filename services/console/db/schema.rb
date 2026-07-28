@@ -281,6 +281,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
     t.bigint "decided_by_id"
     t.string "kind", null: false
     t.jsonb "requested_channel_ids", default: [], null: false
+    t.text "request_text"
     t.string "requester_outcome_message_ts"
     t.datetime "requester_outcome_notification_attempted_at"
     t.datetime "requester_outcome_notification_delivered_at"
@@ -294,7 +295,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
     t.string "requesting_proxy_oid", null: false
     t.string "requesting_slack_channel_id", null: false
     t.string "requesting_slack_thread_ts"
-    t.jsonb "services", default: [], null: false
     t.string "status", default: "pending", null: false
     t.datetime "updated_at", null: false
     t.index ["approver_decision_update_status"], name: "index_permission_requests_on_approver_decision_update_status"

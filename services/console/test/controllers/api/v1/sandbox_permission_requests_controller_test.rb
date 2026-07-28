@@ -134,7 +134,12 @@ module Api
         with_permission_request_env do
           assert_enqueued_jobs 1, only: PermissionRequestApproverNotificationJob do
             post "/api/v1/sandbox/permission_requests",
-                 params: { data: { kind: "services", services: [ "gmail", "Google Drive" ] } }.to_json,
+                 params: {
+                   data: {
+                     kind: "services",
+                     request: "Please authorize Gmail and Google Drive for customer follow-up."
+                   }
+                 }.to_json,
                  headers: auth_headers(token_for(@proxy))
           end
         end
@@ -142,7 +147,7 @@ module Api
         assert_response :created
         request = PermissionRequest.last
         assert_equal PermissionRequest::SERVICES_KIND, request.kind
-        assert_equal [ "gmail", "Google Drive" ], request.services
+        assert_equal "Please authorize Gmail and Google Drive for customer follow-up.", request.request_text
         assert_empty request.requested_channel_ids
       end
 

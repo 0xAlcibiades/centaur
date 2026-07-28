@@ -19,11 +19,11 @@ class PermissionRequestTest < ActiveSupport::TestCase
     request = build_request(
       kind: PermissionRequest::SERVICES_KIND,
       requested_channel_ids: [],
-      services: [ " gmail ", "gmail", "Google Drive", "<!channel>" ]
+      request_text: "  Please authorize Google Drive for quarterly reporting.  "
     )
 
     assert request.valid?
-    assert_equal [ "gmail", "Google Drive", "<!channel>" ], request.services
+    assert_equal "Please authorize Google Drive for quarterly reporting.", request.request_text
   end
 
   test "rejects Slack channel request without requested channels" do
@@ -33,11 +33,11 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_includes request.errors[:requested_channel_ids], "must include at least one channel ID"
   end
 
-  test "rejects service request without services" do
+  test "rejects service request without request text" do
     request = build_request(kind: PermissionRequest::SERVICES_KIND, requested_channel_ids: [])
 
     assert_not request.valid?
-    assert_includes request.errors[:services], "must include at least one service"
+    assert_includes request.errors[:request_text], "must include the requested service permissions"
   end
 
   test "rejects non Slack channel principal" do
@@ -87,7 +87,7 @@ class PermissionRequestTest < ActiveSupport::TestCase
     request = build_request(
       kind: PermissionRequest::SERVICES_KIND,
       requested_channel_ids: [],
-      services: [ "calendar" ]
+      request_text: "Please authorize Calendar access."
     )
     request.save!
 
@@ -121,7 +121,7 @@ class PermissionRequestTest < ActiveSupport::TestCase
       requesting_proxy: @proxy,
       requesting_slack_channel_id: @principal.foreign_id,
       requested_channel_ids: [ "C0123456789" ],
-      services: []
+      request_text: nil
     }.merge(overrides))
   end
 end
