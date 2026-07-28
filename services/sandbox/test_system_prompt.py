@@ -54,5 +54,14 @@ class SystemPromptTest(unittest.TestCase):
         self.assertIn("personal `provider_email`", prompt)
         self.assertIn("Centaur can use their personal connected account", prompt)
 
+    def test_permission_request_guidance_is_present(self) -> None:
+        prompt = SYSTEM_PROMPT.read_text()
+
+        self.assertIn("[Permission requests]", prompt)
+        self.assertIn("confirm the current sandbox permissions with `centaur-console permissions`", prompt)
+        self.assertIn('centaur-console request-permission "<specific permission needed and why>"', prompt)
+        self.assertIn("Do not request broad access when a narrower permission would work", prompt)
+        self.assertIn("Do not claim the permission is granted", prompt)
+
 if __name__ == "__main__":
     unittest.main()

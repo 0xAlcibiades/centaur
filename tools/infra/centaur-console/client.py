@@ -9,6 +9,7 @@ import httpx
 
 SANDBOX_PERMISSIONS_PATH = "/api/v1/sandbox/permissions"
 SANDBOX_OAUTH_APPS_PATH = "/api/v1/sandbox/oauth_apps"
+SANDBOX_PERMISSION_REQUESTS_PATH = "/api/v1/sandbox/permission_requests"
 
 
 class ConsoleClient:
@@ -92,6 +93,41 @@ class ConsoleClient:
     def oauth_apps(self) -> list[dict[str, Any]]:
         """Alias for tool bridge calls."""
         return self.sandbox_oauth_apps()
+
+    def create_permission_request(
+        self,
+        request: str,
+        *,
+        requesting_slack_thread_ts: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a sandbox-scoped permission request for admin review."""
+        data: dict[str, Any] = {
+            "kind": "text",
+            "metadata": {"request": request},
+        }
+        if requesting_slack_thread_ts:
+            data["requesting_slack_thread_ts"] = requesting_slack_thread_ts
+
+        response = self.client.post(SANDBOX_PERMISSION_REQUESTS_PATH, json={"data": data})
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_detail(exc.response)
+            raise RuntimeError(f"centaur-console permission request failed: {detail}") from exc
+
+        payload = response.json()
+        result = payload.get("data")
+        if not isinstance(result, dict):
+            raise RuntimeError("centaur-console permission request response did not include a data object")
+        return result
+
+    def permission_request(
+        self,
+        request: str,
+        requesting_slack_thread_ts: str | None = None,
+    ) -> dict[str, Any]:
+        """Alias for tool bridge calls."""
+        return self.create_permission_request(request, requesting_slack_thread_ts=requesting_slack_thread_ts)
 
     def health(self) -> dict[str, Any]:
         """Assert the sandbox permissions endpoint is reachable and authorized."""

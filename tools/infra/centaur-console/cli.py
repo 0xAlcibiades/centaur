@@ -58,6 +58,31 @@ def oauth_apps(
     console.print_json(json.dumps({"data": result}, default=str))
 
 
+@app.command("request-permission")
+def request_permission(
+    request: str = typer.Argument(..., help="Freeform description of the permission needed"),
+    requesting_slack_thread_ts: str | None = typer.Option(
+        None,
+        "--thread-ts",
+        help="Slack thread timestamp to notify when the request is decided",
+    ),
+    url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
+    bearer_token: str | None = typer.Option(
+        None,
+        "--bearer-token",
+        help="Local/debug bearer token override",
+        envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
+    ),
+):
+    """Create a permission request for admin review."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        result = client.create_permission_request(
+            request,
+            requesting_slack_thread_ts=requesting_slack_thread_ts,
+        )
+    console.print_json(json.dumps(result, default=str))
+
+
 @app.command()
 def health(
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),

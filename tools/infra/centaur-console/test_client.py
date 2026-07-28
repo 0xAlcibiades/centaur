@@ -1,6 +1,11 @@
 import httpx
 import pytest
-from client import SANDBOX_OAUTH_APPS_PATH, SANDBOX_PERMISSIONS_PATH, ConsoleClient
+from client import (
+    SANDBOX_OAUTH_APPS_PATH,
+    SANDBOX_PERMISSION_REQUESTS_PATH,
+    SANDBOX_PERMISSIONS_PATH,
+    ConsoleClient,
+)
 
 
 def json_response(payload, status_code=200):
@@ -87,6 +92,34 @@ def test_sandbox_oauth_apps_wraps_http_errors():
 
     with pytest.raises(RuntimeError, match="HTTP 401"):
         make_client(handler).sandbox_oauth_apps()
+
+
+def test_create_permission_request_posts_text_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == SANDBOX_PERMISSION_REQUESTS_PATH
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Content-Type"] == "application/json"
+        assert request.read() == (
+            b'{"data":{"kind":"text","metadata":{"request":"Need Google Drive access"},'
+            b'"requesting_slack_thread_ts":"170.123"}}'
+        )
+        return json_response({"data": {"id": "preq_123", "status": "pending"}})
+
+    result = make_client(handler).create_permission_request(
+        "Need Google Drive access",
+        requesting_slack_thread_ts="170.123",
+    )
+
+    assert result == {"id": "preq_123", "status": "pending"}
+
+
+def test_create_permission_request_wraps_http_errors():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return json_response({"error": {"message": "permission requests are not configured"}}, status_code=503)
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        make_client(handler).create_permission_request("Need Google Drive access")
 
 
 def test_health_returns_identity_details():
