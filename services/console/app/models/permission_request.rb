@@ -31,7 +31,6 @@ class PermissionRequest < ApplicationRecord
             :requester_outcome_notification_status, inclusion: { in: NOTIFICATION_STATUSES }
   validate :request_payload_matches_kind
   validate :requesting_principal_is_slack_channel
-  validate :requesting_proxy_matches_principal, on: :create
   validate :decision_metadata_matches_status
 
   scope :recent_first, -> { order(created_at: :desc, id: :desc) }
@@ -106,17 +105,6 @@ class PermissionRequest < ApplicationRecord
               requesting_principal.foreign_id.to_s.casecmp?(requesting_slack_channel_id.to_s)
 
     errors.add(:requesting_principal, "must be a Slack channel principal")
-  end
-
-  def requesting_proxy_matches_principal
-    return if requesting_principal.nil?
-    unless requesting_proxy
-      errors.add(:requesting_proxy, "must exist")
-      return
-    end
-    return if requesting_proxy.principal_id == requesting_principal.id
-
-    errors.add(:requesting_proxy, "must be assigned to the requesting principal")
   end
 
   def decision_metadata_matches_status
