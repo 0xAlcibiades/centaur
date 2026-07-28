@@ -17,14 +17,15 @@ class PermissionRequest < ApplicationRecord
     TEXT_KIND => TEXT_METADATA_SCHEMA
   }.freeze
 
-  belongs_to :requesting_principal, class_name: "Principal"
+  belongs_to :requesting_principal, class_name: "Principal", optional: true
+  belongs_to :requesting_proxy, class_name: "Proxy", optional: true
   belongs_to :decided_by, class_name: "User", optional: true
 
   before_validation :normalize_request_payload
 
   validates :status, inclusion: { in: STATUSES }
   validates :kind, inclusion: { in: KINDS }
-  validates :requesting_proxy_id, presence: true
+  validates :requesting_principal_id, :requesting_proxy_id, presence: true
   validates :requesting_slack_channel_id, presence: true,
                                           format: { with: Principal::SLACK_CHANNEL_ID_FORMAT,
                                                     message: "is not a valid Slack channel ID" }
@@ -67,15 +68,6 @@ class PermissionRequest < ApplicationRecord
 
   def decision_label
     status.titleize
-  end
-
-  def requesting_proxy=(proxy)
-    @requesting_proxy = proxy
-    self.requesting_proxy_id = proxy&.id
-  end
-
-  def requesting_proxy
-    @requesting_proxy ||= Proxy.find_by(id: requesting_proxy_id) if requesting_proxy_id.present?
   end
 
   private

@@ -3,7 +3,7 @@ class CreatePermissionRequests < ActiveRecord::Migration[8.1]
     create_table :permission_requests do |t|
       t.string :status, null: false, default: "pending"
       t.string :kind, null: false
-      t.references :requesting_principal, null: false, foreign_key: { to_table: :principals }
+      t.bigint :requesting_principal_id, null: false
       t.bigint :requesting_proxy_id, null: false
       t.string :requesting_slack_channel_id, null: false
       t.string :requesting_slack_thread_ts
@@ -22,6 +22,7 @@ class CreatePermissionRequests < ActiveRecord::Migration[8.1]
 
     add_index :permission_requests, :status
     add_index :permission_requests, :kind
+    add_index :permission_requests, :requesting_principal_id
     add_index :permission_requests, :requesting_proxy_id
     add_index :permission_requests, :requesting_slack_channel_id
     add_index :permission_requests, :approver_notification_status

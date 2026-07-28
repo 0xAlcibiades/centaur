@@ -530,7 +530,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   add_foreign_key "mcp_oauth_refresh_tokens", "users"
   add_foreign_key "oauth_apps", "users", column: "created_by_id"
   add_foreign_key "oauth_token_secrets", "users", column: "created_by_id"
-  add_foreign_key "permission_requests", "principals", column: "requesting_principal_id"
   add_foreign_key "permission_requests", "users", column: "decided_by_id"
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"
   add_foreign_key "principal_roles", "principals"
