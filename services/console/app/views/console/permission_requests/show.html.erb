@@ -28,7 +28,7 @@
     <div>
       <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requester</div>
       <div class="text-zinc-100"><%= @permission_request.requesting_slack_channel_id %></div>
-      <div class="mt-1 text-xs text-zinc-500"><%= @permission_request.requesting_principal_name.presence || @permission_request.requesting_principal_oid %></div>
+      <div class="mt-1 text-xs text-zinc-500"><%= @permission_request.requesting_principal.name.presence || @permission_request.requesting_principal.oid %></div>
     </div>
 
     <div>

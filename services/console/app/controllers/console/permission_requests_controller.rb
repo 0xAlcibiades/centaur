@@ -28,7 +28,7 @@ module Console
 
     def set_permission_request
       @permission_request = PermissionRequest
-        .includes(:requesting_principal, :requesting_proxy, :decided_by)
+        .includes(:requesting_principal, :decided_by)
         .find_by_oid!(params[:id])
     end
 

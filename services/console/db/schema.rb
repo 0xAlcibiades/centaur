@@ -277,12 +277,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
     t.jsonb "metadata", default: {}, null: false
     t.string "requester_outcome_message_ts"
     t.string "requester_outcome_notification_status", default: "pending", null: false
-    t.bigint "requesting_principal_id"
-    t.string "requesting_principal_name"
-    t.string "requesting_principal_oid", null: false
-    t.bigint "requesting_proxy_id"
-    t.string "requesting_proxy_name", null: false
-    t.string "requesting_proxy_oid", null: false
+    t.bigint "requesting_principal_id", null: false
+    t.bigint "requesting_proxy_id", null: false
     t.string "requesting_slack_channel_id", null: false
     t.string "requesting_slack_thread_ts"
     t.string "status", default: "pending", null: false
@@ -534,6 +530,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   add_foreign_key "mcp_oauth_refresh_tokens", "users"
   add_foreign_key "oauth_apps", "users", column: "created_by_id"
   add_foreign_key "oauth_token_secrets", "users", column: "created_by_id"
+  add_foreign_key "permission_requests", "principals", column: "requesting_principal_id"
   add_foreign_key "permission_requests", "users", column: "decided_by_id"
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"
   add_foreign_key "principal_roles", "principals"

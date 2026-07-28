@@ -55,19 +55,15 @@ class PermissionRequestTest < ActiveSupport::TestCase
     assert_equal users(:acme_admin), request.reload.decided_by
   end
 
-  test "stores copied audit fields and does not block principal or proxy deletion" do
+  test "stores requester ids without requiring proxy retention" do
     request = build_request
     request.save!
 
-    assert_equal @principal.oid, request.requesting_principal_oid
-    assert_equal @principal.foreign_id, request.requesting_principal_name
-    assert_equal @proxy.oid, request.requesting_proxy_oid
-    assert_equal @proxy.name, request.requesting_proxy_name
+    assert_equal @principal, request.requesting_principal
+    assert_equal @proxy.id, request.requesting_proxy_id
 
     assert_nothing_raised { @proxy.destroy! }
-    assert_nothing_raised { @principal.destroy! }
-    assert_equal @principal.oid, request.reload.requesting_principal_oid
-    assert_equal @proxy.oid, request.requesting_proxy_oid
+    assert request.reload.approve!(by: users(:acme_admin))
   end
 
   private

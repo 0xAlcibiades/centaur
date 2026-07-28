@@ -17,16 +17,14 @@ class PermissionRequest < ApplicationRecord
     TEXT_KIND => TEXT_METADATA_SCHEMA
   }.freeze
 
-  belongs_to :requesting_principal, class_name: "Principal", optional: true
-  belongs_to :requesting_proxy, class_name: "Proxy", optional: true
+  belongs_to :requesting_principal, class_name: "Principal"
   belongs_to :decided_by, class_name: "User", optional: true
 
-  before_validation :copy_requesting_audit_fields
   before_validation :normalize_request_payload
 
   validates :status, inclusion: { in: STATUSES }
   validates :kind, inclusion: { in: KINDS }
-  validates :requesting_principal_oid, :requesting_proxy_oid, :requesting_proxy_name, presence: true
+  validates :requesting_proxy_id, presence: true
   validates :requesting_slack_channel_id, presence: true,
                                           format: { with: Principal::SLACK_CHANNEL_ID_FORMAT,
                                                     message: "is not a valid Slack channel ID" }
@@ -34,7 +32,7 @@ class PermissionRequest < ApplicationRecord
             :requester_outcome_notification_status, inclusion: { in: NOTIFICATION_STATUSES }
   validate :request_payload_matches_kind
   validate :requesting_principal_is_slack_channel
-  validate :requesting_proxy_matches_principal
+  validate :requesting_proxy_matches_principal, on: :create
   validate :decision_metadata_matches_status
 
   scope :recent_first, -> { order(created_at: :desc, id: :desc) }
@@ -71,6 +69,15 @@ class PermissionRequest < ApplicationRecord
     status.titleize
   end
 
+  def requesting_proxy=(proxy)
+    @requesting_proxy = proxy
+    self.requesting_proxy_id = proxy&.id
+  end
+
+  def requesting_proxy
+    @requesting_proxy ||= Proxy.find_by(id: requesting_proxy_id) if requesting_proxy_id.present?
+  end
+
   private
 
   def transition!(next_status, by:)
@@ -86,17 +93,6 @@ class PermissionRequest < ApplicationRecord
       changed = true
     end
     changed
-  end
-
-  def copy_requesting_audit_fields
-    if requesting_principal
-      self.requesting_principal_oid ||= requesting_principal.oid
-      self.requesting_principal_name ||= requesting_principal.name.presence || requesting_principal.foreign_id
-    end
-    return unless requesting_proxy
-
-    self.requesting_proxy_oid ||= requesting_proxy.oid
-    self.requesting_proxy_name ||= requesting_proxy.name
   end
 
   def normalize_request_payload
@@ -143,8 +139,12 @@ class PermissionRequest < ApplicationRecord
   end
 
   def requesting_proxy_matches_principal
-    return if requesting_proxy.nil? || requesting_principal.nil?
-    return if requesting_proxy.principal_id == requesting_principal_id
+    return if requesting_principal.nil?
+    unless requesting_proxy
+      errors.add(:requesting_proxy, "must exist")
+      return
+    end
+    return if requesting_proxy.principal_id == requesting_principal.id
 
     errors.add(:requesting_proxy, "must be assigned to the requesting principal")
   end
