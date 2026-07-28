@@ -47,7 +47,7 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 secrets = [
-    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"]},
+    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"], http_methods = ["POST"], paths = ["/query"]},
 ]
 ```
 
@@ -91,6 +91,11 @@ Each entry in `secrets` declares one credential the tool can request with
   request the placeholder is allowed to appear. At least one is required.
 - `hosts` is the upstream allowlist for this secret. iron-proxy will only
   inject the real value on requests to these hosts.
+- `http_methods` and `paths` optionally narrow each declared `hosts` rule for
+  `type = "http"`. Methods are normalized to uppercase and must be one of
+  `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or
+  `*`; every path must begin with `/` and may use globs. Multiple paths apply
+  to the same host rule.
 
 Use `optional_secrets` for credentials the tool can run without.
 

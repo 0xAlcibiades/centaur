@@ -79,6 +79,8 @@ ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
+ARG PLANETSCALE_MCP_COMMIT=56a05b658de1d2035510708f3a51ec224048f4ee
+ARG PLANETSCALE_MCP_SHA256=e27b7b6d802ecb89cb871a02e61c4481688af8856e0fbee49df79f2ca0cb2c6d
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -127,6 +129,26 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
+
+# ── PlanetScale MCP server ──────────────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    set -eux; \
+    curl -fsSL \
+      "https://github.com/planetscale/mcp-server/archive/${PLANETSCALE_MCP_COMMIT}.tar.gz" \
+      -o /tmp/planetscale-mcp.tar.gz; \
+    echo "${PLANETSCALE_MCP_SHA256}  /tmp/planetscale-mcp.tar.gz" | sha256sum -c -; \
+    install -d -m 0755 /opt/planetscale-mcp; \
+    tar -xzf /tmp/planetscale-mcp.tar.gz -C /opt/planetscale-mcp --strip-components=1; \
+    cd /opt/planetscale-mcp; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    env -u PLANETSCALE_API_TOKEN sh -c 'printf "%s\n" \
+      '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"centaur-image-smoke","version":"1.0"}}}'\'' \
+      '\''{"jsonrpc":"2.0","method":"notifications/initialized"}'\'' \
+      '\''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'\'' \
+      | node /opt/planetscale-mcp/src/server.ts 2>/tmp/planetscale-mcp-smoke.log \
+      | jq -e '\''select(.id == 2) | [.result.tools[].name] | index("get_insights") != null'\'''; \
+    chmod -R a+rX /opt/planetscale-mcp; \
+    rm -f /tmp/planetscale-mcp.tar.gz /tmp/planetscale-mcp-smoke.log
 
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium

@@ -50,7 +50,7 @@ fn secret_type_routes_by_oid_prefix() {
 #[test]
 fn parses_http_replace_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["get", "POST"], paths = ["/api/auth.test", "/api/conversations.*"]}"#),
         &[],
     )
     .unwrap();
@@ -63,6 +63,53 @@ fn parses_http_replace_secret() {
     assert_eq!(http.replacer, "SLACK_BOT_TOKEN");
     assert_eq!(http.match_headers, vec!["Authorization".to_owned()]);
     assert_eq!(http.hosts, vec!["slack.com".to_owned()]);
+    assert_eq!(http.http_methods, vec!["GET".to_owned(), "POST".to_owned()]);
+    assert_eq!(
+        http.paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn http_request_scopes_reject_invalid_metadata_and_other_secret_types() {
+    let invalid_method = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = ["TRACE"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        invalid_method
+            .to_string()
+            .contains("unsupported http_methods")
+    );
+
+    let invalid_path = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = ["v1/insights"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(invalid_path.to_string().contains("must start with '/'"));
+
+    let empty_entry = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = [""]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(empty_entry.to_string().contains("non-empty strings"));
+
+    let wrong_type = tools::parse_secret(
+        &entry(r#"{type = "pg_dsn", name = "DB", database = "app", http_methods = ["GET"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        wrong_type
+            .to_string()
+            .contains("only supported by type = \"http\"")
+    );
 }
 
 #[test]
@@ -448,7 +495,7 @@ fn legacy_string_shim_is_replace_secret() {
 fn translates_http_replace_to_static_input() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com", "hooks.slack.com"], http_methods = ["get"], paths = ["/api/auth.test", "/api/conversations.*"]}"#),
             &[],
         )
         .unwrap(),
@@ -468,8 +515,25 @@ fn translates_http_replace_to_static_input() {
         input.source.config,
         serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
     );
-    assert_eq!(input.rules.len(), 1);
+    assert_eq!(input.rules.len(), 2);
     assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(input.rules[0].http_methods, vec!["GET".to_owned()]);
+    assert_eq!(
+        input.rules[0].paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
+    assert_eq!(input.rules[1].host.as_deref(), Some("hooks.slack.com"));
+    assert_eq!(input.rules[1].http_methods, vec!["GET".to_owned()]);
+    assert_eq!(
+        input.rules[1].paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
 }
 
 #[test]
