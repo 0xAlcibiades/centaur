@@ -90,27 +90,6 @@ module Console
       end
     end
 
-    test "another text approval records decision without granting Slack permissions" do
-      text_request = PermissionRequest.create!(
-        kind: PermissionRequest::TEXT_KIND,
-        requesting_principal: principals(:acme_channel),
-        requesting_proxy: proxies(:acme_proxy),
-        requesting_slack_channel_id: "C0123456789",
-        metadata: { "request" => "Please authorize Gmail." },
-        approver_notification_channel_id: "CAPPROVERS",
-        approver_notification_message_ts: "171.2"
-      )
-      sign_in users(:acme_admin)
-
-      assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
-        assert_no_difference -> { principals(:acme_channel).slack_channel_permissions.count } do
-          post approve_console_permission_request_url(text_request.oid)
-        end
-      end
-
-      assert text_request.reload.approved?
-    end
-
     private
 
     def sign_in(user)

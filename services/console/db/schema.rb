@@ -266,14 +266,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
   end
 
   create_table "permission_requests", force: :cascade do |t|
-    t.datetime "approver_decision_update_attempted_at"
-    t.datetime "approver_decision_update_delivered_at"
-    t.text "approver_decision_update_last_error"
     t.string "approver_decision_update_status", default: "pending", null: false
-    t.datetime "approver_notification_attempted_at"
     t.string "approver_notification_channel_id"
-    t.datetime "approver_notification_delivered_at"
-    t.text "approver_notification_last_error"
     t.string "approver_notification_message_ts"
     t.string "approver_notification_status", default: "pending", null: false
     t.datetime "created_at", null: false
@@ -282,9 +276,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_28_165652) do
     t.string "kind", null: false
     t.jsonb "metadata", default: {}, null: false
     t.string "requester_outcome_message_ts"
-    t.datetime "requester_outcome_notification_attempted_at"
-    t.datetime "requester_outcome_notification_delivered_at"
-    t.text "requester_outcome_notification_last_error"
     t.string "requester_outcome_notification_status", default: "pending", null: false
     t.bigint "requesting_principal_id"
     t.string "requesting_principal_name"

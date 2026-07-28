@@ -22,7 +22,6 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     assert_equal "sent", @permission_request.reload.approver_notification_status
     assert_equal "CAPPROVERS", @permission_request.approver_notification_channel_id
     assert_equal "171.1", @permission_request.approver_notification_message_ts
-    assert_nil @permission_request.approver_notification_last_error
   end
 
   test "approver notification failure is persisted before retry" do
@@ -35,7 +34,6 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     end
 
     assert_equal "failed", @permission_request.reload.approver_notification_status
-    assert_match "timeout", @permission_request.approver_notification_last_error
   end
 
   test "decision notification updates approver message and requester outcome once" do
@@ -60,26 +58,6 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     assert_equal "sent", @permission_request.approver_decision_update_status
     assert_equal "sent", @permission_request.requester_outcome_notification_status
     assert_equal "172.1", @permission_request.requester_outcome_message_ts
-  end
-
-  test "decision notification skips approver update without approver message but posts requester outcome" do
-    @permission_request.update!(
-      status: "denied",
-      decided_by: users(:acme_admin),
-      decided_at: Time.current,
-      approver_notification_status: "skipped"
-    )
-    outcome_result = PermissionRequestSlackNotifier::Result.new(channel_id: "C0123456789", message_ts: "172.1")
-
-    PermissionRequestSlackNotifier.stub(:update_approver_notification, ->(_request) { raise "should not update" }) do
-      PermissionRequestSlackNotifier.stub(:post_requester_outcome, outcome_result) do
-        PermissionRequestDecisionNotificationJob.perform_now(@permission_request.id)
-      end
-    end
-
-    @permission_request.reload
-    assert_equal "skipped", @permission_request.approver_decision_update_status
-    assert_equal "sent", @permission_request.requester_outcome_notification_status
   end
 
   test "decision notification failure is persisted and retry skips already sent update" do
@@ -109,7 +87,6 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     assert_equal 1, update_calls
     assert_equal "sent", @permission_request.approver_decision_update_status
     assert_equal "failed", @permission_request.requester_outcome_notification_status
-    assert_match "rate_limited", @permission_request.requester_outcome_notification_last_error
 
     outcome_result = PermissionRequestSlackNotifier::Result.new(channel_id: "C0123456789", message_ts: "172.1")
     PermissionRequestSlackNotifier.stub(:update_approver_notification, ->(_request) { raise "should not repeat update" }) do

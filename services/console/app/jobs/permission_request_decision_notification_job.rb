@@ -18,14 +18,14 @@ class PermissionRequestDecisionNotificationJob < ApplicationJob
     return if permission_request.approver_decision_update_status.in?(%w[sent skipped])
 
     unless permission_request.approver_notification_message_ts.present?
-      permission_request.mark_approver_decision_update_skipped!
+      permission_request.update!(approver_decision_update_status: "skipped")
       return
     end
 
     PermissionRequestSlackNotifier.update_approver_notification(permission_request)
-    permission_request.mark_approver_decision_update_sent!
+    permission_request.update!(approver_decision_update_status: "sent")
   rescue PermissionRequestSlackNotifier::SlackApiError => e
-    permission_request.mark_approver_decision_update_failed!(e)
+    permission_request.update!(approver_decision_update_status: "failed")
     raise
   end
 
@@ -33,9 +33,12 @@ class PermissionRequestDecisionNotificationJob < ApplicationJob
     return if permission_request.requester_outcome_notification_status == "sent"
 
     result = PermissionRequestSlackNotifier.post_requester_outcome(permission_request)
-    permission_request.mark_requester_outcome_sent!(message_ts: result.message_ts)
+    permission_request.update!(
+      requester_outcome_notification_status: "sent",
+      requester_outcome_message_ts: result.message_ts
+    )
   rescue PermissionRequestSlackNotifier::SlackApiError => e
-    permission_request.mark_requester_outcome_failed!(e)
+    permission_request.update!(requester_outcome_notification_status: "failed")
     raise
   end
 end

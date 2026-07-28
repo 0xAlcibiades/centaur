@@ -78,78 +78,6 @@ class PermissionRequest < ApplicationRecord
       requester_outcome_notification_status.in?(%w[pending failed])
   end
 
-  def mark_approver_notification_skipped!
-    update!(
-      approver_notification_status: "skipped",
-      approver_notification_attempted_at: Time.current,
-      approver_notification_delivered_at: Time.current,
-      approver_notification_last_error: nil
-    )
-  end
-
-  def mark_approver_notification_sent!(channel_id:, message_ts:)
-    update!(
-      approver_notification_status: "sent",
-      approver_notification_channel_id: channel_id,
-      approver_notification_message_ts: message_ts,
-      approver_notification_attempted_at: Time.current,
-      approver_notification_delivered_at: Time.current,
-      approver_notification_last_error: nil
-    )
-  end
-
-  def mark_approver_notification_failed!(error)
-    update!(
-      approver_notification_status: "failed",
-      approver_notification_attempted_at: Time.current,
-      approver_notification_last_error: notification_error_message(error)
-    )
-  end
-
-  def mark_approver_decision_update_skipped!
-    update!(
-      approver_decision_update_status: "skipped",
-      approver_decision_update_attempted_at: Time.current,
-      approver_decision_update_delivered_at: Time.current,
-      approver_decision_update_last_error: nil
-    )
-  end
-
-  def mark_approver_decision_update_sent!
-    update!(
-      approver_decision_update_status: "sent",
-      approver_decision_update_attempted_at: Time.current,
-      approver_decision_update_delivered_at: Time.current,
-      approver_decision_update_last_error: nil
-    )
-  end
-
-  def mark_approver_decision_update_failed!(error)
-    update!(
-      approver_decision_update_status: "failed",
-      approver_decision_update_attempted_at: Time.current,
-      approver_decision_update_last_error: notification_error_message(error)
-    )
-  end
-
-  def mark_requester_outcome_sent!(message_ts:)
-    update!(
-      requester_outcome_notification_status: "sent",
-      requester_outcome_message_ts: message_ts,
-      requester_outcome_notification_attempted_at: Time.current,
-      requester_outcome_notification_delivered_at: Time.current,
-      requester_outcome_notification_last_error: nil
-    )
-  end
-
-  def mark_requester_outcome_failed!(error)
-    update!(
-      requester_outcome_notification_status: "failed",
-      requester_outcome_notification_attempted_at: Time.current,
-      requester_outcome_notification_last_error: notification_error_message(error)
-    )
-  end
-
   private
 
   def transition!(next_status, by:)
@@ -176,10 +104,6 @@ class PermissionRequest < ApplicationRecord
 
     self.requesting_proxy_oid ||= requesting_proxy.oid
     self.requesting_proxy_name ||= requesting_proxy.name
-  end
-
-  def notification_error_message(error)
-    "#{error.class}: #{error.message}".truncate(1000)
   end
 
   def normalize_request_payload

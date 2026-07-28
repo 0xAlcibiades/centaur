@@ -1,109 +1,61 @@
 <% content_for :title, "Permission Request #{@permission_request.oid} - Centaur Console" %>
 
-<div class="mb-8">
-  <% if @permission_request.requesting_principal %>
-    <a href="<%= console_principal_path(@permission_request.requesting_principal.oid) %>" class="back-link">&larr; back to principal</a>
-  <% end %>
-  <div class="mt-2 flex flex-wrap items-center gap-3">
-    <h1 class="page-title">Permission Request</h1>
-    <span class="resource-badge"><%= @permission_request.status.titleize %></span>
-    <% if @permission_request.pending? %>
-      <div class="ml-auto flex flex-wrap items-center gap-2">
-        <%= button_to "Approve",
-                      approve_console_permission_request_path(@permission_request.oid),
-                      method: :post,
-                      class: "btn-primary" %>
-        <%= button_to "Deny",
-                      deny_console_permission_request_path(@permission_request.oid),
-                      method: :post,
-                      class: "btn-secondary" %>
-      </div>
-    <% end %>
-  </div>
-  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
-    <span class="text-centaur-400 glow"><%= @permission_request.oid %></span>
-    <span class="text-zinc-600">&middot;</span>
-    <span class="rounded bg-ink-700 px-2 py-0.5 text-xs text-zinc-400"><%= @permission_request.kind.humanize %></span>
-    <span class="text-zinc-600">&middot;</span>
-    <span class="text-zinc-400">created <%= time_ago_in_words(@permission_request.created_at) %> ago</span>
-  </div>
+<div class="mb-8 text-center">
+  <%= image_tag "centaur-lockup-white.svg", alt: "Centaur", class: "mx-auto h-9 w-auto", width: 497, height: 127 %>
+  <p class="page-subtitle mt-4">Permission request review.</p>
 </div>
 
-<section class="mb-8">
-  <div class="mb-4">
-    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requester</h2>
-  </div>
-  <div class="console-panel p-5">
-    <dl class="grid gap-4 sm:grid-cols-2">
-      <div>
-        <dt class="text-xs uppercase tracking-wider text-zinc-500">Principal</dt>
-        <dd class="mt-1 text-sm text-zinc-100">
-          <% if @permission_request.requesting_principal %>
-            <%= link_to @permission_request.requesting_principal.oid,
-                        console_principal_path(@permission_request.requesting_principal.oid),
-                        class: "console-link" %>
-          <% else %>
-            <%= @permission_request.requesting_principal_oid %>
-          <% end %>
-          <% if @permission_request.requesting_principal_name.present? %>
-            <span class="text-zinc-500">(<%= @permission_request.requesting_principal_name %>)</span>
-          <% end %>
-        </dd>
-      </div>
-      <div>
-        <dt class="text-xs uppercase tracking-wider text-zinc-500">Proxy</dt>
-        <dd class="mt-1 text-sm text-zinc-100">
-          <%= @permission_request.requesting_proxy_name %>
-          <span class="text-zinc-500">(<%= @permission_request.requesting_proxy_oid %>)</span>
-        </dd>
-      </div>
-      <div>
-        <dt class="text-xs uppercase tracking-wider text-zinc-500">Slack Channel</dt>
-        <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.requesting_slack_channel_id %></dd>
-      </div>
-      <div>
-        <dt class="text-xs uppercase tracking-wider text-zinc-500">Slack Thread</dt>
-        <dd class="mt-1 text-sm text-zinc-100">
-          <%= @permission_request.requesting_slack_thread_ts.presence || "none" %>
-        </dd>
-      </div>
-    </dl>
-  </div>
-</section>
+<% if flash[:notice] %>
+  <div class="mb-6 rounded border border-ink-600 bg-ink-850/60 px-4 py-3 text-sm text-zinc-400"><%= flash[:notice] %></div>
+<% end %>
 
-<section class="mb-8">
-  <div class="mb-4">
-    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requested Access</h2>
-  </div>
-  <div class="console-panel p-5">
-    <div class="whitespace-pre-wrap text-sm text-zinc-100">
-      <%= @permission_request.text_request %>
+<div class="rounded-xl border border-ink-600 bg-ink-850/60 p-6">
+  <% if flash[:alert] %>
+    <div class="alert-error"><%= flash[:alert] %></div>
+  <% end %>
+
+  <div class="mb-5 flex items-center justify-between gap-3">
+    <div>
+      <h1 class="text-lg font-semibold text-zinc-100">Permission Request</h1>
+      <p class="mt-1 text-xs text-zinc-500"><%= @permission_request.oid %></p>
     </div>
+    <span class="rounded border border-ink-600 px-2 py-1 text-xs uppercase tracking-wider text-zinc-400">
+      <%= @permission_request.status %>
+    </span>
   </div>
-</section>
 
-<section>
-  <div class="mb-4">
-    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Decision</h2>
-  </div>
-  <div class="console-panel p-5">
-    <% if @permission_request.pending? %>
-      <div class="text-sm text-zinc-400">No decision yet.</div>
-    <% else %>
-      <dl class="grid gap-4 sm:grid-cols-2">
-        <div>
-          <dt class="text-xs uppercase tracking-wider text-zinc-500">Status</dt>
-          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.status.titleize %></dd>
+  <div class="space-y-5 text-sm">
+    <div>
+      <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Requester</div>
+      <div class="text-zinc-100"><%= @permission_request.requesting_slack_channel_id %></div>
+      <div class="mt-1 text-xs text-zinc-500"><%= @permission_request.requesting_principal_name.presence || @permission_request.requesting_principal_oid %></div>
+    </div>
+
+    <div>
+      <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Request</div>
+      <div class="whitespace-pre-wrap text-zinc-100"><%= @permission_request.text_request %></div>
+    </div>
+
+    <% unless @permission_request.pending? %>
+      <div>
+        <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Decision</div>
+        <div class="text-zinc-100">
+          <%= @permission_request.status.titleize %> by <%= @permission_request.decided_by.email %>
         </div>
-        <div>
-          <dt class="text-xs uppercase tracking-wider text-zinc-500">Decided By</dt>
-          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.decided_by.email %></dd>
-        </div>
-        <div>
-          <dt class="text-xs uppercase tracking-wider text-zinc-500">Decided At</dt>
-          <dd class="mt-1 text-sm text-zinc-100"><%= @permission_request.decided_at.utc.iso8601 %></dd>
-        </div>
-      </dl>
+      </div>
     <% end %>
   </div>
-</section>
+
+  <% if @permission_request.pending? %>
+    <div class="mt-6 grid grid-cols-2 gap-3">
+      <%= button_to "Deny",
+                    deny_console_permission_request_path(@permission_request.oid),
+                    method: :post,
+                    class: "w-full rounded border border-ink-600 bg-ink-800/60 px-4 py-2 text-sm text-zinc-300 transition-colors hover:text-zinc-100" %>
+      <%= button_to "Approve",
+                    approve_console_permission_request_path(@permission_request.oid),
+                    method: :post,
+                    class: "w-full rounded border border-centaur-500/40 bg-centaur-500/10 px-4 py-2 text-sm text-centaur-300 transition-colors hover:bg-centaur-500/20 hover:text-centaur-200" %>
+    </div>
+  <% end %>
+</div>

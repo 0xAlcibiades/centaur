@@ -15,18 +15,9 @@ class CreatePermissionRequests < ActiveRecord::Migration[8.1]
       t.string :approver_notification_status, null: false, default: "pending"
       t.string :approver_notification_channel_id
       t.string :approver_notification_message_ts
-      t.datetime :approver_notification_attempted_at
-      t.datetime :approver_notification_delivered_at
-      t.text :approver_notification_last_error
       t.string :approver_decision_update_status, null: false, default: "pending"
-      t.datetime :approver_decision_update_attempted_at
-      t.datetime :approver_decision_update_delivered_at
-      t.text :approver_decision_update_last_error
       t.string :requester_outcome_notification_status, null: false, default: "pending"
       t.string :requester_outcome_message_ts
-      t.datetime :requester_outcome_notification_attempted_at
-      t.datetime :requester_outcome_notification_delivered_at
-      t.text :requester_outcome_notification_last_error
       t.references :decided_by, foreign_key: { to_table: :users }
       t.datetime :decided_at
 

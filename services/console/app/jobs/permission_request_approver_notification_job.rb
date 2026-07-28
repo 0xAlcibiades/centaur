@@ -9,12 +9,13 @@ class PermissionRequestApproverNotificationJob < ApplicationJob
     return if permission_request.approver_notification_status.in?(%w[sent skipped])
 
     result = PermissionRequestSlackNotifier.post_approver_notification(permission_request, review_url)
-    permission_request.mark_approver_notification_sent!(
-      channel_id: result.channel_id,
-      message_ts: result.message_ts
+    permission_request.update!(
+      approver_notification_status: "sent",
+      approver_notification_channel_id: result.channel_id,
+      approver_notification_message_ts: result.message_ts
     )
   rescue PermissionRequestSlackNotifier::SlackApiError => e
-    permission_request&.mark_approver_notification_failed!(e)
+    permission_request&.update!(approver_notification_status: "failed")
     raise
   end
 end

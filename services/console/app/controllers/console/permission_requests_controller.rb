@@ -1,6 +1,6 @@
 module Console
   class PermissionRequestsController < ApplicationController
-    layout "console"
+    layout "auth"
 
     before_action :require_admin
     before_action :set_permission_request

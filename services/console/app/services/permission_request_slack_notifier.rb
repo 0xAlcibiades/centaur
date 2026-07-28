@@ -131,11 +131,6 @@ class PermissionRequestSlackNotifier
   end
   private_class_method :slack_bot_token
 
-  def self.slack_list(values)
-    Array(values).map { |value| slack_escape(value) }.join(", ")
-  end
-  private_class_method :slack_list
-
   def self.slack_escape(value)
     value.to_s
       .gsub("&", "&amp;")
