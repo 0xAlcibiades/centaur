@@ -86,8 +86,11 @@ module Api
         assert_equal "pending", request.approver_notification_status
       end
 
-      test "normalizes lowercased Slack channel principal foreign id" do
-        Principal.where(id: @proxy.principal_id).update_all(foreign_id: "c0bcqmckjpm")
+      test "uses Slack channel label when principal foreign id is a slug" do
+        Principal.where(id: @proxy.principal_id).update_all(
+          foreign_id: "slack-channel-c0bcqmckjpm",
+          labels: @proxy.principal.labels.merge(Principal::SLACK_CHANNEL_ID_LABEL => "C0BCQMCKJPM")
+        )
         @proxy.association(:principal).reset
 
         with_permission_request_env do

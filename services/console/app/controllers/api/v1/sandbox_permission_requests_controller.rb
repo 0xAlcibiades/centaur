@@ -28,10 +28,14 @@ module Api
           kind: attrs.require(:kind),
           requesting_principal: principal,
           requesting_proxy: current_proxy,
-          requesting_slack_channel_id: normalized_slack_channel_id(principal.foreign_id),
+          requesting_slack_channel_id: normalized_slack_channel_id(requesting_slack_channel_id(principal)),
           requesting_slack_thread_ts: attrs[:requesting_slack_thread_ts],
           metadata: metadata_params
         }
+      end
+
+      def requesting_slack_channel_id(principal)
+        principal.labels[Principal::SLACK_CHANNEL_ID_LABEL].presence || principal.foreign_id
       end
 
       def normalized_slack_channel_id(channel_id)
