@@ -914,31 +914,7 @@ impl WorkflowRuntime {
         queue_name: &str,
         limit: i64,
     ) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
-        let (task_table, run_table) = absurd_queue_tables(queue_name)?;
-        let rows = sqlx::query(&format!(
-            r#"
-            select
-                r.run_id::text as run_id,
-                t.task_id::text as task_id,
-                t.task_name,
-                t.params,
-                t.state,
-                t.attempts,
-                t.completed_payload,
-                r.failure_reason,
-                t.enqueue_at as created_at,
-                greatest(t.enqueue_at, coalesce(r.available_at, t.enqueue_at)) as updated_at
-            from {task_table} t
-            join {run_table} r on r.run_id = t.last_attempt_run
-            order by t.enqueue_at desc, t.task_id desc
-            limit $1
-            "#,
-        ))
-        .bind(limit)
-        .fetch_all(self.inner.client.pool())
-        .await?;
-
-        rows.into_iter().map(workflow_run_from_row).collect()
+        fetch_runs_for_queue(self.inner.client.pool(), queue_name, limit).await
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<WorkflowRun, WorkflowRuntimeError> {
@@ -960,29 +936,7 @@ impl WorkflowRuntime {
         queue_name: &str,
         run_id: &str,
     ) -> Result<Option<WorkflowRun>, WorkflowRuntimeError> {
-        let (task_table, run_table) = absurd_queue_tables(queue_name)?;
-        let row = sqlx::query(&format!(
-            r#"
-            select
-                r.run_id::text as run_id,
-                t.task_id::text as task_id,
-                t.task_name,
-                t.params,
-                t.state,
-                t.attempts,
-                t.completed_payload,
-                r.failure_reason,
-                t.enqueue_at as created_at,
-                greatest(t.enqueue_at, coalesce(r.available_at, t.enqueue_at)) as updated_at
-            from {run_table} r
-            join {task_table} t on t.task_id = r.task_id
-            where r.run_id = $1::uuid
-            "#,
-        ))
-        .bind(run_id)
-        .fetch_optional(self.inner.client.pool())
-        .await?;
-        row.map(workflow_run_from_row).transpose()
+        fetch_run_for_queue(self.inner.client.pool(), queue_name, run_id).await
     }
 
     pub async fn cancel_run(&self, run_id: &str) -> Result<(), WorkflowRuntimeError> {
@@ -1119,6 +1073,81 @@ fn absurd_queue_tables(
             "unknown workflow queue {other:?}"
         ))),
     }
+}
+
+async fn fetch_runs_for_queue(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+    limit: i64,
+) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+    let rows = sqlx::query(&format!(
+        r#"
+        select
+            r.run_id::text as run_id,
+            t.task_id::text as task_id,
+            t.task_name,
+            t.params,
+            t.state,
+            t.attempts,
+            case when t.state = 'completed' then t.completed_payload end as completed_payload,
+            case when t.state = 'failed' then r.failure_reason end as failure_reason,
+            t.enqueue_at as created_at,
+            greatest(
+                t.enqueue_at,
+                case
+                    when isfinite(r.available_at) then r.available_at
+                    else t.enqueue_at
+                end
+            ) as updated_at
+        from {task_table} t
+        join {run_table} r on r.run_id = t.last_attempt_run
+        order by t.enqueue_at desc, t.task_id desc
+        limit $1
+        "#,
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(workflow_run_from_row).collect()
+}
+
+async fn fetch_run_for_queue(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+    run_id: &str,
+) -> Result<Option<WorkflowRun>, WorkflowRuntimeError> {
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+    let row = sqlx::query(&format!(
+        r#"
+        select
+            requested_run.run_id::text as run_id,
+            t.task_id::text as task_id,
+            t.task_name,
+            t.params,
+            t.state,
+            t.attempts,
+            case when t.state = 'completed' then t.completed_payload end as completed_payload,
+            case when t.state = 'failed' then current_run.failure_reason end as failure_reason,
+            t.enqueue_at as created_at,
+            greatest(
+                t.enqueue_at,
+                case
+                    when isfinite(current_run.available_at) then current_run.available_at
+                    else t.enqueue_at
+                end
+            ) as updated_at
+        from {run_table} requested_run
+        join {task_table} t on t.task_id = requested_run.task_id
+        left join {run_table} current_run on current_run.run_id = t.last_attempt_run
+        where requested_run.run_id = $1::uuid
+        "#,
+    ))
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(workflow_run_from_row).transpose()
 }
 
 fn build_webhook_registry(
@@ -4284,6 +4313,294 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use sqlx::{postgres::PgPoolOptions, types::Json};
+    use std::sync::OnceLock;
+
+    fn workflow_run_database_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn optional_workflow_test_client() -> Result<Option<Client>, WorkflowRuntimeError> {
+        let Ok(database_url) = env::var("ABSURD_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?;
+        let has_schema: Option<i32> =
+            sqlx::query_scalar("select 1 from pg_namespace where nspname = 'absurd'")
+                .fetch_optional(&pool)
+                .await?;
+        if has_schema.is_none() {
+            sqlx::raw_sql(include_str!(
+                "../../centaur-session-sqlx/migrations/0007_absurd_workflows.sql"
+            ))
+            .execute(&pool)
+            .await?;
+        }
+        let client = Client::from_pool_with_options(
+            pool,
+            ClientOptions {
+                queue_name: WORKFLOW_QUEUE.to_owned(),
+                ..ClientOptions::default()
+            },
+        )?;
+        client
+            .create_queue(Some(WORKFLOW_QUEUE), CreateQueueOptions::default())
+            .await?;
+        Ok(Some(client))
+    }
+
+    async fn mark_workflow_run_running(
+        pool: &sqlx::PgPool,
+        run_id: &str,
+    ) -> Result<(), WorkflowRuntimeError> {
+        let mut transaction = pool.begin().await?;
+        sqlx::query(
+            r#"
+            update absurd.t_centaur_workflows t
+            set state = 'running',
+                first_started_at = coalesce(first_started_at, absurd.current_time())
+            from absurd.r_centaur_workflows r
+            where r.run_id = $1::uuid
+              and t.task_id = r.task_id
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            update absurd.r_centaur_workflows
+            set state = 'running',
+                started_at = coalesce(started_at, absurd.current_time())
+            where run_id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn fail_workflow_run(
+        pool: &sqlx::PgPool,
+        run_id: &str,
+        failure: Value,
+    ) -> Result<(), WorkflowRuntimeError> {
+        sqlx::query("select absurd.fail_run($1, $2::uuid, $3::jsonb, null)")
+            .bind(WORKFLOW_QUEUE)
+            .bind(run_id)
+            .bind(Json(failure))
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn await_workflow_event_without_timeout(
+        pool: &sqlx::PgPool,
+        task_id: &str,
+        run_id: &str,
+    ) -> Result<(), WorkflowRuntimeError> {
+        let should_suspend: bool = sqlx::query_scalar(
+            r#"
+            select should_suspend
+            from absurd.await_event(
+                $1,
+                $2::uuid,
+                $3::uuid,
+                'wait_for_test_event',
+                'workflow_retry_test_event',
+                null
+            )
+            "#,
+        )
+        .bind(WORKFLOW_QUEUE)
+        .bind(task_id)
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
+        assert!(should_suspend);
+        Ok(())
+    }
+
+    async fn latest_workflow_attempt(
+        pool: &sqlx::PgPool,
+        task_id: &str,
+    ) -> Result<(String, OffsetDateTime), WorkflowRuntimeError> {
+        let row = sqlx::query(
+            r#"
+            select
+                r.run_id::text as run_id,
+                greatest(t.enqueue_at, r.available_at) as updated_at
+            from absurd.t_centaur_workflows t
+            join absurd.r_centaur_workflows r on r.run_id = t.last_attempt_run
+            where t.task_id = $1::uuid
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(pool)
+        .await?;
+        Ok((row.try_get("run_id")?, row.try_get("updated_at")?))
+    }
+
+    fn workflow_test_spawn_options() -> SpawnOptions {
+        SpawnOptions {
+            queue: Some(WORKFLOW_QUEUE.to_owned()),
+            max_attempts: Some(2),
+            ..SpawnOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_successful_retry_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_success",
+                    "input": {"case": "success"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, json!({"attempt": "first"})).await?;
+        let (latest_run_id, latest_updated_at) =
+            latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        assert_ne!(latest_run_id, spawned.run_id);
+        let pending_run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should resolve while its retry is pending");
+        assert_eq!(pending_run.run_id, spawned.run_id);
+        assert_eq!(pending_run.status, "pending");
+        assert_eq!(pending_run.result, None);
+        assert_eq!(pending_run.failure, None);
+        assert_eq!(pending_run.updated_at, latest_updated_at);
+
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        sqlx::query("select absurd.complete_run($1, $2::uuid, $3::jsonb)")
+            .bind(WORKFLOW_QUEUE)
+            .bind(&latest_run_id)
+            .bind(Json(json!({"ok": true})))
+            .execute(client.pool())
+            .await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should remain queryable after a retry");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.result, Some(json!({"ok": true})));
+        assert_eq!(run.failure, None);
+        assert_eq!(run.attempts, 2);
+        assert_eq!(run.updated_at, latest_updated_at);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_latest_exhausted_retry_failure_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_exhaustion",
+                    "input": {"case": "failure"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+        let first_failure = json!({"attempt": "first"});
+        let latest_failure = json!({"attempt": "latest"});
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, first_failure.clone()).await?;
+        let (latest_run_id, latest_updated_at) =
+            latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        assert_ne!(latest_run_id, spawned.run_id);
+
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        fail_workflow_run(client.pool(), &latest_run_id, latest_failure.clone()).await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should remain queryable after retries are exhausted");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.result, None);
+        assert_eq!(run.failure, Some(latest_failure));
+        assert_ne!(run.failure, Some(first_failure));
+        assert_eq!(run.attempts, 2);
+        assert_eq!(run.updated_at, latest_updated_at);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_indefinitely_sleeping_retry_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_event_wait",
+                    "input": {"case": "sleeping"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, json!({"attempt": "first"})).await?;
+        let (latest_run_id, _) = latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        await_workflow_event_without_timeout(client.pool(), &spawned.task_id, &latest_run_id)
+            .await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should resolve while its retry waits indefinitely");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "sleeping");
+        assert_eq!(run.result, None);
+        assert_eq!(run.failure, None);
+        assert_eq!(run.updated_at, run.created_at);
+
+        let listed_run = fetch_runs_for_queue(client.pool(), WORKFLOW_QUEUE, 200)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.task_id == spawned.task_id)
+            .expect("indefinitely sleeping retry should remain listable");
+        assert_eq!(listed_run.run_id, latest_run_id);
+        assert_eq!(listed_run.status, "sleeping");
+        assert_eq!(listed_run.result, None);
+        assert_eq!(listed_run.failure, None);
+        assert_eq!(listed_run.updated_at, listed_run.created_at);
+
+        Ok(())
+    }
 
     #[test]
     fn python_event_names_are_collision_free() {

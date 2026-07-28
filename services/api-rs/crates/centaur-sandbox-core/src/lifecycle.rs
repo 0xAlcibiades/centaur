@@ -100,6 +100,8 @@ pub struct ObservedSandbox {
     pub status: SandboxStatus,
     /// Backend-owned diagnostic reason for the observed status.
     pub reason: Option<String>,
+    /// Backend component metadata, when the backend records it.
+    pub component: Option<String>,
     /// When the backend created the sandbox, if the backend records it.
     pub created_at: Option<SystemTime>,
     /// When the sandbox was suspended, if it is currently suspended and the
@@ -118,6 +120,7 @@ impl ObservedSandbox {
             backend: backend.into(),
             status,
             reason: None,
+            component: None,
             created_at: None,
             suspended_since: None,
         }
@@ -125,6 +128,11 @@ impl ObservedSandbox {
 
     pub fn with_created_at(mut self, created_at: Option<SystemTime>) -> Self {
         self.created_at = created_at;
+        self
+    }
+
+    pub fn with_component(mut self, component: Option<String>) -> Self {
+        self.component = component;
         self
     }
 
