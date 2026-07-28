@@ -1,6 +1,8 @@
 class SlackChannelPermission < ApplicationRecord
   include SyncConfigCacheInvalidation
 
+  oid_prefix "scp"
+
   PERMISSION_FLAGS = [
     { attribute: :upload_enabled, key: :upload, label: "Upload" },
     { attribute: :download_enabled, key: :download, label: "Download" },

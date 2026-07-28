@@ -19,7 +19,7 @@ module Console
       )
 
       assert_difference -> { principal.slack_channel_permissions.count }, -1 do
-        delete console_slack_channel_permission_url(delete_permission.id)
+        delete console_slack_channel_permission_url(delete_permission.oid)
       end
 
       assert_redirected_to console_principal_path(principal.oid)
@@ -40,7 +40,7 @@ module Console
       )
 
       assert_difference -> { role.slack_channel_permissions.count }, -1 do
-        delete console_slack_channel_permission_url(delete_permission.id)
+        delete console_slack_channel_permission_url(delete_permission.oid)
       end
 
       assert_redirected_to console_role_path(role.oid)
