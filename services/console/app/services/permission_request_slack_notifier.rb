@@ -60,16 +60,20 @@ class PermissionRequestSlackNotifier
 
   def self.approver_notification_text(permission_request, review_url)
     [
-      "*Permission Request:* #{request_summary(permission_request)}",
+      "*Permission Request*",
       "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
+      "Request:",
+      slack_code_block(permission_request.text_request),
       "Review in Console: <#{review_url}|Open request>"
     ].join("\n")
   end
 
   def self.decided_approver_notification_text(permission_request)
     [
-      "*Permission Request #{permission_request.decision_label}:* #{request_summary(permission_request)}",
+      "*Permission Request #{permission_request.decision_label}*",
       "Requester: #{slack_escape(permission_request.requesting_slack_channel_id)}",
+      "Request:",
+      slack_code_block(permission_request.text_request),
       "Decision: #{permission_request.decision_label} by #{slack_escape(permission_request.decided_by.email)} at #{permission_request.decided_at.utc.iso8601}"
     ].join("\n")
   end
@@ -77,16 +81,12 @@ class PermissionRequestSlackNotifier
   def self.requester_outcome_text(permission_request)
     case permission_request.status
     when "approved"
-      "Permission request approved for: #{slack_escape(permission_request.text_request)}"
+      "Permission request approved:\n#{slack_code_block(permission_request.text_request)}"
     when "denied"
-      "Permission request denied for #{request_summary(permission_request)}."
+      "Permission request denied:\n#{slack_code_block(permission_request.text_request)}"
     else
-      "Permission request is still pending for #{request_summary(permission_request)}."
+      "Permission request is still pending:\n#{slack_code_block(permission_request.text_request)}"
     end
-  end
-
-  def self.request_summary(permission_request)
-    "request: #{slack_escape(permission_request.text_request)}"
   end
 
   def self.approver_channel_id
@@ -138,4 +138,9 @@ class PermissionRequestSlackNotifier
       .gsub(">", "&gt;")
   end
   private_class_method :slack_escape
+
+  def self.slack_code_block(value)
+    "```#{slack_escape(value).gsub("```", "` ` `")}```"
+  end
+  private_class_method :slack_code_block
 end
