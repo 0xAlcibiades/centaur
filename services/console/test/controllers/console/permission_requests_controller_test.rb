@@ -39,7 +39,10 @@ module Console
     test "approve records decision and enqueues Slack updates without granting permissions" do
       sign_in users(:acme_admin)
 
-      assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
+      assert_enqueued_jobs 2, only: [
+        PermissionRequestApproverDecisionUpdateJob,
+        PermissionRequestRequesterOutcomeNotificationJob
+      ] do
         assert_no_difference -> { principals(:acme_channel).slack_channel_permissions.count } do
           post approve_console_permission_request_url(@permission_request.oid)
         end
@@ -54,7 +57,10 @@ module Console
     test "denies request and enqueues Slack updates without granting permissions" do
       sign_in users(:acme_admin)
 
-      assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
+      assert_enqueued_jobs 2, only: [
+        PermissionRequestApproverDecisionUpdateJob,
+        PermissionRequestRequesterOutcomeNotificationJob
+      ] do
         assert_no_difference -> { principals(:acme_channel).slack_channel_permissions.count } do
           post deny_console_permission_request_url(@permission_request.oid)
         end
@@ -69,7 +75,10 @@ module Console
       sign_in users(:acme_admin)
       @permission_request.approve!(by: users(:acme_admin))
 
-      assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
+      assert_enqueued_jobs 2, only: [
+        PermissionRequestApproverDecisionUpdateJob,
+        PermissionRequestRequesterOutcomeNotificationJob
+      ] do
         post approve_console_permission_request_url(@permission_request.oid)
       end
 
@@ -85,7 +94,10 @@ module Console
         requester_outcome_notification_status: "sent"
       )
 
-      assert_no_enqueued_jobs only: PermissionRequestDecisionNotificationJob do
+      assert_no_enqueued_jobs only: [
+        PermissionRequestApproverDecisionUpdateJob,
+        PermissionRequestRequesterOutcomeNotificationJob
+      ] do
         post approve_console_permission_request_url(@permission_request.oid)
       end
     end

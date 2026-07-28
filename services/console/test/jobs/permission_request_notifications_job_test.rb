@@ -36,7 +36,7 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
     assert_equal "failed", @permission_request.reload.approver_notification_status
   end
 
-  test "decision notification updates approver message and requester outcome once" do
+  test "approver decision update records Slack update" do
     @permission_request.update!(
       status: "approved",
       decided_by: users(:acme_admin),
@@ -46,55 +46,45 @@ class PermissionRequestNotificationsJobTest < ActiveJob::TestCase
       approver_notification_message_ts: "171.1"
     )
     update_result = PermissionRequestSlackNotifier::Result.new(channel_id: "CAPPROVERS", message_ts: "171.1")
-    outcome_result = PermissionRequestSlackNotifier::Result.new(channel_id: "C0123456789", message_ts: "172.1")
 
     PermissionRequestSlackNotifier.stub(:update_approver_notification, update_result) do
-      PermissionRequestSlackNotifier.stub(:post_requester_outcome, outcome_result) do
-        PermissionRequestDecisionNotificationJob.perform_now(@permission_request.id)
-      end
+      PermissionRequestApproverDecisionUpdateJob.perform_now(@permission_request.id)
     end
 
-    @permission_request.reload
-    assert_equal "sent", @permission_request.approver_decision_update_status
-    assert_equal "sent", @permission_request.requester_outcome_notification_status
-    assert_equal "172.1", @permission_request.requester_outcome_message_ts
+    assert_equal "sent", @permission_request.reload.approver_decision_update_status
   end
 
-  test "decision notification failure is persisted and retry skips already sent update" do
+  test "requester outcome failure is persisted before retry" do
     @permission_request.update!(
       status: "approved",
       decided_by: users(:acme_admin),
-      decided_at: Time.current,
-      approver_notification_status: "sent",
-      approver_notification_channel_id: "CAPPROVERS",
-      approver_notification_message_ts: "171.1"
+      decided_at: Time.current
     )
-    update_calls = 0
     error = PermissionRequestSlackNotifier::SlackApiError.new("rate_limited")
 
-    PermissionRequestSlackNotifier.stub(:update_approver_notification, ->(_request) {
-      update_calls += 1
-      PermissionRequestSlackNotifier::Result.new(channel_id: "CAPPROVERS", message_ts: "171.1")
-    }) do
-      PermissionRequestSlackNotifier.stub(:post_requester_outcome, ->(_request) { raise error }) do
-        assert_enqueued_jobs 1, only: PermissionRequestDecisionNotificationJob do
-          PermissionRequestDecisionNotificationJob.perform_now(@permission_request.id)
-        end
+    PermissionRequestSlackNotifier.stub(:post_requester_outcome, ->(_request) { raise error }) do
+      assert_enqueued_jobs 1, only: PermissionRequestRequesterOutcomeNotificationJob do
+        PermissionRequestRequesterOutcomeNotificationJob.perform_now(@permission_request.id)
       end
+    end
+
+    assert_equal "failed", @permission_request.reload.requester_outcome_notification_status
+  end
+
+  test "requester outcome records Slack message metadata" do
+    @permission_request.update!(
+      status: "approved",
+      decided_by: users(:acme_admin),
+      decided_at: Time.current
+    )
+    outcome_result = PermissionRequestSlackNotifier::Result.new(channel_id: "C0123456789", message_ts: "172.1")
+
+    PermissionRequestSlackNotifier.stub(:post_requester_outcome, outcome_result) do
+      PermissionRequestRequesterOutcomeNotificationJob.perform_now(@permission_request.id)
     end
 
     @permission_request.reload
-    assert_equal 1, update_calls
-    assert_equal "sent", @permission_request.approver_decision_update_status
-    assert_equal "failed", @permission_request.requester_outcome_notification_status
-
-    outcome_result = PermissionRequestSlackNotifier::Result.new(channel_id: "C0123456789", message_ts: "172.1")
-    PermissionRequestSlackNotifier.stub(:update_approver_notification, ->(_request) { raise "should not repeat update" }) do
-      PermissionRequestSlackNotifier.stub(:post_requester_outcome, outcome_result) do
-        PermissionRequestDecisionNotificationJob.perform_now(@permission_request.id)
-      end
-    end
-
-    assert_equal "sent", @permission_request.reload.requester_outcome_notification_status
+    assert_equal "sent", @permission_request.requester_outcome_notification_status
+    assert_equal "172.1", @permission_request.requester_outcome_message_ts
   end
 end

@@ -71,13 +71,6 @@ class PermissionRequest < ApplicationRecord
     status.titleize
   end
 
-  def decision_notifications_retryable?
-    return false if pending?
-
-    approver_decision_update_status.in?(%w[pending failed]) ||
-      requester_outcome_notification_status.in?(%w[pending failed])
-  end
-
   private
 
   def transition!(next_status, by:)
