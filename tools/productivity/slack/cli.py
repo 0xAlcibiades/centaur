@@ -593,7 +593,6 @@ def _render_channels(results: list[dict], title: str, include_access: bool = Fal
 
 @app.command("channels")
 def channels(
-    limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
     query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
     bot_member_only: bool = typer.Option(
         False,
@@ -604,7 +603,7 @@ def channels(
     """List Slack channels authorized by the Centaur API server proxy JWT."""
     from .client import list_channels_proxy
 
-    results = list_channels_proxy(limit=limit, history_only=bot_member_only)
+    results = list_channels_proxy(history_only=bot_member_only)
 
     if query:
         results = [c for c in results if query.lower() in c["name"].lower()]

@@ -621,10 +621,14 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       PrincipalSyncConfigSnapshotWarmJob.perform_now(@principal.id)
       removed = PrincipalSyncConfigSnapshot.fetch_for(@principal.reload)
       refute_equal assigned.id, removed.id
-      api_server_secrets = removed.config.fetch("secrets").select do |secret|
+      api_server_secret = removed.config.fetch("secrets").find do |secret|
         secret.dig("inject", "header") == "Authorization"
       end
-      assert_empty api_server_secrets
+      refute_nil api_server_secret
+      claims = jwt_payload(api_server_secret.dig("source", "value"))
+      assert_equal [], claims.dig("slack", "upload_channels")
+      assert_equal [], claims.dig("slack", "download_channels")
+      assert_equal [], claims.dig("slack", "history_channels")
     end
   end
 

@@ -240,11 +240,14 @@ class PrincipalTest < ActiveSupport::TestCase
       principal = principals(:acme_channel)
       principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
 
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal [], claims.dig("slack", "upload_channels")
+      assert_equal [], claims.dig("slack", "download_channels")
+      assert_equal [], claims.dig("slack", "history_channels")
     end
   end
 
-  test "clearing slack channel permissions revokes slack access" do
+  test "clearing slack channel permissions leaves public Slack proxy access" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = Principal.create!(
         default_attrs(
@@ -264,7 +267,10 @@ class PrincipalTest < ActiveSupport::TestCase
       SlackChannelPermission.replace_for!(principal, [])
 
       assert_empty principal.slack_channel_permissions.reload
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal [], claims.dig("slack", "upload_channels")
+      assert_equal [], claims.dig("slack", "download_channels")
+      assert_equal [], claims.dig("slack", "history_channels")
     end
   end
 

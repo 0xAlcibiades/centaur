@@ -160,7 +160,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;

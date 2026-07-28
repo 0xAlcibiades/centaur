@@ -1499,7 +1499,7 @@ class SlackClient:
 
         return sorted(channels, key=lambda x: x["name"])
 
-    def list_channels_proxy(self, limit: int = 200, history_only: bool = False) -> list[dict]:
+    def list_channels_proxy(self, history_only: bool = False) -> list[dict]:
         """List Slack channels exposed by the Centaur API server proxy JWT."""
         if not self._api_server_proxy_enabled():
             raise RuntimeError(
@@ -1527,7 +1527,7 @@ class SlackClient:
             for channel in channels
         ]
         normalized_channels.sort(key=lambda channel: (channel["name"].lower(), channel["id"]))
-        return normalized_channels[:limit]
+        return normalized_channels
 
     def list_files_proxy(
         self,
