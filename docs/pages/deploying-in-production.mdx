@@ -313,7 +313,7 @@ compatibility paths for `/api/slack/events`, `/api/slack/actions`,
 
 ### Enable the Autorotate account-pool command
 
-Autorotate adds a signed, pre-session Slack command for pool status and private
+Autorotate adds a signed, pre-session Slack command for pool status and ephemeral
 Codex account enrollment. It is deliberately separate from the normal agent
 session path: device codes and operator credentials never enter a Centaur
 session, sandbox, tool result, or database.
@@ -383,14 +383,14 @@ from the resulting credential: `add` derives a unique human-readable label, and
 `relogin` discovers and replaces the matching canonical account. Autorotate
 enforces one active enrollment per exact signed Slack workspace/member owner, so
 the flow recovers after a Slackbot restart and works with multiple replicas.
-Pending recovery includes the enrollment ID, action, expiry, and private device
+Pending recovery includes the enrollment ID, action, expiry, and ephemeral device
 link/code; the resolved account label may appear only after authentication.
 Once authorization reaches importing, owner recovery returns the same
 non-secret metadata without the link or code; Slackbot continues polling by
 enrollment ID and reports that canonical credential import is in progress.
 Completion accepts only the nested account label, email, and account status.
-The device code, link, and Slack response URL remain private and are never
-stored in a Centaur session or tool event.
+The device code, link, and Slack response URL remain visible only to the invoking
+operator and are never stored in a Centaur session or tool event.
 
 Sandboxes get observer-only access through `autorotate status`. The command
 calls Console's assigned-sandbox endpoint and can never start enrollment or

@@ -330,23 +330,23 @@ export function createAutorotateSlackCommandHandler(
       if (command.kind === 'accounts') {
         const responseUrl = safeResponseUrl(form.get('response_url'), options)
         if (!responseUrl) {
-          return ephemeralResponse('Slack did not provide a safe private response channel.')
+          return ephemeralResponse('Slack did not provide a safe ephemeral response channel.')
         }
         waitUntil(respondWithAccounts(client, responseUrl, options, fetchFn))
-        return ephemeralResponse('Checking private Codex account status…')
+        return ephemeralResponse('Checking Codex account status…')
       }
 
       if (command.kind === 'login') {
         const responseUrl = safeResponseUrl(form.get('response_url'), options)
         if (!responseUrl) {
-          return ephemeralResponse('Slack did not provide a safe private response channel.')
+          return ephemeralResponse('Slack did not provide a safe ephemeral response channel.')
         }
         const existing = activeEnrollments.get(actorKey)
         if (existing && existing.expiresAtMs <= Date.now()) {
           activeEnrollments.delete(actorKey)
         } else if (existing) {
           return ephemeralResponse(
-            'You already have an active login. Use `/autorotate login status` or `/autorotate login cancel`.'
+            'A Codex login is already active. Wait for it to finish, or try again after it expires.'
           )
         }
         const active: ActiveEnrollment = {
@@ -370,20 +370,20 @@ export function createAutorotateSlackCommandHandler(
             responseUrl
           })
         )
-        return ephemeralResponse('Starting a private Codex device login…')
+        return ephemeralResponse('Starting Codex device login…')
       }
 
       const responseUrl = safeResponseUrl(form.get('response_url'), options)
       if (!responseUrl) {
-        return ephemeralResponse('Slack did not provide a safe private response channel.')
+        return ephemeralResponse('Slack did not provide a safe ephemeral response channel.')
       }
       const active = activeEnrollments.get(actorKey)
       if (command.kind === 'login_status') {
         if (active?.state === 'starting') {
-          return ephemeralResponse('Your private Codex device login is still starting.')
+          return ephemeralResponse('Your Codex device login is still starting.')
         }
         if (active?.state === 'cancel_requested' || active?.state === 'cancelling') {
-          return ephemeralResponse('Your private Codex device login is being cancelled.')
+          return ephemeralResponse('Your Codex device login is being cancelled.')
         }
         waitUntil(
           respondWithEnrollmentStatus({
@@ -468,7 +468,7 @@ async function respondWithAccounts(
     await postSlackResponse(
       fetchFn,
       responseUrl,
-      'Private Codex account status is temporarily unavailable.',
+      'Codex account status is temporarily unavailable.',
       options.requestTimeoutMs
     )
   }
@@ -513,7 +513,11 @@ async function startAndMonitorEnrollment(input: {
       enrollment.action !== createInput.action
       || (expectedLabel !== undefined && enrollment.account_label !== expectedLabel)
     ) {
-      throw new AutorotateError('Autorotate returned a mismatched enrollment')
+      throw new AutorotateError(
+        'Autorotate returned an existing enrollment for this owner',
+        409,
+        'enrollment_already_active'
+      )
     }
     const enrollmentId = enrollment.enrollment_id
     const expiresAtMs = Date.parse(enrollment.expires_at)
@@ -1010,13 +1014,13 @@ function formatDeviceCode(
   const userCode = safeUserCode(enrollment.user_code)
   if (!verificationUrl || !userCode) throw new AutorotateError('invalid device authorization')
   return [
-    '*Private Codex device login*',
+    '*Codex device login*',
     reloginAccount
       ? `Reauthenticating \`${escapeSlackText(reloginAccount.label)}\` (${reloginAccount.email ? escapeSlackText(reloginAccount.email) : 'email unknown'}).`
       : null,
     `Open <${verificationUrl}|the OpenAI device login page> and enter: \`${userCode}\``,
     safeTimestamp(enrollment.expires_at) ? `Expires: ${safeTimestamp(enrollment.expires_at)}` : null,
-    'This private response will be replaced when login completes.'
+    'This ephemeral response will be replaced when login completes.'
   ].filter(Boolean).join('\n')
 }
 
@@ -1064,6 +1068,9 @@ function loginFailureText(error: unknown): string {
   if (error instanceof AutorotateError && error.code === 'account_busy') {
     return 'That Codex account is already being reauthenticated. Try again after the active login finishes.'
   }
+  if (error instanceof AutorotateError && error.code === 'enrollment_already_active') {
+    return 'Another Codex login is already active. Wait for it to finish, or try again after it expires.'
+  }
   if (error instanceof AutorotateError && error.code === 'email_mismatch') {
     return 'The expected email does not match that Codex account.'
   }
@@ -1089,7 +1096,7 @@ function completedEnrollmentText(enrollment: EnrollmentStatusResponse): string {
   const email = safeEmail(enrollment.account.email)
     ? ` (${escapeSlackText(enrollment.account.email)})`
     : ''
-  return `Codex account ${label}${email} was added to Autorotate.`
+  return `Codex account ${label}${email} is ready in Autorotate.`
 }
 
 function validateStartEnrollment(payload: JsonObject): StartEnrollmentResponse {
