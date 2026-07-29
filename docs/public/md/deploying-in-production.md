@@ -307,7 +307,7 @@ compatibility paths for `/api/slack/events`, `/api/slack/actions`,
 
 ### Enable the Autorotate account-pool command
 
-Autorotate adds a signed, pre-session Slack command for pool status and private
+Autorotate adds a signed, pre-session Slack command for pool status and ephemeral
 Codex account enrollment. It is deliberately separate from the normal agent
 session path: device codes and operator credentials never enter a Centaur
 session, sandbox, tool result, or database.
@@ -321,7 +321,7 @@ Register the command once in the existing Slack app using Slack's
    - **Command:** `/autorotate`
    - **Request URL:** `https://<your-host>/api/slack/commands`
    - **Short description:** `Manage the Codex account pool`
-   - **Usage hint:** `status | accounts | login [label] [expected-email] | login relogin <label> | login status | login cancel`
+   - **Usage hint:** `status | accounts | add | relogin`
 3. Save the command and reinstall the app if Slack prompts you. The app's
    existing `SLACK_SIGNING_SECRET` validates requests; no Autorotate credential
    is configured in Slack.
@@ -360,31 +360,31 @@ profiles; obtain the workspace ID from Slack's `auth.test` response or the
 workspace administration page. `credentialsSecretName` must not name the
 shared Centaur infrastructure Secret.
 
-Operators can run `/autorotate status` from Slack for aggregate capacity.
-`/autorotate accounts` is DM-only and shows the operator-safe account list:
-label, email, enabled/disabled/dead status, rate-limit end, and whether login is
-required. It never includes account IDs, provider subjects, ownership, usage,
-or auth data.
+Allowlisted operators can run every `/autorotate` subcommand from any Slack
+conversation. Slackbot sends both the immediate acknowledgement and every
+follow-up through Slack's ephemeral response path, so account emails, device
+links, and device codes are visible only to the invoking operator. `/autorotate
+status` shows aggregate capacity. `/autorotate accounts` shows the operator-safe
+account list: label, email, enabled/disabled/dead status, rate-limit end, and
+whether login is required. It never includes account IDs, provider subjects,
+ownership, usage, or auth data.
 
-Account enrollment is also DM-only. `/autorotate login` returns a private device
-link and code, polls the broker, and replaces that response when enrollment
-reaches a terminal state. A reauthentication alert can be pasted back verbatim
-as `/autorotate login relogin <label>`; Slackbot validates the exact label
-against the safe account list and supplies the known email to the broker.
-Labels containing spaces or control characters use a JSON string as the final
-argument, for example `/autorotate login relogin "legacy primary"`; alerts use
-this same deterministic quoting rule.
-`/autorotate login status` and `/autorotate login cancel` reconcile the active
-enrollment by the exact signed Slack workspace/member owner. Autorotate enforces
-one active enrollment per owner, so these commands recover after a Slackbot
-restart and work with multiple replicas. Pending recovery includes the
-enrollment ID, action, account label, expiry, and private device link/code.
+`/autorotate add` and `/autorotate relogin` return the ephemeral device link and
+code, poll the broker, and replace that response when enrollment reaches a
+terminal state. Neither command accepts an account label or email. After the
+operator authenticates with stock Codex, Autorotate reads the verified identity
+from the resulting credential: `add` derives a unique human-readable label, and
+`relogin` discovers and replaces the matching canonical account. Autorotate
+enforces one active enrollment per exact signed Slack workspace/member owner, so
+the flow recovers after a Slackbot restart and works with multiple replicas.
+Pending recovery includes the enrollment ID, action, expiry, and ephemeral device
+link/code; the resolved account label may appear only after authentication.
 Once authorization reaches importing, owner recovery returns the same
 non-secret metadata without the link or code; Slackbot continues polling by
 enrollment ID and reports that canonical credential import is in progress.
 Completion accepts only the nested account label, email, and account status.
-The device code, link, and Slack response URL remain private and are never
-stored in a Centaur session or tool event.
+The device code, link, and Slack response URL remain visible only to the invoking
+operator and are never stored in a Centaur session or tool event.
 
 Sandboxes get observer-only access through `autorotate status`. The command
 calls Console's assigned-sandbox endpoint and can never start enrollment or

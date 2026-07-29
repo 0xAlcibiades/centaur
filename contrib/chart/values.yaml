@@ -485,7 +485,8 @@ slackbotv2:
   # Join newly-created public channels after subscribed channel_created events.
   # Requires the Slack app to grant channels:read and channels:join.
   autoJoinCreatedChannels: false
-  # Signed, pre-session `/autorotate` Slack command. Login is DM-only and
+  # Signed, pre-session `/autorotate` Slack command. Every subcommand can be
+  # invoked from any Slack conversation, but responses remain ephemeral and are
   # available only to the exact workspace/member allowlists below. Observer and
   # operator tokens come from a dedicated Secret so no broker administration
   # credential enters Slack, a sandbox, or the shared infra Secret.
