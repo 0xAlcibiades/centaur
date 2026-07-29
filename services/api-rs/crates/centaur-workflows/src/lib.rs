@@ -12,7 +12,9 @@ use absurd::{
     RetryStrategy, SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker,
     WorkerOptions,
 };
-use centaur_iron_control::{IdentityInput, IronControlClient, IronControlError, slugify};
+use centaur_iron_control::{
+    IdentityInput, IronControlClient, IronControlError, Principal, slugify,
+};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -30,7 +32,7 @@ use sqlx::Row;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::Command,
     task::JoinHandle,
 };
@@ -53,6 +55,7 @@ const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const WORKFLOW_HOST_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
@@ -277,19 +280,20 @@ impl WorkflowHostSandboxRuntime {
         };
     }
 
-    fn spec_for_workflow(&self, workflow_name: &str) -> Result<SandboxSpec, WorkflowRuntimeError> {
+    fn binding_for_workflow(
+        &self,
+        workflow_name: &str,
+    ) -> Result<(SandboxSpec, Option<String>), WorkflowRuntimeError> {
+        let assignments = self
+            .workflow_principals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let principal = assignments.principal_for_workflow(workflow_name)?;
         let mut spec = self.spec.clone();
-        let principal = {
-            let assignments = self
-                .workflow_principals
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assignments.principal_for_workflow(workflow_name)?
-        };
-        if let Some(principal) = principal {
-            spec.iron_control_principal = Some(principal);
+        if let Some(principal) = principal.as_ref() {
+            spec.iron_control_principal = Some(principal.clone());
         }
-        Ok(spec)
+        Ok((spec, principal))
     }
 }
 
@@ -311,22 +315,73 @@ impl WorkflowPrincipalRegistrar {
         &self,
         principals: &BTreeSet<String>,
     ) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
+        validate_workflow_principal_foreign_ids(principals)?;
         let mut registered = BTreeMap::new();
         for workflow_name in principals {
             let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
+            let labels = workflow_principal_labels(workflow_name);
+            let labels = match self
+                .client
+                .get_principal(&self.namespace, &foreign_id)
+                .await
+            {
+                Ok(existing) => merge_existing_workflow_principal_labels(
+                    workflow_name,
+                    &foreign_id,
+                    &existing,
+                    labels,
+                )?,
+                Err(IronControlError::Status { status: 404, .. }) => labels,
+                Err(error) => return Err(error.into()),
+            };
             let record = self
                 .client
                 .upsert_principal(&IdentityInput {
                     namespace: self.namespace.clone(),
                     foreign_id,
                     name: format!("Workflow {workflow_name}"),
-                    labels: workflow_principal_labels(workflow_name),
+                    labels,
                 })
                 .await?;
             registered.insert(workflow_name.clone(), record.id);
         }
         Ok(registered)
     }
+}
+
+fn merge_existing_workflow_principal_labels(
+    workflow_name: &str,
+    foreign_id: &str,
+    existing: &Principal,
+    required: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
+    let identity_matches = existing.foreign_id.as_deref() == Some(foreign_id)
+        && existing.labels.get("kind").map(String::as_str) == Some("workflow")
+        && existing.labels.get("managed-by").map(String::as_str) == Some("centaur")
+        && existing.labels.get("workflow_name").map(String::as_str) == Some(workflow_name);
+    if !identity_matches {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "workflow {workflow_name} principal {foreign_id} already exists with a different identity"
+        )));
+    }
+    let mut labels = existing.labels.clone();
+    labels.extend(required);
+    Ok(labels)
+}
+
+fn validate_workflow_principal_foreign_ids(
+    workflow_names: &BTreeSet<String>,
+) -> Result<(), WorkflowRuntimeError> {
+    let mut owners = BTreeMap::new();
+    for workflow_name in workflow_names {
+        let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
+        if let Some(existing) = owners.insert(foreign_id.clone(), workflow_name) {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflows {existing} and {workflow_name} map to the same principal {foreign_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_workflow_principal_foreign_id(workflow_name: &str) -> String {
@@ -524,6 +579,28 @@ struct AgentTurnResult {
     status: String,
     output_lines: Vec<String>,
     result_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PythonAgentTurnResult {
+    thread_key: String,
+    execution_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_lines: Option<Vec<String>>,
+    result_text: String,
+}
+
+impl PythonAgentTurnResult {
+    fn from_agent_turn(result: AgentTurnResult, include_output_lines: bool) -> Self {
+        Self {
+            thread_key: result.thread_key,
+            execution_id: result.execution_id,
+            status: result.status,
+            output_lines: include_output_lines.then_some(result.output_lines),
+            result_text: result.result_text,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1845,6 +1922,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -1879,8 +1957,8 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
     write_host_message(&mut stdin, &json!({"type": "workflow.discover"})).await?;
     drop(stdin);
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -2828,6 +2906,7 @@ async fn run_centaur_workflow_inner(
                                 execution_idempotency_key: format!(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
+                                iron_control_principal: None,
                                 workflow_owned_thread: true,
                                 idle_timeout_ms,
                                 max_duration_ms,
@@ -3019,6 +3098,7 @@ async fn run_python_workflow_host_local(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -3050,7 +3130,7 @@ async fn run_python_workflow_host_local(
         collected.join("\n")
     });
 
-    write_host_message(
+    if let Err(error) = write_host_message(
         &mut stdin,
         &json!({
             "type": "workflow.start",
@@ -3060,10 +3140,17 @@ async fn run_python_workflow_host_local(
             "input": input.input,
         }),
     )
-    .await?;
+    .await
+    {
+        drop(stdin);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = stderr_task.await;
+        return Err(error);
+    }
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -3076,6 +3163,7 @@ async fn run_python_workflow_host_local(
             }
             Some("workflow.error") | Some("host.error") => {
                 let stderr = stderr_task.await.unwrap_or_default();
+                let _ = child.wait().await;
                 return Err(WorkflowRuntimeError::Internal(format!(
                     "Python workflow host error: {}{}{}",
                     message
@@ -3109,6 +3197,7 @@ async fn run_python_workflow_host_local(
                     &session_runtime,
                     &input,
                     &workflow_clients,
+                    None,
                 )
                 .await
                 {
@@ -3120,7 +3209,13 @@ async fn run_python_workflow_host_local(
                         return Err(error);
                     }
                 };
-                write_host_message(&mut stdin, &response).await?;
+                if let Err(error) = write_host_message(&mut stdin, &response).await {
+                    drop(stdin);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = stderr_task.await;
+                    return Err(error);
+                }
             }
             other => {
                 return Err(WorkflowRuntimeError::Internal(format!(
@@ -3144,7 +3239,8 @@ async fn run_python_workflow_host_in_sandbox(
     sandbox: WorkflowHostSandboxRuntime,
     workflow_clients: WorkflowQueueClients,
 ) -> Result<Value, WorkflowRuntimeError> {
-    let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+    let (mut spec, workflow_agent_principal) =
+        sandbox.binding_for_workflow(&input.workflow_name)?;
     spec = spec
         .env("WORKFLOW_RUN_ID", ctx.run_id())
         .env("WORKFLOW_TASK_ID", ctx.task_id())
@@ -3171,8 +3267,11 @@ async fn run_python_workflow_host_in_sandbox(
     let result = run_python_workflow_host_protocol(
         input,
         ctx,
-        session_runtime,
-        workflow_clients,
+        WorkflowHostProtocolRuntime {
+            session_runtime,
+            workflow_clients,
+            workflow_agent_principal,
+        },
         &mut stdin,
         io.stdout,
         stderr_task,
@@ -3189,11 +3288,16 @@ fn sandbox_spec_has_env(spec: &SandboxSpec, name: &str) -> bool {
     spec.env.iter().any(|entry| entry.name == name)
 }
 
+struct WorkflowHostProtocolRuntime {
+    session_runtime: SessionRuntime,
+    workflow_clients: WorkflowQueueClients,
+    workflow_agent_principal: Option<String>,
+}
+
 async fn run_python_workflow_host_protocol<W, R>(
     input: WorkflowTaskInput,
     ctx: TaskContext,
-    session_runtime: SessionRuntime,
-    workflow_clients: WorkflowQueueClients,
+    runtime: WorkflowHostProtocolRuntime,
     stdin: &mut W,
     stdout: R,
     stderr_task: JoinHandle<String>,
@@ -3214,8 +3318,8 @@ where
     )
     .await?;
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -3256,9 +3360,10 @@ where
                 let response = handle_python_context_request(
                     &message,
                     &ctx,
-                    &session_runtime,
+                    &runtime.session_runtime,
                     &input,
-                    &workflow_clients,
+                    &runtime.workflow_clients,
+                    runtime.workflow_agent_principal.as_deref(),
                 )
                 .await?;
                 write_host_message(stdin, &response).await?;
@@ -3391,6 +3496,7 @@ async fn handle_python_context_request(
     session_runtime: &SessionRuntime,
     input: &WorkflowTaskInput,
     workflow_clients: &WorkflowQueueClients,
+    workflow_agent_principal: Option<&str>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let request_id = message
         .get("request_id")
@@ -3490,8 +3596,15 @@ async fn handle_python_context_request(
         }
         Some("ctx.agent_turn") => {
             let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-            match run_python_agent_turn(session_runtime.clone(), ctx, input, args, &request_id)
-                .await
+            match run_python_agent_turn(
+                session_runtime.clone(),
+                ctx,
+                input,
+                args,
+                &request_id,
+                workflow_agent_principal,
+            )
+            .await
             {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
@@ -3647,6 +3760,7 @@ async fn run_python_agent_turn(
     input: &WorkflowTaskInput,
     args: Value,
     request_id: &str,
+    workflow_agent_principal: Option<&str>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let text = args
         .get("text")
@@ -3675,14 +3789,12 @@ async fn run_python_agent_turn(
         .get("thread_key")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let workflow_owned_thread = explicit_thread_key.is_none();
-    let thread_key = explicit_thread_key.unwrap_or_else(|| {
-        format!(
-            "wf:{}:agent:{}",
-            ctx.task_id().replace('-', ""),
-            input.workflow_name
-        )
-    });
+    let (thread_key, workflow_owned_thread) = resolve_python_agent_thread(
+        ctx.task_id(),
+        &input.workflow_name,
+        explicit_thread_key,
+        workflow_agent_principal.is_some(),
+    )?;
     let harness_type = parse_agent_harness(&args)?.unwrap_or_else(|| input.harness_type.clone());
     let persona_id = args
         .get("persona_id")
@@ -3738,6 +3850,7 @@ async fn run_python_agent_turn(
     let model = first_str_arg(&args, &["model"]);
     let provider = first_str_arg(&args, &["provider"]);
     let reasoning = first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]);
+    let include_output_lines = parse_include_output_lines(&args)?;
     // Record the model on the execution like the slackbot does, so Console
     // readers can show what a workflow-dispatched turn ran on.
     if let Some(model) = model.as_deref() {
@@ -3755,6 +3868,7 @@ async fn run_python_agent_turn(
             message_metadata,
             execution_metadata,
             execution_idempotency_key,
+            iron_control_principal: workflow_agent_principal.map(ToOwned::to_owned),
             workflow_owned_thread,
             idle_timeout_ms,
             max_duration_ms,
@@ -3764,7 +3878,38 @@ async fn run_python_agent_turn(
         },
     )
     .await?;
-    serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
+    serde_json::to_value(PythonAgentTurnResult::from_agent_turn(
+        result,
+        include_output_lines,
+    ))
+    .map_err(WorkflowRuntimeError::from)
+}
+
+fn resolve_python_agent_thread(
+    task_id: &str,
+    workflow_name: &str,
+    explicit_thread_key: Option<String>,
+    has_scoped_principal: bool,
+) -> Result<(String, bool), WorkflowRuntimeError> {
+    if has_scoped_principal && explicit_thread_key.is_some() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.agent_turn thread_key must be omitted for scoped workflow principals".to_owned(),
+        ));
+    }
+    let workflow_owned_thread = explicit_thread_key.is_none();
+    let thread_key = explicit_thread_key
+        .unwrap_or_else(|| format!("wf:{}:agent:{workflow_name}", task_id.replace('-', "")));
+    Ok((thread_key, workflow_owned_thread))
+}
+
+fn parse_include_output_lines(args: &Value) -> Result<bool, WorkflowRuntimeError> {
+    match args.get("include_output_lines") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(WorkflowRuntimeError::BadRequest(
+            "ctx.agent_turn include_output_lines must be boolean".to_owned(),
+        )),
+    }
 }
 
 /// Returns the first arg key that holds a non-empty (trimmed) string, owned.
@@ -3819,9 +3964,55 @@ where
 {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
+    if line.len() > WORKFLOW_HOST_MAX_MESSAGE_BYTES {
+        return Err(WorkflowRuntimeError::Internal(format!(
+            "workflow host protocol message exceeds {WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+        )));
+    }
     stdin.write_all(&line).await?;
     stdin.flush().await?;
     Ok(())
+}
+
+async fn read_host_message_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, WorkflowRuntimeError> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let consumed = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len() + consumed > WORKFLOW_HOST_MAX_MESSAGE_BYTES {
+            return Err(WorkflowRuntimeError::Internal(format!(
+                "workflow host protocol message exceeds {WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+            )));
+        }
+        line.extend_from_slice(&buffer[..consumed]);
+        let found_newline = buffer.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consumed);
+        if found_newline {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    String::from_utf8(line).map(Some).map_err(|error| {
+        WorkflowRuntimeError::Internal(format!(
+            "workflow host protocol message is not UTF-8: {error}"
+        ))
+    })
 }
 
 fn python_workflow_host_path() -> PathBuf {
@@ -4072,6 +4263,7 @@ struct AgentTurnRequest {
     message_metadata: Value,
     execution_metadata: Value,
     execution_idempotency_key: String,
+    iron_control_principal: Option<String>,
     workflow_owned_thread: bool,
     idle_timeout_ms: u64,
     max_duration_ms: u64,
@@ -4127,6 +4319,7 @@ async fn run_agent_session_turn(
         message_metadata,
         execution_metadata,
         execution_idempotency_key,
+        iron_control_principal,
         workflow_owned_thread,
         idle_timeout_ms,
         max_duration_ms,
@@ -4139,15 +4332,28 @@ async fn run_agent_session_turn(
     if workflow_owned_thread {
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
-    session_runtime
-        .create_or_get_session(
-            &thread_key,
-            &harness_type,
-            persona_id.as_deref(),
-            Some(session_metadata),
-            HarnessConflictPolicy::Reject,
-        )
-        .await?;
+    if let Some(principal_id) = iron_control_principal.as_deref() {
+        session_runtime
+            .create_or_get_session_bound_to_principal(
+                &thread_key,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+                principal_id,
+            )
+            .await?;
+    } else {
+        session_runtime
+            .create_or_get_session(
+                &thread_key,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+            )
+            .await?;
+    }
     session_runtime
         .append_messages(
             &thread_key,
@@ -4193,20 +4399,22 @@ async fn run_agent_session_turn(
                 }
             }
             "session.execution_completed" => {
+                let result_text = terminal_result_text(&event.payload, &output_lines);
                 return Ok(AgentTurnResult {
                     thread_key: thread_key.into_string(),
                     execution_id: execution.execution_id,
                     status: "completed".to_owned(),
-                    result_text: result_text_from_output_lines(&output_lines),
+                    result_text,
                     output_lines,
                 });
             }
             "session.execution_failed" | "session.execution_cancelled" => {
+                let result_text = terminal_result_text(&event.payload, &output_lines);
                 let result = AgentTurnResult {
                     thread_key: thread_key.into_string(),
                     execution_id: execution.execution_id,
                     status: event.event_type,
-                    result_text: result_text_from_output_lines(&output_lines),
+                    result_text,
                     output_lines,
                 };
                 return Err(WorkflowRuntimeError::Upstream(format!(
@@ -4221,6 +4429,16 @@ async fn run_agent_session_turn(
     Err(WorkflowRuntimeError::Upstream(
         "session event stream ended before terminal execution event".to_owned(),
     ))
+}
+
+fn terminal_result_text(payload: &Value, output_lines: &[String]) -> String {
+    payload
+        .get("result_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| result_text_from_output_lines(output_lines))
 }
 
 fn result_text_from_output_lines(lines: &[String]) -> String {
@@ -4645,6 +4863,136 @@ mod tests {
     }
 
     #[test]
+    fn python_agent_turn_result_can_omit_raw_output_lines() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["x".repeat(3 * 1024 * 1024)],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, false)).unwrap();
+
+        assert_eq!(value.get("result_text"), Some(&json!("final report")));
+        assert!(value.get("output_lines").is_none());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 1_024);
+    }
+
+    #[test]
+    fn python_agent_turn_result_includes_raw_output_lines_by_default() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["raw event".to_owned()],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, true)).unwrap();
+
+        assert_eq!(value.get("output_lines"), Some(&json!(["raw event"])));
+    }
+
+    #[test]
+    fn include_output_lines_is_strict_and_defaults_to_compatible_shape() {
+        assert!(parse_include_output_lines(&json!({})).unwrap());
+        assert!(
+            !parse_include_output_lines(&json!({
+                "include_output_lines": false
+            }))
+            .unwrap()
+        );
+        assert!(
+            parse_include_output_lines(&json!({"include_output_lines": "false"}))
+                .unwrap_err()
+                .to_string()
+                .contains("include_output_lines must be boolean")
+        );
+    }
+
+    #[test]
+    fn scoped_workflow_agent_threads_are_server_owned_and_per_task() {
+        let first =
+            resolve_python_agent_thread("task-111", "planetscale_daily_audit", None, true).unwrap();
+        let second =
+            resolve_python_agent_thread("task-222", "planetscale_daily_audit", None, true).unwrap();
+
+        assert_eq!(
+            first,
+            ("wf:task111:agent:planetscale_daily_audit".to_owned(), true)
+        );
+        assert_ne!(first.0, second.0);
+    }
+
+    #[test]
+    fn scoped_workflow_agent_rejects_caller_selected_thread() {
+        let error = resolve_python_agent_thread(
+            "task-111",
+            "planetscale_daily_audit",
+            Some("workflow:shared".to_owned()),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("thread_key must be omitted"));
+        assert_eq!(
+            resolve_python_agent_thread(
+                "task-111",
+                "ordinary_workflow",
+                Some("workflow:shared".to_owned()),
+                false,
+            )
+            .unwrap(),
+            ("workflow:shared".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn terminal_result_text_prefers_persisted_result() {
+        let output_lines = vec![json!({"delta": "fallback"}).to_string()];
+
+        assert_eq!(
+            terminal_result_text(
+                &json!({"result_text": "  persisted final report  "}),
+                &output_lines,
+            ),
+            "persisted final report"
+        );
+        assert_eq!(terminal_result_text(&json!({}), &output_lines), "fallback");
+    }
+
+    #[tokio::test]
+    async fn workflow_host_message_rejects_oversized_frame() {
+        let mut sink = tokio::io::sink();
+        let message = json!({"value": "x".repeat(WORKFLOW_HOST_MAX_MESSAGE_BYTES)});
+
+        let error = write_host_message(&mut sink, &message).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow host protocol message exceeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_host_reader_rejects_oversized_frame() {
+        let input = vec![b'x'; WORKFLOW_HOST_MAX_MESSAGE_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+
+        let error = read_host_message_line(&mut reader).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow host protocol message exceeds")
+        );
+    }
+
+    #[test]
     fn first_str_arg_picks_first_non_empty_alias() {
         let args = json!({"reasoning": "  ", "reasoning_effort": " high ", "effort": "low"});
         assert_eq!(
@@ -5007,6 +5355,18 @@ mod tests {
     }
 
     #[test]
+    fn workflow_principal_foreign_ids_must_be_unique() {
+        let error = validate_workflow_principal_foreign_ids(&BTreeSet::from([
+            "daily_audit".to_owned(),
+            "daily-audit".to_owned(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("same principal"));
+        assert!(error.to_string().contains("workflow-daily-audit"));
+    }
+
+    #[test]
     fn workflow_principal_labels_identify_workflow_kind() {
         let labels = workflow_principal_labels("nightly_report");
 
@@ -5016,6 +5376,49 @@ mod tests {
             labels.get("workflow_name").map(String::as_str),
             Some("nightly_report")
         );
+    }
+
+    #[test]
+    fn existing_workflow_principal_must_match_its_exact_identity() {
+        let required = workflow_principal_labels("nightly_report");
+        let matching = Principal {
+            id: "prn_matching".to_owned(),
+            namespace: "default".to_owned(),
+            foreign_id: Some("workflow-nightly-report".to_owned()),
+            name: "Workflow nightly_report".to_owned(),
+            labels: {
+                let mut labels = required.clone();
+                labels.insert("grant-owner".to_owned(), "operator".to_owned());
+                labels
+            },
+            sandbox_observability_enabled: true,
+            sandbox_api_server_enabled: true,
+        };
+
+        let labels = merge_existing_workflow_principal_labels(
+            "nightly_report",
+            "workflow-nightly-report",
+            &matching,
+            required.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            labels.get("grant-owner").map(String::as_str),
+            Some("operator")
+        );
+
+        let mut aliased = matching;
+        aliased
+            .labels
+            .insert("workflow_name".to_owned(), "nightly-report".to_owned());
+        let error = merge_existing_workflow_principal_labels(
+            "nightly_report",
+            "workflow-nightly-report",
+            &aliased,
+            required,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different identity"));
     }
 
     #[test]
