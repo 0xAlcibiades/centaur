@@ -434,7 +434,7 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(1)
   })
 
-  it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
+  it('collects ignored subscribed messages when the bot is next mentioned', async () => {
     const parent = await postUserMessage('The deploy context is above.')
     const firstMention = await postUserMessage(
       `<@${BOT_USER_ID}> run with this screenshot`,
@@ -496,6 +496,8 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
 
     const secondMention = await postUserMessage(`<@${BOT_USER_ID}> now execute with the latest`, parent.ts)
     const secondMentionWaits: Promise<unknown>[] = []
@@ -520,9 +522,8 @@ describe('slackbotv2', () => {
     expect(secondMentionResponse.status).toBe(200)
     await Promise.all(secondMentionWaits)
 
-    expect(codexApi.appends).toHaveLength(3)
+    expect(codexApi.appends).toHaveLength(2)
     expect(codexApi.creates.map(create => create.threadKey)).toEqual([
-      threadKey(parent.ts),
       threadKey(parent.ts),
       threadKey(parent.ts)
     ])
@@ -579,15 +580,16 @@ describe('slackbotv2', () => {
     )
     expect(JSON.stringify(firstInputLine)).not.toContain('data:image/png;base64')
 
-    const followUpAppend = codexApi.appends[1]!
-    expect(followUpAppend.threadKey).toBe(threadKey(parent.ts))
-    expect(followUpAppend.body.messages[0]?.client_message_id).toBe(followUp.ts)
-    expect(sessionMessageTexts(followUpAppend.body.messages)).toEqual([
-      'Additional detail for the subscribed thread.'
+    const secondMentionAppend = codexApi.appends[1]!
+    expect(secondMentionAppend.threadKey).toBe(threadKey(parent.ts))
+    expect(secondMentionAppend.body.messages.map(message => message.client_message_id)).toEqual([
+      followUp.ts,
+      secondMention.ts
     ])
-
-    const secondMentionAppend = codexApi.appends[2]!
-    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toContain(
+    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toBe(
+      'Additional detail for the subscribed thread.'
+    )
+    expect(sessionMessageTexts(secondMentionAppend.body.messages)[1]).toContain(
       'now execute with the latest'
     )
     const secondExecute = codexApi.executes[1]!
@@ -2065,7 +2067,7 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('forwards subscribed messages to /messages without executing during a stream', async () => {
+  it('ignores unmentioned subscribed messages during a stream, including stop', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before the long run.')
@@ -2115,11 +2117,32 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
-    expect(codexApi.appends).toHaveLength(2)
+
+    const stop = await postUserMessage('stop', parent.ts)
+    const stopWaits: Promise<unknown>[] = []
+    const stopResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-unmentioned-stop-during-stream',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: stop.ts,
+          thread_ts: parent.ts,
+          text: 'stop'
+        }
+      }),
+      {},
+      waitUntilContext(stopWaits)
+    )
+
+    expect(stopResponse.status).toBe(200)
+    await Promise.all(stopWaits)
+    expect(codexApi.creates).toHaveLength(1)
+    expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
-    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
-      'Actually queue this extra constraint.'
-    ])
 
     codexApi.closeStreams()
     await Promise.all(firstWaits)
