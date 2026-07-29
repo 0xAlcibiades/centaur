@@ -166,11 +166,15 @@ workflow:
 kubectl create namespace centaur-system
 kubectl create secret generic centaur-infra-env \
   --namespace centaur-system \
-  --from-literal=OP_SERVICE_ACCOUNT_TOKEN=... \
   --from-literal=OP_VAULT=... \
   --from-literal=SLACK_BOT_TOKEN=... \
   --from-literal=SLACK_SIGNING_SECRET=... \
   --from-literal=SLACKBOT_API_KEY=...
+
+# Keep the 1Password service-account token separate from the broad infra Secret.
+kubectl create secret generic centaur-iron-proxy-source-auth \
+  --namespace centaur-system \
+  --from-file=OP_SERVICE_ACCOUNT_TOKEN=/run/secrets/centaur-op-service-account-token
 ```
 
 Model and tool credentials such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,

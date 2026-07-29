@@ -32,11 +32,15 @@ ongoing broker state. If 1Password is used to carry a fresh bootstrap seed into
 the Console, clear or archive that one-shot item as soon as the Console accepts
 the credential.
 
-`secretManager.existingSecretName` is mounted into every sandbox iron-proxy so
-it can supply the 1Password client credentials. It must never contain a broker
-refresh seed. Keep `secrets.bootstrapSecretName` unset for 1Password and
-Connect deployments; Helm rejects assigning it the same name as
-`secretManager.existingSecretName` in those modes.
+For 1Password and Connect, a sandbox iron-proxy receives no full `envFrom`
+mount from `secretManager.existingSecretName` or `secrets.bootstrapSecretName`.
+It receives exactly one source-authentication `secretKeyRef` from
+`ironProxy.sourceAuth.existingSecretName`: the service-account token for
+`onepassword`, or the Connect token for `onepassword-connect`. That Secret must
+be dedicated—different from both the broad infra Secret and the broker bootstrap
+Secret—and must never contain a broker refresh seed. `OP_VAULT` remains
+API-side configuration used to construct the `op://` reference; it is not
+mounted into sandbox proxy Pods.
 
 ## Configure the chart (Connect, preferred)
 
@@ -44,6 +48,9 @@ Connect deployments; Helm rejects assigning it the same name as
 ironProxy:
   secretSource: onepassword-connect
   secretTtl: 10m
+  sourceAuth:
+    existingSecretName: centaur-iron-proxy-source-auth
+    connectTokenKey: OP_CONNECT_TOKEN
 
 onepasswordConnect:
   connect:
@@ -58,12 +65,14 @@ secretManager:
 
 The credentials Secret must contain `1password-credentials.json`; local
 bootstrap creates it when `OP_CONNECT_CREDENTIALS_FILE` points at that file.
-The infra Secret must include:
+The dedicated source-auth Secret must provide the selected token key:
 
 ```text
 OP_CONNECT_TOKEN
-OP_VAULT
 ```
+
+The infra Secret keeps API and service configuration such as `OP_VAULT`; it
+does not need `OP_CONNECT_TOKEN` for Connect proxy authentication.
 
 ## Configure the chart (service account)
 
@@ -71,18 +80,24 @@ OP_VAULT
 ironProxy:
   secretSource: onepassword
   secretTtl: 10m
+  sourceAuth:
+    existingSecretName: centaur-iron-proxy-source-auth
+    serviceAccountTokenKey: OP_SERVICE_ACCOUNT_TOKEN
 
 secretManager:
   existingSecretName: centaur-infra-env
   envPrefix: ""
 ```
 
-The infra Secret must include:
+The dedicated source-auth Secret must provide the selected token key:
 
 ```text
 OP_SERVICE_ACCOUNT_TOKEN
-OP_VAULT
 ```
+
+The infra Secret keeps API and service configuration such as `OP_VAULT`; it
+does not need `OP_SERVICE_ACCOUNT_TOKEN` for service-account proxy
+authentication.
 
 It must also include infrastructure secrets such as:
 
@@ -148,7 +163,7 @@ For Connect mode, also verify the Connect pod and token Secret exist:
 ```bash
 kubectl get pods -n centaur-system -l app.kubernetes.io/name=connect
 kubectl get secret -n centaur-system centaur-onepassword-connect-credentials
-kubectl get secret -n centaur-system centaur-infra-env -o jsonpath='{.data.OP_CONNECT_TOKEN}' >/dev/null
+kubectl get secret -n centaur-system centaur-iron-proxy-source-auth
 ```
 
 Then run a tool or harness call that reaches an allowed host. If injection

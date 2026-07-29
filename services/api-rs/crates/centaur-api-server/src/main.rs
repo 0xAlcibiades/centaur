@@ -197,6 +197,12 @@ pub(crate) enum ServerError {
     ToolSource(String),
     #[error("iron-proxy requires both firewall CA cert and key Secret names")]
     MissingIronProxyCaSecret,
+    #[error(
+        "iron-proxy requires a dedicated source-auth Secret name and key for non-environment secret sources"
+    )]
+    MissingIronProxySourceAuthSecret,
+    #[error("iron-proxy source-auth Secret must differ from both firewall CA Secrets")]
+    IronProxySourceAuthSecretCollision,
     #[error("{0}")]
     UnsupportedConfig(String),
 }

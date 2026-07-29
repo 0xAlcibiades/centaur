@@ -1,4 +1,29 @@
 {{- if .Values.apiRs.enabled }}
+{{- $ironProxyManagedEnv := list
+  "KUBERNETES_SANDBOX_IRON_PROXY_MODE"
+  "KUBERNETES_IRON_PROXY_IMAGE"
+  "KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY"
+  "KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS"
+  "KUBERNETES_FIREWALL_CA_SECRET_NAME"
+  "KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME"
+  "KUBERNETES_SECRET_ENV_NAME"
+  "KUBERNETES_BOOTSTRAP_SECRET_NAME"
+  "KUBERNETES_API_POD_LABEL_SELECTOR"
+  "FIREWALL_MANAGER_SECRET_SOURCE"
+  "FIREWALL_MANAGER_SECRET_TTL"
+  "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME"
+  "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY"
+  "OP_VAULT"
+  "KUBERNETES_OP_CONNECT_HOST"
+  "CODEX_AUTH_MODE"
+  "CLAUDE_CODE_AUTH_MODE"
+  "KUBERNETES_IRON_PROXY_HARNESS_ENGINE"
+-}}
+{{- range $name := $ironProxyManagedEnv }}
+{{- if hasKey $.Values.apiRs.extraEnv $name }}
+{{- fail (printf "apiRs.extraEnv.%s is chart-managed; use the matching ironProxy, firewall, secretManager, apiRs.opVault, or sandbox value instead" $name) }}
+{{- end }}
+{{- end }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
@@ -367,6 +392,17 @@ spec:
               value: {{ .Values.ironProxy.secretSource | quote }}
             - name: FIREWALL_MANAGER_SECRET_TTL
               value: {{ .Values.ironProxy.secretTtl | quote }}
+{{- if eq .Values.ironProxy.secretSource "onepassword" }}
+            - name: KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME
+              value: {{ required "ironProxy.sourceAuth.existingSecretName is required when ironProxy.secretSource is onepassword" .Values.ironProxy.sourceAuth.existingSecretName | quote }}
+            - name: KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY
+              value: {{ required "ironProxy.sourceAuth.serviceAccountTokenKey is required when ironProxy.secretSource is onepassword" .Values.ironProxy.sourceAuth.serviceAccountTokenKey | quote }}
+{{- else if eq .Values.ironProxy.secretSource "onepassword-connect" }}
+            - name: KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME
+              value: {{ required "ironProxy.sourceAuth.existingSecretName is required when ironProxy.secretSource is onepassword-connect" .Values.ironProxy.sourceAuth.existingSecretName | quote }}
+            - name: KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY
+              value: {{ required "ironProxy.sourceAuth.connectTokenKey is required when ironProxy.secretSource is onepassword-connect" .Values.ironProxy.sourceAuth.connectTokenKey | quote }}
+{{- end }}
 {{- if .Values.apiRs.opVault }}
             - name: OP_VAULT
               value: {{ .Values.apiRs.opVault | quote }}

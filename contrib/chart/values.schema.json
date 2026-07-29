@@ -94,6 +94,14 @@
         },
         "secretSource": { "type": "string" },
         "secretTtl": { "type": "string" },
+        "sourceAuth": {
+          "type": "object",
+          "properties": {
+            "existingSecretName": { "type": "string" },
+            "serviceAccountTokenKey": { "type": "string" },
+            "connectTokenKey": { "type": "string" }
+          }
+        },
         "upstreamDenyCidrs": {
           "type": "array",
           "items": { "type": "string" }

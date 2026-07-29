@@ -38,7 +38,7 @@ These must exist for the normal Helm deployment. For local development,
 | `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot and api-rs Slack helpers. |
 | `SANDBOX_SIGNING_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Signing key for short-lived sandbox API tokens. |
 | `IRON_MANAGEMENT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Management key for API-created iron-proxy pods. |
-| `OP_SERVICE_ACCOUNT_TOKEN` | Local shell, then `centaur-infra-env`; production Secret. | 1Password service-account auth when using `onepassword` secret source. |
+| `OP_SERVICE_ACCOUNT_TOKEN` | `ironProxy.sourceAuth.existingSecretName` under `serviceAccountTokenKey` for `onepassword`; `centaur-infra-env` only for `env`. | 1Password service-account auth. Non-env proxy Pods receive this one key, not the broad infra Secret. |
 | `OP_VAULT` | Local shell, then `centaur-infra-env`; defaults to `ai-agents` in code. | 1Password vault used for `op://...` secret refs. |
 
 Optional required-by-mode variables:
@@ -46,7 +46,9 @@ Optional required-by-mode variables:
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `OP_CONNECT_CREDENTIALS_FILE` | Local shell before `just deploy`. | Enables the 1Password Connect subchart and creates its credentials Secret. |
-| `OP_CONNECT_TOKEN` | Secret or local bootstrap shell env. | Token used by iron-proxy when `ironProxy.secretSource=onepassword-connect`. |
+| `OP_CONNECT_TOKEN` | `ironProxy.sourceAuth.existingSecretName` under `connectTokenKey` for `onepassword-connect`; `centaur-infra-env` only for `env`. | Token used by iron-proxy for Connect authentication. Non-env proxy Pods receive this one key, not the broad infra Secret. |
+| `CENTAUR_IRON_PROXY_SECRET_SOURCE` | Local shell before `just bootstrap-secrets` or `just up`; defaults to `onepassword`. | Passed to both the bootstrap script and Helm so environment-backed GitHub tokens are only seeded for `env` deployments. |
+| `CENTAUR_IRON_PROXY_SOURCE_AUTH_SECRET_NAME`, `CENTAUR_IRON_PROXY_SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY`, `CENTAUR_IRON_PROXY_SOURCE_AUTH_CONNECT_TOKEN_KEY` | Local shell before `just bootstrap-secrets` or `just up`; defaults to `centaur-iron-proxy-source-auth`, `OP_SERVICE_ACCOUNT_TOKEN`, and `OP_CONNECT_TOKEN`. | Keeps the local bootstrap Secret and Helm's dedicated non-env proxy key reference aligned. |
 | `LOCAL_DEV_API_KEY` | API env. | Static local admin/dev key bootstrapped into Postgres. |
 | `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
 | `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
@@ -185,7 +187,8 @@ Kubernetes backend:
 | `KUBERNETES_SANDBOX_EXTRA_ENV` | `sandbox.extraEnv`. | JSON list copied into each sandbox. |
 | `KUBERNETES_WORKFLOW_DIRS` | Chart-rendered from `overlays.sources[*].workflowsSubdir` (default `workflows`) using the sandbox repo-cache mount prefix. | Workflow-host sandbox discovery paths. |
 | `KUBERNETES_FIREWALL_CA_SECRET_NAME`, `KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME` | `firewall.existingCa*` or generated CA Secrets. | CA material for sandbox/proxy TLS interception. |
-| `KUBERNETES_SECRET_ENV_NAME`, `KUBERNETES_BOOTSTRAP_SECRET_NAME` | `secretManager.existingSecretName`, `secrets.bootstrapSecretName`. | `KUBERNETES_SECRET_ENV_NAME` identifies static service secrets and is mounted into each proxy. `KUBERNETES_BOOTSTRAP_SECRET_NAME` is mounted only when `ironProxy.secretSource=env`; 1Password and Connect sources never mount it. In those modes Helm rejects using the same name for both values, and the static Secret must never contain a broker refresh seed. |
+| `KUBERNETES_SECRET_ENV_NAME`, `KUBERNETES_BOOTSTRAP_SECRET_NAME` | `secretManager.existingSecretName`, `secrets.bootstrapSecretName`. | `env` source proxies mount static and optional bootstrap Secret `envFrom`s. 1Password and Connect proxies mount neither; Helm rejects unsafe name reuse and the static Secret must never contain a broker refresh seed. |
+| `KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME`, `KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY` | `ironProxy.sourceAuth.*`. | For 1Password and Connect only, injects exactly one dedicated source-auth `secretKeyRef` into each sandbox proxy (`OP_SERVICE_ACCOUNT_TOKEN` or `OP_CONNECT_TOKEN`). The source-auth Secret must differ from static and bootstrap Secrets. |
 | `KUBERNETES_IRON_PROXY_IMAGE`, `KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY`, `KUBERNETES_IRON_PROXY_PORT`, `KUBERNETES_IRON_PROXY_MANAGEMENT_PORT`, `KUBERNETES_IRON_PROXY_HEALTH_PORT` | `ironProxy.*`. | Per-sandbox iron-proxy image and ports. |
 | `FIREWALL_MANAGER_SECRET_SOURCE`, `FIREWALL_MANAGER_SECRET_TTL` | `ironProxy.secretSource`, `ironProxy.secretTtl`. | Secret source and cache TTL for rendered proxy config. |
 | `KUBERNETES_OP_CONNECT_HOST`, `KUBERNETES_OP_CONNECT_APP_NAME`, `KUBERNETES_OP_CONNECT_PORT` | Chart helper or `api.extraEnv`. | 1Password Connect endpoint details. |

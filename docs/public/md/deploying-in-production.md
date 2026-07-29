@@ -65,13 +65,20 @@ Minimum keys:
 | `SLACK_BOT_TOKEN` | Slackbot/API | Bot User OAuth Token from the Slack app. |
 | `SLACK_SIGNING_SECRET` | Slackbot/API | Used to verify Slack webhook signatures. |
 | `SLACKBOT_API_KEY` | Slackbot to API | Static service token; API bootstraps it into Postgres on startup with `agent` scope. |
-| `OP_CONNECT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password Connect source (preferred) | Needed when `ironProxy.secretSource` is `onepassword-connect`. |
-| `OP_SERVICE_ACCOUNT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password service-account source | Needed when `ironProxy.secretSource` is `onepassword`. |
 | `OP_VAULT` | [iron-proxy](https://docs.iron.sh) 1Password source | Vault name or id used for `op://` references (either mode). |
 
 `SLACKBOT_API_KEY` is not created with the admin API during initial boot, because
 the API process requires it before it can start. Generate a high-entropy value,
 store it in the infra Secret, and reuse the same value in Slackbot.
+
+For either non-environment 1Password source, create a separate
+`ironProxy.sourceAuth.existingSecretName` Secret. It exposes exactly one key to
+each proxy:
+`OP_CONNECT_TOKEN` for `onepassword-connect`, or
+`OP_SERVICE_ACCOUNT_TOKEN` for `onepassword`. The source-auth Secret must
+differ from `secretManager.existingSecretName` and
+`secrets.bootstrapSecretName`. Each sandbox proxy receives only that key by
+`secretKeyRef`; it does not receive a full infra or bootstrap Secret `envFrom`.
 
 ## 3. Configure harness credentials
 
@@ -315,6 +322,9 @@ api:
 ironProxy:
   secretSource: onepassword-connect
   secretTtl: 10m
+  sourceAuth:
+    existingSecretName: centaur-iron-proxy-source-auth
+    connectTokenKey: OP_CONNECT_TOKEN
 
 apiRs:
   # Delete any sandbox older than this, running or suspended.
