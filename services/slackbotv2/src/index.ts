@@ -56,6 +56,7 @@ import {
   buildConsoleSessionContextBlock,
   defaultModelForHarness,
   effectiveReasoningForHarness,
+  reasoningForModel,
   type SlackContextBlock
 } from './console-session-link'
 import { resolveChannelDefault } from './channel-defaults'
@@ -1102,7 +1103,6 @@ async function syncThreadMessageToSession(
     stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
       ? undefined
       : effectiveOverrides.provider ?? channelDefault?.provider
-  const resolvedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const effectiveHarnessType = resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
   // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
@@ -1110,12 +1110,16 @@ async function syncThreadMessageToSession(
   const effectiveModel =
     resolvedModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
-  const effectiveReasoning =
-    effectiveReasoningForHarness(
-      effectiveHarnessType,
-      resolvedReasoning,
-      input.options.harnessDefaultReasoning
-    )
+  const resolvedReasoning = reasoningForModel(
+    effectiveHarnessType,
+    effectiveModel,
+    overrides.reasoning ?? channelDefault?.reasoning
+  )
+  const effectiveReasoning = effectiveReasoningForHarness(
+    effectiveHarnessType,
+    resolvedReasoning,
+    input.options.harnessDefaultReasoning
+  )
   let consoleSessionBlock = isFirstAssistantMessage
     ? buildConsoleSessionContextBlock({
         consoleBaseUrl: input.options.consolePublicUrl,
@@ -1331,13 +1335,14 @@ async function syncThreadMessageToSession(
         if (harnessType === effectiveHarnessType && !abTested) return
         const model =
           resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
-        const reasoning =
-          effectiveReasoningForHarness(
-            harnessType,
-            resolvedReasoning,
-            input.options.harnessDefaultReasoning
-          )
+        const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+        const reasoning = effectiveReasoningForHarness(
+          harnessType,
+          requestedReasoning,
+          input.options.harnessDefaultReasoning
+        )
         forwardInput.metadataModel = model
+        forwardInput.reasoning = requestedReasoning
         if (isFirstAssistantMessage) {
           consoleSessionBlock = buildConsoleSessionContextBlock({
             consoleBaseUrl: input.options.consolePublicUrl,
