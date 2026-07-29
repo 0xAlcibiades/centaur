@@ -183,6 +183,17 @@ spec:
             # matches regardless of what Host the sync request carried.
             - name: CENTAUR_CONSOLE_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
+{{- if .Values.slackbotv2.autorotate.enabled }}
+            # Aggregate pool status only. Device enrollment bypasses Console and
+            # is handled by Slack's signed, pre-session command path.
+            - name: CENTAUR_CONSOLE_AUTOROTATE_URL
+              value: {{ .Values.slackbotv2.autorotate.url | quote }}
+            - name: CENTAUR_CONSOLE_AUTOROTATE_OBSERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ .Values.slackbotv2.autorotate.observerTokenKey | quote }}
+{{- end }}
 {{- if $console.publicUrl }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}

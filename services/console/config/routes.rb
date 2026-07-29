@@ -221,6 +221,7 @@ Rails.application.routes.draw do
       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
       get "sandbox/permissions", to: "sandbox_permissions#show"
       get "sandbox/oauth_apps", to: "sandbox_oauth_apps#index"
+      get "sandbox/autorotate/status", to: "sandbox_autorotate#status"
     end
   end
 

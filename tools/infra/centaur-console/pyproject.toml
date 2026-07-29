@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 centaur-console = "centaur_tool_centaur_console.cli:app"
+autorotate = "centaur_tool_centaur_console.autorotate:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]

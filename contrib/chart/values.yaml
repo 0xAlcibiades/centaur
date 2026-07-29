@@ -478,6 +478,18 @@ slackbotv2:
   # Join newly-created public channels after subscribed channel_created events.
   # Requires the Slack app to grant channels:read and channels:join.
   autoJoinCreatedChannels: false
+  # Signed, pre-session `/autorotate` Slack command. Login is DM-only and
+  # available only to the exact workspace/member allowlists below. Observer and
+  # operator tokens come from a dedicated Secret so no broker administration
+  # credential enters Slack, a sandbox, or the shared infra Secret.
+  autorotate:
+    enabled: false
+    url: ""
+    credentialsSecretName: ""
+    observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
+    operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
+    operatorSlackTeamIds: []
+    operatorSlackUserIds: []
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
   mcpPublicUrl: "http://localhost:3000"

@@ -9,6 +9,7 @@ import httpx
 
 SANDBOX_PERMISSIONS_PATH = "/api/v1/sandbox/permissions"
 SANDBOX_OAUTH_APPS_PATH = "/api/v1/sandbox/oauth_apps"
+SANDBOX_AUTOROTATE_STATUS_PATH = "/api/v1/sandbox/autorotate/status"
 
 
 class ConsoleClient:
@@ -30,7 +31,16 @@ class ConsoleClient:
     @property
     def base_url(self) -> str:
         # Non-secret endpoint config. Sandboxes receive this from api-rs.
-        url = (self._url or os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000")).strip().rstrip("/")  # noqa: TID251
+        url = (
+            (
+                self._url
+                or os.getenv(  # noqa: TID251
+                    "CENTAUR_CONSOLE_URL", "http://centaur-console:3000"
+                )
+            )
+            .strip()
+            .rstrip("/")
+        )
         if url and not url.startswith(("http://", "https://")):
             url = f"http://{url}"
         return url
@@ -93,6 +103,11 @@ class ConsoleClient:
         """Alias for tool bridge calls."""
         return self.sandbox_oauth_apps()
 
+    def autorotate_status(self) -> dict[str, Any]:
+        """Return redacted Autorotate pool health and capacity."""
+        response = self.client.get(SANDBOX_AUTOROTATE_STATUS_PATH)
+        return _response_data_object(response, "Autorotate status")
+
     def health(self) -> dict[str, Any]:
         """Assert the sandbox permissions endpoint is reachable and authorized."""
         try:
@@ -133,6 +148,20 @@ def _response_error_detail(response: httpx.Response) -> str:
     except ValueError:
         body = response.text
     return f"HTTP {response.status_code}: {body}"
+
+
+def _response_data_object(response: httpx.Response, operation: str) -> dict[str, Any]:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _response_error_detail(exc.response)
+        raise RuntimeError(f"centaur-console {operation} request failed: {detail}") from exc
+
+    payload = response.json()
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"centaur-console {operation} response did not include a data object")
+    return data
 
 
 def _client() -> ConsoleClient:

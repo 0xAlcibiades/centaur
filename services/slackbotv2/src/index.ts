@@ -67,6 +67,7 @@ import {
   parseSlackWebhookPayload
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
+import { createAutorotateSlackCommandHandler } from './autorotate-command'
 import type {
   ForwardSessionInput,
   JsonObject,
@@ -258,6 +259,18 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     logger
   })
   const state = options.state ?? createDefaultState(options, logger)
+  const autorotateCommands = createAutorotateSlackCommandHandler({
+    brokerUrl: options.autorotateUrl,
+    fetch: options.fetch,
+    logger,
+    observerToken: options.autorotateObserverToken,
+    operatorSlackTeamIds: options.autorotateSlackTeamIds,
+    operatorSlackUserIds: options.autorotateSlackUserIds,
+    operatorToken: options.autorotateOperatorToken,
+    pollIntervalMs: options.autorotatePollIntervalMs,
+    responseUrlHosts: options.autorotateSlackResponseUrlHosts,
+    signingSecret: options.signingSecret
+  })
   const chat = new Chat<{ slack: typeof slack }, SlackbotV2ThreadState>({
     userName,
     adapters: { slack },
@@ -465,7 +478,13 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/events', handleSlackWebhook)
   app.post('/api/slack/actions', handleSlackWebhook)
   app.post('/api/slack/options', handleSlackWebhook)
-  app.post('/api/slack/commands', handleSlackWebhook)
+  app.post('/api/slack/commands', async c => {
+    const response = await autorotateCommands.handle(
+      c.req.raw,
+      promise => waitUntil(c, promise)
+    )
+    return response ?? handleSlackWebhook(c)
+  })
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, stateConnected)
