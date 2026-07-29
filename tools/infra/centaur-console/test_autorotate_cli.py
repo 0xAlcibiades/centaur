@@ -1,6 +1,6 @@
 import json
 
-import autorotate
+import cli
 from typer.testing import CliRunner
 
 
@@ -21,8 +21,8 @@ class FakeClient:
 
 def invoke(monkeypatch, args):
     client = FakeClient()
-    monkeypatch.setattr(autorotate, "get_client", lambda: client)
-    return client, CliRunner().invoke(autorotate.app, args)
+    monkeypatch.setattr(cli, "get_client", lambda: client)
+    return client, CliRunner().invoke(cli.app, args)
 
 
 def test_status_prints_machine_readable_pool_capacity(monkeypatch):
@@ -34,7 +34,7 @@ def test_status_prints_machine_readable_pool_capacity(monkeypatch):
 
 
 def test_help_has_no_token_options():
-    result = CliRunner().invoke(autorotate.app, ["--help"])
+    result = CliRunner().invoke(cli.app, ["status", "--help"])
 
     assert result.exit_code == 0
     assert "token" not in result.stdout.lower()
