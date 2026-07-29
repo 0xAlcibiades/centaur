@@ -3,6 +3,7 @@ import email.message
 import json
 
 import pytest
+from centaur_sdk import ToolContext, reset_tool_context, set_tool_context
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
 from slack_sdk.errors import SlackApiError
 
@@ -1181,6 +1182,32 @@ def test_get_thread_replies_page_uses_bounded_default() -> None:
     assert result["continuation_available"] is False
 
 
+def test_get_thread_replies_page_can_skip_user_cache() -> None:
+    client, fake_web_client = _make_client()
+
+    def fail_user_cache():
+        raise AssertionError("user cache should not be loaded")
+
+    client._get_user_cache = fail_user_cache  # type: ignore[method-assign]
+    fake_web_client.reply_pages = [
+        {
+            "messages": [
+                {"user": "U1", "text": "ACK", "ts": "100.000001"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+    ]
+
+    result = client.get_thread_replies_page(
+        "C123",
+        "100.000000",
+        resolve_users=False,
+    )
+
+    assert result["messages"][0]["text"] == "ACK"
+    assert result["messages"][0]["user_id"] == "U1"
+
+
 def test_dump_channel_with_threads_limits_thread_expansion() -> None:
     client, fake_web_client = _make_client()
     client._get_user_cache = lambda: {}  # type: ignore[method-assign]
@@ -1524,6 +1551,41 @@ def test_native_search_uses_dedicated_search_client() -> None:
         }
     ]
     assert fake_bot_client.api_calls == []
+
+
+def test_client_accepts_bot_search_token_alias() -> None:
+    token = set_tool_context(
+        ToolContext(
+            name="slack",
+            secrets={
+                "SLACK_BOT_TOKEN": "xoxb-bot",
+                "SLACK_BOT_SEARCH_TOKEN": "xoxp-search",
+            },
+        )
+    )
+    try:
+        client = SlackClient()
+    finally:
+        reset_tool_context(token)
+
+    assert client.search_token == "xoxp-search"
+
+
+def test_client_ignores_missing_optional_token_placeholders() -> None:
+    token = set_tool_context(
+        ToolContext(
+            name="slack",
+            secrets={
+                "SLACK_BOT_TOKEN": "xoxb-bot",
+            },
+        )
+    )
+    try:
+        client = SlackClient()
+    finally:
+        reset_tool_context(token)
+
+    assert client.search_token == ""
 
 
 def test_sync_channel_history_uses_watermark_lookback() -> None:

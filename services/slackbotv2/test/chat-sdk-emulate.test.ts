@@ -5,7 +5,6 @@ import {
   type Server as HttpServer,
   type ServerResponse
 } from 'node:http'
-import { connect } from 'node:net'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
@@ -432,6 +431,69 @@ describe('slackbotv2', () => {
     }
 
     expect(codexApi.workflowEvents).toHaveLength(1)
+  })
+
+  it('durably registers human PR pings and subscribes for acknowledgement', async () => {
+    const parent = await postUserMessage('Review thread context.')
+    const prText =
+      '@reviewer <https://github.com/example/repository/pull/42|example/repository#42>'
+    const prMessage = await postUserMessage(prText, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-pr-registration',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: prMessage.ts,
+          thread_ts: parent.ts,
+          text: prText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.appends[0]!.threadKey).toBe(threadKey(parent.ts))
+    expect(codexApi.appends[0]!.body.messages[0]?.metadata).toEqual(
+      expect.objectContaining({ is_mention: true, source: 'slackbotv2' })
+    )
+
+    const ack = await postUserMessage('ack', parent.ts)
+    const ackWaits: Promise<unknown>[] = []
+    const ackResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-pr-ack',
+        event: {
+          type: 'message',
+          user: 'U_REVIEWER',
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: ack.ts,
+          thread_ts: parent.ts,
+          text: 'ack'
+        }
+      }),
+      {},
+      waitUntilContext(ackWaits)
+    )
+
+    expect(ackResponse.status).toBe(200)
+    await Promise.all(ackWaits)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(2)
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual(['ack'])
+    expect(codexApi.appends[1]!.body.messages[0]?.metadata).toEqual(
+      expect.objectContaining({ is_mention: false, source: 'slackbotv2' })
+    )
   })
 
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
@@ -2699,6 +2761,66 @@ describe('slackbotv2', () => {
         renderObligation: null
       })
     )
+  })
+
+  it('reattaches a fallback answer when the original Slack root was replaced', async () => {
+    codexApi.autoRespond = false
+    slackApi.failStreamAppendsAfter(0, 'invalid_thread_ts')
+
+    const mentionText = `<@${BOT_USER_ID}> finish this task with the attached image`
+    const original = await postUserMessage(mentionText)
+    const key = threadKey(original.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-replaced-root-fallback',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: original.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const replacement = await postUserMessage(mentionText)
+    slackApi.failRepliesWithThreadNotFound(CHANNEL_ID, original.ts)
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-replaced-root',
+          type: 'commandExecution',
+          command: 'true',
+          status: 'completed',
+          aggregatedOutput: 'done'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-replaced-root',
+      status: 'completed',
+      result_text: 'REATTACHED_FALLBACK_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    expect(await threadText(replacement.ts)).toContain('REATTACHED_FALLBACK_VISIBLE')
+    const history = await slack.conversations.history({ channel: CHANNEL_ID, limit: 100 })
+    const topLevelAnswers = (history.messages ?? []).filter(message =>
+      message.text?.includes('REATTACHED_FALLBACK_VISIBLE')
+    )
+    expect(topLevelAnswers).toHaveLength(0)
   })
 
   it('rotates Slack stream segments before they reach the streaming age limit', async () => {
@@ -6574,22 +6696,17 @@ async function sleep(ms: number): Promise<void> {
 
 async function availablePort(preferred: number): Promise<number> {
   for (let port = preferred; port < preferred + 100; port++) {
-    if (!(await isPortOpen(port))) return port
+    if (await canBindPort(port)) return port
   }
   throw new Error(`No available port near ${preferred}`)
 }
 
-async function isPortOpen(port: number): Promise<boolean> {
+async function canBindPort(port: number): Promise<boolean> {
+  const server = createServer()
   return new Promise(resolve => {
-    const socket = connect(port, '127.0.0.1')
-    socket.once('connect', () => {
-      socket.destroy()
-      resolve(true)
-    })
-    socket.once('error', () => resolve(false))
-    socket.setTimeout(250, () => {
-      socket.destroy()
-      resolve(false)
+    server.once('error', () => resolve(false))
+    server.listen(port, '127.0.0.1', () => {
+      server.close(() => resolve(true))
     })
   })
 }

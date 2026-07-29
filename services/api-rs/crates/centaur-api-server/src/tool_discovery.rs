@@ -37,6 +37,10 @@ const DEFAULT_MATCH_HEADERS: &[&str] = &[
     "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/",
 ];
 
+const HTTP_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
+];
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolDiscoveryConfig {
     pub tool_dirs: Option<String>,
@@ -613,6 +617,8 @@ struct HttpSecret {
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -733,6 +739,8 @@ fn parse_secret(
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: Vec::new(),
+            paths: Vec::new(),
             replacer: name,
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -752,7 +760,11 @@ fn parse_secret(
     let secret_ref = optional_str(table, "secret_ref")
         .unwrap_or(name.as_str())
         .to_owned();
-    match optional_str(table, "type").unwrap_or("http") {
+    let secret_type = optional_str(table, "type").unwrap_or("http");
+    if !matches!(secret_type, "http" | "header") {
+        reject_http_request_scope_keys(table, &name, secret_type)?;
+    }
+    match secret_type {
         "http" | "header" => parse_http_secret(table, name, secret_ref, default_hosts, labels),
         "oauth_token" => parse_oauth_token_secret(table, name, labels),
         "gcp_auth" => parse_gcp_auth_secret(table, name, secret_ref, labels),
@@ -785,6 +797,8 @@ fn parse_http_secret(
              iron-proxy"
         )));
     }
+    let http_methods = parse_http_methods(table, &name)?;
+    let paths = parse_http_paths(table, &name)?;
     let mode = optional_str(table, "mode").unwrap_or("replace");
     match mode {
         "replace" => {
@@ -804,6 +818,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -839,6 +855,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: Vec::new(),
                 match_path: false,
@@ -1089,14 +1107,26 @@ fn fragment_from_secrets(secrets: Vec<ToolSecret>) -> Result<ProxyFragment, Tool
 }
 
 fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, ToolDiscoveryError> {
-    let mut grouped =
-        BTreeMap::<HttpSecretKey, (BTreeSet<String>, BTreeMap<String, String>)>::new();
+    let mut grouped = BTreeMap::<
+        HttpSecretKey,
+        (BTreeSet<HttpSecretRequestRule>, BTreeMap<String, String>),
+    >::new();
     for secret in secrets {
         let ToolSecret::Http(secret) = secret else {
             continue;
         };
         let entry = grouped.entry(HttpSecretKey::from(secret)).or_default();
-        entry.0.extend(secret.hosts.iter().cloned());
+        entry.0.extend(
+            secret
+                .hosts
+                .iter()
+                .cloned()
+                .map(|host| HttpSecretRequestRule {
+                    host,
+                    http_methods: secret.http_methods.clone(),
+                    paths: secret.paths.clone(),
+                }),
+        );
         merge_tool_labels(&mut entry.1, &secret.labels);
     }
     if grouped.is_empty() {
@@ -1108,7 +1138,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut entry = Secret {
             id: Some(key.name.clone()),
             source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
-            rules: host_rules(hosts)?,
+            rules: http_secret_rules(hosts)?,
             ..Default::default()
         };
         entry.extra.insert("labels".to_owned(), yaml_value(labels)?);
@@ -1164,6 +1194,13 @@ struct HttpSecretKey {
     inject_header: String,
     inject_formatter: String,
     inject_query_param: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HttpSecretRequestRule {
+    host: String,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
 }
 
 impl From<&HttpSecret> for HttpSecretKey {
@@ -1463,6 +1500,24 @@ fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryEr
         .collect()
 }
 
+fn http_secret_rules(
+    rules: BTreeSet<HttpSecretRequestRule>,
+) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            let mut value = BTreeMap::from([("host".to_owned(), yaml_string(&rule.host))]);
+            if !rule.http_methods.is_empty() {
+                value.insert("http_methods".to_owned(), yaml_value(rule.http_methods)?);
+            }
+            if !rule.paths.is_empty() {
+                value.insert("paths".to_owned(), yaml_value(rule.paths)?);
+            }
+            yaml_value(value)
+        })
+        .collect()
+}
+
 fn host_rules_set(hosts: &[String]) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     host_rules(hosts.iter().cloned().collect())
 }
@@ -1549,6 +1604,51 @@ fn optional_string_array(
         out.push(value.to_owned());
     }
     Ok(Some(out))
+}
+
+fn parse_http_methods(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
+    let methods = optional_string_array(table.get("http_methods"))?.unwrap_or_default();
+    methods
+        .into_iter()
+        .map(|method| {
+            let method = method.to_ascii_uppercase();
+            if HTTP_METHODS.contains(&method.as_str()) {
+                Ok(method)
+            } else {
+                Err(ToolDiscoveryError::Invalid(format!(
+                    "HTTP secret {name:?} has unsupported http_methods entry {method:?}; expected one of {}",
+                    HTTP_METHODS.join(", ")
+                )))
+            }
+        })
+        .collect()
+}
+
+fn parse_http_paths(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
+    let paths = optional_string_array(table.get("paths"))?.unwrap_or_default();
+    for path in &paths {
+        if !path.starts_with('/') {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "HTTP secret {name:?} paths entry {path:?} must start with '/'"
+            )));
+        }
+    }
+    Ok(paths)
+}
+
+fn reject_http_request_scope_keys(
+    table: &toml::Table,
+    name: &str,
+    secret_type: &str,
+) -> Result<(), ToolDiscoveryError> {
+    for key in ["http_methods", "paths"] {
+        if table.contains_key(key) {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "{secret_type} secret {name:?} must not declare {key:?}; request scopes are only supported by type = \"http\""
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn optional_bool(table: &toml::Table, key: &str) -> Result<Option<bool>, ToolDiscoveryError> {
@@ -1795,6 +1895,89 @@ secrets = [
         assert_eq!(tokens[0]["labels"]["centaur-tool"].as_str(), Some("gsuite"));
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn discovers_http_request_scopes_for_each_host() {
+        let temp = temp_dir("api-rs-http-request-scopes");
+        let base = temp.join("base");
+        write_tool(
+            &base.join("platform").join("example"),
+            r#"
+[project]
+description = "scoped HTTP secret"
+
+[tool.centaur]
+secrets = [
+  { type = "http", name = "EXAMPLE_TOKEN", match_headers = ["Authorization"], hosts = ["api.example.com", "api-alt.example.com"], http_methods = ["get", "POST"], paths = ["/v1/branches/main", "/v1/insights*"] },
+]
+"#,
+        );
+
+        let discovered = discover_tool_proxy_fragment(std::slice::from_ref(&base)).unwrap();
+        let inputs = centaur_iron_control::secret_inputs_from_fragment(
+            "default",
+            "tool-example",
+            &discovered.fragment,
+            &centaur_iron_proxy::SourcePolicy::env(),
+        )
+        .unwrap();
+        let centaur_iron_control::SecretInput::Static(secret) = &inputs[0] else {
+            panic!("expected static secret input")
+        };
+        let rules = &secret.rules;
+        assert_eq!(rules.len(), 2);
+        for host in ["api.example.com", "api-alt.example.com"] {
+            let rule = rules
+                .iter()
+                .find(|rule| rule.host.as_deref() == Some(host))
+                .expect("host request rule present");
+            assert_eq!(rule.http_methods, vec!["GET".to_owned(), "POST".to_owned()]);
+            assert_eq!(
+                rule.paths,
+                vec!["/v1/branches/main".to_owned(), "/v1/insights*".to_owned()]
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn http_request_scopes_reject_invalid_metadata_and_other_secret_types() {
+        let invalid_method: TomlValue = toml::from_str(
+            r#"entry = { type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = ["TRACE"] }"#,
+        )
+        .unwrap();
+        let err =
+            parse_secret(invalid_method.get("entry").unwrap(), &[], &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("unsupported http_methods"));
+
+        let invalid_path: TomlValue = toml::from_str(
+            r#"entry = { type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = ["v1/insights"] }"#,
+        )
+        .unwrap();
+        let err =
+            parse_secret(invalid_path.get("entry").unwrap(), &[], &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("must start with '/'"));
+
+        let empty_path: TomlValue = toml::from_str(
+            r#"entry = { type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = [""] }"#,
+        )
+        .unwrap();
+        let err =
+            parse_secret(empty_path.get("entry").unwrap(), &[], &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("expected non-empty string array"));
+
+        let wrong_type: TomlValue = toml::from_str(
+            r#"entry = { type = "pg_dsn", name = "DB", database = "app", paths = ["/v1"] }"#,
+        )
+        .unwrap();
+        let err =
+            parse_secret(wrong_type.get("entry").unwrap(), &[], &BTreeMap::new()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported by type = \"http\"")
+        );
     }
 
     #[test]

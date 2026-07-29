@@ -63,7 +63,6 @@ These are broadly useful across most deployments and are good candidates to conf
 | `centaur-console` | Inspect the current sandbox's redacted permissions and capabilities | None |
 | `chart` | Render charts as PNG images for Slack or reports | None |
 | `demo` | Test tool hot-reload and basic tool plumbing | None |
-| `grafana` | Grafana dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Product analytics through HogQL, events, pageviews, and breakdowns | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
 | `amplitude` | Amplitude event segmentation, funnels, retention, user activity, realtime, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
 | `profslice` | Extract Firefox Profiler data for analysis | None |

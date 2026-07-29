@@ -9,6 +9,8 @@ use sqlx::{Connection, Executor, PgConnection, Row};
 const GRANOLA_SYNC_SQL: &str = include_str!("../migrations/0040_granola_sync_tables.sql");
 const GRANOLA_CONTEXT_PROJECTION_SQL: &str =
     include_str!("../migrations/0044_granola_context_projection.sql");
+const GRANOLA_DOCUMENT_ID_UPGRADE_SQL: &str =
+    include_str!("../migrations/0046_preserve_granola_projection_document_ids.sql");
 
 #[tokio::test]
 async fn granola_notes_project_into_their_dedicated_rls_protected_context_table()
@@ -37,18 +39,20 @@ async fn run_assertions(conn: &mut PgConnection, schema: &str) -> Result<(), Box
             'note_backfilled', 'Existing note', 'alice@example.com',
             array['alice@example.com'], 'Existing source data', '2026-07-13T09:00:00Z'
         );
-
-        insert into granola_context_documents (
-            document_id, note_id, title, body, content_hash
-        ) values (
-            'granola:note:note_backfilled', 'note_backfilled',
-            'Stale title', 'Stale body', 'stale-hash'
-        );
         "#,
     )
     .execute(&mut *conn)
     .await?;
     execute_migration(conn, GRANOLA_CONTEXT_PROJECTION_SQL).await?;
+
+    let original_document_id: String = sqlx::query_scalar(
+        "select document_id from granola_context_documents where note_id = 'note_backfilled'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    assert_eq!(original_document_id, "granola:note_backfilled");
+
+    execute_migration(conn, GRANOLA_DOCUMENT_ID_UPGRADE_SQL).await?;
     grant_schema_usage(conn, schema).await?;
 
     let backfilled = sqlx::query(
@@ -242,10 +246,18 @@ async fn create_roles(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         r#"
         do $$
+        declare
+            role_name text;
         begin
-            if not exists (select 1 from pg_roles where rolname = 'centaur_slack_reader') then
-                create role centaur_slack_reader nologin;
-            end if;
+            foreach role_name in array array[
+                'centaur_slack_reader',
+                'centaur_slack_admin',
+                'centaur_readonly'
+            ] loop
+                if not exists (select 1 from pg_roles where rolname = role_name) then
+                    execute format('create role %I nologin', role_name);
+                end if;
+            end loop;
         end
         $$;
         "#,

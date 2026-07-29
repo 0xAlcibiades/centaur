@@ -47,7 +47,7 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 secrets = [
-    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"]},
+    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"], http_methods = ["POST"], paths = ["/query"]},
 ]
 ```
 
@@ -67,17 +67,16 @@ Each entry in `secrets` declares one credential the tool can request with
   auth). For `jwt_bearer` (RFC 7523), supply `issuer`, `subject`, and
   `private_key` (an RSA PEM) in `fields`, plus a top-level `audience`; an
   optional `private_key_id` field is emitted as the JWT `kid` header.
-- `type = "brokered_token"` routes OAuth2 refresh-token rotation through
-  iron-token-broker instead of iron-proxy. Use this when the upstream IdP
-  rotates refresh tokens with strict reuse detection (OpenAI Codex, Anthropic
-  Claude Code OAuth, modern Okta or Auth0 with rotation enabled) and more
-  than one proxy shares the credential. Required `fields`: `client_id`,
-  `refresh_token`. Optional: `client_secret`. The `refresh_token` field names
-  the writable credential blob the broker rewrites on every rotation; the
-  other fields are read-only. Read-side fields and `token_endpoint_headers`
-  entries accept `json_key` to pluck a value out of a JSON-encoded secret;
-  the `refresh_token` field does not (the broker rewrites the whole
-  document).
+- `type = "brokered_token"` consumes a separately provisioned Console broker
+  credential. The Console stores its refresh-token state encrypted in Postgres,
+  performs all rotation, and sends only the current access token to iron-proxy.
+  Use this when several proxies need one OAuth credential with strict refresh
+  token reuse rules. Configure the consumer's `name`, `hosts`, and optional
+  `credential` or injection settings. Do not put refresh-token fields,
+  `token_endpoint`, or `scopes` in a tool declaration: those legacy fields are
+  ignored. Never use a mutable 1Password item as the broker's ongoing state;
+  seed or re-authenticate the Console broker credential through its management
+  path instead.
 - `type = "gcp_auth"` is for Google service-account JSON. iron-proxy resolves
   the keyfile, mints Google OAuth tokens for `scopes`, and injects them for the
   configured Google API `hosts`. If omitted, hosts default to
@@ -91,6 +90,11 @@ Each entry in `secrets` declares one credential the tool can request with
   request the placeholder is allowed to appear. At least one is required.
 - `hosts` is the upstream allowlist for this secret. iron-proxy will only
   inject the real value on requests to these hosts.
+- `http_methods` and `paths` optionally narrow each declared `hosts` rule for
+  `type = "http"`. Methods are normalized to uppercase and must be one of
+  `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or
+  `*`; every path must begin with `/` and may use globs. Multiple paths apply
+  to the same host rule.
 
 Use `optional_secrets` for credentials the tool can run without.
 

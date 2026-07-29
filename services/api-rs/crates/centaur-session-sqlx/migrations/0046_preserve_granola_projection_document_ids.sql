@@ -1,6 +1,5 @@
--- Granola's OAuth sync writes normalized source rows. Project those rows into
--- the dedicated search table in the same transaction, rather than routing
--- them through the generic company_context_documents projection.
+-- Migration 44 originally projected note IDs as granola:<note_id>. Keep that
+-- applied migration immutable and move existing rows to the canonical ID here.
 
 create or replace function centaur_refresh_granola_context_document(
     p_note_id text
@@ -22,7 +21,7 @@ as $$
     ),
     projected as (
         select
-            concat_ws(':', 'granola', notes.note_id) as document_id,
+            concat_ws(':', 'granola', 'note', notes.note_id) as document_id,
             notes.note_id,
             coalesce(nullif(notes.title, ''), 'Granola note') as title,
             notes.content_text as body,
@@ -152,6 +151,10 @@ create trigger trg_granola_sync_notes_refresh_context
     after insert or update on granola_sync_notes
     for each row
     execute function centaur_refresh_granola_context_document_from_note();
+
+update granola_context_documents
+set document_id = concat_ws(':', 'granola', 'note', note_id)
+where document_id = concat_ws(':', 'granola', note_id);
 
 select centaur_refresh_granola_context_document(note_id)
 from granola_sync_notes;

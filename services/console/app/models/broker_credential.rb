@@ -1,7 +1,8 @@
-# A managed OAuth credential whose token lifecycle centaur-console owns itself:
-# the in-control port of iron-token-broker. control drives a refresh loop
-# (Broker::PollRefreshJob -> Broker::RefreshCredentialJob -> #refresh!) that
-# mints fresh access tokens before expiry.
+# A managed OAuth credential whose token lifecycle the Console owns in its
+# encrypted Postgres record as the only rotating refresh-token writer. The
+# refresh loop
+# (Broker::PollRefreshJob -> Broker::RefreshCredentialJob -> #refresh!) mints
+# fresh access tokens before expiry.
 #
 # The minted access token reaches iron-proxy through the normal /sync path: a
 # `token_broker` SecretSource on some grantable secret references this credential
@@ -25,8 +26,7 @@ class BrokerCredential < ApplicationRecord
   GRANTS = Broker::CredentialGrants::GRANTS
 
   # The access token must keep at least this much life past the scheduled
-  # refresh, regardless of slack/fraction. Mirrors the 60s floor in
-  # iron-token-broker's nextRefreshAt.
+  # refresh, regardless of slack/fraction.
   REFRESH_FLOOR_SECONDS = 60
   # IdPs that omit expires_in get a conservative default so the loop refreshes
   # before the token quietly stops working. Mirrors refreshOnce.
@@ -120,7 +120,7 @@ class BrokerCredential < ApplicationRecord
     oauth_app&.provider_strategy&.refresh_scopes(scopes) || scopes
   end
 
-  # --- Refresh state machine (ported from iron-token-broker credential.go) ----
+  # --- Refresh state machine --------------------------------------------------
 
   # The wall-clock time the loop should next refresh. min(early-trigger,
   # max-interval-ceiling) with a 60s floor before expiry. A credential that has

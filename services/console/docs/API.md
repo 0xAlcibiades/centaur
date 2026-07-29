@@ -136,7 +136,7 @@ Shape:
 
 The `secret` field is encrypted at rest, is write-only, and is never returned in any response. It is only permitted for `control_plane` sources; supplying it for any other type is a validation error, and omitting it for `control_plane` is also an error.
 
-`token_broker` is also resolved by iron-control rather than by the proxy. `credential_id` names a [broker credential](#broker-credentials), and at sync time iron-control substitutes that credential's current access token, delivered inline exactly like a `control_plane` value. The reference never reaches the proxy. If the credential has no current token (it is still bootstrapping, or it is dead), the owning secret is omitted from the proxy's config until the credential recovers.
+`token_broker` is also resolved by iron-control rather than by the proxy. `credential_id` names a [broker credential](#broker-credentials), and at sync time iron-control substitutes that credential's current access token, delivered inline exactly like a `control_plane` value. The reference never reaches the proxy. The Console's encrypted Postgres record is the sole rotating refresh-token state; external sources may hold static references, but not a mutable refresh-token blob. If the credential has no current token (it is still bootstrapping, or it is dead), the owning secret is omitted from the proxy's config until the credential recovers.
 
 `credential_id` is either the credential's opaque id (`bcr_...`) or its `foreign_id`. With a `foreign_id`, `credential_namespace` is required; with an opaque id it must be omitted (opaque ids are namespace independent, so they can reference a credential in any namespace, including a shared one). The reference is validated on write: it must resolve to an existing broker credential.
 
@@ -803,11 +803,40 @@ Returns `201`. Response shape (note that `credentials` echoes each source as `{ 
 
 ## Broker credentials
 
-A broker credential is an OAuth credential whose token lifecycle iron-control manages itself. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
+A broker credential is an OAuth credential whose token lifecycle the Console manages in its encrypted Postgres record. The Console runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
 
 Unlike the secret types above, a broker credential is not granted directly and is not injected on its own. It is referenced by a `token_broker` source on a grantable secret (typically a [static secret](#static-secrets)), which carries the rules and injection config. Refresh tokens, usernames, passwords, and API keys never leave iron-control.
 
-The token credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, and the `token_endpoint_headers` values are encrypted at rest and never returned.
+The token credentials it refreshes with are fields on the credential, resolved by the Console itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, refresh tokens, and the `token_endpoint_headers` values are encrypted at rest and never returned. Supply a refresh token only as a fresh bootstrap seed through the broker API; do not point the broker at a writable external secret.
+
+### Operator bootstrap
+
+An administrator can create or reseed a broker credential in the Console at
+`/console/credentials/new`; its **Refresh Token** field is write-only and
+encrypted. Automation can use the authenticated HTTPS create or update API
+below, but must not expose the request body in command history or logs. Do not
+pass a refresh token as a command-line argument, and do not use a writable
+external secret as the broker's rotating state.
+
+`centaur-perms broker create` supports a refresh seed only through stdin or a
+mode-0600 file. It checks the existing redacted status before consuming a seed
+and permits an unforced seed only for a missing or `dead` credential. Replacing
+a `live` or `bootstrapping` credential requires explicit `--force-reauth`.
+For example, a public Codex OAuth client can be seeded without putting its
+refresh token in argv:
+
+```bash
+centaur-perms --namespace default broker create \
+  --foreign-id openai-codex \
+  --token-endpoint https://auth.openai.com/oauth/token \
+  --client-id app_EMoamEEZ73f0CkXaXp7hrann \
+  --refresh-token-file /run/secrets/openai-codex-refresh-token
+```
+
+This safe-source handling currently applies to the refresh-token seed only.
+`--client-secret` and `--token-endpoint-header` still accept literal command
+line values, so use the Console's write-only form or an API client that keeps
+request bodies out of history and logs when those secret fields are needed.
 
 ### Attributes
 

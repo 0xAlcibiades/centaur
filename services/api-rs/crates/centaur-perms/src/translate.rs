@@ -40,6 +40,19 @@ fn rules_from_hosts(hosts: &[String]) -> Vec<RequestRule> {
     hosts.iter().map(RequestRule::host).collect()
 }
 
+fn rules_from_http_secret(secret: &HttpSecret) -> Vec<RequestRule> {
+    secret
+        .hosts
+        .iter()
+        .map(|host| RequestRule {
+            host: Some(host.clone()),
+            cidr: None,
+            http_methods: secret.http_methods.clone(),
+            paths: secret.paths.clone(),
+        })
+        .collect()
+}
+
 /// Translate every secret declared by a tool into iron-control inputs to grant
 /// to the tool's role (`role_foreign_id`, e.g. `tool-github`).
 #[cfg(test)]
@@ -209,7 +222,7 @@ fn static_input(
         inject_config,
         replace_config,
         source: source_from_placeholder(policy, &http.secret_ref, None),
-        rules: rules_from_hosts(&http.hosts),
+        rules: rules_from_http_secret(http),
     }
 }
 

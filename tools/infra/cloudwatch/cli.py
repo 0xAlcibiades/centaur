@@ -1,6 +1,6 @@
 """CLI for AWS CloudWatch (read-only).
 
-Mirrors the other infra tools' CLIs (grafana, vlogs): a Typer app whose
+Mirrors the other infra tools' CLIs (vlogs): a Typer app whose
 commands wrap ``CloudWatchClient`` and print JSON to stdout. The agent reaches
 this via the ``cloudwatch`` shim that ``install_tool_shims.py`` installs from
 ``[project.scripts]``; without that entry the tool is invisible on the

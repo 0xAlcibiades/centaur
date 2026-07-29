@@ -20,6 +20,7 @@ jobs:
       migration_order: ${{ steps.filter.outputs.migration_order }}
       rust_api: ${{ steps.filter.outputs.rust_api }}
       sandbox_tests: ${{ steps.filter.outputs.sandbox_tests }}
+      bootstrap_secrets: ${{ steps.filter.outputs.bootstrap_secrets }}
       slackbotv2_tests: ${{ steps.filter.outputs.slackbotv2_tests }}
       discordbot_checks: ${{ steps.filter.outputs.discordbot_checks }}
       githubbot_checks: ${{ steps.filter.outputs.githubbot_checks }}
@@ -74,6 +75,11 @@ jobs:
           set_output sandbox_tests \
             '^services/sandbox/' \
             '^\.github/workflows/ci\.yml$'
+          set_output bootstrap_secrets \
+            '^contrib/scripts/bootstrap-k8s-secrets\.sh$' \
+            '^contrib/scripts/test-bootstrap-k8s-secrets\.sh$' \
+            '^Justfile$' \
+            '^\.github/workflows/ci\.yml$'
           set_output slackbotv2_tests \
             '^services/slackbotv2/' \
             '^package\.json$' \
@@ -101,7 +107,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -115,7 +121,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -207,9 +213,22 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m unittest discover -s services/sandbox -p 'test_*.py'
 
+  bootstrap-secrets:
+    name: Bootstrap secret-source regression
+    runs-on: ubuntu-latest
+    needs: ci_changes
+    if: needs.ci_changes.outputs.bootstrap_secrets == 'true'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test bootstrap source boundary
+        run: bash contrib/scripts/test-bootstrap-k8s-secrets.sh
+
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -267,7 +286,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -301,7 +320,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -335,7 +354,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:

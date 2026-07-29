@@ -36,6 +36,8 @@ spec:
 {{ toYaml . | nindent 12 }}
 {{- end }}
           env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_DB
               value: {{ .Values.postgres.auth.database | quote }}
             - name: POSTGRES_USER

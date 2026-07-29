@@ -371,6 +371,19 @@ impl IronControlClient {
             .await
     }
 
+    /// Fetch a broker credential's redacted identity and lifecycle status by OID
+    /// (``bcr_…``) or ``foreign_id``. Unlike the detail endpoint, this typed
+    /// form is suitable for callers that only need to make a lifecycle decision.
+    pub async fn get_broker_credential(
+        &self,
+        namespace: &str,
+        ident: &str,
+    ) -> Result<BrokerCredentialRecord> {
+        let path = resource_path("broker_credentials", "bcr_", namespace, ident, "");
+        let resp = self.send(Method::GET, &path, None::<&Value>).await?;
+        decode_data(resp, Method::GET, &path).await
+    }
+
     /// Fetch a broker credential's full resource object (every field
     /// iron-control returns; secret material is never echoed) by OID (``bcr_``)
     /// or ``foreign_id``. Returned as a raw [`Value`] so callers can render the

@@ -8,10 +8,11 @@ use std::{
 };
 
 use absurd::{
-    AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
-    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
+    AwaitEventOptions, CancellationPolicy, Client, ClientOptions, CreateQueueOptions, RetryKind,
+    RetryStrategy, SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker,
+    WorkerOptions,
 };
-use centaur_iron_control::{IdentityInput, IronControlClient, IronControlError, slugify};
+use centaur_iron_control::{IronControlClient, IronControlError, Principal, workflow_principal};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -29,7 +30,7 @@ use sqlx::Row;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::Command,
     task::JoinHandle,
 };
@@ -45,10 +46,14 @@ pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const WORKFLOW_TOOL_TIMEOUT_SECS_ENV: &str = "WORKFLOW_TOOL_TIMEOUT_SECS";
+const DEFAULT_WORKFLOW_TOOL_TIMEOUT_SECS: u64 = 300;
+const MAX_WORKFLOW_TOOL_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const WORKFLOW_HOST_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
@@ -273,19 +278,20 @@ impl WorkflowHostSandboxRuntime {
         };
     }
 
-    fn spec_for_workflow(&self, workflow_name: &str) -> Result<SandboxSpec, WorkflowRuntimeError> {
+    fn binding_for_workflow(
+        &self,
+        workflow_name: &str,
+    ) -> Result<(SandboxSpec, Option<String>), WorkflowRuntimeError> {
+        let assignments = self
+            .workflow_principals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let principal = assignments.principal_for_workflow(workflow_name)?;
         let mut spec = self.spec.clone();
-        let principal = {
-            let assignments = self
-                .workflow_principals
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assignments.principal_for_workflow(workflow_name)?
-        };
-        if let Some(principal) = principal {
-            spec.iron_control_principal = Some(principal);
+        if let Some(principal) = principal.as_ref() {
+            spec.iron_control_principal = Some(principal.clone());
         }
-        Ok(spec)
+        Ok((spec, principal))
     }
 }
 
@@ -307,34 +313,74 @@ impl WorkflowPrincipalRegistrar {
         &self,
         principals: &BTreeSet<String>,
     ) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
+        validate_workflow_principal_foreign_ids(principals)?;
         let mut registered = BTreeMap::new();
         for workflow_name in principals {
-            let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
-            let record = self
+            let mut identity = workflow_principal(workflow_name).to_identity_input(&self.namespace);
+            let foreign_id = identity.foreign_id.clone();
+            let labels = identity.labels.clone();
+            let labels = match self
                 .client
-                .upsert_principal(&IdentityInput {
-                    namespace: self.namespace.clone(),
-                    foreign_id,
-                    name: format!("Workflow {workflow_name}"),
-                    labels: workflow_principal_labels(workflow_name),
-                })
-                .await?;
+                .get_principal(&self.namespace, &foreign_id)
+                .await
+            {
+                Ok(existing) => merge_existing_workflow_principal_labels(
+                    workflow_name,
+                    &foreign_id,
+                    &existing,
+                    labels,
+                )?,
+                Err(IronControlError::Status { status: 404, .. }) => labels,
+                Err(error) => return Err(error.into()),
+            };
+            identity.labels = labels;
+            let record = self.client.upsert_principal(&identity).await?;
             registered.insert(workflow_name.clone(), record.id);
         }
         Ok(registered)
     }
 }
 
-fn canonical_workflow_principal_foreign_id(workflow_name: &str) -> String {
-    format!("workflow-{}", slugify(workflow_name))
+fn merge_existing_workflow_principal_labels(
+    workflow_name: &str,
+    foreign_id: &str,
+    existing: &Principal,
+    required: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
+    let identity_matches = existing.foreign_id.as_deref() == Some(foreign_id)
+        && existing.labels.get("kind").map(String::as_str) == Some("workflow")
+        && existing.labels.get("managed-by").map(String::as_str) == Some("centaur")
+        && existing.labels.get("workflow_name").map(String::as_str) == Some(workflow_name);
+    if !identity_matches {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "workflow {workflow_name} principal {foreign_id} already exists with a different identity"
+        )));
+    }
+    let mut labels = existing.labels.clone();
+    labels.extend(required);
+    Ok(labels)
 }
 
+fn validate_workflow_principal_foreign_ids(
+    workflow_names: &BTreeSet<String>,
+) -> Result<(), WorkflowRuntimeError> {
+    let mut owners = BTreeMap::new();
+    for workflow_name in workflow_names {
+        let foreign_id = workflow_principal(workflow_name).foreign_id;
+        if let Some(existing) = owners.insert(foreign_id.clone(), workflow_name) {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflows {existing} and {workflow_name} map to the same principal {foreign_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn workflow_principal_labels(workflow_name: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("kind".to_owned(), "workflow".to_owned()),
-        ("managed-by".to_owned(), "centaur".to_owned()),
-        ("workflow_name".to_owned(), workflow_name.to_owned()),
-    ])
+    workflow_principal(workflow_name)
+        .to_identity_input("default")
+        .labels
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -483,6 +529,18 @@ pub struct RegisteredWorkflowSchedule {
     pub enabled: bool,
     #[serde(default)]
     pub no_delivery: bool,
+    #[serde(default)]
+    pub overlap_policy: WorkflowScheduleOverlapPolicy,
+    #[serde(default)]
+    pub max_duration_seconds: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowScheduleOverlapPolicy {
+    #[default]
+    Allow,
+    Skip,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -508,6 +566,28 @@ struct AgentTurnResult {
     status: String,
     output_lines: Vec<String>,
     result_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PythonAgentTurnResult {
+    thread_key: String,
+    execution_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_lines: Option<Vec<String>>,
+    result_text: String,
+}
+
+impl PythonAgentTurnResult {
+    fn from_agent_turn(result: AgentTurnResult, include_output_lines: bool) -> Self {
+        Self {
+            thread_key: result.thread_key,
+            execution_id: result.execution_id,
+            status: result.status,
+            output_lines: include_output_lines.then_some(result.output_lines),
+            result_text: result.result_text,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -898,31 +978,7 @@ impl WorkflowRuntime {
         queue_name: &str,
         limit: i64,
     ) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
-        let (task_table, run_table) = absurd_queue_tables(queue_name)?;
-        let rows = sqlx::query(&format!(
-            r#"
-            select
-                r.run_id::text as run_id,
-                t.task_id::text as task_id,
-                t.task_name,
-                t.params,
-                t.state,
-                t.attempts,
-                t.completed_payload,
-                r.failure_reason,
-                t.enqueue_at as created_at,
-                greatest(t.enqueue_at, coalesce(r.available_at, t.enqueue_at)) as updated_at
-            from {task_table} t
-            join {run_table} r on r.run_id = t.last_attempt_run
-            order by t.enqueue_at desc, t.task_id desc
-            limit $1
-            "#,
-        ))
-        .bind(limit)
-        .fetch_all(self.inner.client.pool())
-        .await?;
-
-        rows.into_iter().map(workflow_run_from_row).collect()
+        fetch_runs_for_queue(self.inner.client.pool(), queue_name, limit).await
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<WorkflowRun, WorkflowRuntimeError> {
@@ -944,29 +1000,7 @@ impl WorkflowRuntime {
         queue_name: &str,
         run_id: &str,
     ) -> Result<Option<WorkflowRun>, WorkflowRuntimeError> {
-        let (task_table, run_table) = absurd_queue_tables(queue_name)?;
-        let row = sqlx::query(&format!(
-            r#"
-            select
-                r.run_id::text as run_id,
-                t.task_id::text as task_id,
-                t.task_name,
-                t.params,
-                t.state,
-                t.attempts,
-                t.completed_payload,
-                r.failure_reason,
-                t.enqueue_at as created_at,
-                greatest(t.enqueue_at, coalesce(r.available_at, t.enqueue_at)) as updated_at
-            from {run_table} r
-            join {task_table} t on t.task_id = r.task_id
-            where r.run_id = $1::uuid
-            "#,
-        ))
-        .bind(run_id)
-        .fetch_optional(self.inner.client.pool())
-        .await?;
-        row.map(workflow_run_from_row).transpose()
+        fetch_run_for_queue(self.inner.client.pool(), queue_name, run_id).await
     }
 
     pub async fn cancel_run(&self, run_id: &str) -> Result<(), WorkflowRuntimeError> {
@@ -1103,6 +1137,81 @@ fn absurd_queue_tables(
             "unknown workflow queue {other:?}"
         ))),
     }
+}
+
+async fn fetch_runs_for_queue(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+    limit: i64,
+) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+    let rows = sqlx::query(&format!(
+        r#"
+        select
+            r.run_id::text as run_id,
+            t.task_id::text as task_id,
+            t.task_name,
+            t.params,
+            t.state,
+            t.attempts,
+            case when t.state = 'completed' then t.completed_payload end as completed_payload,
+            case when t.state = 'failed' then r.failure_reason end as failure_reason,
+            t.enqueue_at as created_at,
+            greatest(
+                t.enqueue_at,
+                case
+                    when isfinite(r.available_at) then r.available_at
+                    else t.enqueue_at
+                end
+            ) as updated_at
+        from {task_table} t
+        join {run_table} r on r.run_id = t.last_attempt_run
+        order by t.enqueue_at desc, t.task_id desc
+        limit $1
+        "#,
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(workflow_run_from_row).collect()
+}
+
+async fn fetch_run_for_queue(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+    run_id: &str,
+) -> Result<Option<WorkflowRun>, WorkflowRuntimeError> {
+    let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+    let row = sqlx::query(&format!(
+        r#"
+        select
+            requested_run.run_id::text as run_id,
+            t.task_id::text as task_id,
+            t.task_name,
+            t.params,
+            t.state,
+            t.attempts,
+            case when t.state = 'completed' then t.completed_payload end as completed_payload,
+            case when t.state = 'failed' then current_run.failure_reason end as failure_reason,
+            t.enqueue_at as created_at,
+            greatest(
+                t.enqueue_at,
+                case
+                    when isfinite(current_run.available_at) then current_run.available_at
+                    else t.enqueue_at
+                end
+            ) as updated_at
+        from {run_table} requested_run
+        join {task_table} t on t.task_id = requested_run.task_id
+        left join {run_table} current_run on current_run.run_id = t.last_attempt_run
+        where requested_run.run_id = $1::uuid
+        "#,
+    ))
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(workflow_run_from_row).transpose()
 }
 
 fn build_webhook_registry(
@@ -1447,6 +1556,31 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
     }
     let enabled = schedule_bool(object.get("enabled"), true);
     let no_delivery = schedule_bool(object.get("no_delivery"), false);
+    let overlap_policy = match object
+        .get("overlap_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("allow")
+        .trim()
+    {
+        "allow" => WorkflowScheduleOverlapPolicy::Allow,
+        "skip" => WorkflowScheduleOverlapPolicy::Skip,
+        value => {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflow schedule {schedule_id:?} has invalid overlap_policy {value:?}"
+            )));
+        }
+    };
+    let max_duration_seconds = match object.get("max_duration_seconds") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64() {
+            Some(seconds) if seconds > 0 => Some(seconds),
+            _ => {
+                return Err(WorkflowRuntimeError::BadRequest(format!(
+                    "workflow schedule {schedule_id:?} max_duration_seconds must be a positive integer"
+                )));
+            }
+        },
+    };
     let timezone = object
         .get("timezone")
         .and_then(Value::as_str)
@@ -1487,6 +1621,8 @@ fn normalize_schedule(raw: Value) -> Result<RegisteredWorkflowSchedule, Workflow
         input,
         enabled,
         no_delivery,
+        overlap_policy,
+        max_duration_seconds,
     })
 }
 
@@ -1773,6 +1909,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -1807,8 +1944,8 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
     write_host_message(&mut stdin, &json!({"type": "workflow.discover"})).await?;
     drop(stdin);
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -2371,12 +2508,37 @@ async fn run_schedule_tick(
         schedule.schedule_id,
         input.scheduled_at.to_rfc3339()
     );
-    let target_client = match workflow_queue_class(&schedule.workflow_name) {
+    let queue_class = workflow_queue_class(&schedule.workflow_name);
+    let target_client = match queue_class {
         WorkflowQueueClass::Standard => &workflow_clients.standard,
         WorkflowQueueClass::SlackLive => &workflow_clients.slack_live,
         WorkflowQueueClass::Etl => &workflow_clients.etl,
         WorkflowQueueClass::EtlBackfill => &workflow_clients.etl_backfill,
     };
+    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
+        .map_err(absurd_error)?;
+    if schedule.overlap_policy == WorkflowScheduleOverlapPolicy::Skip
+        && has_active_workflow_task(
+            target_client,
+            queue_name_for_class(queue_class),
+            &schedule.workflow_name,
+        )
+        .await
+        .map_err(absurd_error)?
+    {
+        spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
+            .await
+            .map_err(absurd_error)?;
+        return Ok(json!({
+            "schedule_id": schedule.schedule_id,
+            "workflow_name": schedule.workflow_name,
+            "scheduled_at": input.scheduled_at.to_rfc3339(),
+            "fire_key": fire_key,
+            "skipped": true,
+            "reason": "overlap",
+            "next_run_at": next_run_at.to_rfc3339(),
+        }));
+    }
     let workflow_spawn = target_client
         .spawn(
             WORKFLOW_TASK,
@@ -2387,12 +2549,16 @@ async fn run_schedule_tick(
             },
             SpawnOptions {
                 idempotency_key: Some(fire_key.clone()),
+                cancellation: schedule.max_duration_seconds.map(|max_duration| {
+                    CancellationPolicy {
+                        max_duration: Some(max_duration),
+                        max_delay: None,
+                    }
+                }),
                 ..SpawnOptions::default()
             },
         )
         .await?;
-    let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
-        .map_err(absurd_error)?;
     spawn_schedule_tick(&schedule_client, &schedule, next_run_at)
         .await
         .map_err(absurd_error)?;
@@ -2406,6 +2572,29 @@ async fn run_schedule_tick(
         "workflow_created": workflow_spawn.created,
         "next_run_at": next_run_at.to_rfc3339(),
     }))
+}
+
+async fn has_active_workflow_task(
+    client: &Client,
+    queue_name: &str,
+    workflow_name: &str,
+) -> Result<bool, WorkflowRuntimeError> {
+    let (task_table, _) = absurd_queue_tables(queue_name)?;
+    let row = sqlx::query(&format!(
+        r#"
+        select 1
+        from {task_table} t
+        where t.task_name = $1
+          and t.params->>'workflow_name' = $2
+          and t.state not in {ABSURD_TERMINAL_TASK_STATES}
+        limit 1
+        "#,
+    ))
+    .bind(WORKFLOW_TASK)
+    .bind(workflow_name)
+    .fetch_optional(client.pool())
+    .await?;
+    Ok(row.is_some())
 }
 
 async fn ensure_schedule_tick(
@@ -2704,6 +2893,7 @@ async fn run_centaur_workflow_inner(
                                 execution_idempotency_key: format!(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
+                                iron_control_principal: None,
                                 workflow_owned_thread: true,
                                 idle_timeout_ms,
                                 max_duration_ms,
@@ -2895,6 +3085,7 @@ async fn run_python_workflow_host_local(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -2926,7 +3117,7 @@ async fn run_python_workflow_host_local(
         collected.join("\n")
     });
 
-    write_host_message(
+    if let Err(error) = write_host_message(
         &mut stdin,
         &json!({
             "type": "workflow.start",
@@ -2936,10 +3127,17 @@ async fn run_python_workflow_host_local(
             "input": input.input,
         }),
     )
-    .await?;
+    .await
+    {
+        drop(stdin);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = stderr_task.await;
+        return Err(error);
+    }
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -2952,6 +3150,7 @@ async fn run_python_workflow_host_local(
             }
             Some("workflow.error") | Some("host.error") => {
                 let stderr = stderr_task.await.unwrap_or_default();
+                let _ = child.wait().await;
                 return Err(WorkflowRuntimeError::Internal(format!(
                     "Python workflow host error: {}{}{}",
                     message
@@ -2985,6 +3184,7 @@ async fn run_python_workflow_host_local(
                     &session_runtime,
                     &input,
                     &workflow_clients,
+                    None,
                 )
                 .await
                 {
@@ -2996,7 +3196,13 @@ async fn run_python_workflow_host_local(
                         return Err(error);
                     }
                 };
-                write_host_message(&mut stdin, &response).await?;
+                if let Err(error) = write_host_message(&mut stdin, &response).await {
+                    drop(stdin);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = stderr_task.await;
+                    return Err(error);
+                }
             }
             other => {
                 return Err(WorkflowRuntimeError::Internal(format!(
@@ -3020,7 +3226,8 @@ async fn run_python_workflow_host_in_sandbox(
     sandbox: WorkflowHostSandboxRuntime,
     workflow_clients: WorkflowQueueClients,
 ) -> Result<Value, WorkflowRuntimeError> {
-    let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+    let (mut spec, workflow_agent_principal) =
+        sandbox.binding_for_workflow(&input.workflow_name)?;
     spec = spec
         .env("WORKFLOW_RUN_ID", ctx.run_id())
         .env("WORKFLOW_TASK_ID", ctx.task_id())
@@ -3047,8 +3254,11 @@ async fn run_python_workflow_host_in_sandbox(
     let result = run_python_workflow_host_protocol(
         input,
         ctx,
-        session_runtime,
-        workflow_clients,
+        WorkflowHostProtocolRuntime {
+            session_runtime,
+            workflow_clients,
+            workflow_agent_principal,
+        },
         &mut stdin,
         io.stdout,
         stderr_task,
@@ -3065,11 +3275,16 @@ fn sandbox_spec_has_env(spec: &SandboxSpec, name: &str) -> bool {
     spec.env.iter().any(|entry| entry.name == name)
 }
 
+struct WorkflowHostProtocolRuntime {
+    session_runtime: SessionRuntime,
+    workflow_clients: WorkflowQueueClients,
+    workflow_agent_principal: Option<String>,
+}
+
 async fn run_python_workflow_host_protocol<W, R>(
     input: WorkflowTaskInput,
     ctx: TaskContext,
-    session_runtime: SessionRuntime,
-    workflow_clients: WorkflowQueueClients,
+    runtime: WorkflowHostProtocolRuntime,
     stdin: &mut W,
     stdout: R,
     stderr_task: JoinHandle<String>,
@@ -3090,8 +3305,8 @@ where
     )
     .await?;
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stdout = BufReader::new(stdout);
+    while let Some(line) = read_host_message_line(&mut stdout).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -3132,9 +3347,10 @@ where
                 let response = handle_python_context_request(
                     &message,
                     &ctx,
-                    &session_runtime,
+                    &runtime.session_runtime,
                     &input,
-                    &workflow_clients,
+                    &runtime.workflow_clients,
+                    runtime.workflow_agent_principal.as_deref(),
                 )
                 .await?;
                 write_host_message(stdin, &response).await?;
@@ -3267,6 +3483,7 @@ async fn handle_python_context_request(
     session_runtime: &SessionRuntime,
     input: &WorkflowTaskInput,
     workflow_clients: &WorkflowQueueClients,
+    workflow_agent_principal: Option<&str>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let request_id = message
         .get("request_id")
@@ -3366,8 +3583,15 @@ async fn handle_python_context_request(
         }
         Some("ctx.agent_turn") => {
             let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-            match run_python_agent_turn(session_runtime.clone(), ctx, input, args, &request_id)
-                .await
+            match run_python_agent_turn(
+                session_runtime.clone(),
+                ctx,
+                input,
+                args,
+                &request_id,
+                workflow_agent_principal,
+            )
+            .await
             {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
@@ -3523,6 +3747,7 @@ async fn run_python_agent_turn(
     input: &WorkflowTaskInput,
     args: Value,
     request_id: &str,
+    workflow_agent_principal: Option<&str>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let text = args
         .get("text")
@@ -3551,14 +3776,12 @@ async fn run_python_agent_turn(
         .get("thread_key")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let workflow_owned_thread = explicit_thread_key.is_none();
-    let thread_key = explicit_thread_key.unwrap_or_else(|| {
-        format!(
-            "wf:{}:agent:{}",
-            ctx.task_id().replace('-', ""),
-            input.workflow_name
-        )
-    });
+    let (thread_key, workflow_owned_thread) = resolve_python_agent_thread(
+        ctx.task_id(),
+        &input.workflow_name,
+        explicit_thread_key,
+        workflow_agent_principal.is_some(),
+    )?;
     let harness_type = parse_agent_harness(&args)?.unwrap_or_else(|| input.harness_type.clone());
     let persona_id = args
         .get("persona_id")
@@ -3614,6 +3837,7 @@ async fn run_python_agent_turn(
     let model = first_str_arg(&args, &["model"]);
     let provider = first_str_arg(&args, &["provider"]);
     let reasoning = first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]);
+    let include_output_lines = parse_include_output_lines(&args)?;
     // Record the model on the execution like the slackbot does, so Console
     // readers can show what a workflow-dispatched turn ran on.
     if let Some(model) = model.as_deref() {
@@ -3631,6 +3855,7 @@ async fn run_python_agent_turn(
             message_metadata,
             execution_metadata,
             execution_idempotency_key,
+            iron_control_principal: workflow_agent_principal.map(ToOwned::to_owned),
             workflow_owned_thread,
             idle_timeout_ms,
             max_duration_ms,
@@ -3640,7 +3865,38 @@ async fn run_python_agent_turn(
         },
     )
     .await?;
-    serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
+    serde_json::to_value(PythonAgentTurnResult::from_agent_turn(
+        result,
+        include_output_lines,
+    ))
+    .map_err(WorkflowRuntimeError::from)
+}
+
+fn resolve_python_agent_thread(
+    task_id: &str,
+    workflow_name: &str,
+    explicit_thread_key: Option<String>,
+    has_scoped_principal: bool,
+) -> Result<(String, bool), WorkflowRuntimeError> {
+    if has_scoped_principal && explicit_thread_key.is_some() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.agent_turn thread_key must be omitted for scoped workflow principals".to_owned(),
+        ));
+    }
+    let workflow_owned_thread = explicit_thread_key.is_none();
+    let thread_key = explicit_thread_key
+        .unwrap_or_else(|| format!("wf:{}:agent:{workflow_name}", task_id.replace('-', "")));
+    Ok((thread_key, workflow_owned_thread))
+}
+
+fn parse_include_output_lines(args: &Value) -> Result<bool, WorkflowRuntimeError> {
+    match args.get("include_output_lines") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(WorkflowRuntimeError::BadRequest(
+            "ctx.agent_turn include_output_lines must be boolean".to_owned(),
+        )),
+    }
 }
 
 /// Returns the first arg key that holds a non-empty (trimmed) string, owned.
@@ -3695,9 +3951,55 @@ where
 {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
+    if line.len() > WORKFLOW_HOST_MAX_MESSAGE_BYTES {
+        return Err(WorkflowRuntimeError::Internal(format!(
+            "workflow host protocol message exceeds {WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+        )));
+    }
     stdin.write_all(&line).await?;
     stdin.flush().await?;
     Ok(())
+}
+
+async fn read_host_message_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, WorkflowRuntimeError> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let consumed = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len() + consumed > WORKFLOW_HOST_MAX_MESSAGE_BYTES {
+            return Err(WorkflowRuntimeError::Internal(format!(
+                "workflow host protocol message exceeds {WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+            )));
+        }
+        line.extend_from_slice(&buffer[..consumed]);
+        let found_newline = buffer.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consumed);
+        if found_newline {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    String::from_utf8(line).map(Some).map_err(|error| {
+        WorkflowRuntimeError::Internal(format!(
+            "workflow host protocol message is not UTF-8: {error}"
+        ))
+    })
 }
 
 fn python_workflow_host_path() -> PathBuf {
@@ -3734,6 +4036,27 @@ fn run_time_now_tool() -> ToolResult {
     }
 }
 
+fn workflow_tool_timeout(message: &Value) -> Result<Duration, WorkflowRuntimeError> {
+    let seconds = if let Some(value) = message.get("timeout_seconds") {
+        value.as_u64().ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.call_tool timeout_seconds must be a positive integer".to_owned(),
+            )
+        })?
+    } else {
+        env::var(WORKFLOW_TOOL_TIMEOUT_SECS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WORKFLOW_TOOL_TIMEOUT_SECS)
+    };
+    if !(1..=MAX_WORKFLOW_TOOL_TIMEOUT_SECS).contains(&seconds) {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "ctx.call_tool timeout_seconds must be between 1 and {MAX_WORKFLOW_TOOL_TIMEOUT_SECS}"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRuntimeError> {
     let tool = message
         .get("tool")
@@ -3764,7 +4087,11 @@ async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRun
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/tools/{tool}/{method}");
     let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-    let request = reqwest::Client::new().post(&url).json(&args);
+    let request = reqwest::Client::builder()
+        .timeout(workflow_tool_timeout(message)?)
+        .build()?
+        .post(&url)
+        .json(&args);
     let response = request.send().await?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
@@ -3923,6 +4250,7 @@ struct AgentTurnRequest {
     message_metadata: Value,
     execution_metadata: Value,
     execution_idempotency_key: String,
+    iron_control_principal: Option<String>,
     workflow_owned_thread: bool,
     idle_timeout_ms: u64,
     max_duration_ms: u64,
@@ -3978,6 +4306,7 @@ async fn run_agent_session_turn(
         message_metadata,
         execution_metadata,
         execution_idempotency_key,
+        iron_control_principal,
         workflow_owned_thread,
         idle_timeout_ms,
         max_duration_ms,
@@ -3990,15 +4319,28 @@ async fn run_agent_session_turn(
     if workflow_owned_thread {
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
-    session_runtime
-        .create_or_get_session(
-            &thread_key,
-            &harness_type,
-            persona_id.as_deref(),
-            Some(session_metadata),
-            HarnessConflictPolicy::Reject,
-        )
-        .await?;
+    if let Some(principal_id) = iron_control_principal.as_deref() {
+        session_runtime
+            .create_or_get_session_bound_to_principal(
+                &thread_key,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+                principal_id,
+            )
+            .await?;
+    } else {
+        session_runtime
+            .create_or_get_session(
+                &thread_key,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+            )
+            .await?;
+    }
     session_runtime
         .append_messages(
             &thread_key,
@@ -4044,20 +4386,22 @@ async fn run_agent_session_turn(
                 }
             }
             "session.execution_completed" => {
+                let result_text = terminal_result_text(&event.payload, &output_lines);
                 return Ok(AgentTurnResult {
                     thread_key: thread_key.into_string(),
                     execution_id: execution.execution_id,
                     status: "completed".to_owned(),
-                    result_text: result_text_from_output_lines(&output_lines),
+                    result_text,
                     output_lines,
                 });
             }
             "session.execution_failed" | "session.execution_cancelled" => {
+                let result_text = terminal_result_text(&event.payload, &output_lines);
                 let result = AgentTurnResult {
                     thread_key: thread_key.into_string(),
                     execution_id: execution.execution_id,
                     status: event.event_type,
-                    result_text: result_text_from_output_lines(&output_lines),
+                    result_text,
                     output_lines,
                 };
                 return Err(WorkflowRuntimeError::Upstream(format!(
@@ -4072,6 +4416,16 @@ async fn run_agent_session_turn(
     Err(WorkflowRuntimeError::Upstream(
         "session event stream ended before terminal execution event".to_owned(),
     ))
+}
+
+fn terminal_result_text(payload: &Value, output_lines: &[String]) -> String {
+    payload
+        .get("result_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| result_text_from_output_lines(output_lines))
 }
 
 fn result_text_from_output_lines(lines: &[String]) -> String {
@@ -4164,6 +4518,294 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use sqlx::{postgres::PgPoolOptions, types::Json};
+    use std::sync::OnceLock;
+
+    fn workflow_run_database_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn optional_workflow_test_client() -> Result<Option<Client>, WorkflowRuntimeError> {
+        let Ok(database_url) = env::var("ABSURD_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?;
+        let has_schema: Option<i32> =
+            sqlx::query_scalar("select 1 from pg_namespace where nspname = 'absurd'")
+                .fetch_optional(&pool)
+                .await?;
+        if has_schema.is_none() {
+            sqlx::raw_sql(include_str!(
+                "../../centaur-session-sqlx/migrations/0007_absurd_workflows.sql"
+            ))
+            .execute(&pool)
+            .await?;
+        }
+        let client = Client::from_pool_with_options(
+            pool,
+            ClientOptions {
+                queue_name: WORKFLOW_QUEUE.to_owned(),
+                ..ClientOptions::default()
+            },
+        )?;
+        client
+            .create_queue(Some(WORKFLOW_QUEUE), CreateQueueOptions::default())
+            .await?;
+        Ok(Some(client))
+    }
+
+    async fn mark_workflow_run_running(
+        pool: &sqlx::PgPool,
+        run_id: &str,
+    ) -> Result<(), WorkflowRuntimeError> {
+        let mut transaction = pool.begin().await?;
+        sqlx::query(
+            r#"
+            update absurd.t_centaur_workflows t
+            set state = 'running',
+                first_started_at = coalesce(first_started_at, absurd.current_time())
+            from absurd.r_centaur_workflows r
+            where r.run_id = $1::uuid
+              and t.task_id = r.task_id
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            update absurd.r_centaur_workflows
+            set state = 'running',
+                started_at = coalesce(started_at, absurd.current_time())
+            where run_id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn fail_workflow_run(
+        pool: &sqlx::PgPool,
+        run_id: &str,
+        failure: Value,
+    ) -> Result<(), WorkflowRuntimeError> {
+        sqlx::query("select absurd.fail_run($1, $2::uuid, $3::jsonb, null)")
+            .bind(WORKFLOW_QUEUE)
+            .bind(run_id)
+            .bind(Json(failure))
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn await_workflow_event_without_timeout(
+        pool: &sqlx::PgPool,
+        task_id: &str,
+        run_id: &str,
+    ) -> Result<(), WorkflowRuntimeError> {
+        let should_suspend: bool = sqlx::query_scalar(
+            r#"
+            select should_suspend
+            from absurd.await_event(
+                $1,
+                $2::uuid,
+                $3::uuid,
+                'wait_for_test_event',
+                'workflow_retry_test_event',
+                null
+            )
+            "#,
+        )
+        .bind(WORKFLOW_QUEUE)
+        .bind(task_id)
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
+        assert!(should_suspend);
+        Ok(())
+    }
+
+    async fn latest_workflow_attempt(
+        pool: &sqlx::PgPool,
+        task_id: &str,
+    ) -> Result<(String, OffsetDateTime), WorkflowRuntimeError> {
+        let row = sqlx::query(
+            r#"
+            select
+                r.run_id::text as run_id,
+                greatest(t.enqueue_at, r.available_at) as updated_at
+            from absurd.t_centaur_workflows t
+            join absurd.r_centaur_workflows r on r.run_id = t.last_attempt_run
+            where t.task_id = $1::uuid
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(pool)
+        .await?;
+        Ok((row.try_get("run_id")?, row.try_get("updated_at")?))
+    }
+
+    fn workflow_test_spawn_options() -> SpawnOptions {
+        SpawnOptions {
+            queue: Some(WORKFLOW_QUEUE.to_owned()),
+            max_attempts: Some(2),
+            ..SpawnOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_successful_retry_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_success",
+                    "input": {"case": "success"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, json!({"attempt": "first"})).await?;
+        let (latest_run_id, latest_updated_at) =
+            latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        assert_ne!(latest_run_id, spawned.run_id);
+        let pending_run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should resolve while its retry is pending");
+        assert_eq!(pending_run.run_id, spawned.run_id);
+        assert_eq!(pending_run.status, "pending");
+        assert_eq!(pending_run.result, None);
+        assert_eq!(pending_run.failure, None);
+        assert_eq!(pending_run.updated_at, latest_updated_at);
+
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        sqlx::query("select absurd.complete_run($1, $2::uuid, $3::jsonb)")
+            .bind(WORKFLOW_QUEUE)
+            .bind(&latest_run_id)
+            .bind(Json(json!({"ok": true})))
+            .execute(client.pool())
+            .await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should remain queryable after a retry");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.result, Some(json!({"ok": true})));
+        assert_eq!(run.failure, None);
+        assert_eq!(run.attempts, 2);
+        assert_eq!(run.updated_at, latest_updated_at);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_latest_exhausted_retry_failure_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_exhaustion",
+                    "input": {"case": "failure"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+        let first_failure = json!({"attempt": "first"});
+        let latest_failure = json!({"attempt": "latest"});
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, first_failure.clone()).await?;
+        let (latest_run_id, latest_updated_at) =
+            latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        assert_ne!(latest_run_id, spawned.run_id);
+
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        fail_workflow_run(client.pool(), &latest_run_id, latest_failure.clone()).await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should remain queryable after retries are exhausted");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.result, None);
+        assert_eq!(run.failure, Some(latest_failure));
+        assert_ne!(run.failure, Some(first_failure));
+        assert_eq!(run.attempts, 2);
+        assert_eq!(run.updated_at, latest_updated_at);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_run_id_tracks_indefinitely_sleeping_retry_when_database_url_is_set()
+    -> Result<(), WorkflowRuntimeError> {
+        let _guard = workflow_run_database_lock().lock().await;
+        let Some(client) = optional_workflow_test_client().await? else {
+            return Ok(());
+        };
+        let spawned = client
+            .spawn(
+                WORKFLOW_TASK,
+                json!({
+                    "workflow_name": "retry_event_wait",
+                    "input": {"case": "sleeping"}
+                }),
+                workflow_test_spawn_options(),
+            )
+            .await?;
+
+        mark_workflow_run_running(client.pool(), &spawned.run_id).await?;
+        fail_workflow_run(client.pool(), &spawned.run_id, json!({"attempt": "first"})).await?;
+        let (latest_run_id, _) = latest_workflow_attempt(client.pool(), &spawned.task_id).await?;
+        mark_workflow_run_running(client.pool(), &latest_run_id).await?;
+        await_workflow_event_without_timeout(client.pool(), &spawned.task_id, &latest_run_id)
+            .await?;
+
+        let run = fetch_run_for_queue(client.pool(), WORKFLOW_QUEUE, &spawned.run_id)
+            .await?
+            .expect("original run id should resolve while its retry waits indefinitely");
+        assert_eq!(run.run_id, spawned.run_id);
+        assert_eq!(run.task_id, spawned.task_id);
+        assert_eq!(run.status, "sleeping");
+        assert_eq!(run.result, None);
+        assert_eq!(run.failure, None);
+        assert_eq!(run.updated_at, run.created_at);
+
+        let listed_run = fetch_runs_for_queue(client.pool(), WORKFLOW_QUEUE, 200)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.task_id == spawned.task_id)
+            .expect("indefinitely sleeping retry should remain listable");
+        assert_eq!(listed_run.run_id, latest_run_id);
+        assert_eq!(listed_run.status, "sleeping");
+        assert_eq!(listed_run.result, None);
+        assert_eq!(listed_run.failure, None);
+        assert_eq!(listed_run.updated_at, listed_run.created_at);
+
+        Ok(())
+    }
 
     #[test]
     fn python_event_names_are_collision_free() {
@@ -4208,6 +4850,136 @@ mod tests {
     }
 
     #[test]
+    fn python_agent_turn_result_can_omit_raw_output_lines() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["x".repeat(3 * 1024 * 1024)],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, false)).unwrap();
+
+        assert_eq!(value.get("result_text"), Some(&json!("final report")));
+        assert!(value.get("output_lines").is_none());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 1_024);
+    }
+
+    #[test]
+    fn python_agent_turn_result_includes_raw_output_lines_by_default() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["raw event".to_owned()],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, true)).unwrap();
+
+        assert_eq!(value.get("output_lines"), Some(&json!(["raw event"])));
+    }
+
+    #[test]
+    fn include_output_lines_is_strict_and_defaults_to_compatible_shape() {
+        assert!(parse_include_output_lines(&json!({})).unwrap());
+        assert!(
+            !parse_include_output_lines(&json!({
+                "include_output_lines": false
+            }))
+            .unwrap()
+        );
+        assert!(
+            parse_include_output_lines(&json!({"include_output_lines": "false"}))
+                .unwrap_err()
+                .to_string()
+                .contains("include_output_lines must be boolean")
+        );
+    }
+
+    #[test]
+    fn scoped_workflow_agent_threads_are_server_owned_and_per_task() {
+        let first =
+            resolve_python_agent_thread("task-111", "planetscale_daily_audit", None, true).unwrap();
+        let second =
+            resolve_python_agent_thread("task-222", "planetscale_daily_audit", None, true).unwrap();
+
+        assert_eq!(
+            first,
+            ("wf:task111:agent:planetscale_daily_audit".to_owned(), true)
+        );
+        assert_ne!(first.0, second.0);
+    }
+
+    #[test]
+    fn scoped_workflow_agent_rejects_caller_selected_thread() {
+        let error = resolve_python_agent_thread(
+            "task-111",
+            "planetscale_daily_audit",
+            Some("workflow:shared".to_owned()),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("thread_key must be omitted"));
+        assert_eq!(
+            resolve_python_agent_thread(
+                "task-111",
+                "ordinary_workflow",
+                Some("workflow:shared".to_owned()),
+                false,
+            )
+            .unwrap(),
+            ("workflow:shared".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn terminal_result_text_prefers_persisted_result() {
+        let output_lines = vec![json!({"delta": "fallback"}).to_string()];
+
+        assert_eq!(
+            terminal_result_text(
+                &json!({"result_text": "  persisted final report  "}),
+                &output_lines,
+            ),
+            "persisted final report"
+        );
+        assert_eq!(terminal_result_text(&json!({}), &output_lines), "fallback");
+    }
+
+    #[tokio::test]
+    async fn workflow_host_message_rejects_oversized_frame() {
+        let mut sink = tokio::io::sink();
+        let message = json!({"value": "x".repeat(WORKFLOW_HOST_MAX_MESSAGE_BYTES)});
+
+        let error = write_host_message(&mut sink, &message).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow host protocol message exceeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_host_reader_rejects_oversized_frame() {
+        let input = vec![b'x'; WORKFLOW_HOST_MAX_MESSAGE_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+
+        let error = read_host_message_line(&mut reader).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow host protocol message exceeds")
+        );
+    }
+
+    #[test]
     fn first_str_arg_picks_first_non_empty_alias() {
         let args = json!({"reasoning": "  ", "reasoning_effort": " high ", "effort": "low"});
         assert_eq!(
@@ -4232,6 +5004,19 @@ mod tests {
     }
 
     #[test]
+    fn workflow_tool_timeout_accepts_bounded_per_call_override() {
+        assert_eq!(
+            workflow_tool_timeout(&json!({"timeout_seconds": 42})).unwrap(),
+            Duration::from_secs(42)
+        );
+        assert!(workflow_tool_timeout(&json!({"timeout_seconds": 0})).is_err());
+        assert!(
+            workflow_tool_timeout(&json!({"timeout_seconds": MAX_WORKFLOW_TOOL_TIMEOUT_SECS + 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn normalizes_interval_schedule_with_delivery_metadata() {
         let schedule = normalize_schedule(json!({
             "workflow_name": "slack_sync",
@@ -4246,12 +5031,48 @@ mod tests {
         assert!(schedule.enabled);
         assert!(schedule.no_delivery);
         assert_eq!(
+            schedule.overlap_policy,
+            WorkflowScheduleOverlapPolicy::Allow
+        );
+        assert_eq!(schedule.max_duration_seconds, None);
+        assert_eq!(
             schedule.input.pointer("/metadata/source"),
             Some(&json!("workflow_schedule"))
         );
         assert_eq!(
             schedule.input.pointer("/metadata/no_delivery"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn normalizes_schedule_execution_bounds() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "pr_status_monitor",
+            "schedule_id": "pr_status_monitor",
+            "cron": "* 9-21 * * *",
+            "overlap_policy": "skip",
+            "max_duration_seconds": 55,
+        }))
+        .unwrap();
+
+        assert_eq!(schedule.overlap_policy, WorkflowScheduleOverlapPolicy::Skip);
+        assert_eq!(schedule.max_duration_seconds, Some(55));
+        assert!(
+            normalize_schedule(json!({
+                "workflow_name": "invalid_overlap",
+                "interval_seconds": 60,
+                "overlap_policy": "queue",
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_schedule(json!({
+                "workflow_name": "invalid_duration",
+                "interval_seconds": 60,
+                "max_duration_seconds": 0,
+            }))
+            .is_err()
         );
     }
 
@@ -4511,13 +5332,25 @@ mod tests {
     #[test]
     fn workflow_principal_foreign_id_is_derived_from_workflow_name() {
         assert_eq!(
-            canonical_workflow_principal_foreign_id("nightly_report"),
+            workflow_principal("nightly_report").foreign_id,
             "workflow-nightly-report"
         );
         assert_eq!(
-            canonical_workflow_principal_foreign_id("Managing Partner Daily Briefing"),
+            workflow_principal("Managing Partner Daily Briefing").foreign_id,
             "workflow-managing-partner-daily-briefing"
         );
+    }
+
+    #[test]
+    fn workflow_principal_foreign_ids_must_be_unique() {
+        let error = validate_workflow_principal_foreign_ids(&BTreeSet::from([
+            "daily_audit".to_owned(),
+            "daily-audit".to_owned(),
+        ]))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("same principal"));
+        assert!(error.to_string().contains("workflow-daily-audit"));
     }
 
     #[test]
@@ -4530,6 +5363,49 @@ mod tests {
             labels.get("workflow_name").map(String::as_str),
             Some("nightly_report")
         );
+    }
+
+    #[test]
+    fn existing_workflow_principal_must_match_its_exact_identity() {
+        let required = workflow_principal_labels("nightly_report");
+        let matching = Principal {
+            id: "prn_matching".to_owned(),
+            namespace: "default".to_owned(),
+            foreign_id: Some("workflow-nightly-report".to_owned()),
+            name: "Workflow nightly_report".to_owned(),
+            labels: {
+                let mut labels = required.clone();
+                labels.insert("grant-owner".to_owned(), "operator".to_owned());
+                labels
+            },
+            sandbox_observability_enabled: true,
+            sandbox_api_server_enabled: true,
+        };
+
+        let labels = merge_existing_workflow_principal_labels(
+            "nightly_report",
+            "workflow-nightly-report",
+            &matching,
+            required.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            labels.get("grant-owner").map(String::as_str),
+            Some("operator")
+        );
+
+        let mut aliased = matching;
+        aliased
+            .labels
+            .insert("workflow_name".to_owned(), "nightly-report".to_owned());
+        let error = merge_existing_workflow_principal_labels(
+            "nightly_report",
+            "workflow-nightly-report",
+            &aliased,
+            required,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different identity"));
     }
 
     #[test]

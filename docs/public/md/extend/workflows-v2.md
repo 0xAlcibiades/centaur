@@ -64,6 +64,7 @@ Supported v2 primitives:
 | `ctx._pool` | Supported when the workflow-host sandbox receives `DATABASE_URL` |
 | `WEBHOOKS` | Supported |
 | `SCHEDULE` | Supported |
+| `WORKFLOW_PRINCIPAL` | Supported for scoped workflow-host and agent-sandbox permissions |
 
 ## Required migrations
 
@@ -108,7 +109,6 @@ Use `ctx.agent_turn(...)` when the workflow needs an agent sandbox:
 ```python
 result = await ctx.agent_turn(
     "Investigate this alert and return the next action.",
-    thread_key=f"workflow:{ctx.run_id}:agent",
     harness="codex",
     model="gpt-5.2",
     reasoning="high",
@@ -118,7 +118,48 @@ result = await ctx.agent_turn(
 
 The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
-session runtime.
+session runtime. Unscoped workflows may pass an explicit `thread_key` when they
+intentionally need a shared thread. Scoped workflows must omit it; api-rs owns a
+fresh per-task thread and reuses that thread only for turns in the same task.
+
+Agent-turn results include the raw `output_lines` event stream by default for
+compatibility. When a workflow only needs the terminal answer, pass
+`include_output_lines=False`; the response omits `output_lines` and keeps the
+authoritative terminal answer in `result_text`.
+
+#### Declare Workflow Permissions
+
+When a workflow or one of its agent turns needs scoped tools, declare the
+principal that should own those permissions:
+
+```python
+WORKFLOW_NAME = "nightly_report"
+WORKFLOW_PRINCIPAL = True
+```
+
+The API derives and registers the `workflow-nightly-report` principal in the
+Centaur Console, runs that workflow's host sandbox under it, and binds its agent
+sessions to the same principal. Grant only the roles or secrets that workflow
+needs:
+
+```bash
+cargo run -p centaur-perms -- \
+  principals grant workflow-nightly-report \
+  --workflow-name nightly_report \
+  --tool slack
+```
+
+The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
+Workflow code cannot choose another principal id, display name, or labels. An
+The required `--workflow-name` flag makes pre-granting create those exact labels;
+it can explicitly claim an older untyped Centaur-managed principal with the same
+canonical id, but rejects a conflicting typed identity. api-rs likewise fails
+closed instead of reusing a principal left by a differently named workflow.
+Scoped `ctx.agent_turn(...)` calls cannot choose `thread_key`, so a workflow
+cannot attach its grants to an unrelated session. `WORKFLOW_PRINCIPAL = True`
+requires `apiRs.workflowHostSandbox=true`, which renders
+`WORKFLOW_HOST_SANDBOX=true`; startup fails if a workflow declares a principal
+while workflow-host sandboxing is disabled.
 
 #### Pick the model and reasoning effort
 

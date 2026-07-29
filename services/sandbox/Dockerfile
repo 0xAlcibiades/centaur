@@ -79,6 +79,8 @@ ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
+ARG PLANETSCALE_MCP_COMMIT=56a05b658de1d2035510708f3a51ec224048f4ee
+ARG PLANETSCALE_MCP_SHA256=e27b7b6d802ecb89cb871a02e61c4481688af8856e0fbee49df79f2ca0cb2c6d
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -128,6 +130,26 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
 
+# ── PlanetScale MCP server ──────────────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    set -eux; \
+    curl -fsSL \
+      "https://github.com/planetscale/mcp-server/archive/${PLANETSCALE_MCP_COMMIT}.tar.gz" \
+      -o /tmp/planetscale-mcp.tar.gz; \
+    echo "${PLANETSCALE_MCP_SHA256}  /tmp/planetscale-mcp.tar.gz" | sha256sum -c -; \
+    install -d -m 0755 /opt/planetscale-mcp; \
+    tar -xzf /tmp/planetscale-mcp.tar.gz -C /opt/planetscale-mcp --strip-components=1; \
+    cd /opt/planetscale-mcp; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    env -u PLANETSCALE_API_TOKEN sh -c 'printf "%s\n" \
+      '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"centaur-image-smoke","version":"1.0"}}}'\'' \
+      '\''{"jsonrpc":"2.0","method":"notifications/initialized"}'\'' \
+      '\''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'\'' \
+      | node /opt/planetscale-mcp/src/server.ts 2>/tmp/planetscale-mcp-smoke.log \
+      | jq -e '\''select(.id == 2) | [.result.tools[].name] | index("get_insights") != null'\'''; \
+    chmod -R a+rX /opt/planetscale-mcp; \
+    rm -f /tmp/planetscale-mcp.tar.gz /tmp/planetscale-mcp-smoke.log
+
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -166,6 +188,23 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && cargo +nightly fmt --version \
     && cargo +nightly clippy --version \
     && rm -rf "$HOME/.rustup/toolchains"/*/share/doc "$HOME/.rustup/toolchains"/*/share/man
+ARG SCCACHE_VERSION=0.15.0
+RUN set -eux; \
+    sccache_arch="$(case "$(dpkg --print-architecture)" in \
+      amd64) echo x86_64 ;; \
+      arm64) echo aarch64 ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac)"; \
+    sccache_pkg="sccache-v${SCCACHE_VERSION}-${sccache_arch}-unknown-linux-musl"; \
+    sccache_base="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${sccache_pkg}.tar.gz"; \
+    curl -fsSL "$sccache_base" -o /tmp/sccache.tar.gz; \
+    curl -fsSL "${sccache_base}.sha256" -o /tmp/sccache.sha256; \
+    echo "$(cat /tmp/sccache.sha256)  /tmp/sccache.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${sccache_pkg}/sccache" "$HOME/.cargo/bin/sccache"; \
+    rm -rf /tmp/sccache.tar.gz /tmp/sccache.sha256 "/tmp/${sccache_pkg}"; \
+    mkdir -p "$HOME/.cache/sccache"; \
+    sccache --version
 RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cache/kache-install-target,uid=1001,gid=1001,sharing=locked \
@@ -213,7 +252,9 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
     && git config --global --add safe.directory '*' \
-    && git config --global user.useConfigOnly true
+    && git config --global user.useConfigOnly true \
+    && git config --global user.name "pseudolabel" \
+    && git config --global user.email "sudolabel@safeon.de"
 
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
@@ -234,6 +275,10 @@ COPY --link --chmod=0755 services/sandbox/git-hooks/ /opt/centaur/git-hooks/
 COPY --link --chown=1001:1001 tools/ /opt/centaur/tools/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
+COPY --link --chmod=755 services/sandbox/github-gist.sh /usr/local/bin/github-gist
+COPY --link --chmod=755 services/sandbox/github-link.sh /usr/local/bin/github-link
+COPY --link --chmod=755 services/sandbox/share-artifact.sh /usr/local/bin/share-artifact
+COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
 COPY --link services/workflow-python/api/ /usr/local/bin/api/

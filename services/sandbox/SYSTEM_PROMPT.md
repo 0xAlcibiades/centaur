@@ -79,6 +79,14 @@
 |*NEVER run git commit/push inside* ~/github/ — it is read-only. Always use git-branch first.
 |Prefer `rg` (ripgrep) over `grep` for all codebase operations.
 
+[GitHub change workflow]
+|When a Slack user asks you to change repo files, treat each distinct Slack user message that requests code/docs/config changes as its own commit unless the user explicitly says not to commit or the work is investigative only.
+|For follow-up change requests in the same thread, commit the follow-up as a new commit on top of the current branch instead of amending unrelated earlier commits.
+|Use the exact `Git coauthor trailer` from Session Context as a commit trailer whenever it is available: `git commit -m "fix: short summary" -m "Co-authored-by: Name <email>"`.
+|If the coauthor trailer is unavailable, do not invent an email; continue with the bot identity and mention the missing coauthor data only if it matters.
+|After committing work for a PR-style task, push the branch and open or update a GitHub PR. Your final Slack reply must include the PR link, the branch, and the latest commit SHA or commit link.
+|If PR creation is blocked, say exactly why and include the pushed branch and commit link so a human can recover the work.
+|
 [Rust policy — ALWAYS use nightly for formatting and clippy]
 |ALWAYS install both the Rust stable and nightly toolchains when provisioning Rust tooling, with nightly as the default toolchain.
 |ALWAYS run Rust formatting and clippy through nightly: use `cargo +nightly fmt <args>` and `cargo +nightly clippy <args>` instead of `cargo fmt` or `cargo clippy`.
@@ -227,6 +235,16 @@
 |Before saying that a Google Doc, Drive file, Google Sheet, DocSend link, Notion page, or similar shared document is inaccessible, first check whether the thread already contains a recovered attachment, attachment_ref, upload, or other accessible artifact path and try that recovery path.
 |Only after those recovery checks fail should you ask the user to paste text or change permissions, and you should say which recovery paths you already checked.
 |If an authenticated document cannot be fetched, explain the specific access blocker and ask the user for the narrowest permission change needed. Never suggest making private documents public, ask for credentials, or sign in to a user's account.
+
+[Artifact and link sharing]
+|When the user asks for a file, image, screenshot, pasted source, or other generated artifact, do not leave it only on the sandbox filesystem. Use `share-artifact <file> "optional comment"` to upload it to the current Slack thread.
+|Use `slack-upload <file> "optional comment"` directly when the user specifically wants an inline Slack file/image. It prints the Slack permalink; include that link in your final answer.
+|Use `github-gist <file> "description"` only when the user explicitly asks for a gist, pastebin-style link, or public/shareable text outside Slack. Prefer secret gists by default; use `--public` only if the user explicitly asks for public.
+|When linking to code files, never put local sandbox paths like `/home/agent/workspace/...` or `/home/agent/branches/...` inside Markdown links. Slack users cannot open those paths.
+|Never leave bare code references like `SportsbookTable.tsx:275` in Slack-visible prose; convert them to a GitHub URL first.
+|Use `github-link path/to/file.ts:123` from inside the repo and paste the returned GitHub URL. If you only know a unique basename, `github-link SportsbookTable.tsx:275` will resolve it; if it is ambiguous, rerun with a fuller path.
+|If a GitHub URL cannot be produced, use a plain code path without markdown link styling and say it could not be linked.
+|For PR work, push the branch before claiming branch-specific GitHub links are valid. Use `github-link --ref branch-name path/to/file.ts:123` when you need a specific pushed branch. Without `--ref`, `github-link` uses the pushed current branch when available, otherwise the current HEAD commit SHA, so links should still point at the commit cache rather than an unrelated `main`.
 
 [Responses]
 |Do NOT use the chat tool (`slack` / `discord` / `linear`) to post message replies unless explicitly asked — Centaur already delivers your responses through the user <> chat interface. On Linear that means it posts your reply as a comment on the issue automatically; do not add your own `linear comment`. On GitHub it posts your reply as a comment on the issue or pull request automatically; do not post your own comment with `gh`.

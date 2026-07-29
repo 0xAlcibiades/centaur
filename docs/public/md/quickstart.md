@@ -48,6 +48,9 @@ The `Justfile` builds local images named `centaur-api-rs:latest`,
 
 The default local chart expects one infra Secret named `centaur-infra-env`.
 `just bootstrap-secrets` creates it from your shell environment.
+The local recipes pass the same `CENTAUR_IRON_PROXY_SECRET_SOURCE` value to the
+bootstrap script and Helm; it defaults to `onepassword`, matching the chart.
+Set it to `env` only when deploying environment-backed credentials.
 
 `just bootstrap-secrets` currently requires these shell variables:
 
@@ -68,6 +71,14 @@ resolve model and tool credentials through 1Password. `SLACK_SIGNING_SECRET`
 and `SLACKBOT_API_KEY` are API boot requirements in the current chart.
 `SLACK_BOT_TOKEN` is required by the default local bootstrap because Slackbot is
 enabled in `values.dev.yaml`; use a real token if you want to test Slack.
+
+With the default `onepassword` source, bootstrap writes
+`OP_SERVICE_ACCOUNT_TOKEN` only to the dedicated
+`centaur-iron-proxy-source-auth` Secret. Sandbox proxy Pods receive that one
+key through `secretKeyRef`, never the full `centaur-infra-env` Secret. To use
+Connect instead, set `CENTAUR_IRON_PROXY_SECRET_SOURCE=onepassword-connect`
+and export `OP_CONNECT_TOKEN` (plus `OP_CONNECT_CREDENTIALS_FILE`) rather than
+using the service-account token.
 
 `SLACKBOT_API_KEY` is a static service token. The API bootstraps that value into
 Postgres on startup, so it must exist before `just up`.
