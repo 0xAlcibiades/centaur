@@ -28,6 +28,7 @@ use crate::util::{managed_labels, slugify};
 const KIND_LABEL: &str = "kind";
 const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
+const WORKFLOW_KIND: &str = "workflow";
 
 /// The principal a session resolves to, as a stable upsert key plus a label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +50,18 @@ impl PrincipalRef {
             name: self.name.clone(),
             labels,
         }
+    }
+}
+
+/// Derive the canonical principal owned by a scoped workflow.
+pub fn workflow_principal(workflow_name: &str) -> PrincipalRef {
+    PrincipalRef {
+        foreign_id: format!("workflow-{}", slugify(workflow_name)),
+        name: format!("Workflow {workflow_name}"),
+        labels: BTreeMap::from([
+            (KIND_LABEL.to_owned(), WORKFLOW_KIND.to_owned()),
+            ("workflow_name".to_owned(), workflow_name.to_owned()),
+        ]),
     }
 }
 
