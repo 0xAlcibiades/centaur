@@ -366,17 +366,20 @@ profiles; obtain the workspace ID from Slack's `auth.test` response or the
 workspace administration page. `credentialsSecretName` must not name the
 shared Centaur infrastructure Secret.
 
-Operators can run `/autorotate status` from Slack for aggregate capacity.
-`/autorotate accounts` is DM-only and shows the operator-safe account list:
-label, email, enabled/disabled/dead status, rate-limit end, and whether login is
-required. It never includes account IDs, provider subjects, ownership, usage,
-or auth data.
+Allowlisted operators can run every `/autorotate` subcommand from any Slack
+conversation. Slackbot sends both the immediate acknowledgement and every
+follow-up through Slack's ephemeral response path, so account emails, device
+links, and device codes are visible only to the invoking operator. `/autorotate
+status` shows aggregate capacity. `/autorotate accounts` shows the operator-safe
+account list: label, email, enabled/disabled/dead status, rate-limit end, and
+whether login is required. It never includes account IDs, provider subjects,
+ownership, usage, or auth data.
 
-Account enrollment is also DM-only. `/autorotate login` returns a private device
-link and code, polls the broker, and replaces that response when enrollment
-reaches a terminal state. A reauthentication alert can be pasted back verbatim
-as `/autorotate login relogin <label>`; Slackbot validates the exact label
-against the safe account list and supplies the known email to the broker.
+`/autorotate login` returns the ephemeral device link and code, polls the broker,
+and replaces that response when enrollment reaches a terminal state. A
+reauthentication alert can be pasted back verbatim as `/autorotate login relogin
+<label>`; Slackbot validates the exact label against the safe account list and
+supplies the known email to the broker.
 Labels containing spaces or control characters use a JSON string as the final
 argument, for example `/autorotate login relogin "legacy primary"`; alerts use
 this same deterministic quoting rule.

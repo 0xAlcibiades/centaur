@@ -309,7 +309,6 @@ export function createAutorotateSlackCommandHandler(
 
       const teamId = form.get('team_id')?.trim() ?? ''
       const userId = form.get('user_id')?.trim() ?? ''
-      const channelId = form.get('channel_id')?.trim() ?? ''
       if (!authorizedOperator(options, teamId, userId)) {
         return ephemeralResponse('You are not authorized to operate the Codex account pool.')
       }
@@ -326,9 +325,6 @@ export function createAutorotateSlackCommandHandler(
           respondWithStatus(client, form, options, fetchFn)
         )
         return ephemeralResponse('Checking the Codex account pool…')
-      }
-      if (!channelId.startsWith('D')) {
-        return ephemeralResponse('For account security, run this command in a DM with me.')
       }
 
       if (command.kind === 'accounts') {
@@ -968,7 +964,7 @@ function helpText(): string {
     '*Autorotate commands*',
     '• `/autorotate status` — redacted pool health and capacity',
     '• `/autorotate accounts` — private account emails and status',
-    '• `/autorotate login [label] [expected-email]` — add an account from a DM',
+    '• `/autorotate login [label] [expected-email]` — privately add an account',
     '• `/autorotate login relogin <label> [expected-email]` — reauthenticate an account',
     '• `/autorotate login status` — check your active login',
     '• `/autorotate login cancel` — cancel your active login'

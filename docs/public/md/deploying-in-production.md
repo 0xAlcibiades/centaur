@@ -289,14 +289,20 @@ Use the app page to install the bot, copy the Bot User OAuth Token for
 5. Enable Event Subscriptions.
 6. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
 7. Subscribe to `app_mention` and to the message events you want Centaur to see:
-   `message.channels`, `message.groups`, and `message.im`.
+   `message.channels`, `message.groups`, and `message.im`. To automatically join
+   newly-created public channels, set `slackbotv2.autoJoinCreatedChannels` to
+   `true` and subscribe to `channel_created`.
 8. Enable Interactivity and set its Request URL to the same
    `https://<your-host>/api/webhooks/slack` URL. Block Kit actions are emitted
    to the workflow engine as `slack.block_action.<action_id>` events.
 
 The Slackbot normalizes Slack `app_mention` and `message` events plus
-`block_actions` interactions. Do not rely on assistant-specific Slack event
-types unless the Slackbot code has explicit support for them.
+`block_actions` interactions. When `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` is
+enabled, it also joins newly-created public channels from subscribed
+`channel_created` events. The Slack app needs `channels:read` to receive those
+events and `channels:join` for the auto-join behavior. Do not rely on
+assistant-specific Slack event types unless the Slackbot code has explicit
+support for them.
 
 Do not put Centaur API-key auth in front of `/api/webhooks/slack`; the Slackbot
 validates Slack's signature and then calls the Centaur API separately.
@@ -360,17 +366,20 @@ profiles; obtain the workspace ID from Slack's `auth.test` response or the
 workspace administration page. `credentialsSecretName` must not name the
 shared Centaur infrastructure Secret.
 
-Operators can run `/autorotate status` from Slack for aggregate capacity.
-`/autorotate accounts` is DM-only and shows the operator-safe account list:
-label, email, enabled/disabled/dead status, rate-limit end, and whether login is
-required. It never includes account IDs, provider subjects, ownership, usage,
-or auth data.
+Allowlisted operators can run every `/autorotate` subcommand from any Slack
+conversation. Slackbot sends both the immediate acknowledgement and every
+follow-up through Slack's ephemeral response path, so account emails, device
+links, and device codes are visible only to the invoking operator. `/autorotate
+status` shows aggregate capacity. `/autorotate accounts` shows the operator-safe
+account list: label, email, enabled/disabled/dead status, rate-limit end, and
+whether login is required. It never includes account IDs, provider subjects,
+ownership, usage, or auth data.
 
-Account enrollment is also DM-only. `/autorotate login` returns a private device
-link and code, polls the broker, and replaces that response when enrollment
-reaches a terminal state. A reauthentication alert can be pasted back verbatim
-as `/autorotate login relogin <label>`; Slackbot validates the exact label
-against the safe account list and supplies the known email to the broker.
+`/autorotate login` returns the ephemeral device link and code, polls the broker,
+and replaces that response when enrollment reaches a terminal state. A
+reauthentication alert can be pasted back verbatim as `/autorotate login relogin
+<label>`; Slackbot validates the exact label against the safe account list and
+supplies the known email to the broker.
 Labels containing spaces or control characters use a JSON string as the final
 argument, for example `/autorotate login relogin "legacy primary"`; alerts use
 this same deterministic quoting rule.

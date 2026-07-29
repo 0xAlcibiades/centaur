@@ -83,7 +83,7 @@ function logger(logs: Array<{ data?: unknown; event: string }>): Logger {
 function commandRequest(
   text: string,
   {
-    channelId = 'D123456789',
+    channelId = 'C123456789',
     signatureValid = true,
     teamId = TEAM_ID,
     userId = USER_ID
@@ -270,23 +270,7 @@ describe('Autorotate Slack command', () => {
     expect(JSON.stringify(slackCall?.body)).not.toContain('must-not-render')
   })
 
-  it('refuses to start login outside a DM', async () => {
-    const handler = testHandler(async () => {
-      throw new Error('must not fetch')
-    })
-
-    const response = await handleAndWait(
-      handler,
-      commandRequest('login', { channelId: 'C123456789' })
-    )
-
-    expect(await response.json()).toEqual({
-      response_type: 'ephemeral',
-      text: 'For account security, run this command in a DM with me.'
-    })
-  })
-
-  it('sends a device code only to the private response URL and replaces it on completion', async () => {
+  it('starts login from a channel, sends the code only ephemerally, and replaces it on completion', async () => {
     const calls: FetchCall[] = []
     const logs: Array<{ data?: unknown; event: string }> = []
     const handler = testHandler(async (input, init) => {
@@ -329,15 +313,24 @@ describe('Autorotate Slack command', () => {
       response_type: 'ephemeral',
       text: 'Starting a private Codex device login…'
     })
-    const slackBodies = calls
+    const slackResponses = calls
       .filter(call => call.url === RESPONSE_URL)
-      .map(call => JSON.stringify(call.body))
-    expect(slackBodies).toHaveLength(2)
-    expect(slackBodies[0]).toContain('ABCD-EFGH')
-    expect(slackBodies[0]).toContain('response_type')
-    expect(slackBodies[1]).not.toContain('ABCD-EFGH')
-    expect(slackBodies[1]).not.toContain('refresh_token')
-    expect(slackBodies[1]).toContain('was added to Autorotate')
+      .map(call => call.body)
+    expect(slackResponses).toHaveLength(2)
+    expect(slackResponses).toEqual([
+      expect.objectContaining({
+        replace_original: true,
+        response_type: 'ephemeral',
+        text: expect.stringContaining('ABCD-EFGH')
+      }),
+      expect.objectContaining({
+        replace_original: true,
+        response_type: 'ephemeral',
+        text: expect.stringContaining('was added to Autorotate')
+      })
+    ])
+    expect(JSON.stringify(slackResponses[1])).not.toContain('ABCD-EFGH')
+    expect(JSON.stringify(slackResponses[1])).not.toContain('refresh_token')
     expect(JSON.stringify(logs)).not.toContain('ABCD-EFGH')
     expect(JSON.stringify(logs)).not.toContain('refresh_token')
     expect(JSON.stringify(calls.filter(call => call.url !== RESPONSE_URL))).not.toContain('ABCD-EFGH')
@@ -409,7 +402,7 @@ describe('Autorotate Slack command', () => {
     })
   })
 
-  it('shows operator-only account emails and status in a private response', async () => {
+  it('shows operator-only account emails and status ephemerally from a channel', async () => {
     const calls: FetchCall[] = []
     const handler = testHandler(async (input, init) => {
       const url = String(input)
@@ -436,9 +429,17 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    await handleAndWait(handler, commandRequest('accounts'))
+    const response = await handleAndWait(handler, commandRequest('accounts'))
 
     const slackBody = calls.find(call => call.url === RESPONSE_URL)?.body
+    expect(await response.json()).toEqual({
+      response_type: 'ephemeral',
+      text: 'Checking private Codex account status…'
+    })
+    expect(slackBody).toMatchObject({
+      replace_original: true,
+      response_type: 'ephemeral'
+    })
     expect(JSON.stringify(slackBody)).toContain('person@example.test')
     expect(JSON.stringify(slackBody)).toContain('login required')
     expect(JSON.stringify(slackBody)).not.toContain('refresh_token')
