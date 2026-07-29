@@ -289,20 +289,14 @@ Use the app page to install the bot, copy the Bot User OAuth Token for
 5. Enable Event Subscriptions.
 6. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
 7. Subscribe to `app_mention` and to the message events you want Centaur to see:
-   `message.channels`, `message.groups`, and `message.im`. To automatically join
-   newly-created public channels, set `slackbotv2.autoJoinCreatedChannels` to
-   `true` and subscribe to `channel_created`.
+   `message.channels`, `message.groups`, and `message.im`.
 8. Enable Interactivity and set its Request URL to the same
    `https://<your-host>/api/webhooks/slack` URL. Block Kit actions are emitted
    to the workflow engine as `slack.block_action.<action_id>` events.
 
 The Slackbot normalizes Slack `app_mention` and `message` events plus
-`block_actions` interactions. When `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` is
-enabled, it also joins newly-created public channels from subscribed
-`channel_created` events. The Slack app needs `channels:read` to receive those
-events and `channels:join` for the auto-join behavior. Do not rely on
-assistant-specific Slack event types unless the Slackbot code has explicit
-support for them.
+`block_actions` interactions. Do not rely on assistant-specific Slack event
+types unless the Slackbot code has explicit support for them.
 
 Do not put Centaur API-key auth in front of `/api/webhooks/slack`; the Slackbot
 validates Slack's signature and then calls the Centaur API separately.
@@ -327,7 +321,7 @@ Register the command once in the existing Slack app using Slack's
    - **Command:** `/autorotate`
    - **Request URL:** `https://<your-host>/api/slack/commands`
    - **Short description:** `Manage the Codex account pool`
-   - **Usage hint:** `status | accounts | login [label] [expected-email] | login relogin <label> | login status | login cancel`
+   - **Usage hint:** `status | accounts | add | relogin`
 3. Save the command and reinstall the app if Slack prompts you. The app's
    existing `SLACK_SIGNING_SECRET` validates requests; no Autorotate credential
    is configured in Slack.
@@ -375,19 +369,16 @@ account list: label, email, enabled/disabled/dead status, rate-limit end, and
 whether login is required. It never includes account IDs, provider subjects,
 ownership, usage, or auth data.
 
-`/autorotate login` returns the ephemeral device link and code, polls the broker,
-and replaces that response when enrollment reaches a terminal state. A
-reauthentication alert can be pasted back verbatim as `/autorotate login relogin
-<label>`; Slackbot validates the exact label against the safe account list and
-supplies the known email to the broker.
-Labels containing spaces or control characters use a JSON string as the final
-argument, for example `/autorotate login relogin "legacy primary"`; alerts use
-this same deterministic quoting rule.
-`/autorotate login status` and `/autorotate login cancel` reconcile the active
-enrollment by the exact signed Slack workspace/member owner. Autorotate enforces
-one active enrollment per owner, so these commands recover after a Slackbot
-restart and work with multiple replicas. Pending recovery includes the
-enrollment ID, action, account label, expiry, and private device link/code.
+`/autorotate add` and `/autorotate relogin` return the ephemeral device link and
+code, poll the broker, and replace that response when enrollment reaches a
+terminal state. Neither command accepts an account label or email. After the
+operator authenticates with stock Codex, Autorotate reads the verified identity
+from the resulting credential: `add` derives a unique human-readable label, and
+`relogin` discovers and replaces the matching canonical account. Autorotate
+enforces one active enrollment per exact signed Slack workspace/member owner, so
+the flow recovers after a Slackbot restart and works with multiple replicas.
+Pending recovery includes the enrollment ID, action, account label, expiry, and
+private device link/code.
 Once authorization reaches importing, owner recovery returns the same
 non-secret metadata without the link or code; Slackbot continues polling by
 enrollment ID and reports that canonical credential import is in progress.

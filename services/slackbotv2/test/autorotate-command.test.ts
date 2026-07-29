@@ -235,6 +235,22 @@ describe('Autorotate Slack command', () => {
     })
   })
 
+  it('advertises only the four primary commands in ephemeral help', async () => {
+    const handler = testHandler(async () => {
+      throw new Error('must not fetch')
+    })
+
+    const response = await handleAndWait(handler, commandRequest(''))
+    const body = await response.json() as { response_type: string; text: string }
+
+    expect(body.response_type).toBe('ephemeral')
+    expect(body.text).toContain('/autorotate status')
+    expect(body.text).toContain('/autorotate accounts')
+    expect(body.text).toContain('/autorotate add')
+    expect(body.text).toContain('/autorotate relogin')
+    expect(body.text).not.toContain('/autorotate login')
+  })
+
   it('returns aggregate status through the observer token', async () => {
     const calls: FetchCall[] = []
     const handler = testHandler(async (input, init) => {
@@ -281,8 +297,6 @@ describe('Autorotate Slack command', () => {
         expect(new Headers(init?.headers).get('authorization')).toBe('Bearer operator-secret')
         expect(body).toEqual({
           action: 'add',
-          expected_email: 'person@example.test',
-          label: 'team-codex',
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
         return Response.json({
@@ -306,7 +320,7 @@ describe('Autorotate Slack command', () => {
 
     const response = await handleAndWait(
       handler,
-      commandRequest('login team-codex person@example.test')
+      commandRequest('add')
     )
 
     expect(await response.json()).toEqual({
@@ -416,12 +430,19 @@ describe('Autorotate Slack command', () => {
         return Response.json({
           accounts: [
             {
-              label: 'primary',
-              email: 'person@example.test',
-              status: 'enabled',
+              label: 'broken-primary',
+              email: 'broken@example.test',
+              status: 'dead',
               limited_until: null,
               login_required: true,
               auth_json: { refresh_token: 'must-not-render' }
+            },
+            {
+              label: 'rate-limited',
+              email: 'limited@example.test',
+              status: 'enabled',
+              limited_until: '2026-07-29T22:00:00Z',
+              login_required: false
             }
           ]
         })
@@ -440,35 +461,25 @@ describe('Autorotate Slack command', () => {
       replace_original: true,
       response_type: 'ephemeral'
     })
-    expect(JSON.stringify(slackBody)).toContain('person@example.test')
-    expect(JSON.stringify(slackBody)).toContain('login required')
+    expect(JSON.stringify(slackBody)).toContain('broken@example.test')
+    expect(JSON.stringify(slackBody)).toContain('broken-primary')
+    expect(JSON.stringify(slackBody)).toContain('UNUSABLE')
+    expect(JSON.stringify(slackBody)).toContain('login required · status dead')
+    expect(JSON.stringify(slackBody)).toContain('limited@example.test')
+    expect(JSON.stringify(slackBody)).toContain('LIMITED')
+    expect(JSON.stringify(slackBody)).toContain('rate limited until')
     expect(JSON.stringify(slackBody)).not.toContain('refresh_token')
   })
 
-  it('uses the safe account list to start a relogin by label and expected email', async () => {
+  it('starts targetless relogin and lets the broker discover the authenticated account', async () => {
     const calls: FetchCall[] = []
     const handler = testHandler(async (input, init) => {
       const url = String(input)
       const body = init?.body ? JSON.parse(String(init.body)) : undefined
       calls.push({ body, method: init?.method ?? 'GET', url })
-      if (url.endsWith('/v1/operator/accounts')) {
-        return Response.json({
-          accounts: [
-            {
-              label: 'livermore-ci-legacy',
-              email: 'person@example.test',
-              status: 'dead',
-              limited_until: null,
-              login_required: true
-            }
-          ]
-        })
-      }
       if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
         expect(body).toEqual({
           action: 'relogin',
-          account: 'livermore-ci-legacy',
-          expected_email: 'person@example.test',
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
         return Response.json(startEnrollmentResponse('livermore-ci-legacy', {
@@ -483,14 +494,14 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    await handleAndWait(handler, commandRequest('login relogin livermore-ci-legacy'))
+    await handleAndWait(handler, commandRequest('relogin'))
 
     const slackBodies = calls
       .filter(call => call.url === RESPONSE_URL)
       .map(call => JSON.stringify(call.body))
-    expect(slackBodies[0]).toContain('Reauthenticating')
-    expect(slackBodies[0]).toContain('person@example.test')
+    expect(slackBodies[0]).toContain('ABCD-EFGH')
     expect(slackBodies[1]).toContain('was added to Autorotate')
+    expect(calls.some(call => call.url.endsWith('/v1/operator/accounts'))).toBe(false)
   })
 
   it('accepts a JSON-quoted relogin label while preserving the exact account name', async () => {

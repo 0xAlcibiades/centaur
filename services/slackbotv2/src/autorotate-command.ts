@@ -111,8 +111,8 @@ type ActiveEnrollment = {
 }
 
 type CreateEnrollmentInput =
-  | { action: 'add'; expected_email?: string; label: string; owner: string }
-  | { action: 'relogin'; account: string; expected_email?: string; owner: string }
+  | { action: 'add'; expected_email?: string; label?: string; owner: string }
+  | { action: 'relogin'; account?: string; expected_email?: string; owner: string }
 
 type AutorotateSlackOptions = {
   brokerUrl?: string
@@ -365,7 +365,6 @@ export function createAutorotateSlackCommandHandler(
             client,
             command,
             fetchFn,
-            form,
             options,
             pollIntervalMs,
             responseUrl
@@ -482,15 +481,12 @@ async function startAndMonitorEnrollment(input: {
   client: AutorotateClient
   command: Extract<ParsedCommand, { kind: 'login' }>
   fetchFn: SlackbotV2Fetch
-  form: URLSearchParams
   options: AutorotateSlackOptions
   pollIntervalMs: number
   responseUrl: string
 }): Promise<void> {
   try {
-    const userId = input.form.get('user_id')!.trim()
-    const teamId = input.form.get('team_id')!.trim()
-    const reloginAccount = input.command.action === 'relogin'
+    const reloginAccount = input.command.action === 'relogin' && input.command.account
       ? await findReloginAccount(input.client, input.command)
       : null
     const reloginExpectedEmail = input.command.action === 'relogin'
@@ -499,14 +495,14 @@ async function startAndMonitorEnrollment(input: {
     const createInput: CreateEnrollmentInput = input.command.action === 'relogin'
       ? {
           action: 'relogin',
-          account: input.command.account,
           owner: input.active.owner,
+          ...(input.command.account ? { account: input.command.account } : {}),
           ...(reloginExpectedEmail ? { expected_email: reloginExpectedEmail } : {})
         }
       : {
           action: 'add',
-          label: input.command.label ?? `codex-${userId.toLowerCase()}`,
-          owner: `slack:${teamId}:${userId}`,
+          owner: input.active.owner,
+          ...(input.command.label ? { label: input.command.label } : {}),
           ...(input.command.expectedEmail
             ? { expected_email: input.command.expectedEmail }
             : {})
@@ -515,7 +511,7 @@ async function startAndMonitorEnrollment(input: {
     const expectedLabel = createInput.action === 'add' ? createInput.label : createInput.account
     if (
       enrollment.action !== createInput.action
-      || enrollment.account_label !== expectedLabel
+      || (expectedLabel !== undefined && enrollment.account_label !== expectedLabel)
     ) {
       throw new AutorotateError('Autorotate returned a mismatched enrollment')
     }
@@ -655,7 +651,7 @@ async function monitorEnrollment(
   await postSlackResponse(
     fetchFn,
     active.responseUrl,
-    'Codex device login expired. Run `/autorotate login` to start again.',
+    'Codex device login expired. Run `/autorotate add` or `/autorotate relogin` to start again.',
     options.requestTimeoutMs
   )
 }
@@ -876,7 +872,7 @@ type ParsedCommand =
   | { kind: 'status' }
   | { kind: 'accounts' }
   | { kind: 'login'; action: 'add'; expectedEmail?: string; label?: string }
-  | { kind: 'login'; action: 'relogin'; account: string; expectedEmail?: string }
+  | { kind: 'login'; action: 'relogin'; account?: string; expectedEmail?: string }
   | { kind: 'login_status' }
   | { kind: 'login_cancel' }
 
@@ -884,6 +880,12 @@ function parseCommand(text: string): ParsedCommand {
   const parts = text.trim().split(/\s+/).filter(Boolean)
   if (parts.length === 1 && parts[0]?.toLowerCase() === 'status') return { kind: 'status' }
   if (parts.length === 1 && parts[0]?.toLowerCase() === 'accounts') return { kind: 'accounts' }
+  if (parts.length === 1 && parts[0]?.toLowerCase() === 'add') {
+    return { kind: 'login', action: 'add' }
+  }
+  if (parts.length === 1 && parts[0]?.toLowerCase() === 'relogin') {
+    return { kind: 'login', action: 'relogin' }
+  }
   if (parts[0]?.toLowerCase() !== 'login') return { kind: 'help' }
   if (parts.length === 2 && parts[1]?.toLowerCase() === 'status') return { kind: 'login_status' }
   if (parts.length === 2 && parts[1]?.toLowerCase() === 'cancel') return { kind: 'login_cancel' }
@@ -906,7 +908,7 @@ function parseCommand(text: string): ParsedCommand {
 
 function parseReloginCommand(
   text: string
-): Extract<ParsedCommand, { action: 'relogin'; kind: 'login' }> | null {
+): (Extract<ParsedCommand, { action: 'relogin'; kind: 'login' }> & { account: string }) | null {
   const match = /^\s*login\s+relogin\s+([\s\S]+?)\s*$/i.exec(text)
   if (!match?.[1]) return null
   const rest = match[1]
@@ -963,11 +965,9 @@ function helpText(): string {
   return [
     '*Autorotate commands*',
     '• `/autorotate status` — redacted pool health and capacity',
-    '• `/autorotate accounts` — private account emails and status',
-    '• `/autorotate login [label] [expected-email]` — privately add an account',
-    '• `/autorotate login relogin <label> [expected-email]` — reauthenticate an account',
-    '• `/autorotate login status` — check your active login',
-    '• `/autorotate login cancel` — cancel your active login'
+    '• `/autorotate accounts` — account health, emails, and labels',
+    '• `/autorotate add` — add the Codex account you authenticate',
+    '• `/autorotate relogin` — repair the Codex account you authenticate'
   ].join('\n')
 }
 
@@ -989,14 +989,15 @@ function formatAccounts(accounts: readonly AutorotateAccount[]): string {
     '*Codex accounts*',
     ...accounts.map(account => {
       const email = account.email ? escapeSlackText(account.email) : 'email unknown'
-      const state = [
-        account.status,
-        account.login_required ? 'login required' : null,
-        safeTimestamp(account.limited_until)
-          ? `limited until ${safeTimestamp(account.limited_until)}`
-          : null
-      ].filter(Boolean).join(' · ')
-      return `• \`${escapeSlackText(account.label)}\` — ${email} — ${state}`
+      const limitedUntil = safeTimestamp(account.limited_until)
+      const condition = account.login_required
+        ? `:red_circle: *UNUSABLE* — login required · status ${account.status}`
+        : account.status !== 'enabled'
+          ? `:red_circle: *UNUSABLE* — status ${account.status}`
+          : limitedUntil
+            ? `:large_yellow_circle: *LIMITED* — rate limited until ${limitedUntil}`
+            : ':large_green_circle: *AVAILABLE*'
+      return `• ${condition}\n  ${email} — \`${escapeSlackText(account.label)}\``
     })
   ].join('\n')
 }
@@ -1038,6 +1039,9 @@ async function findReloginAccount(
   client: AutorotateClient,
   command: Extract<ParsedCommand, { action: 'relogin'; kind: 'login' }>
 ): Promise<AutorotateAccount> {
+  if (!command.account) {
+    throw new AutorotateError('relogin account was not specified')
+  }
   const accounts = await client.accounts()
   const account = accounts.find(candidate => candidate.label === command.account)
   if (!account) {
@@ -1055,7 +1059,10 @@ async function findReloginAccount(
 
 function loginFailureText(error: unknown): string {
   if (error instanceof AutorotateError && error.code === 'account_not_found') {
-    return 'That Codex account label was not found. Run `/autorotate accounts` and try again.'
+    return 'No existing account matched that Codex login. Use `/autorotate add` to add it instead.'
+  }
+  if (error instanceof AutorotateError && error.code === 'account_busy') {
+    return 'That Codex account is already being reauthenticated. Try again after the active login finishes.'
   }
   if (error instanceof AutorotateError && error.code === 'email_mismatch') {
     return 'The expected email does not match that Codex account.'
@@ -1070,9 +1077,9 @@ function formatTerminalEnrollment(enrollment: EnrollmentStatusResponse): string 
     case 'cancelled':
       return 'Codex device login was cancelled.'
     case 'expired':
-      return 'Codex device login expired. Run `/autorotate login` to start again.'
+      return 'Codex device login expired. Run `/autorotate add` or `/autorotate relogin` to start again.'
     default:
-      return 'Codex device login failed. Run `/autorotate login` to try again.'
+      return 'Codex device login failed. Run `/autorotate add` or `/autorotate relogin` to try again.'
   }
 }
 
