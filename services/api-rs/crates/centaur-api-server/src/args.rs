@@ -1806,7 +1806,7 @@ impl IronProxySourceArgs {
     }
 
     fn uses_bootstrap_secret(&self) -> bool {
-        matches!(self.source, SourceKind::Env | SourceKind::OnePassword)
+        matches!(self.source, SourceKind::Env)
     }
 }
 
@@ -1835,7 +1835,7 @@ impl IronProxyHarnessArgs {
 
     /// The harness auth fragment — infra, baked in and selected by auth mode.
     /// Carries the harness credential secret(s) and, for access_token, the
-    /// token-broker credential.
+    /// Console-managed broker credential.
     fn fragment(&self) -> Result<ProxyFragment, ServerError> {
         let engine = harness_fragment_engine_name(&self.engine);
         let auth_mode = self.resolved_auth_mode();
@@ -2846,6 +2846,60 @@ mod tests {
                 "centaur-infra-env".to_owned(),
                 "centaur-secret-env".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn onepassword_secret_source_does_not_mount_bootstrap_secret_into_iron_proxy() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "enabled",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword",
+            "--kubernetes-bootstrap-secret-name",
+            "centaur-infra-env",
+            "--kubernetes-secret-env-name",
+            "centaur-secret-env",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.iron_proxy.env_from_secret_names(),
+            vec!["centaur-secret-env".to_owned()]
+        );
+    }
+
+    #[test]
+    fn onepassword_connect_secret_source_does_not_mount_bootstrap_secret_into_iron_proxy() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "enabled",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword-connect",
+            "--kubernetes-bootstrap-secret-name",
+            "centaur-infra-env",
+            "--kubernetes-secret-env-name",
+            "centaur-secret-env",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.iron_proxy.env_from_secret_names(),
+            vec!["centaur-secret-env".to_owned()]
         );
     }
 

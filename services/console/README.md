@@ -10,7 +10,7 @@ It is a Rails application backed by Postgres. It provides a JSON API, an operato
 - **Controls who can use them.** A **principal** is an identity that a proxy runs as. A **role** groups credentials so they can be assigned together. A **grant** gives one credential to a principal or a role. A principal can use its own grants plus the grants of every role it has.
 - **Limits where they apply.** Each grant has request rules for host, methods, and paths, so a credential is only added to the requests it is meant for.
 - **Configures proxies.** A **proxy** registers with `iron-control`, gets assigned a principal, and calls `POST /api/v1/proxy/sync` to fetch its configuration. The response includes a config hash that works like an ETag, so a proxy that already has the current config gets an empty response.
-- **Issues short-lived tokens.** For `token_broker` credentials, `iron-control` mints and rotates the access token itself and sends only the token to the proxy. The underlying credential never leaves the control plane.
+- **Issues short-lived tokens.** For `token_broker` credentials, the Console stores the refresh state encrypted in Postgres, is the sole rotating writer, and sends only the current access token to the proxy. The underlying credential never leaves the control plane.
 
 ## How It Fits Together
 
