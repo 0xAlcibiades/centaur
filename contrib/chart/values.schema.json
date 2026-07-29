@@ -367,6 +367,24 @@
       "type": "object",
       "properties": {
         "mcpPublicUrl": { "type": "string" },
+        "autorotate": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "url": { "type": "string" },
+            "credentialsSecretName": { "type": "string" },
+            "observerTokenKey": { "type": "string" },
+            "operatorTokenKey": { "type": "string" },
+            "operatorSlackTeamIds": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "operatorSlackUserIds": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
         "metrics": {
           "type": "object",
           "properties": {

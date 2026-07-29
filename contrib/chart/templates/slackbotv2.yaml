@@ -108,6 +108,24 @@ spec:
             - name: SLACKBOT_TRIGGER_BOT_ALLOWLIST
               value: {{ .Values.slackbotv2.triggerBotAllowlist | quote }}
 {{- end }}
+{{- if .Values.slackbotv2.autorotate.enabled }}
+            - name: SLACKBOTV2_AUTOROTATE_URL
+              value: {{ required "slackbotv2.autorotate.url is required when Autorotate commands are enabled" .Values.slackbotv2.autorotate.url | quote }}
+            - name: SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS
+              value: {{ required "slackbotv2.autorotate.operatorSlackTeamIds must not be empty when Autorotate commands are enabled" (join "," .Values.slackbotv2.autorotate.operatorSlackTeamIds) | quote }}
+            - name: SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS
+              value: {{ required "slackbotv2.autorotate.operatorSlackUserIds must not be empty when Autorotate commands are enabled" (join "," .Values.slackbotv2.autorotate.operatorSlackUserIds) | quote }}
+            - name: AUTOROTATE_OBSERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "slackbotv2.autorotate.credentialsSecretName is required when Autorotate commands are enabled" .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ .Values.slackbotv2.autorotate.observerTokenKey | quote }}
+            - name: AUTOROTATE_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ .Values.slackbotv2.autorotate.operatorTokenKey | quote }}
+{{- end }}
 {{- if .Values.slackbotv2.channelDefaults }}
             # Per-channel default harness / model / provider / reasoning, keyed
             # by Slack conversation id (each value an object of harness/model/

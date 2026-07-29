@@ -40,6 +40,11 @@ const options: SlackbotV2Options = {
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
   autoJoinCreatedChannels: booleanEnv('SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS', false),
+  autorotateUrl: optionalEnv('SLACKBOTV2_AUTOROTATE_URL'),
+  autorotateObserverToken: optionalEnv('AUTOROTATE_OBSERVER_TOKEN'),
+  autorotateOperatorToken: optionalEnv('AUTOROTATE_OPERATOR_TOKEN'),
+  autorotateSlackTeamIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS'),
+  autorotateSlackUserIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS'),
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
   channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
@@ -118,6 +123,13 @@ function requiredEnv(name: string): string {
 
 function stringEnv(name: string, fallback: string): string {
   return optionalEnv(name) ?? fallback
+}
+
+function listEnv(name: string): string[] {
+  return (optionalEnv(name) ?? '')
+    .split(/[\s,]+/)
+    .map(value => value.trim())
+    .filter(Boolean)
 }
 
 function numberEnv(name: string, fallback: number): number {

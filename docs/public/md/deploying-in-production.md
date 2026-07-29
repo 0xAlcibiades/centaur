@@ -305,6 +305,91 @@ The Slackbot accepts Slack events at `/api/webhooks/slack`. It also registers
 compatibility paths for `/api/slack/events`, `/api/slack/actions`,
 `/api/slack/options`, and `/api/slack/commands`.
 
+### Enable the Autorotate account-pool command
+
+Autorotate adds a signed, pre-session Slack command for pool status and private
+Codex account enrollment. It is deliberately separate from the normal agent
+session path: device codes and operator credentials never enter a Centaur
+session, sandbox, tool result, or database.
+
+Register the command once in the existing Slack app using Slack's
+[Slash Commands settings](https://docs.slack.dev/interactivity/implementing-slash-commands/):
+
+1. Open the app identified by `SLACK_APP_ID` at
+   [api.slack.com/apps](https://api.slack.com/apps).
+2. Open **Slash Commands**, select **Create New Command**, and set:
+   - **Command:** `/autorotate`
+   - **Request URL:** `https://<your-host>/api/slack/commands`
+   - **Short description:** `Manage the Codex account pool`
+   - **Usage hint:** `status | accounts | login [label] [expected-email] | login relogin <label> | login status | login cancel`
+3. Save the command and reinstall the app if Slack prompts you. The app's
+   existing `SLACK_SIGNING_SECRET` validates requests; no Autorotate credential
+   is configured in Slack.
+
+Slack bot and app runtime tokens cannot create a slash command. Slack's
+[`apps.manifest.update`](https://docs.slack.dev/reference/methods/apps.manifest.update/)
+API requires a separate app-configuration token and replaces the complete
+manifest, so use the app console when the deployment only has `SLACK_APP_ID`,
+`SLACK_BOT_TOKEN`, and `SLACK_SIGNING_SECRET`.
+
+Create a dedicated Kubernetes Secret containing only the two scoped Autorotate
+tokens:
+
+```bash
+kubectl --namespace centaur create secret generic centaur-autorotate \
+  --from-literal=AUTOROTATE_OBSERVER_TOKEN='<observer token>' \
+  --from-literal=AUTOROTATE_OPERATOR_TOKEN='<enrollment operator token>'
+```
+
+Then enable the integration in the deployment values:
+
+```yaml
+slackbotv2:
+  autorotate:
+    enabled: true
+    url: "https://autorotate.example.com/"
+    credentialsSecretName: centaur-autorotate
+    operatorSlackTeamIds:
+      - T0123456789
+    operatorSlackUserIds:
+      - U0123456789
+```
+
+Both allowlists must match the signed Slack request. Copy member IDs from Slack
+profiles; obtain the workspace ID from Slack's `auth.test` response or the
+workspace administration page. `credentialsSecretName` must not name the
+shared Centaur infrastructure Secret.
+
+Operators can run `/autorotate status` from Slack for aggregate capacity.
+`/autorotate accounts` is DM-only and shows the operator-safe account list:
+label, email, enabled/disabled/dead status, rate-limit end, and whether login is
+required. It never includes account IDs, provider subjects, ownership, usage,
+or auth data.
+
+Account enrollment is also DM-only. `/autorotate login` returns a private device
+link and code, polls the broker, and replaces that response when enrollment
+reaches a terminal state. A reauthentication alert can be pasted back verbatim
+as `/autorotate login relogin <label>`; Slackbot validates the exact label
+against the safe account list and supplies the known email to the broker.
+Labels containing spaces or control characters use a JSON string as the final
+argument, for example `/autorotate login relogin "legacy primary"`; alerts use
+this same deterministic quoting rule.
+`/autorotate login status` and `/autorotate login cancel` reconcile the active
+enrollment by the exact signed Slack workspace/member owner. Autorotate enforces
+one active enrollment per owner, so these commands recover after a Slackbot
+restart and work with multiple replicas. Pending recovery includes the
+enrollment ID, action, account label, expiry, and private device link/code.
+Once authorization reaches importing, owner recovery returns the same
+non-secret metadata without the link or code; Slackbot continues polling by
+enrollment ID and reports that canonical credential import is in progress.
+Completion accepts only the nested account label, email, and account status.
+The device code, link, and Slack response URL remain private and are never
+stored in a Centaur session or tool event.
+
+Sandboxes get observer-only access through `autorotate status`. The command
+calls Console's assigned-sandbox endpoint and can never start enrollment or
+receive an Autorotate token.
+
 ## 5. Deploy with Helm
 
 The chart lives at `contrib/chart`. Select service images, [iron-proxy](https://docs.iron.sh) secret

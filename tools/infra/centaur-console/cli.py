@@ -58,6 +58,16 @@ def oauth_apps(
     console.print_json(json.dumps({"data": result}, default=str))
 
 
+@app.command("status")
+def autorotate_status():
+    """Print redacted Codex account-pool health and capacity."""
+    # Sandboxes reach Console through iron-proxy, which injects the scoped JWT.
+    # This command never accepts or handles an Autorotate broker credential.
+    with get_client() as client:
+        result = client.autorotate_status()
+    console.print_json(json.dumps(result, default=str))
+
+
 @app.command()
 def health(
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),

@@ -1157,6 +1157,38 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 }
 ```
 
+### Sandbox Autorotate Status
+
+`GET /api/v1/sandbox/autorotate/status`
+
+Returns redacted Codex account-pool health for the currently assigned sandbox.
+Authenticate with the sandbox entitlement JWT injected by its assigned
+iron-proxy. Console verifies the JWT and the live proxy-to-principal assignment,
+then calls Autorotate with a server-side observer token. Autorotate credentials,
+account labels, emails, and device enrollment data are never returned.
+
+```json
+{
+  "data": {
+    "generated_at": "2026-07-29T12:00:00Z",
+    "total": 8,
+    "healthy": 6,
+    "available": 5,
+    "limited": 1,
+    "login_required": 1,
+    "disabled": 0,
+    "leased": 1,
+    "removed": 0,
+    "next_available_at": "2026-07-29T13:00:00Z",
+    "pending_enrollments": 1
+  }
+}
+```
+
+The sandbox CLI exposes the same response as `autorotate status`. Login is not
+available from the sandbox CLI because tool calls and results are durable
+session events; use the private signed Slack command instead.
+
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).
