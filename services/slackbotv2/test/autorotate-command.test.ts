@@ -48,9 +48,11 @@ function enrollmentStatusResponse(
   status: 'pending' | 'importing' | 'completed' | 'failed' | 'cancelled' | 'expired',
   {
     accountLabel = 'team-codex',
+    errorCode = status === 'failed' ? 'provider_login_failed' : null,
     enrollmentId = 'enr_abcdefgh'
   }: {
     accountLabel?: string
+    errorCode?: string | null
     enrollmentId?: string
   } = {}
 ): Record<string, unknown> {
@@ -65,7 +67,7 @@ function enrollmentStatusResponse(
           status: 'enabled'
         }
       : null,
-    error_code: status === 'failed' ? 'provider_login_failed' : null
+    error_code: errorCode
   }
 }
 
@@ -531,6 +533,34 @@ describe('Autorotate Slack command', () => {
     expect(calls.find(call => call.url === RESPONSE_URL)?.body).toMatchObject({
       response_type: 'ephemeral',
       text: 'Another Codex login is already active. Wait for it to finish, or try again after it expires.'
+    })
+  })
+
+  it('directs an unmatched targetless relogin to the add command', async () => {
+    const slackResponses: Array<Record<string, unknown>> = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
+        const start = startEnrollmentResponse('pending-account', { action: 'relogin' })
+        delete start.account_label
+        return Response.json(start)
+      }
+      if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
+        return Response.json(enrollmentStatusResponse('failed', {
+          errorCode: 'account_not_found'
+        }))
+      }
+      if (url === RESPONSE_URL) {
+        slackResponses.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('relogin'))
+
+    expect(slackResponses.at(-1)).toMatchObject({
+      response_type: 'ephemeral',
+      text: 'No existing account matched that Codex login. Use `/autorotate add` to add it instead.'
     })
   })
 

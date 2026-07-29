@@ -1062,19 +1062,28 @@ async function findReloginAccount(
 }
 
 function loginFailureText(error: unknown): string {
-  if (error instanceof AutorotateError && error.code === 'account_not_found') {
-    return 'No existing account matched that Codex login. Use `/autorotate add` to add it instead.'
+  const code = error instanceof AutorotateError ? error.code : undefined
+  return enrollmentFailureText(
+    code,
+    'Codex device login could not be started. Try again or ask an Autorotate operator.'
+  )
+}
+
+function enrollmentFailureText(errorCode: string | null | undefined, fallback: string): string {
+  switch (errorCode) {
+    case 'account_not_found':
+      return 'No existing account matched that Codex login. Use `/autorotate add` to add it instead.'
+    case 'account_busy':
+      return 'That Codex account is already being reauthenticated. Try again after the active login finishes.'
+    case 'account_mismatch':
+      return 'Autorotate could not safely match that Codex login. Check `/autorotate accounts` and try again.'
+    case 'enrollment_already_active':
+      return 'Another Codex login is already active. Wait for it to finish, or try again after it expires.'
+    case 'email_mismatch':
+      return 'The expected email does not match that Codex account.'
+    default:
+      return fallback
   }
-  if (error instanceof AutorotateError && error.code === 'account_busy') {
-    return 'That Codex account is already being reauthenticated. Try again after the active login finishes.'
-  }
-  if (error instanceof AutorotateError && error.code === 'enrollment_already_active') {
-    return 'Another Codex login is already active. Wait for it to finish, or try again after it expires.'
-  }
-  if (error instanceof AutorotateError && error.code === 'email_mismatch') {
-    return 'The expected email does not match that Codex account.'
-  }
-  return 'Codex device login could not be started. Try again or ask an Autorotate operator.'
 }
 
 function formatTerminalEnrollment(enrollment: EnrollmentStatusResponse): string {
@@ -1085,8 +1094,13 @@ function formatTerminalEnrollment(enrollment: EnrollmentStatusResponse): string 
       return 'Codex device login was cancelled.'
     case 'expired':
       return 'Codex device login expired. Run `/autorotate add` or `/autorotate relogin` to start again.'
+    case 'failed':
+      return enrollmentFailureText(
+        enrollment.error_code,
+        'Codex device login failed. Run `/autorotate add` or `/autorotate relogin` to try again.'
+      )
     default:
-      return 'Codex device login failed. Run `/autorotate add` or `/autorotate relogin` to try again.'
+      return 'Codex device login failed.'
   }
 }
 
