@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
 pub use generated::agents_x_k8s_io as crd;
-pub use iron_proxy::IronProxyConfig;
+pub use iron_proxy::{IronProxyConfig, IronProxySecretEnv};
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
 pub mod generated;

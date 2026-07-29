@@ -5,8 +5,9 @@ use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{SandboxError, SandboxId, SandboxResult, SandboxSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
-    EnvVar as K8sEnvVar, HTTPGetAction, Pod, PodSpec, Probe, SecretEnvSource, SecretVolumeSource,
-    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    EnvVar as K8sEnvVar, EnvVarSource, HTTPGetAction, Pod, PodSpec, Probe, SecretEnvSource,
+    SecretKeySelector, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec,
+    Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -81,12 +82,22 @@ pub struct IronProxyConfig {
     pub ca_cert_secret_name: String,
     pub ca_key_secret_name: String,
     pub env_from_secret_names: Vec<String>,
+    /// Individual source-authentication keys mounted into a non-environment
+    /// proxy. Never put the static infra Secret in `envFrom` for these modes.
+    pub secret_env: Vec<IronProxySecretEnv>,
     pub extra_env: BTreeMap<String, String>,
     pub upstream_deny_cidrs: Vec<String>,
     pub op_connect_app_name: String,
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
     pub control_plane_pod_labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IronProxySecretEnv {
+    pub name: String,
+    pub secret_name: String,
+    pub secret_key: String,
 }
 
 impl IronProxyConfig {
@@ -103,6 +114,7 @@ impl IronProxyConfig {
             ca_cert_secret_name: ca_cert_secret_name.into(),
             ca_key_secret_name: ca_key_secret_name.into(),
             env_from_secret_names: Vec::new(),
+            secret_env: Vec::new(),
             extra_env: BTreeMap::new(),
             upstream_deny_cidrs: Vec::new(),
             op_connect_app_name: "onepassword-connect".to_owned(),
@@ -1360,6 +1372,9 @@ fn iron_proxy_env_vars(
     for (name, value) in &iron_proxy.extra_env {
         env.insert(name.clone(), env_var(name, value));
     }
+    for secret_env in &iron_proxy.secret_env {
+        env.insert(secret_env.name.clone(), secret_env_var(secret_env));
+    }
     // Single-listener Postgres local config. The control plane owns every
     // upstream DSN + role (the pg_dsn secrets) and multiplexes them through this
     // one listener; api-rs only supplies the bind address and the shared client
@@ -1374,6 +1389,21 @@ fn iron_proxy_env_vars(
         }
     }
     env.into_values().collect()
+}
+
+fn secret_env_var(secret_env: &IronProxySecretEnv) -> K8sEnvVar {
+    K8sEnvVar {
+        name: secret_env.name.clone(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                key: secret_env.secret_key.clone(),
+                name: secret_env.secret_name.clone(),
+                optional: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 fn iron_proxy_env_from(iron_proxy: &IronProxyConfig) -> Option<Vec<EnvFromSource>> {
@@ -2311,6 +2341,101 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn iron_proxy_uses_narrow_source_key_refs_without_env_from() {
+        let id = SandboxId::new("asbx-test");
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        for (name, key) in [
+            ("OP_SERVICE_ACCOUNT_TOKEN", "service-account"),
+            ("OP_CONNECT_TOKEN", "connect-token"),
+        ] {
+            let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+            iron_proxy.secret_env = vec![IronProxySecretEnv {
+                name: name.to_owned(),
+                secret_name: "centaur-iron-proxy-source-auth".to_owned(),
+                secret_key: key.to_owned(),
+            }];
+
+            let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync);
+            let spec = pod.spec.as_ref().expect("iron-proxy Pod spec");
+            assert_eq!(spec.automount_service_account_token, Some(false));
+            assert!(
+                spec.volumes
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .all(|volume| volume.projected.is_none()),
+                "source auth must not be materialized through a projected volume"
+            );
+            let secret_volumes = spec
+                .volumes
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(|volume| {
+                    volume
+                        .secret
+                        .as_ref()
+                        .and_then(|secret| secret.secret_name.as_deref())
+                        .map(|secret_name| (volume.name.as_str(), secret_name))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(secret_volumes, [("iron-proxy-ca", "ca-key")]);
+            assert_eq!(spec.containers.len(), 1);
+            let container = &spec.containers[0];
+            assert_eq!(container.name, "iron-proxy");
+            assert!(container.env_from.is_none());
+            let key_ref = container
+                .env
+                .as_ref()
+                .and_then(|env| env.iter().find(|env| env.name == name))
+                .and_then(|env| env.value_from.as_ref())
+                .and_then(|source| source.secret_key_ref.as_ref())
+                .expect("narrow secret key reference");
+            assert_eq!(key_ref.name, "centaur-iron-proxy-source-auth");
+            assert_eq!(key_ref.key, key);
+            assert_eq!(key_ref.optional, Some(false));
+        }
+    }
+
+    #[test]
+    fn iron_proxy_keeps_env_from_for_environment_source() {
+        let id = SandboxId::new("asbx-test");
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy.env_from_secret_names = vec![
+            "centaur-infra-env".to_owned(),
+            "centaur-bootstrap-env".to_owned(),
+        ];
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync);
+        let container = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.containers.first())
+            .expect("iron-proxy container");
+        let names = container
+            .env_from
+            .as_ref()
+            .expect("environment-backed proxy secret refs")
+            .iter()
+            .filter_map(|source| source.secret_ref.as_ref())
+            .map(|source| source.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["centaur-infra-env", "centaur-bootstrap-env"]);
     }
 
     #[test]

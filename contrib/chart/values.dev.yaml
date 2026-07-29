@@ -40,8 +40,7 @@ console:
 ironProxy:
   image:
     pullPolicy: IfNotPresent
-  manager:
-    secretSource: onepassword
+  secretSource: onepassword
 
 sandbox:
   image:

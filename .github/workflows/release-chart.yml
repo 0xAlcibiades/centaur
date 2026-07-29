@@ -63,6 +63,9 @@ jobs:
       - name: Lint chart
         run: helm lint contrib/chart
 
+      - name: Test 1Password source-auth rendering
+        run: contrib/chart/test-source-auth-render.sh
+
       - name: Install yq
         uses: mikefarah/yq@5a7e72a743649b1b3a47d1a1d8214f3453173c51 # v4
 

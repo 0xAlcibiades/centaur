@@ -24,7 +24,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    IronProxySecretEnv, OtlpEgressTarget, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -1642,6 +1642,12 @@ impl IronProxyArgs {
         }
         let (ca_cert_secret_name, ca_key_secret_name) =
             ca.ok_or(ServerError::MissingIronProxyCaSecret)?;
+        let secret_env = self.secret_env()?;
+        if secret_env.iter().any(|secret| {
+            secret.secret_name == ca_cert_secret_name || secret.secret_name == ca_key_secret_name
+        }) {
+            return Err(ServerError::IronProxySourceAuthSecretCollision);
+        }
 
         let harness_fragments = self.harness.fragments()?;
         let mut config =
@@ -1656,6 +1662,7 @@ impl IronProxyArgs {
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
+        config.secret_env = secret_env;
         if let Some(labels) = self
             .api_pod_label_selector
             .as_ref()
@@ -1704,16 +1711,33 @@ impl IronProxyArgs {
     }
 
     fn env_from_secret_names(&self) -> Vec<String> {
+        if !self.source.uses_static_secret_env() {
+            return Vec::new();
+        }
         let mut names = BTreeSet::new();
         if let Some(secret_name) = non_empty(self.secret_env_name.as_deref()) {
             names.insert(secret_name.to_owned());
         }
-        if self.source.uses_bootstrap_secret()
-            && let Some(secret_name) = non_empty(self.bootstrap_secret_name.as_deref())
-        {
+        if let Some(secret_name) = non_empty(self.bootstrap_secret_name.as_deref()) {
             names.insert(secret_name.to_owned());
         }
         names.into_iter().collect()
+    }
+
+    fn secret_env(&self) -> Result<Vec<IronProxySecretEnv>, ServerError> {
+        let Some(env_name) = self.source.proxy_source_auth_env_name() else {
+            return Ok(Vec::new());
+        };
+        let secret_name = non_empty(self.source.source_auth_secret_name.as_deref())
+            .ok_or(ServerError::MissingIronProxySourceAuthSecret)?;
+        let secret_key = non_empty(self.source.source_auth_secret_key.as_deref())
+            .ok_or(ServerError::MissingIronProxySourceAuthSecret)?;
+
+        Ok(vec![IronProxySecretEnv {
+            name: env_name.to_owned(),
+            secret_name: secret_name.to_owned(),
+            secret_key: secret_key.to_owned(),
+        }])
     }
 }
 
@@ -1776,6 +1800,16 @@ struct IronProxySourceArgs {
         env = "KUBERNETES_OP_CONNECT_PORT"
     )]
     op_connect_port: Option<u16>,
+    #[arg(
+        long = "kubernetes-iron-proxy-source-auth-secret-name",
+        env = "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME"
+    )]
+    source_auth_secret_name: Option<String>,
+    #[arg(
+        long = "kubernetes-iron-proxy-source-auth-secret-key",
+        env = "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY"
+    )]
+    source_auth_secret_key: Option<String>,
 }
 
 impl IronProxySourceArgs {
@@ -1805,8 +1839,20 @@ impl IronProxySourceArgs {
         }
     }
 
-    fn uses_bootstrap_secret(&self) -> bool {
+    fn uses_static_secret_env(&self) -> bool {
         matches!(self.source, SourceKind::Env)
+    }
+
+    /// The 1Password source is fully described by the `op://` reference sent
+    /// through iron-control. The proxy needs only the credential that
+    /// authenticates its source backend; the static infra Secret must not be
+    /// mounted wholesale into the sandbox pod.
+    fn proxy_source_auth_env_name(&self) -> Option<&'static str> {
+        match self.source {
+            SourceKind::Env => None,
+            SourceKind::OnePassword => Some("OP_SERVICE_ACCOUNT_TOKEN"),
+            SourceKind::OnePasswordConnect => Some("OP_CONNECT_TOKEN"),
+        }
     }
 }
 
@@ -2847,10 +2893,11 @@ mod tests {
                 "centaur-secret-env".to_owned()
             ]
         );
+        assert!(args.sandbox.iron_proxy.secret_env().unwrap().is_empty());
     }
 
     #[test]
-    fn onepassword_secret_source_does_not_mount_bootstrap_secret_into_iron_proxy() {
+    fn onepassword_secret_source_mounts_only_service_account_key_into_iron_proxy() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -2867,17 +2914,29 @@ mod tests {
             "centaur-infra-env",
             "--kubernetes-secret-env-name",
             "centaur-secret-env",
+            "--kubernetes-iron-proxy-source-auth-secret-name",
+            "centaur-iron-proxy-source-auth",
+            "--kubernetes-iron-proxy-source-auth-secret-key",
+            "service-account",
         ])
         .unwrap();
 
         assert_eq!(
             args.sandbox.iron_proxy.env_from_secret_names(),
-            vec!["centaur-secret-env".to_owned()]
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            args.sandbox.iron_proxy.secret_env().unwrap(),
+            vec![IronProxySecretEnv {
+                name: "OP_SERVICE_ACCOUNT_TOKEN".to_owned(),
+                secret_name: "centaur-iron-proxy-source-auth".to_owned(),
+                secret_key: "service-account".to_owned(),
+            }]
         );
     }
 
     #[test]
-    fn onepassword_connect_secret_source_does_not_mount_bootstrap_secret_into_iron_proxy() {
+    fn onepassword_connect_secret_source_mounts_only_connect_token_into_iron_proxy() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -2894,13 +2953,77 @@ mod tests {
             "centaur-infra-env",
             "--kubernetes-secret-env-name",
             "centaur-secret-env",
+            "--kubernetes-iron-proxy-source-auth-secret-name",
+            "centaur-iron-proxy-source-auth",
+            "--kubernetes-iron-proxy-source-auth-secret-key",
+            "connect-token",
         ])
         .unwrap();
 
         assert_eq!(
             args.sandbox.iron_proxy.env_from_secret_names(),
-            vec!["centaur-secret-env".to_owned()]
+            Vec::<String>::new()
         );
+        assert_eq!(
+            args.sandbox.iron_proxy.secret_env().unwrap(),
+            vec![IronProxySecretEnv {
+                name: "OP_CONNECT_TOKEN".to_owned(),
+                secret_name: "centaur-iron-proxy-source-auth".to_owned(),
+                secret_key: "connect-token".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn onepassword_secret_source_requires_dedicated_source_auth_secret() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "enabled",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.sandbox.iron_proxy.to_config(),
+            Err(ServerError::MissingIronProxySourceAuthSecret)
+        ));
+    }
+
+    #[test]
+    fn onepassword_source_auth_secret_must_not_collide_with_firewall_secrets() {
+        for source_auth_secret in ["centaur-firewall-ca", "centaur-firewall-ca-key"] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-sandbox-iron-proxy-mode",
+                "enabled",
+                "--kubernetes-firewall-ca-secret-name",
+                "centaur-firewall-ca",
+                "--kubernetes-firewall-ca-key-secret-name",
+                "centaur-firewall-ca-key",
+                "--kubernetes-firewall-manager-secret-source",
+                "onepassword",
+                "--kubernetes-iron-proxy-source-auth-secret-name",
+                source_auth_secret,
+                "--kubernetes-iron-proxy-source-auth-secret-key",
+                "service-account",
+            ])
+            .unwrap();
+
+            assert!(matches!(
+                args.sandbox.iron_proxy.to_config(),
+                Err(ServerError::IronProxySourceAuthSecretCollision)
+            ));
+        }
     }
 
     #[test]

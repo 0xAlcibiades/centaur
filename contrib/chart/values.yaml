@@ -41,6 +41,13 @@ ironProxy:
     - "10.43.0.0/16"
   secretSource: onepassword
   secretTtl: 10m
+  # Dedicated Kubernetes Secret that authenticates only the per-sandbox proxy
+  # to the selected 1Password source. It must not be the broad infra or broker
+  # bootstrap Secret.
+  sourceAuth:
+    existingSecretName: centaur-iron-proxy-source-auth
+    serviceAccountTokenKey: OP_SERVICE_ACCOUNT_TOKEN
+    connectTokenKey: OP_CONNECT_TOKEN
 
 # Base tools delivery for api-rs sandboxes. When enabled, repo-cache keeps `repo`
 # fresh on each node and a tools-bootstrap init container copies `subdir` into
