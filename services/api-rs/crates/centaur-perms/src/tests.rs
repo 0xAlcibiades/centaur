@@ -2,16 +2,296 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use centaur_iron_control::SecretInput;
+use centaur_iron_control::{BrokerCredentialRecord, IronControlClient, SecretInput};
 use centaur_iron_proxy::{SourcePolicy, pg_sandbox_env_var};
+use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::tools::{self, ParsedSecret, SecretMode};
 use crate::translate;
+use crate::{
+    BrokerCmd, Cli, Command, broker_create, ensure_reseed_allowed, normalize_refresh_seed,
+    read_refresh_seed_file, validate_broker_seed_args,
+};
 
 fn entry(toml_src: &str) -> toml::Value {
     let v: toml::Value = toml::from_str(&format!("x = {toml_src}")).expect("valid toml");
     v.get("x").expect("x key").clone()
+}
+
+fn broker_create_argv(extra: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "broker",
+        "create",
+        "--foreign-id",
+        "test-broker",
+        "--token-endpoint",
+        "https://auth.example.test/token",
+        "--client-id",
+        "client-id",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    argv
+}
+
+fn broker_create_args(extra: &[&str]) -> crate::BrokerCreateArgs {
+    let cli =
+        Cli::try_parse_from(broker_create_argv(extra)).expect("broker create args should parse");
+    let Command::Broker(BrokerCmd::Create(args)) = cli.command else {
+        panic!("expected broker create command");
+    };
+    *args
+}
+
+fn broker_create_cli(base_url: &str, extra: &[&str]) -> Cli {
+    let mut argv = vec![
+        "centaur-perms".to_owned(),
+        "--iron-control-url".to_owned(),
+        base_url.to_owned(),
+        "--iron-control-api-key".to_owned(),
+        "iak_test".to_owned(),
+        "broker".to_owned(),
+        "create".to_owned(),
+        "--foreign-id".to_owned(),
+        "test-broker".to_owned(),
+        "--token-endpoint".to_owned(),
+        "https://auth.example.test/token".to_owned(),
+        "--client-id".to_owned(),
+        "client-id".to_owned(),
+    ];
+    argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    Cli::try_parse_from(argv).expect("broker create args should parse")
+}
+
+async fn spawn_live_broker_stub() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            let first_line = request.lines().next().unwrap_or_default();
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            seen.lock().unwrap().push(format!("{method} {path}"));
+
+            let (status_line, body) = match (method, path) {
+                ("GET", "/api/v1/broker_credentials/lookup/default/test-broker") => (
+                    "200 OK",
+                    r#"{"data":{"id":"bcr_test","namespace":"default","foreign_id":"test-broker","name":null,"status":"live","client_id":"client-id"}}"#,
+                ),
+                _ => ("500 Internal Server Error", r#"{"error":"unexpected"}"#),
+            };
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (base_url, requests, server)
+}
+
+fn broker_record(status: Option<&str>) -> BrokerCredentialRecord {
+    BrokerCredentialRecord {
+        id: "bcr_test".to_owned(),
+        namespace: "default".to_owned(),
+        foreign_id: Some("test-broker".to_owned()),
+        name: None,
+        status: status.map(ToOwned::to_owned),
+        client_id: Some("client-id".to_owned()),
+    }
+}
+
+#[test]
+fn broker_refresh_seed_cli_rejects_literal_argv_value() {
+    let err = Cli::try_parse_from([
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "broker",
+        "create",
+        "--foreign-id",
+        "test-broker",
+        "--token-endpoint",
+        "https://auth.example.test/token",
+        "--client-id",
+        "client-id",
+        "--refresh-token",
+        "secret-must-not-be-an-argument",
+    ])
+    .unwrap_err();
+    assert!(err.to_string().contains("--refresh-token"), "{err}");
+}
+
+#[test]
+fn broker_refresh_seed_cli_accepts_only_the_safe_source_flags() {
+    let stdin = broker_create_args(&["--refresh-token-stdin"]);
+    assert!(stdin.refresh_token_stdin);
+    assert!(stdin.refresh_token_file.is_none());
+    assert!(validate_broker_seed_args(&stdin).unwrap());
+
+    let file = broker_create_args(&["--refresh-token-file", "/tmp/seed"]);
+    assert!(!file.refresh_token_stdin);
+    assert_eq!(
+        file.refresh_token_file.as_deref(),
+        Some(Path::new("/tmp/seed"))
+    );
+    assert!(validate_broker_seed_args(&file).unwrap());
+}
+
+#[test]
+fn broker_refresh_seed_cli_rejects_multiple_sources() {
+    let err = Cli::try_parse_from(broker_create_argv(&[
+        "--refresh-token-stdin",
+        "--refresh-token-file",
+        "/tmp/seed",
+    ]))
+    .unwrap_err();
+    assert!(err.to_string().contains("cannot be used with"), "{err}");
+}
+
+#[test]
+fn broker_force_reauth_requires_a_safe_refresh_seed_source() {
+    let args = broker_create_args(&["--force-reauth"]);
+    let err = validate_broker_seed_args(&args).unwrap_err();
+    assert!(
+        err.to_string().contains("requires --refresh-token-stdin"),
+        "{err}"
+    );
+}
+
+#[test]
+fn broker_reseed_guard_allows_only_missing_or_dead_states_by_default() {
+    assert!(ensure_reseed_allowed(None, false, "test-broker").is_ok());
+    assert!(
+        ensure_reseed_allowed(Some(&broker_record(Some("dead"))), false, "test-broker").is_ok()
+    );
+    let err = ensure_reseed_allowed(
+        Some(&broker_record(Some("bootstrapping"))),
+        false,
+        "test-broker",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert!(
+        ensure_reseed_allowed(
+            Some(&broker_record(Some("bootstrapping"))),
+            true,
+            "test-broker"
+        )
+        .is_ok()
+    );
+
+    let err = ensure_reseed_allowed(Some(&broker_record(Some("live"))), false, "test-broker")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert!(ensure_reseed_allowed(Some(&broker_record(Some("live"))), true, "test-broker").is_ok());
+
+    let err = ensure_reseed_allowed(Some(&broker_record(None)), false, "test-broker").unwrap_err();
+    assert!(
+        err.to_string().contains("lifecycle status is unavailable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn broker_create_refuses_a_live_credential_before_consuming_or_writing_a_seed() {
+    let (base_url, requests, server) = spawn_live_broker_stub().await;
+    let cli = broker_create_cli(
+        &base_url,
+        &["--refresh-token-file", "/path/that/must/not/be/read"],
+    );
+    let Command::Broker(BrokerCmd::Create(args)) = &cli.command else {
+        panic!("expected broker create command");
+    };
+    let client = IronControlClient::new(&cli.iron_control_url, &cli.iron_control_api_key);
+
+    let err = broker_create(&cli, &client, args).await.unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        ["GET /api/v1/broker_credentials/lookup/default/test-broker"]
+    );
+    server.abort();
+}
+
+#[test]
+fn refresh_seed_normalization_allows_one_trailing_newline_only() {
+    assert_eq!(
+        normalize_refresh_seed("seed\n".to_owned(), "test").unwrap(),
+        "seed"
+    );
+    assert_eq!(
+        normalize_refresh_seed("seed\r\n".to_owned(), "test").unwrap(),
+        "seed"
+    );
+    let err = normalize_refresh_seed("seed\nsecond".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("exactly one token"), "{err}");
+    let err = normalize_refresh_seed("seed\n\n".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("exactly one token"), "{err}");
+    let err = normalize_refresh_seed("\n".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_seed_file_must_be_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+        "centaur-perms-refresh-seed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, "seed\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(read_refresh_seed_file(&path).unwrap(), "seed");
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let err = read_refresh_seed_file(&path).unwrap_err();
+    assert!(err.to_string().contains("mode 0600"), "{err}");
+    fs::remove_file(&path).unwrap();
 }
 
 // ----- secrets routing -----------------------------------------------------

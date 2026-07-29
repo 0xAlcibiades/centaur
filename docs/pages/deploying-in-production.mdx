@@ -109,6 +109,94 @@ so any thread can use any configured credential. Per-user and per-channel
 scoping is on the roadmap; until then, scope tool and harness access
 accordingly. See [Security](/security) for the full threat model.
 
+### Broker ownership
+
+`access_token` mode uses a Console broker credential. The Console stores the
+credential's refresh-token state encrypted in Postgres and its refresh worker
+is the sole rotating writer. 1Password and other external secret backends are
+only for static references, such as an account id. They may carry one fresh
+bootstrap seed into the Console, but that temporary item must be cleared or
+archived as soon as the Console accepts it. Never configure a mutable
+`OPENAI_CODEX_BLOB` or `CLAUDE_CODE_BLOB` item as ongoing broker state.
+
+Before selecting `access_token`, enable a reachable Console and its refresh
+worker in Helm. `console.enabled` is `false` by default; keep
+`console.worker.replicaCount` at least `1` so the refresh loop runs:
+
+```yaml
+console:
+  enabled: true
+  worker:
+    replicaCount: 1
+```
+
+### Safely create or re-authenticate a broker credential
+
+Use an administrator session in the Console's **Credentials** tab (the create
+form is at `/console/credentials/new`). The Console form stores the **Refresh
+Token** field encrypted and write-only: it is never shown again after save. An
+automation client may instead use the authenticated HTTPS
+`POST`/`PATCH /api/v1/broker_credentials` endpoint, provided it keeps the
+request body out of command history and logs.
+
+For the built-in access-token harnesses, create the following standalone
+`refresh_token` credentials in the `default` namespace:
+
+| Console field | Codex | Claude Code |
+|---------------|-------|-------------|
+| **Foreign ID** | `openai-codex` | `anthropic-claude` |
+| **Token endpoint** | `https://auth.openai.com/oauth/token` | `https://console.anthropic.com/v1/oauth/token` |
+| **Client ID** | `app_EMoamEEZ73f0CkXaXp7hrann` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| **Grant** | `refresh_token` | `refresh_token` |
+
+Paste a fresh provider refresh token only into the write-only **Refresh Token**
+field, save it, and wait for the Console worker to show the credential as
+`live`. To re-authenticate a dead credential, enter a fresh seed in that same
+field and save; the Console clears the dead state and resumes the refresh loop.
+Never pass a refresh token as a command-line argument, and never make an
+external secret backend the refresh loop's write target.
+
+`centaur-perms broker create` accepts a seed only through
+`--refresh-token-stdin` or `--refresh-token-file <path>`; the file must be mode
+`0600`. It fetches the existing redacted status before consuming the seed and
+refuses to replace active credentials (`live` or `bootstrapping`) by default.
+Only `missing` and `dead` credentials may be seeded without an override; use
+`--force-reauth` only after intentionally retiring the active OAuth family.
+The command polls redacted status for up to 180 seconds by default; set
+`--wait-timeout-seconds 0` only when asynchronous
+follow-up is intentional. That status check confirms the broker's reported
+usability, not the identity of a particular refresh-token generation.
+
+For example, provide Codex's fresh refresh token through a mode-`0600` file
+(such as a one-time file materialized from 1Password), never through an
+argument:
+
+```bash
+centaur-perms --namespace default broker create \
+  --foreign-id openai-codex \
+  --token-endpoint https://auth.openai.com/oauth/token \
+  --client-id app_EMoamEEZ73f0CkXaXp7hrann \
+  --refresh-token-file /run/secrets/openai-codex-refresh-token
+```
+
+Use `--force-reauth` only when deliberately replacing a `live` or
+`bootstrapping` credential after its prior OAuth family has been retired.
+
+If the one-time bootstrap seed is in 1Password, stream it directly from the
+CLI rather than storing it in a shell variable or argument:
+
+```bash
+op read 'op://<vault>/<one-time-broker-bootstrap>/credential' | \
+  centaur-perms --namespace default broker create \
+    --foreign-id openai-codex \
+    --token-endpoint https://auth.openai.com/oauth/token \
+    --client-id app_EMoamEEZ73f0CkXaXp7hrann \
+    --refresh-token-stdin
+```
+
+Archive or delete that one-time 1Password item after the Console reports the
+credential usable.
+
 ### Codex Auth Modes
 
 :::warning[Dedicate the account to Centaur]
@@ -121,38 +209,28 @@ token family is revoked, logging both sides out at random. Use a separate
 ChatGPT account for any non-Centaur Codex work.
 :::
 
-Codex supports two authentication modes, selected per deployment with the
-`CODEX_AUTH_MODE` env var on the sandbox (set it via `sandbox.extraEnv`):
+Codex supports two authentication modes. Set `sandbox.codexAuthMode` in Helm;
+the chart renders `CODEX_AUTH_MODE` into api-rs before it registers the matching
+iron-proxy fragment, then propagates the same value to each sandbox:
 
 | Mode | Upstream | Secrets required |
 |------|----------|------------------|
 | `api_key` (default) | `api.openai.com` | `OPENAI_API_KEY` |
-| `access_token` | `chatgpt.com` | `OPENAI_CODEX_CLIENT_ID`, `OPENAI_CODEX_BLOB`, `OPENAI_CODEX_ACCOUNT_ID` |
+| `access_token` | `chatgpt.com` | Console broker credential `openai-codex`; static `OPENAI_CODEX_ACCOUNT_ID` |
 
 `access_token` mode routes Codex through a ChatGPT account rather than a raw
-API key. [iron-token-broker](https://docs.iron.sh) holds the refresh token
-and mints short-lived access tokens, which iron-proxy injects on outbound
-requests so the sandbox never sees them.
+API key. The Console broker credential holds the Codex OAuth client id and
+refresh token, mints short-lived access tokens, and sends only the current
+access token to iron-proxy for injection. Sandboxes never receive either token.
+`OPENAI_CODEX_ACCOUNT_ID` remains a static reference that iron-proxy injects
+as the `chatgpt-account-id` header.
 
-Store these three items in your secrets backend (1Password vault, Kubernetes
-Secret, etc.) when running in `access_token` mode:
-
-- `OPENAI_CODEX_CLIENT_ID`: the Codex CLI's OAuth client id. This is a
-  fixed, publicly known constant: `app_EMoamEEZ73f0CkXaXp7hrann`. It is
-  the same for every Codex install and never rotates, but the broker
-  still resolves it through your secrets backend, so store the literal
-  value as-is.
-- `OPENAI_CODEX_BLOB`: a JSON document `{"refresh_token": "..."}`. The
-  broker rotates this in place on every refresh, so the backing item must
-  be writable.
-- `OPENAI_CODEX_ACCOUNT_ID`: the ChatGPT account UUID the credential is
-  bound to. It is static, but iron-proxy injects it as the
-  `chatgpt-account-id` header so the backend can route to the right
-  workspace. Store it alongside the other two, not in code.
-
-To bootstrap, run `codex login` locally, then copy the refresh token and
-account id from `~/.codex/auth.json` into the matching secret items. Use
-the constant above for `OPENAI_CODEX_CLIENT_ID`.
+To bootstrap, run `codex login` locally, then use the fresh refresh token and
+account id from `~/.codex/auth.json`. Create or re-bootstrap `openai-codex`
+through the Console form described above, and store the account id as a static
+secret reference. If a 1Password item was used to transport the seed, clear or
+archive it after the Console accepts the credential; do not create
+`OPENAI_CODEX_BLOB`.
 
 ### Claude Auth Modes
 
@@ -166,38 +244,30 @@ entire token family is revoked, logging both sides out at random. Use a
 separate Claude.ai account for any non-Centaur Claude Code work.
 :::
 
-Claude Code supports two authentication modes, selected per deployment
-with the `CLAUDE_CODE_AUTH_MODE` env var on the sandbox (set it via
-`sandbox.extraEnv`):
+Claude Code supports two authentication modes. Set `sandbox.claudeCodeAuthMode`
+in Helm; the chart renders `CLAUDE_CODE_AUTH_MODE` into api-rs before it
+registers the matching iron-proxy fragment, then propagates the same value to
+each sandbox:
 
 | Mode | Upstream | Secrets required |
 |------|----------|------------------|
 | `api_key` (default) | `api.anthropic.com` | `ANTHROPIC_API_KEY` |
-| `access_token` | `api.anthropic.com` | `CLAUDE_CODE_CLIENT_ID`, `CLAUDE_CODE_BLOB` |
+| `access_token` | `api.anthropic.com` | Console broker credential `anthropic-claude` |
 
 `access_token` mode routes Claude Code through a Claude.ai Pro or Max
-subscription rather than a raw API key. [iron-token-broker](https://docs.iron.sh)
-holds the refresh token and mints short-lived access tokens, which iron-proxy
-injects on outbound requests so the sandbox never sees them. The entrypoint
-plants a dummy `~/.claude/.credentials.json` so the CLI emits OAuth-shaped
-requests; the broker overwrites the Bearer at request time.
+subscription rather than a raw API key. The Console broker credential holds
+the Claude OAuth client id and refresh token, mints short-lived access tokens,
+and sends only the current access token to iron-proxy for injection. The
+entrypoint plants a dummy `~/.claude/.credentials.json` so the CLI emits
+OAuth-shaped requests; the Console-supplied token replaces the Bearer at
+request time.
 
-Store these two items in your secrets backend (1Password vault, Kubernetes
-Secret, etc.) when running in `access_token` mode:
-
-- `CLAUDE_CODE_CLIENT_ID`: the Claude Code CLI's OAuth client id. This
-  is a fixed, publicly known constant:
-  `9d1c250a-e61b-44d9-88ed-5944d1962f5e`. It is the same for every Claude
-  Code install and never rotates, but the broker still resolves it through
-  your secrets backend, so store the literal value as-is.
-- `CLAUDE_CODE_BLOB`: a JSON document `{"refresh_token": "..."}`. The
-  broker rotates this in place on every refresh, so the backing item must be
-  writable.
-
-To bootstrap, run `claude login` locally, then copy the refresh token from
-`~/.claude/.credentials.json` (or from the `Claude Code-credentials` keychain
-item on macOS) into `CLAUDE_CODE_BLOB`. Use the constant above for
-`CLAUDE_CODE_CLIENT_ID`.
+To bootstrap, run `claude login` locally, then use the fresh refresh token from
+`~/.claude/.credentials.json` (or the `Claude Code-credentials` keychain item
+on macOS). Create or re-bootstrap `anthropic-claude` through the Console form
+described above. If a 1Password item was used to transport the seed, clear or
+archive it after the Console accepts the credential; do not create
+`CLAUDE_CODE_BLOB`.
 
 ## 4. Configure Slack
 

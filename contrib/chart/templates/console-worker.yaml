@@ -7,8 +7,8 @@
 # console background job worker — runs Solid Queue (`bin/jobs`) so
 # console's enqueued jobs actually execute. The most important of these is
 # the broker-credential OAuth refresh loop, which mints and refreshes the access
-# tokens delivered inline via `token_broker` sources (e.g. the `openai-codex`
-# brokered token); the web (Puma) pod runs no worker, so without this those jobs
+# tokens delivered inline via `token_broker` sources; the web (Puma) pod runs no
+# worker, so without this those jobs
 # never run. The web Deployment owns database setup (create-db init + the image's
 # Rails db:prepare on boot), so this worker only processes jobs and waits for the
 # Solid Queue database to exist before starting.

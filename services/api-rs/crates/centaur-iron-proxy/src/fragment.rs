@@ -193,8 +193,8 @@ transforms:
           rules: [{ host: api.ai.meta.com }]
 "#;
 
-// The `openai-codex` broker credential this references is managed by
-// iron-control and provisioned out of band (see `centaur-perms broker create`).
+// The `openai-codex` broker credential is stored and rotated by the Console,
+// then provisioned separately through its broker management path.
 const CODEX_ACCESS_TOKEN_FRAGMENT: &str = r#"
 transforms:
   - name: secrets
@@ -225,8 +225,8 @@ transforms:
           rules: [{ host: api.anthropic.com }]
 "#;
 
-// The `anthropic-claude` broker credential this references is managed by
-// iron-control and provisioned out of band (see `centaur-perms broker create`).
+// The `anthropic-claude` broker credential is stored and rotated by the Console,
+// then provisioned separately through its broker management path.
 const CLAUDE_CODE_ACCESS_TOKEN_FRAGMENT: &str = r#"
 transforms:
   - name: secrets

@@ -355,7 +355,7 @@ spec:
               value: {{ include "centaur.trustedCaKeySecretName" . | quote }}
             - name: KUBERNETES_SECRET_ENV_NAME
               value: {{ include "centaur.secretEnvName" . | quote }}
-{{- if .Values.secrets.bootstrapSecretName }}
+{{- if and (eq .Values.ironProxy.secretSource "env") .Values.secrets.bootstrapSecretName }}
             - name: KUBERNETES_BOOTSTRAP_SECRET_NAME
               value: {{ .Values.secrets.bootstrapSecretName | quote }}
 {{- end }}
@@ -480,10 +480,6 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "centaur.secretEnvName" . }}
-{{- if and (eq .Values.ironProxy.secretSource "onepassword") .Values.secrets.bootstrapSecretName }}
-            - secretRef:
-                name: {{ .Values.secrets.bootstrapSecretName | quote }}
-{{- end }}
           ports:
             - containerPort: {{ .Values.apiRs.port }}
               name: http

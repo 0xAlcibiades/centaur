@@ -7,15 +7,20 @@
 //! and role `foreign_id`s it writes match exactly what api-rs registers.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use centaur_iron_control::{
-    BrokerCredentialInput, Grant, GrantSecret, Grantee, IdentityInput, IronControlClient,
-    IronControlError, Role, RoleSpec, SECRET_TYPES, grant_inputs_to_role, managed_labels,
+    BrokerCredentialInput, BrokerCredentialRecord, Grant, GrantSecret, Grantee, IdentityInput,
+    IronControlClient, IronControlError, Role, RoleSpec, SECRET_TYPES, grant_inputs_to_role,
+    managed_labels,
 };
 use centaur_iron_proxy::SourcePolicy;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use eyre::{Result, bail};
+use eyre::{Result, WrapErr, bail};
+use tokio::time::{Instant, sleep};
 
 mod principal;
 mod tools;
@@ -133,9 +138,9 @@ struct SecretSelector {
 #[derive(Subcommand, Debug)]
 enum BrokerCmd {
     /// Create or update a broker credential. iron-control owns the OAuth refresh
-    /// loop and delivers the current access token inline to proxies. Values are
-    /// passed literally; re-supplying `--refresh-token` re-bootstraps the
-    /// credential.
+    /// loop and delivers the current access token inline to proxies. A refresh
+    /// seed is accepted only through stdin or an owner-only file; reseeding an
+    /// active credential requires `--force-reauth`.
     Create(Box<BrokerCreateArgs>),
     /// List broker credentials registered in iron-control.
     List(FilterArgs),
@@ -172,10 +177,26 @@ struct BrokerCreateArgs {
     #[arg(long)]
     client_secret: Option<String>,
 
-    /// Seed refresh token (literal; write-only). Supplying it (re)bootstraps the
-    /// credential and triggers an immediate refresh.
+    /// Read a write-only refresh-token seed from stdin. Refuses an interactive
+    /// terminal; pipe exactly one token, optionally followed by a newline.
+    #[arg(long, conflicts_with = "refresh_token_file")]
+    refresh_token_stdin: bool,
+
+    /// Read a write-only refresh-token seed from an owner-only mode-0600 file.
+    /// The file must contain exactly one token, optionally followed by a newline.
+    #[arg(long, value_name = "PATH", conflicts_with = "refresh_token_stdin")]
+    refresh_token_file: Option<PathBuf>,
+
+    /// Explicitly permit replacing a currently live refresh-token family. Use
+    /// only for intentional provider re-authentication after the old family is
+    /// no longer in use.
     #[arg(long)]
-    refresh_token: Option<String>,
+    force_reauth: bool,
+
+    /// Seconds to wait for a supplied refresh seed to become `live` (default
+    /// 180). Set to 0 to return after the redacted upsert response.
+    #[arg(long, default_value_t = 180, value_name = "SECONDS")]
+    wait_timeout_seconds: u64,
 
     /// OAuth scope to request. Repeatable.
     #[arg(long = "scope", value_name = "SCOPE")]
@@ -797,6 +818,25 @@ async fn broker_create(
     client: &IronControlClient,
     args: &BrokerCreateArgs,
 ) -> Result<()> {
+    let has_refresh_seed = validate_broker_seed_args(args)?;
+
+    // Read the redacted lifecycle before accepting a seed. This is deliberately
+    // before stdin/file consumption, so an accidental live re-auth never asks an
+    // operator to expose a token at all.
+    let existing = get_broker_or_missing(client, &cli.namespace, &args.foreign_id).await?;
+    if has_refresh_seed {
+        ensure_reseed_allowed(existing.as_ref(), args.force_reauth, &args.foreign_id)?;
+    }
+
+    let refresh_token = read_refresh_seed(args)?;
+    if refresh_token.is_some() {
+        // There is no conditional upsert in the control API. Recheck as close as
+        // possible to the write so a credential that became live while its seed
+        // was being retrieved is still protected by the default refusal.
+        let current = get_broker_or_missing(client, &cli.namespace, &args.foreign_id).await?;
+        ensure_reseed_allowed(current.as_ref(), args.force_reauth, &args.foreign_id)?;
+    }
+
     let token_endpoint_headers = args
         .token_endpoint_headers
         .iter()
@@ -812,7 +852,7 @@ async fn broker_create(
         scopes: args.scopes.clone(),
         client_id: args.client_id.clone(),
         client_secret: args.client_secret.clone(),
-        refresh_token: args.refresh_token.clone(),
+        refresh_token,
         token_endpoint_headers,
         early_refresh_slack_seconds: args.early_refresh_slack_seconds,
         early_refresh_fraction: args.early_refresh_fraction,
@@ -830,7 +870,194 @@ async fn broker_create(
             .map(|s| format!(" — status {s}"))
             .unwrap_or_default(),
     );
+
+    if has_refresh_seed {
+        wait_for_broker_live(
+            client,
+            &cli.namespace,
+            &args.foreign_id,
+            record.status.as_deref(),
+            args.wait_timeout_seconds,
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// Fetch only the broker's redacted identity/lifecycle record. A 404 is the
+/// expected create case; every other API error remains fatal rather than being
+/// mistaken for permission to overwrite a credential.
+async fn get_broker_or_missing(
+    client: &IronControlClient,
+    namespace: &str,
+    foreign_id: &str,
+) -> Result<Option<BrokerCredentialRecord>> {
+    match client.get_broker_credential(namespace, foreign_id).await {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if is_status(&error, 404) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A refresh seed can create a missing credential or repair a dead credential.
+/// Replacing an active OAuth family risks refresh-token reuse detection, so it
+/// must be an explicit operator choice.
+fn ensure_reseed_allowed(
+    existing: Option<&BrokerCredentialRecord>,
+    force_reauth: bool,
+    foreign_id: &str,
+) -> Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    match existing.status.as_deref() {
+        Some("dead") => Ok(()),
+        Some("live" | "bootstrapping") if force_reauth => Ok(()),
+        Some("live" | "bootstrapping") => bail!(
+            "refusing to replace active broker credential {foreign_id:?}; retry only after the old OAuth family is no longer in use with --force-reauth"
+        ),
+        Some(_) if force_reauth => Ok(()),
+        Some(status) => bail!(
+            "refusing to reseed broker credential {foreign_id:?} with unrecognized status {status:?}; inspect it first or use --force-reauth for an intentional re-authentication"
+        ),
+        None if force_reauth => Ok(()),
+        None => bail!(
+            "refusing to reseed broker credential {foreign_id:?} because its lifecycle status is unavailable; inspect it first or use --force-reauth for an intentional re-authentication"
+        ),
+    }
+}
+
+fn validate_broker_seed_args(args: &BrokerCreateArgs) -> Result<bool> {
+    let has_refresh_seed = args.refresh_token_stdin || args.refresh_token_file.is_some();
+    if args.force_reauth && !has_refresh_seed {
+        bail!("--force-reauth requires --refresh-token-stdin or --refresh-token-file");
+    }
+    Ok(has_refresh_seed)
+}
+
+fn read_refresh_seed(args: &BrokerCreateArgs) -> Result<Option<String>> {
+    match (args.refresh_token_stdin, args.refresh_token_file.as_deref()) {
+        (false, None) => Ok(None),
+        (true, None) => {
+            if io::stdin().is_terminal() {
+                bail!(
+                    "--refresh-token-stdin requires piped stdin; use --refresh-token-file with a mode-0600 file instead of typing a token into a terminal"
+                );
+            }
+            let mut raw = String::new();
+            io::stdin()
+                .lock()
+                .read_to_string(&mut raw)
+                .wrap_err("reading refresh-token seed from stdin")?;
+            normalize_refresh_seed(raw, "stdin").map(Some)
+        }
+        (false, Some(path)) => read_refresh_seed_file(path).map(Some),
+        // clap enforces this invariant for normal CLI parsing; retain a
+        // fail-closed guard for direct construction in tests or future callers.
+        (true, Some(_)) => bail!(
+            "pass exactly one refresh-token source: --refresh-token-stdin or --refresh-token-file"
+        ),
+    }
+}
+
+fn read_refresh_seed_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .wrap_err_with(|| format!("opening refresh-token seed file {}", path.display()))?;
+    ensure_owner_only_seed_file(&file, path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .wrap_err_with(|| format!("reading refresh-token seed file {}", path.display()))?;
+    normalize_refresh_seed(raw, "refresh-token file")
+}
+
+#[cfg(unix)]
+fn ensure_owner_only_seed_file(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = file.metadata().wrap_err_with(|| {
+        format!(
+            "reading metadata for refresh-token seed file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "refresh-token seed path {} must be a regular file",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "refresh-token seed file {} must have mode 0600 (found {mode:04o})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_seed_file(_file: &File, path: &Path) -> Result<()> {
+    bail!(
+        "--refresh-token-file is unsupported on this platform because centaur-perms cannot verify mode 0600 for {}",
+        path.display()
+    );
+}
+
+fn normalize_refresh_seed(raw: String, source: &str) -> Result<String> {
+    let seed = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(&raw);
+    if seed.is_empty() {
+        bail!("refresh-token seed from {source} is empty");
+    }
+    if seed.contains('\r') || seed.contains('\n') {
+        bail!("refresh-token seed from {source} must contain exactly one token");
+    }
+    Ok(seed.to_owned())
+}
+
+async fn wait_for_broker_live(
+    client: &IronControlClient,
+    namespace: &str,
+    foreign_id: &str,
+    initial_status: Option<&str>,
+    wait_timeout_seconds: u64,
+) -> Result<()> {
+    if wait_timeout_seconds == 0 {
+        println!(
+            "broker credential {foreign_id}: status {} (not waiting)",
+            initial_status.unwrap_or("unknown")
+        );
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(wait_timeout_seconds);
+    loop {
+        // Poll at least once even if the upsert response already says `live`;
+        // callers only receive a redacted lifecycle confirmation from here.
+        let record = client.get_broker_credential(namespace, foreign_id).await?;
+        let status = record.status.as_deref().unwrap_or("unknown");
+        match status {
+            "live" => {
+                println!("broker credential {foreign_id}: status live");
+                return Ok(());
+            }
+            "dead" => bail!(
+                "broker credential {foreign_id:?} is dead after re-authentication; inspect its redacted status in the Console"
+            ),
+            _ => {}
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "broker credential {foreign_id:?} did not become live within {wait_timeout_seconds}s (last redacted status {status:?})"
+            );
+        }
+        sleep(remaining.min(Duration::from_secs(1))).await;
+    }
 }
 
 async fn broker_list(cli: &Cli, client: &IronControlClient, args: &FilterArgs) -> Result<()> {

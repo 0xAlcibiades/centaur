@@ -21,6 +21,23 @@ There are two source modes:
   iron-proxy. Simpler to set up and fine for local development or low-volume
   deployments, but expect throttling once real traffic shows up.
 
+### Keep OAuth refresh state in the Console
+
+1Password sources are for static tool, harness, and header values. A Console
+broker credential stores rotating OAuth refresh-token state encrypted in
+Postgres, and the Console refresh worker is its only rotating writer. Do not
+configure a
+mutable 1Password item such as `OPENAI_CODEX_BLOB` or `CLAUDE_CODE_BLOB` as
+ongoing broker state. If 1Password is used to carry a fresh bootstrap seed into
+the Console, clear or archive that one-shot item as soon as the Console accepts
+the credential.
+
+`secretManager.existingSecretName` is mounted into every sandbox iron-proxy so
+it can supply the 1Password client credentials. It must never contain a broker
+refresh seed. Keep `secrets.bootstrapSecretName` unset for 1Password and
+Connect deployments; Helm rejects assigning it the same name as
+`secretManager.existingSecretName` in those modes.
+
 ## Configure the chart (Connect, preferred)
 
 ```yaml

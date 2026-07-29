@@ -1,9 +1,8 @@
 module Broker
-  # The recurring driver of the refresh loop, replacing iron-token-broker's
-  # per-credential goroutine. Level-triggered: every tick it re-derives which
-  # credentials are due from the database, so a missed tick is caught by the
-  # next one (unlike a self-rescheduling job, which orphans a credential forever
-  # if its enqueue is ever lost).
+  # The recurring driver of the refresh loop. Level-triggered: every tick
+  # re-derives which credentials are due from the database, so a missed tick is
+  # caught by the next one. A self-rescheduling job could orphan a credential
+  # if its enqueue were ever lost.
   #
   # FOR UPDATE SKIP LOCKED skips credentials whose refresh is already in flight
   # (locked by a RefreshCredentialJob), so we don't enqueue redundant work for
