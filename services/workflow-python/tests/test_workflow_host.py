@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -453,6 +454,61 @@ class WorkflowHostTests(unittest.TestCase):
 
         assert registered is not None
         self.assertEqual(host.normalize_principal(registered), True)
+
+
+class WorkflowHostProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_workflow_exits_while_stdin_remains_open(self) -> None:
+        host_path = Path(__file__).resolve().parents[1] / "workflow_host.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_dir = Path(tmp)
+            (workflow_dir / "failing_workflow.py").write_text(
+                "WORKFLOW_NAME = 'failing_workflow'\n"
+                "async def handler(inp, ctx):\n"
+                "    raise RuntimeError('intentional workflow failure')\n"
+            )
+            env = os.environ.copy()
+            env["WORKFLOW_DIRS"] = str(workflow_dir)
+            env.pop("DATABASE_URL", None)
+            env.pop("WORKFLOW_ENABLE_MODE", None)
+            env.pop("WORKFLOW_ALLOWED_NAMES", None)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(host_path),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            try:
+                process.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "workflow.start",
+                                "workflow_name": "failing_workflow",
+                                "run_id": "run-123",
+                                "task_id": "task-456",
+                                "input": {},
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await process.stdin.drain()
+
+                response = json.loads(
+                    (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+                )
+                self.assertEqual(response["type"], "workflow.error")
+                self.assertEqual(response["message"], "intentional workflow failure")
+                self.assertEqual(await asyncio.wait_for(process.wait(), timeout=5), 0)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                process.stdin.close()
 
 
 if __name__ == "__main__":
