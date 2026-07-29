@@ -74,6 +74,15 @@ requires `apiRs.workflowHostSandbox=true`, which renders
 `WORKFLOW_HOST_SANDBOX=true`; startup fails if workflow-host sandboxing is
 disabled.
 
+When pre-granting with `centaur-perms`, bind the canonical identity explicitly:
+
+```bash
+cargo run -p centaur-perms -- \
+  principals grant workflow-nightly-report \
+  --workflow-name nightly_report \
+  --tool slack
+```
+
 ## Durable primitives
 
 | Primitive | Use it for |

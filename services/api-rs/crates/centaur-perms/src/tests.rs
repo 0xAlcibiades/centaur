@@ -13,8 +13,9 @@ use tokio::net::TcpListener;
 use crate::tools::{self, ParsedSecret, SecretMode};
 use crate::translate;
 use crate::{
-    BrokerCmd, Cli, Command, broker_create, ensure_reseed_allowed, normalize_refresh_seed,
-    read_refresh_seed_file, validate_broker_seed_args,
+    BrokerCmd, Cli, Command, PrincipalsCmd, broker_create, ensure_reseed_allowed,
+    labels_for_explicit_workflow_claim, normalize_refresh_seed, read_refresh_seed_file,
+    require_exact_workflow_labels, resolve_grant_principal, validate_broker_seed_args,
 };
 
 fn entry(toml_src: &str) -> toml::Value {
@@ -72,6 +73,72 @@ fn broker_create_cli(base_url: &str, extra: &[&str]) -> Cli {
     ];
     argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
     Cli::try_parse_from(argv).expect("broker create args should parse")
+}
+
+#[test]
+fn explicit_workflow_claim_upgrades_only_an_unclaimed_centaur_principal() {
+    let required = std::collections::BTreeMap::from([
+        ("kind".to_owned(), "workflow".to_owned()),
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        (
+            "workflow_name".to_owned(),
+            "planetscale_daily_audit".to_owned(),
+        ),
+    ]);
+    let old_generic = std::collections::BTreeMap::from([
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        ("grant-owner".to_owned(), "operator".to_owned()),
+    ]);
+
+    let upgraded = labels_for_explicit_workflow_claim(&old_generic, &required)
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded.get("kind").map(String::as_str), Some("workflow"));
+    assert_eq!(
+        upgraded.get("workflow_name").map(String::as_str),
+        Some("planetscale_daily_audit")
+    );
+    assert_eq!(
+        upgraded.get("grant-owner").map(String::as_str),
+        Some("operator")
+    );
+    assert!(
+        labels_for_explicit_workflow_claim(&upgraded, &required)
+            .unwrap()
+            .is_none()
+    );
+
+    let conflicting = std::collections::BTreeMap::from([
+        ("kind".to_owned(), "workflow".to_owned()),
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        ("workflow_name".to_owned(), "other".to_owned()),
+    ]);
+    assert!(labels_for_explicit_workflow_claim(&conflicting, &required).is_err());
+    assert!(require_exact_workflow_labels(&conflicting, &required).is_err());
+    assert!(require_exact_workflow_labels(&upgraded, &required).is_ok());
+}
+
+#[test]
+fn workflow_principal_namespace_requires_an_explicit_workflow_name() {
+    let cli = Cli::try_parse_from([
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "principals",
+        "grant",
+        "workflow-planetscale-daily-audit",
+        "--tool",
+        "planetscale_mcp",
+    ])
+    .unwrap();
+    let Command::Principals(PrincipalsCmd::Grant(args)) = &cli.command else {
+        panic!("expected principal grant command");
+    };
+
+    let error = resolve_grant_principal(&cli, args).unwrap_err();
+    assert!(error.to_string().contains("pass --workflow-name"));
 }
 
 async fn spawn_live_broker_stub() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)

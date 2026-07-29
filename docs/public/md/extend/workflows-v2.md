@@ -145,12 +145,15 @@ needs:
 ```bash
 cargo run -p centaur-perms -- \
   principals grant workflow-nightly-report \
+  --workflow-name nightly_report \
   --tool slack
 ```
 
 The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
 Workflow code cannot choose another principal id, display name, or labels. An
-existing principal must carry the exact workflow identity labels; api-rs fails
+The required `--workflow-name` flag makes pre-granting create those exact labels;
+it can explicitly claim an older untyped Centaur-managed principal with the same
+canonical id, but rejects a conflicting typed identity. api-rs likewise fails
 closed instead of reusing a principal left by a differently named workflow.
 Scoped `ctx.agent_turn(...)` calls cannot choose `thread_key`, so a workflow
 cannot attach its grants to an unrelated session. `WORKFLOW_PRINCIPAL = True`

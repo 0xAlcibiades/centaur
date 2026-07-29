@@ -266,6 +266,10 @@ struct PrincipalGrantArgs {
     #[arg(long)]
     slack_user: Option<String>,
 
+    /// Bind this grant to the canonical server-owned principal for a workflow.
+    #[arg(long, conflicts_with = "slack_user")]
+    workflow_name: Option<String>,
+
     /// Tool name — registers its `tool-{slug}` role + secrets, then (un)assigns
     /// it. Repeatable.
     #[arg(long = "tool", value_name = "NAME")]
@@ -473,9 +477,8 @@ async fn principals_grant(
         bail!("--grant-id is only valid for `principals revoke`");
     }
     let policy = build_source_policy(cli)?;
-    let identity =
-        principal::resolve_principal(&args.principal, args.slack_user.as_deref(), &cli.namespace);
-    let principal_id = ensure_principal(client, &identity).await?;
+    let identity = resolve_grant_principal(cli, args)?;
+    let principal_id = ensure_principal(client, &identity, args.workflow_name.is_some()).await?;
     println!("principal: {} ({principal_id})", identity.foreign_id);
 
     let dirs =
@@ -537,9 +540,11 @@ async fn principals_revoke(
     {
         bail!("nothing to revoke: pass at least one --tool, --role, --secret, or --grant-id");
     }
-    let identity =
-        principal::resolve_principal(&args.principal, args.slack_user.as_deref(), &cli.namespace);
+    let identity = resolve_grant_principal(cli, args)?;
     let principal = get_principal_or_fail(client, &cli.namespace, &identity.foreign_id).await?;
+    if args.workflow_name.is_some() {
+        require_exact_workflow_labels(&principal.labels, &identity.labels)?;
+    }
     println!("principal: {} ({})", identity.foreign_id, principal.id);
 
     let assigned = client.list_principal_roles(&principal.id).await?;
@@ -1250,18 +1255,92 @@ fn parse_kv(raw: &str, flag: &str) -> Result<(String, String)> {
     }
 }
 
-/// Ensure the principal exists, returning its OID. Looks it up first so an
-/// existing principal (e.g. one a session created) is never clobbered; creates
-/// it only when absent.
-async fn ensure_principal(client: &IronControlClient, identity: &IdentityInput) -> Result<String> {
+/// Ensure the principal exists, returning its OID. Existing principals are not
+/// changed except for an explicit workflow claim of the same untyped,
+/// Centaur-managed identity.
+fn resolve_grant_principal(cli: &Cli, args: &PrincipalGrantArgs) -> Result<IdentityInput> {
+    match args.workflow_name.as_deref() {
+        Some(workflow_name) => {
+            principal::resolve_workflow_principal(&args.principal, workflow_name, &cli.namespace)
+        }
+        None => {
+            if args.principal.starts_with("workflow-") {
+                bail!(
+                    "principal {:?} is in the reserved workflow namespace; pass --workflow-name",
+                    args.principal
+                );
+            }
+            Ok(principal::resolve_principal(
+                &args.principal,
+                args.slack_user.as_deref(),
+                &cli.namespace,
+            ))
+        }
+    }
+}
+
+async fn ensure_principal(
+    client: &IronControlClient,
+    identity: &IdentityInput,
+    require_exact_labels: bool,
+) -> Result<String> {
     match client
         .get_principal(&identity.namespace, &identity.foreign_id)
         .await
     {
-        Ok(p) => Ok(p.id),
+        Ok(p) => {
+            if require_exact_labels {
+                match labels_for_explicit_workflow_claim(&p.labels, &identity.labels)? {
+                    None => return Ok(p.id),
+                    Some(labels) => {
+                        let claimed = IdentityInput {
+                            labels,
+                            ..identity.clone()
+                        };
+                        return Ok(client.upsert_principal(&claimed).await?.id);
+                    }
+                }
+            }
+            Ok(p.id)
+        }
         Err(e) if is_status(&e, 404) => Ok(client.upsert_principal(identity).await?.id),
         Err(e) => Err(e.into()),
     }
+}
+
+fn labels_for_explicit_workflow_claim(
+    existing: &BTreeMap<String, String>,
+    required: &BTreeMap<String, String>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    if required
+        .iter()
+        .all(|(key, value)| existing.get(key) == Some(value))
+    {
+        return Ok(None);
+    }
+    let is_unclaimed_centaur_principal = existing.get("managed-by").map(String::as_str)
+        == Some("centaur")
+        && !existing.contains_key("kind")
+        && !existing.contains_key("workflow_name");
+    if !is_unclaimed_centaur_principal {
+        bail!("principal already exists with a different identity");
+    }
+    let mut claimed = existing.clone();
+    claimed.extend(required.clone());
+    Ok(Some(claimed))
+}
+
+fn require_exact_workflow_labels(
+    existing: &BTreeMap<String, String>,
+    required: &BTreeMap<String, String>,
+) -> Result<()> {
+    if required
+        .iter()
+        .all(|(key, value)| existing.get(key) == Some(value))
+    {
+        return Ok(());
+    }
+    bail!("principal already exists with a different identity")
 }
 
 async fn get_principal_or_fail(

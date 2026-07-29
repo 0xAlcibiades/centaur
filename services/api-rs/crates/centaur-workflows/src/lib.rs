@@ -12,9 +12,7 @@ use absurd::{
     RetryStrategy, SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker,
     WorkerOptions,
 };
-use centaur_iron_control::{
-    IdentityInput, IronControlClient, IronControlError, Principal, slugify,
-};
+use centaur_iron_control::{IronControlClient, IronControlError, Principal, workflow_principal};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -318,8 +316,9 @@ impl WorkflowPrincipalRegistrar {
         validate_workflow_principal_foreign_ids(principals)?;
         let mut registered = BTreeMap::new();
         for workflow_name in principals {
-            let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
-            let labels = workflow_principal_labels(workflow_name);
+            let mut identity = workflow_principal(workflow_name).to_identity_input(&self.namespace);
+            let foreign_id = identity.foreign_id.clone();
+            let labels = identity.labels.clone();
             let labels = match self
                 .client
                 .get_principal(&self.namespace, &foreign_id)
@@ -334,15 +333,8 @@ impl WorkflowPrincipalRegistrar {
                 Err(IronControlError::Status { status: 404, .. }) => labels,
                 Err(error) => return Err(error.into()),
             };
-            let record = self
-                .client
-                .upsert_principal(&IdentityInput {
-                    namespace: self.namespace.clone(),
-                    foreign_id,
-                    name: format!("Workflow {workflow_name}"),
-                    labels,
-                })
-                .await?;
+            identity.labels = labels;
+            let record = self.client.upsert_principal(&identity).await?;
             registered.insert(workflow_name.clone(), record.id);
         }
         Ok(registered)
@@ -374,7 +366,7 @@ fn validate_workflow_principal_foreign_ids(
 ) -> Result<(), WorkflowRuntimeError> {
     let mut owners = BTreeMap::new();
     for workflow_name in workflow_names {
-        let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
+        let foreign_id = workflow_principal(workflow_name).foreign_id;
         if let Some(existing) = owners.insert(foreign_id.clone(), workflow_name) {
             return Err(WorkflowRuntimeError::BadRequest(format!(
                 "workflows {existing} and {workflow_name} map to the same principal {foreign_id}"
@@ -384,16 +376,11 @@ fn validate_workflow_principal_foreign_ids(
     Ok(())
 }
 
-fn canonical_workflow_principal_foreign_id(workflow_name: &str) -> String {
-    format!("workflow-{}", slugify(workflow_name))
-}
-
+#[cfg(test)]
 fn workflow_principal_labels(workflow_name: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("kind".to_owned(), "workflow".to_owned()),
-        ("managed-by".to_owned(), "centaur".to_owned()),
-        ("workflow_name".to_owned(), workflow_name.to_owned()),
-    ])
+    workflow_principal(workflow_name)
+        .to_identity_input("default")
+        .labels
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5345,11 +5332,11 @@ mod tests {
     #[test]
     fn workflow_principal_foreign_id_is_derived_from_workflow_name() {
         assert_eq!(
-            canonical_workflow_principal_foreign_id("nightly_report"),
+            workflow_principal("nightly_report").foreign_id,
             "workflow-nightly-report"
         );
         assert_eq!(
-            canonical_workflow_principal_foreign_id("Managing Partner Daily Briefing"),
+            workflow_principal("Managing Partner Daily Briefing").foreign_id,
             "workflow-managing-partner-daily-briefing"
         );
     }

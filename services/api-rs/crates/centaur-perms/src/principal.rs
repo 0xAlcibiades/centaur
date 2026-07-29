@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use centaur_iron_control::{IdentityInput, derive_principal};
+use centaur_iron_control::{IdentityInput, derive_principal, workflow_principal};
+use eyre::{Result, bail};
 
 /// Turn a `--principal` value (plus optional `--slack-user`) into the identity
 /// to upsert/look up.
@@ -29,6 +30,22 @@ pub fn resolve_principal(
             labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
         }
     }
+}
+
+/// Resolve and validate a server-owned workflow principal for pre-granting.
+pub fn resolve_workflow_principal(
+    principal: &str,
+    workflow_name: &str,
+    namespace: &str,
+) -> Result<IdentityInput> {
+    let identity = workflow_principal(workflow_name).to_identity_input(namespace);
+    if principal != identity.foreign_id {
+        bail!(
+            "workflow {workflow_name:?} requires principal {:?}, not {principal:?}",
+            identity.foreign_id
+        );
+    }
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -76,5 +93,37 @@ mod tests {
         let id = resolve_principal("slack-channel-t1-c9", None, "default");
         assert_eq!(id.foreign_id, "slack-channel-t1-c9");
         assert_eq!(id.name, "slack-channel-t1-c9");
+    }
+
+    #[test]
+    fn workflow_foreign_id_and_identity_labels_are_exact() {
+        let id = resolve_workflow_principal(
+            "workflow-planetscale-daily-audit",
+            "planetscale_daily_audit",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(id.name, "Workflow planetscale_daily_audit");
+        assert_eq!(id.labels.get("kind").map(String::as_str), Some("workflow"));
+        assert_eq!(
+            id.labels.get("workflow_name").map(String::as_str),
+            Some("planetscale_daily_audit")
+        );
+        assert_eq!(
+            id.labels.get("managed-by").map(String::as_str),
+            Some("centaur")
+        );
+    }
+
+    #[test]
+    fn workflow_foreign_id_mismatch_fails_closed() {
+        let error =
+            resolve_workflow_principal("workflow-other", "planetscale_daily_audit", "default")
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workflow-planetscale-daily-audit")
+        );
     }
 }
