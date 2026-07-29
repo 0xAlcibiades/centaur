@@ -22,15 +22,23 @@ const STATUS_FIELDS = [
   'next_available_at',
   'pending_enrollments'
 ] as const
-const ENROLLMENT_FIELDS = [
+const START_ENROLLMENT_FIELDS = [
   'enrollment_id',
+  'action',
+  'account_label',
   'verification_url',
   'user_code',
   'expires_at',
+  'status'
+] as const
+const ENROLLMENT_STATUS_FIELDS = [
+  'enrollment_id',
   'status',
+  'expires_at',
   'account',
   'error_code'
 ] as const
+const ENROLLMENT_ACCOUNT_FIELDS = ['label', 'email', 'status'] as const
 const ACCOUNT_FIELDS = [
   'label',
   'email',
@@ -57,14 +65,30 @@ type AutorotateStatus = {
   pending_enrollments?: number
 }
 
-type AutorotateEnrollment = {
-  enrollment_id?: string
+type EnrollmentAction = 'add' | 'relogin'
+type EnrollmentStatus = 'pending' | 'importing' | 'completed' | 'failed' | 'cancelled' | 'expired'
+type EnrollmentAccount = {
+  email: string | null
+  label: string
+  status: AutorotateAccount['status']
+}
+
+type StartEnrollmentResponse = {
+  enrollment_id: string
+  action: EnrollmentAction
+  account_label: string
   verification_url?: string
   user_code?: string
-  expires_at?: string
-  status?: string
-  account?: { email: string | null; label: string } | null
-  error_code?: string
+  expires_at: string
+  status: 'pending' | 'importing'
+}
+
+type EnrollmentStatusResponse = {
+  enrollment_id: string
+  expires_at: string
+  status: EnrollmentStatus
+  account: EnrollmentAccount | null
+  error_code: string | null
 }
 
 type AutorotateAccount = {
@@ -75,9 +99,10 @@ type AutorotateAccount = {
   login_required: boolean
 }
 
-type ActiveEnrollmentState = 'starting' | 'pending' | 'cancel_requested' | 'cancelling'
+type ActiveEnrollmentState = 'starting' | 'monitoring' | 'cancel_requested' | 'cancelling'
 
 type ActiveEnrollment = {
+  brokerStatus: 'pending' | 'importing'
   enrollmentId?: string
   expiresAtMs: number
   owner: string
@@ -139,17 +164,17 @@ class AutorotateClient {
     return selectFields(payload, STATUS_FIELDS) as AutorotateStatus
   }
 
-  async createEnrollment(input: CreateEnrollmentInput): Promise<AutorotateEnrollment> {
+  async createEnrollment(input: CreateEnrollmentInput): Promise<StartEnrollmentResponse> {
     const payload = await this.request(
       'POST',
       'v1/operator/enrollments',
       this.operatorToken,
       input
     )
-    return validateEnrollment(selectFields(payload, ENROLLMENT_FIELDS))
+    return validateStartEnrollment(selectFields(payload, START_ENROLLMENT_FIELDS))
   }
 
-  async enrollment(enrollmentId: string): Promise<AutorotateEnrollment> {
+  async enrollment(enrollmentId: string): Promise<EnrollmentStatusResponse> {
     if (!ENROLLMENT_ID_PATTERN.test(enrollmentId)) {
       throw new AutorotateError('invalid enrollment id')
     }
@@ -158,17 +183,17 @@ class AutorotateClient {
       `v1/operator/enrollments/${encodeURIComponent(enrollmentId)}`,
       this.operatorToken
     )
-    return validateEnrollment(selectFields(payload, ENROLLMENT_FIELDS))
+    return validateEnrollmentStatus(selectFields(payload, ENROLLMENT_STATUS_FIELDS))
   }
 
-  async activeEnrollment(owner: string): Promise<AutorotateEnrollment | null> {
+  async activeEnrollment(owner: string): Promise<StartEnrollmentResponse | null> {
     try {
       const payload = await this.request(
         'GET',
         `v1/operator/enrollments?owner=${encodeURIComponent(owner)}`,
         this.operatorToken
       )
-      return validateEnrollment(selectFields(payload, ENROLLMENT_FIELDS))
+      return validateStartEnrollment(selectFields(payload, START_ENROLLMENT_FIELDS))
     } catch (error) {
       if (error instanceof AutorotateError && error.status === 404) return null
       throw error
@@ -192,7 +217,7 @@ class AutorotateClient {
     })
   }
 
-  async cancelEnrollment(enrollmentId: string): Promise<AutorotateEnrollment> {
+  async cancelEnrollment(enrollmentId: string): Promise<EnrollmentStatusResponse | null> {
     if (!ENROLLMENT_ID_PATTERN.test(enrollmentId)) {
       throw new AutorotateError('invalid enrollment id')
     }
@@ -203,7 +228,9 @@ class AutorotateClient {
       undefined,
       true
     )
-    return validateEnrollment(selectFields(payload, ENROLLMENT_FIELDS))
+    return Object.keys(payload).length === 0
+      ? null
+      : validateEnrollmentStatus(selectFields(payload, ENROLLMENT_STATUS_FIELDS))
   }
 
   private async request(
@@ -327,6 +354,7 @@ export function createAutorotateSlackCommandHandler(
           )
         }
         const active: ActiveEnrollment = {
+          brokerStatus: 'pending',
           expiresAtMs: Date.now() + DEFAULT_ENROLLMENT_LIFETIME_MS,
           owner,
           responseUrl,
@@ -395,6 +423,7 @@ export function createAutorotateSlackCommandHandler(
           fetchFn,
           options,
           owner,
+          pollIntervalMs,
           responseUrl
         })
       )
@@ -471,51 +500,79 @@ async function startAndMonitorEnrollment(input: {
     const reloginExpectedEmail = input.command.action === 'relogin'
       ? input.command.expectedEmail ?? reloginAccount?.email ?? undefined
       : undefined
-    const enrollment = await input.client.createEnrollment(
-      input.command.action === 'relogin'
-        ? {
-            action: 'relogin',
-            account: input.command.account,
-            owner: input.active.owner,
-            ...(reloginExpectedEmail ? { expected_email: reloginExpectedEmail } : {})
-          }
-        : {
-            action: 'add',
-            label: input.command.label ?? `codex-${userId.toLowerCase()}`,
-            owner: `slack:${teamId}:${userId}`,
-            ...(input.command.expectedEmail
-              ? { expected_email: input.command.expectedEmail }
-              : {})
-          }
-    )
-    const enrollmentId = enrollment.enrollment_id
-    const expiresAtMs = Date.parse(enrollment.expires_at ?? '')
-    if (!enrollmentId || !ENROLLMENT_ID_PATTERN.test(enrollmentId) || !Number.isFinite(expiresAtMs)) {
-      throw new AutorotateError('Autorotate returned an invalid enrollment')
+    const createInput: CreateEnrollmentInput = input.command.action === 'relogin'
+      ? {
+          action: 'relogin',
+          account: input.command.account,
+          owner: input.active.owner,
+          ...(reloginExpectedEmail ? { expected_email: reloginExpectedEmail } : {})
+        }
+      : {
+          action: 'add',
+          label: input.command.label ?? `codex-${userId.toLowerCase()}`,
+          owner: `slack:${teamId}:${userId}`,
+          ...(input.command.expectedEmail
+            ? { expected_email: input.command.expectedEmail }
+            : {})
+        }
+    const enrollment = await input.client.createEnrollment(createInput)
+    const expectedLabel = createInput.action === 'add' ? createInput.label : createInput.account
+    if (
+      enrollment.action !== createInput.action
+      || enrollment.account_label !== expectedLabel
+    ) {
+      throw new AutorotateError('Autorotate returned a mismatched enrollment')
     }
+    const enrollmentId = enrollment.enrollment_id
+    const expiresAtMs = Date.parse(enrollment.expires_at)
     input.active.enrollmentId = enrollmentId
     input.active.expiresAtMs = expiresAtMs
+    input.active.brokerStatus = enrollment.status
     if (input.activeEnrollments.get(input.actorKey) !== input.active) {
       await cancelEnrollmentQuietly(input.client, enrollmentId, input.options)
       return
     }
     if (input.active.state === 'cancel_requested') {
       input.active.state = 'cancelling'
-      await input.client.cancelEnrollment(enrollmentId)
+      const cancelled = await input.client.cancelEnrollment(enrollmentId)
+      if (cancelled?.status === 'importing') {
+        input.active.brokerStatus = 'importing'
+        input.active.state = 'monitoring'
+        await postSlackResponse(
+          input.fetchFn,
+          input.responseUrl,
+          'Codex login is already importing the canonical credential and can no longer be cancelled.',
+          input.options.requestTimeoutMs
+        )
+        await monitorEnrollment(
+          input.client,
+          input.active,
+          input.actorKey,
+          input.activeEnrollments,
+          input.options,
+          input.fetchFn,
+          input.pollIntervalMs
+        )
+        return
+      }
       input.activeEnrollments.delete(input.actorKey)
       await postSlackResponse(
         input.fetchFn,
         input.responseUrl,
-        'Codex device login was cancelled.',
+        cancelled && cancelled.status !== 'cancelled'
+          ? formatTerminalEnrollment(cancelled)
+          : 'Codex device login was cancelled.',
         input.options.requestTimeoutMs
       )
       return
     }
-    input.active.state = 'pending'
+    input.active.state = 'monitoring'
     await postSlackResponse(
       input.fetchFn,
       input.responseUrl,
-      formatDeviceCode(enrollment, reloginAccount),
+      enrollment.status === 'pending'
+        ? formatDeviceCode(enrollment, reloginAccount)
+        : formatActiveEnrollment(enrollment),
       input.options.requestTimeoutMs
     )
     await monitorEnrollment(
@@ -566,22 +623,25 @@ async function monitorEnrollment(
   pollIntervalMs: number
 ): Promise<void> {
   while (
-    Date.now() < active.expiresAtMs
-    && activeEnrollments.get(actorKey) === active
-    && active.state === 'pending'
+    activeEnrollments.get(actorKey) === active
+    && active.state === 'monitoring'
   ) {
+    if (active.brokerStatus === 'pending' && Date.now() >= active.expiresAtMs) break
     await delay(pollIntervalMs)
-    if (activeEnrollments.get(actorKey) !== active || active.state !== 'pending') return
+    if (activeEnrollments.get(actorKey) !== active || active.state !== 'monitoring') return
     const enrollmentId = active.enrollmentId
     if (!enrollmentId) return
-    let enrollment: AutorotateEnrollment
+    let enrollment: EnrollmentStatusResponse
     try {
       enrollment = await client.enrollment(enrollmentId)
     } catch (error) {
       safeCommandWarning(options.logger, 'slackbotv2_autorotate_login_poll_failed', error)
       continue
     }
-    if (activeEnrollments.get(actorKey) !== active || active.state !== 'pending') return
+    if (activeEnrollments.get(actorKey) !== active || active.state !== 'monitoring') return
+    if (enrollment.status === 'importing') {
+      active.brokerStatus = 'importing'
+    }
     if (!isTerminalStatus(enrollment.status)) continue
 
     activeEnrollments.delete(actorKey)
@@ -594,7 +654,7 @@ async function monitorEnrollment(
     return
   }
 
-  if (activeEnrollments.get(actorKey) !== active || active.state !== 'pending') return
+  if (activeEnrollments.get(actorKey) !== active || active.state !== 'monitoring') return
   activeEnrollments.delete(actorKey)
   await postSlackResponse(
     fetchFn,
@@ -629,6 +689,9 @@ async function respondWithEnrollmentStatus(input: {
       return
     }
     if (isTerminalStatus(enrollment.status)) {
+      if (!('account' in enrollment)) {
+        throw new AutorotateError('Autorotate returned an invalid active enrollment')
+      }
       if (input.activeEnrollments.get(input.actorKey) === input.active) {
         input.activeEnrollments.delete(input.actorKey)
       }
@@ -640,20 +703,25 @@ async function respondWithEnrollmentStatus(input: {
       )
       return
     }
+    if (!input.active && !('action' in enrollment)) {
+      throw new AutorotateError('Autorotate returned an invalid active enrollment')
+    }
     const active = input.active ?? activeEnrollmentFromBroker(
-      enrollment,
+      enrollment as StartEnrollmentResponse,
       input.owner,
       input.responseUrl
     )
     if (!input.active) input.activeEnrollments.set(input.actorKey, active)
+    if (enrollment.status !== 'pending' && enrollment.status !== 'importing') {
+      throw new AutorotateError('Autorotate returned an invalid active enrollment')
+    }
     active.responseUrl = input.responseUrl
-    active.state = 'pending'
+    active.brokerStatus = enrollment.status
+    active.state = 'monitoring'
     await postSlackResponse(
       input.fetchFn,
       input.responseUrl,
-      enrollment.verification_url && enrollment.user_code
-        ? formatDeviceCode(enrollment)
-        : 'Codex login is still waiting for device authorization.',
+      formatActiveEnrollment(enrollment),
       input.options.requestTimeoutMs
     )
     await monitorEnrollment(
@@ -682,6 +750,7 @@ async function cancelEnrollment(input: {
   fetchFn: SlackbotV2Fetch
   options: AutorotateSlackOptions
   owner: string
+  pollIntervalMs: number
   responseUrl: string
 }): Promise<void> {
   try {
@@ -702,23 +771,34 @@ async function cancelEnrollment(input: {
       return
     }
     const cancelled = await input.client.cancelEnrollment(enrollmentId)
-    if (cancelled.status === 'importing') {
-      if (
-        input.active
-        && input.activeEnrollments.get(input.actorKey) === input.active
-      ) {
-        input.active.state = 'pending'
-      }
+    if (cancelled?.status === 'importing') {
+      const active = input.active ?? (recovered
+        ? activeEnrollmentFromBroker(recovered, input.owner, input.responseUrl)
+        : null)
+      if (!active) throw new AutorotateError('Autorotate returned an invalid active enrollment')
+      active.brokerStatus = 'importing'
+      active.responseUrl = input.responseUrl
+      active.state = 'monitoring'
+      input.activeEnrollments.set(input.actorKey, active)
       await postSlackResponse(
         input.fetchFn,
         input.responseUrl,
         'Codex login is already importing the canonical credential and can no longer be cancelled.',
         input.options.requestTimeoutMs
       )
+      await monitorEnrollment(
+        input.client,
+        active,
+        input.actorKey,
+        input.activeEnrollments,
+        input.options,
+        input.fetchFn,
+        input.pollIntervalMs
+      )
       return
     }
     if (
-      cancelled.status
+      cancelled?.status
       && cancelled.status !== 'cancelled'
       && isTerminalStatus(cancelled.status)
     ) {
@@ -733,7 +813,7 @@ async function cancelEnrollment(input: {
       )
       return
     }
-    if (cancelled.status && cancelled.status !== 'cancelled') {
+    if (cancelled?.status && cancelled.status !== 'cancelled') {
       throw new AutorotateError('Autorotate did not cancel enrollment')
     }
     if (input.activeEnrollments.get(input.actorKey) === input.active) {
@@ -750,7 +830,7 @@ async function cancelEnrollment(input: {
       input.active
       && input.activeEnrollments.get(input.actorKey) === input.active
     ) {
-      input.active.state = 'pending'
+      input.active.state = 'monitoring'
     }
     safeCommandWarning(
       input.options.logger,
@@ -779,25 +859,19 @@ async function cancelEnrollmentQuietly(
 }
 
 function activeEnrollmentFromBroker(
-  enrollment: AutorotateEnrollment,
+  enrollment: StartEnrollmentResponse,
   owner: string,
   responseUrl: string
 ): ActiveEnrollment {
   const enrollmentId = enrollment.enrollment_id
-  const expiresAtMs = Date.parse(enrollment.expires_at ?? '')
-  if (
-    !enrollmentId
-    || !ENROLLMENT_ID_PATTERN.test(enrollmentId)
-    || !Number.isFinite(expiresAtMs)
-  ) {
-    throw new AutorotateError('Autorotate returned an invalid enrollment')
-  }
+  const expiresAtMs = Date.parse(enrollment.expires_at)
   return {
+    brokerStatus: enrollment.status,
     enrollmentId,
     expiresAtMs,
     owner,
     responseUrl,
-    state: 'pending'
+    state: 'monitoring'
   }
 }
 
@@ -932,7 +1006,7 @@ function formatAccounts(accounts: readonly AutorotateAccount[]): string {
 }
 
 function formatDeviceCode(
-  enrollment: AutorotateEnrollment,
+  enrollment: StartEnrollmentResponse,
   reloginAccount: AutorotateAccount | null = null
 ): string {
   const verificationUrl = safeVerificationUrl(enrollment.verification_url)
@@ -947,6 +1021,21 @@ function formatDeviceCode(
     safeTimestamp(enrollment.expires_at) ? `Expires: ${safeTimestamp(enrollment.expires_at)}` : null,
     'This private response will be replaced when login completes.'
   ].filter(Boolean).join('\n')
+}
+
+function formatActiveEnrollment(
+  enrollment: StartEnrollmentResponse | EnrollmentStatusResponse
+): string {
+  if (enrollment.status === 'importing') {
+    const label = 'account_label' in enrollment
+      ? ` for \`${escapeSlackText(enrollment.account_label)}\``
+      : ''
+    return `Codex login${label} is authorized and importing the canonical credential.`
+  }
+  if ('verification_url' in enrollment && 'user_code' in enrollment) {
+    return formatDeviceCode(enrollment)
+  }
+  return 'Codex login is still waiting for device authorization.'
 }
 
 async function findReloginAccount(
@@ -978,7 +1067,7 @@ function loginFailureText(error: unknown): string {
   return 'Codex device login could not be started. Try again or ask an Autorotate operator.'
 }
 
-function formatTerminalEnrollment(enrollment: AutorotateEnrollment): string {
+function formatTerminalEnrollment(enrollment: EnrollmentStatusResponse): string {
   switch (enrollment.status) {
     case 'completed':
       return completedEnrollmentText(enrollment)
@@ -991,48 +1080,96 @@ function formatTerminalEnrollment(enrollment: AutorotateEnrollment): string {
   }
 }
 
-function completedEnrollmentText(enrollment: AutorotateEnrollment): string {
-  const label = enrollment.account?.label
-    ? `\`${escapeSlackText(enrollment.account.label)}\``
-    : null
-  const email = safeEmail(enrollment.account?.email)
+function completedEnrollmentText(enrollment: EnrollmentStatusResponse): string {
+  if (!enrollment.account) throw new AutorotateError('Autorotate returned invalid completion')
+  const label = `\`${escapeSlackText(enrollment.account.label)}\``
+  const email = safeEmail(enrollment.account.email)
     ? ` (${escapeSlackText(enrollment.account.email)})`
     : ''
-  return label
-    ? `Codex account ${label}${email} was added to Autorotate.`
-    : email
-      ? `Codex account${email} was added to Autorotate.`
-      : 'Codex account was added to Autorotate.'
+  return `Codex account ${label}${email} was added to Autorotate.`
 }
 
-function validateEnrollment(payload: JsonObject): AutorotateEnrollment {
+function validateStartEnrollment(payload: JsonObject): StartEnrollmentResponse {
+  const enrollmentId = payload.enrollment_id
+  const action = payload.action
+  const accountLabel = payload.account_label
+  const expiresAt = payload.expires_at
+  const status = payload.status
+  const verificationUrl = payload.verification_url
+  const userCode = payload.user_code
+  if (
+    typeof enrollmentId !== 'string'
+    || !ENROLLMENT_ID_PATTERN.test(enrollmentId)
+    || (action !== 'add' && action !== 'relogin')
+    || !safeAccountLabel(accountLabel)
+    || typeof expiresAt !== 'string'
+    || !safeTimestamp(expiresAt)
+    || (status !== 'pending' && status !== 'importing')
+  ) {
+    throw new AutorotateError('Autorotate returned an invalid enrollment')
+  }
+  if (status === 'pending') {
+    if (!safeVerificationUrl(verificationUrl) || !safeUserCode(userCode)) {
+      throw new AutorotateError('invalid device authorization')
+    }
+  } else if (verificationUrl !== undefined || userCode !== undefined) {
+    throw new AutorotateError('Autorotate returned device authorization after pending')
+  }
+  return {
+    enrollment_id: enrollmentId,
+    action,
+    account_label: accountLabel,
+    ...(typeof verificationUrl === 'string' ? { verification_url: verificationUrl } : {}),
+    ...(typeof userCode === 'string' ? { user_code: userCode } : {}),
+    expires_at: expiresAt,
+    status
+  }
+}
+
+function validateEnrollmentStatus(payload: JsonObject): EnrollmentStatusResponse {
+  const enrollmentId = payload.enrollment_id
+  const status = payload.status
+  const expiresAt = payload.expires_at
   const account = validateEnrollmentAccount(payload.account)
-  const enrollment = {
-    ...payload,
-    ...(payload.account !== undefined ? { account } : {})
-  } as AutorotateEnrollment
-  if (enrollment.verification_url && !safeVerificationUrl(enrollment.verification_url)) {
-    throw new AutorotateError('invalid device authorization URL')
+  const errorCode = payload.error_code
+  if (
+    typeof enrollmentId !== 'string'
+    || !ENROLLMENT_ID_PATTERN.test(enrollmentId)
+    || !isEnrollmentStatus(status)
+    || typeof expiresAt !== 'string'
+    || !safeTimestamp(expiresAt)
+    || !Object.hasOwn(payload, 'account')
+    || !Object.hasOwn(payload, 'error_code')
+    || (errorCode !== null && !safeErrorCode(errorCode))
+    || (status === 'completed') !== (account !== null)
+  ) {
+    throw new AutorotateError('Autorotate returned an invalid enrollment status')
   }
-  if (enrollment.user_code && !safeUserCode(enrollment.user_code)) {
-    throw new AutorotateError('invalid device authorization code')
+  return {
+    enrollment_id: enrollmentId,
+    status,
+    expires_at: expiresAt,
+    account,
+    error_code: errorCode
   }
-  return enrollment
 }
 
-function validateEnrollmentAccount(
-  value: unknown
-): AutorotateEnrollment['account'] {
-  if (value === undefined || value === null) return value
+function validateEnrollmentAccount(value: unknown): EnrollmentAccount | null {
+  if (value === null) return null
   if (!isJsonObject(value)) {
     throw new AutorotateError('Autorotate returned invalid account identity')
   }
-  const label = value.label
-  const email = value.email
+  const safeAccount = selectFields(value, ENROLLMENT_ACCOUNT_FIELDS)
+  const label = safeAccount.label
+  const email = safeAccount.email
+  const status = safeAccount.status
   if (!safeAccountLabel(label) || (email !== null && !safeEmail(email))) {
     throw new AutorotateError('Autorotate returned invalid account identity')
   }
-  return { label, email }
+  if (!isAccountStatus(status)) {
+    throw new AutorotateError('Autorotate returned invalid account identity')
+  }
+  return { label, email, status }
 }
 
 function validateAccount(payload: JsonObject): AutorotateAccount {
@@ -1045,7 +1182,7 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
     typeof label !== 'string'
     || !safeAccountLabel(label)
     || (email !== null && !safeEmail(email))
-    || !['enabled', 'disabled', 'dead'].includes(typeof status === 'string' ? status : '')
+    || !isAccountStatus(status)
     || (limitedUntil !== null && limitedUntil !== undefined && !safeTimestamp(limitedUntil))
     || typeof loginRequired !== 'boolean'
   ) {
@@ -1183,13 +1320,31 @@ function safeAccountLabel(value: unknown): value is string {
     && !value.includes('\0')
 }
 
+function safeErrorCode(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[a-z0-9_]{1,128}$/.test(value)
+}
+
+function isAccountStatus(value: unknown): value is AutorotateAccount['status'] {
+  return value === 'enabled' || value === 'disabled' || value === 'dead'
+}
+
+function isEnrollmentStatus(value: unknown): value is EnrollmentStatus {
+  return value === 'pending'
+    || value === 'importing'
+    || value === 'completed'
+    || value === 'failed'
+    || value === 'cancelled'
+    || value === 'expired'
+}
+
 function safeTimestamp(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const milliseconds = Date.parse(value)
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null
 }
 
-function isTerminalStatus(value: string | undefined): boolean {
+function isTerminalStatus(value: EnrollmentStatus | undefined): boolean {
   return ['completed', 'expired', 'failed', 'cancelled'].includes(value ?? '')
 }
 

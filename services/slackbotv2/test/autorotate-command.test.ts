@@ -17,6 +17,58 @@ type FetchCall = {
   url: string
 }
 
+function startEnrollmentResponse(
+  accountLabel: string,
+  {
+    action = 'add',
+    enrollmentId = 'enr_abcdefgh',
+    status = 'pending'
+  }: {
+    action?: 'add' | 'relogin'
+    enrollmentId?: string
+    status?: 'pending' | 'importing'
+  } = {}
+): Record<string, unknown> {
+  return {
+    enrollment_id: enrollmentId,
+    action,
+    account_label: accountLabel,
+    ...(status === 'pending'
+      ? {
+          verification_url: 'https://auth.openai.com/codex/device',
+          user_code: 'ABCD-EFGH'
+        }
+      : {}),
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    status
+  }
+}
+
+function enrollmentStatusResponse(
+  status: 'pending' | 'importing' | 'completed' | 'failed' | 'cancelled' | 'expired',
+  {
+    accountLabel = 'team-codex',
+    enrollmentId = 'enr_abcdefgh'
+  }: {
+    accountLabel?: string
+    enrollmentId?: string
+  } = {}
+): Record<string, unknown> {
+  return {
+    enrollment_id: enrollmentId,
+    status,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    account: status === 'completed'
+      ? {
+          label: accountLabel,
+          email: 'person@example.test',
+          status: 'enabled'
+        }
+      : null,
+    error_code: status === 'failed' ? 'provider_login_failed' : null
+  }
+}
+
 function logger(logs: Array<{ data?: unknown; event: string }>): Logger {
   const capture = {
     debug: (event: string, data?: unknown) => logs.push({ event, data }),
@@ -250,21 +302,17 @@ describe('Autorotate Slack command', () => {
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
         return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending',
+          ...startEnrollmentResponse('team-codex'),
           auth_json: { refresh_token: 'must-not-render' }
         }, { status: 201 })
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
         return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          status: 'completed',
+          ...enrollmentStatusResponse('completed'),
           account: {
             label: 'team-codex',
             email: 'person@example.test',
+            status: 'enabled',
             auth_json: { refresh_token: 'must-not-render' }
           }
         })
@@ -333,20 +381,16 @@ describe('Autorotate Slack command', () => {
       const url = String(input)
       calls.push({ method: init?.method ?? 'GET', url })
       if (url.endsWith('/v1/operator/enrollments')) {
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        }, { status: 201 })
+        return Response.json(startEnrollmentResponse(`codex-${USER_ID.toLowerCase()}`), {
+          status: 201
+        })
       }
       if (init?.method === 'DELETE') return new Response(null, { status: 204 })
       if (url === RESPONSE_URL) {
         resolveDeviceCodePosted?.()
         return new Response('', { status: 200 })
       }
-      return Response.json({ enrollment_id: 'enr_abcdefgh', status: 'pending' })
+      return Response.json(enrollmentStatusResponse('pending'))
     })
     const pending: Promise<unknown>[] = []
 
@@ -426,23 +470,14 @@ describe('Autorotate Slack command', () => {
           expected_email: 'person@example.test',
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/codex/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        }, { status: 201 })
+        return Response.json(startEnrollmentResponse('livermore-ci-legacy', {
+          action: 'relogin'
+        }), { status: 201 })
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          status: 'completed',
-          account: {
-            label: 'livermore-ci-legacy',
-            email: 'person@example.test'
-          }
-        })
+        return Response.json(enrollmentStatusResponse('completed', {
+          accountLabel: 'livermore-ci-legacy'
+        }))
       }
       return new Response('', { status: 200 })
     })
@@ -476,16 +511,14 @@ describe('Autorotate Slack command', () => {
       }
       if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
         reloginBody = JSON.parse(String(init.body))
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/codex/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        }, { status: 201 })
+        return Response.json(startEnrollmentResponse('legacy "primary" \\ ci', {
+          action: 'relogin'
+        }), { status: 201 })
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
-        return Response.json({ enrollment_id: 'enr_abcdefgh', status: 'completed' })
+        return Response.json(enrollmentStatusResponse('completed', {
+          accountLabel: 'legacy "primary" \\ ci'
+        }))
       }
       return new Response('', { status: 200 })
     })
@@ -536,7 +569,7 @@ describe('Autorotate Slack command', () => {
         return createResponse
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
-        return Response.json({ enrollment_id: 'enr_abcdefgh', status: 'completed' })
+        return Response.json(enrollmentStatusResponse('completed', { accountLabel: 'first' }))
       }
       return new Response('', { status: 200 })
     })
@@ -554,13 +587,7 @@ describe('Autorotate Slack command', () => {
     expect(await first?.json()).toMatchObject({ text: 'Starting a private Codex device login…' })
     expect(await second?.json()).toMatchObject({ text: expect.stringContaining('already') })
     expect(createCount).toBe(1)
-    releaseCreate?.(Response.json({
-      enrollment_id: 'enr_abcdefgh',
-      verification_url: 'https://auth.openai.com/codex/device',
-      user_code: 'ABCD-EFGH',
-      expires_at: new Date(Date.now() + 60_000).toISOString(),
-      status: 'pending'
-    }, { status: 201 }))
+    releaseCreate?.(Response.json(startEnrollmentResponse('first'), { status: 201 }))
     await Promise.all(pending)
   })
 
@@ -581,13 +608,9 @@ describe('Autorotate Slack command', () => {
     const handler = testHandler(async (input, init) => {
       const url = String(input)
       if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/codex/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        }, { status: 201 })
+        return Response.json(startEnrollmentResponse(`codex-${USER_ID.toLowerCase()}`), {
+          status: 201
+        })
       }
       if (
         url.endsWith('/v1/operator/enrollments/enr_abcdefgh')
@@ -610,10 +633,9 @@ describe('Autorotate Slack command', () => {
     await devicePosted
     await pollStarted
     await handler.handle(commandRequest('login cancel'), promise => pending.push(promise))
-    finishPoll?.(Response.json({
-      enrollment_id: 'enr_abcdefgh',
-      status: 'completed'
-    }))
+    finishPoll?.(Response.json(enrollmentStatusResponse('completed', {
+      accountLabel: `codex-${USER_ID.toLowerCase()}`
+    })))
     await Promise.all(pending)
 
     expect(slackBodies.some(body => body.includes('was added to Autorotate'))).toBe(false)
@@ -627,13 +649,10 @@ describe('Autorotate Slack command', () => {
       const url = String(input)
       if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
         createCount += 1
-        return Response.json({
-          enrollment_id: `enr_abcdefg${createCount}`,
-          verification_url: 'https://auth.openai.com/codex/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        }, { status: 201 })
+        const body = JSON.parse(String(init.body)) as { label: string }
+        return Response.json(startEnrollmentResponse(body.label, {
+          enrollmentId: `enr_abcdefg${createCount}`
+        }), { status: 201 })
       }
       if (init?.method === 'DELETE') {
         cancelCount += 1
@@ -651,25 +670,74 @@ describe('Autorotate Slack command', () => {
     expect(cancelCount).toBe(2)
   })
 
+  it('continues polling when a repeated start is already importing', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      calls.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method ?? 'GET',
+        url
+      })
+      if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
+        return Response.json(startEnrollmentResponse('team-codex', {
+          status: 'importing'
+        }))
+      }
+      if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
+        return Response.json(enrollmentStatusResponse('completed'))
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('login team-codex'))
+
+    const slackBodies = calls
+      .filter(call => call.url === RESPONSE_URL)
+      .map(call => JSON.stringify(call.body))
+    expect(slackBodies).toHaveLength(2)
+    expect(slackBodies[0]).toContain('authorized and importing')
+    expect(slackBodies[0]).not.toContain('ABCD-EFGH')
+    expect(slackBodies[1]).toContain('was added to Autorotate')
+  })
+
+  it('rejects a pending start response without both device credentials', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      calls.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method ?? 'GET',
+        url
+      })
+      if (url.endsWith('/v1/operator/enrollments') && init?.method === 'POST') {
+        const response = startEnrollmentResponse('team-codex')
+        delete response.user_code
+        return Response.json(response)
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('login team-codex'))
+
+    const slackBodies = calls
+      .filter(call => call.url === RESPONSE_URL)
+      .map(call => JSON.stringify(call.body))
+    expect(slackBodies).toHaveLength(1)
+    expect(slackBodies[0]).toContain('could not be started')
+    expect(slackBodies[0]).not.toContain('auth.openai.com')
+  })
+
   it('recovers active login by exact Slack owner after a process restart', async () => {
     const calls: FetchCall[] = []
     const handler = testHandler(async (input, init) => {
       const url = String(input)
       calls.push({ method: init?.method ?? 'GET', url })
       if (url.includes('/v1/operator/enrollments?owner=')) {
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          verification_url: 'https://auth.openai.com/codex/device',
-          user_code: 'ABCD-EFGH',
-          expires_at: new Date(Date.now() + 60_000).toISOString(),
-          status: 'pending'
-        })
+        return Response.json(startEnrollmentResponse('team-codex'))
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
-        return Response.json({
-          enrollment_id: 'enr_abcdefgh',
-          status: 'completed'
-        })
+        return Response.json(enrollmentStatusResponse('completed'))
       }
       return new Response('', { status: 200 })
     })
@@ -681,5 +749,76 @@ describe('Autorotate Slack command', () => {
       url: `https://autorotate.example.test/broker/v1/operator/enrollments?owner=${encodeURIComponent(`slack:${TEAM_ID}:${USER_ID}`)}`
     })
     expect(calls.filter(call => call.url === RESPONSE_URL)).toHaveLength(2)
+  })
+
+  it('recovers an importing login without expecting or exposing a device code', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      calls.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method ?? 'GET',
+        url
+      })
+      if (url.includes('/v1/operator/enrollments?owner=')) {
+        const response = startEnrollmentResponse('team-codex', {
+          status: 'importing'
+        })
+        response.expires_at = new Date(Date.now() - 1_000).toISOString()
+        return Response.json(response)
+      }
+      if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
+        return Response.json(enrollmentStatusResponse('completed'))
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('login status'))
+
+    const slackBodies = calls
+      .filter(call => call.url === RESPONSE_URL)
+      .map(call => JSON.stringify(call.body))
+    expect(slackBodies).toHaveLength(2)
+    expect(slackBodies[0]).toContain('authorized and importing')
+    expect(slackBodies[0]).toContain('team-codex')
+    expect(slackBodies[0]).not.toContain('ABCD-EFGH')
+    expect(slackBodies[0]).not.toContain('auth.openai.com')
+    expect(slackBodies[1]).toContain('was added to Autorotate')
+  })
+
+  it('resumes monitoring when an importing recovery can no longer be cancelled', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      calls.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method ?? 'GET',
+        url
+      })
+      if (url.includes('/v1/operator/enrollments?owner=')) {
+        return Response.json(startEnrollmentResponse('team-codex', {
+          status: 'importing'
+        }))
+      }
+      if (
+        url.endsWith('/v1/operator/enrollments/enr_abcdefgh')
+        && init?.method === 'DELETE'
+      ) {
+        return Response.json(enrollmentStatusResponse('importing'))
+      }
+      if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
+        return Response.json(enrollmentStatusResponse('completed'))
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('login cancel'))
+
+    const slackBodies = calls
+      .filter(call => call.url === RESPONSE_URL)
+      .map(call => JSON.stringify(call.body))
+    expect(slackBodies).toHaveLength(2)
+    expect(slackBodies[0]).toContain('can no longer be cancelled')
+    expect(slackBodies[1]).toContain('was added to Autorotate')
   })
 })

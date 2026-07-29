@@ -300,9 +300,14 @@ this same deterministic quoting rule.
 `/autorotate login status` and `/autorotate login cancel` reconcile the active
 enrollment by the exact signed Slack workspace/member owner. Autorotate enforces
 one active enrollment per owner, so these commands recover after a Slackbot
-restart and work with multiple replicas. The device code, link, and Slack
-response URL remain private and are never stored in a Centaur session or tool
-event.
+restart and work with multiple replicas. Pending recovery includes the
+enrollment ID, action, account label, expiry, and private device link/code.
+Once authorization reaches importing, owner recovery returns the same
+non-secret metadata without the link or code; Slackbot continues polling by
+enrollment ID and reports that canonical credential import is in progress.
+Completion accepts only the nested account label, email, and account status.
+The device code, link, and Slack response URL remain private and are never
+stored in a Centaur session or tool event.
 
 Sandboxes get observer-only access through `autorotate status`. The command
 calls Console's assigned-sandbox endpoint and can never start enrollment or
