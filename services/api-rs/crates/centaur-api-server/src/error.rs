@@ -67,6 +67,9 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PersonaConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrincipalConflict {
+                ..
+            })) => StatusCode::CONFLICT,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,
@@ -124,4 +127,23 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn principal_conflict_returns_http_conflict() {
+        let response = ApiError::Runtime(SessionRuntimeError::Store(
+            SessionStoreError::PrincipalConflict {
+                thread_key: "workflow:test".to_owned(),
+                existing: Some("prn_existing".to_owned()),
+                requested: Some("prn_requested".to_owned()),
+            },
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 }

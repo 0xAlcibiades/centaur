@@ -88,6 +88,13 @@ pub struct PgSessionStore {
     pool: PgPool,
 }
 
+#[derive(Clone, Copy)]
+enum SessionPrincipalBinding<'a> {
+    Unconstrained,
+    ClaimOrExact(&'a str),
+    Exact(&'a str),
+}
+
 impl PgSessionStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -124,10 +131,85 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
     ) -> Result<Session, SessionStoreError> {
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            proxy_labels,
+            SessionPrincipalBinding::Unconstrained,
+        )
+        .await
+    }
+
+    pub async fn create_or_get_session_with_exact_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Value,
+        proxy_labels: BTreeMap<String, String>,
+        iron_control_principal: &str,
+    ) -> Result<Session, SessionStoreError> {
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            proxy_labels,
+            SessionPrincipalBinding::Exact(iron_control_principal),
+        )
+        .await
+    }
+
+    pub async fn create_or_get_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Value,
+        proxy_labels: BTreeMap<String, String>,
+        iron_control_principal: &str,
+    ) -> Result<Session, SessionStoreError> {
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            proxy_labels,
+            SessionPrincipalBinding::ClaimOrExact(iron_control_principal),
+        )
+        .await
+    }
+
+    async fn create_or_get_session_inner(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Value,
+        proxy_labels: BTreeMap<String, String>,
+        principal_binding: SessionPrincipalBinding<'_>,
+    ) -> Result<Session, SessionStoreError> {
+        let (requested_principal, claim_unbound_principal) = match principal_binding {
+            SessionPrincipalBinding::Unconstrained => (None, false),
+            SessionPrincipalBinding::ClaimOrExact(principal) => (Some(principal), true),
+            SessionPrincipalBinding::Exact(principal) => (Some(principal), false),
+        };
+        let enforce_exact_principal = requested_principal.is_some();
+
         sqlx::query(
             r#"
-            insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels)
-            values ($1, $2, $3, $4, $5, $6)
+            insert into sessions (
+                thread_key,
+                harness_type,
+                persona_id,
+                status,
+                metadata,
+                proxy_labels,
+                iron_control_principal
+            )
+            values ($1, $2, $3, $4, $5, $6, $7)
             on conflict (thread_key) do nothing
             "#,
         )
@@ -137,24 +219,55 @@ impl PgSessionStore {
         .bind(SessionStatus::Idle.as_ref())
         .bind(metadata)
         .bind(Json(proxy_labels.clone()))
+        .bind(requested_principal)
         .execute(&self.pool)
         .await?;
+
+        if claim_unbound_principal {
+            sqlx::query(
+                r#"
+                update sessions
+                set iron_control_principal = $2, updated_at = now()
+                where thread_key = $1 and iron_control_principal is null
+                "#,
+            )
+            .bind(thread_key.as_str())
+            .bind(requested_principal)
+            .execute(&self.pool)
+            .await?;
+        }
 
         if !proxy_labels.is_empty() {
             sqlx::query(
                 r#"
                 update sessions
                 set proxy_labels = $2, updated_at = now()
-                where thread_key = $1 and proxy_labels = '{}'::jsonb
+                where thread_key = $1
+                    and proxy_labels = '{}'::jsonb
+                    and (
+                        not $3
+                        or iron_control_principal is not distinct from $4
+                    )
                 "#,
             )
             .bind(thread_key.as_str())
             .bind(Json(proxy_labels))
+            .bind(enforce_exact_principal)
+            .bind(requested_principal)
             .execute(&self.pool)
             .await?;
         }
 
         let session = self.get_session(thread_key).await?;
+        if enforce_exact_principal
+            && session.iron_control_principal.as_deref() != requested_principal
+        {
+            return Err(SessionStoreError::PrincipalConflict {
+                thread_key: thread_key.as_str().to_owned(),
+                existing: session.iron_control_principal,
+                requested: requested_principal.map(str::to_owned),
+            });
+        }
         if session.harness_type != *harness_type {
             return Err(SessionStoreError::HarnessConflict {
                 thread_key: thread_key.as_str().to_owned(),
@@ -1591,6 +1704,14 @@ pub enum SessionStoreError {
         existing: Option<String>,
         requested: Option<String>,
     },
+    #[error(
+        "session {thread_key} already exists with iron_control_principal {existing:?}, requested {requested:?}"
+    )]
+    PrincipalConflict {
+        thread_key: String,
+        existing: Option<String>,
+        requested: Option<String>,
+    },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
@@ -1921,7 +2042,9 @@ mod tests {
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
+    use super::{
+        IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification, SessionStoreError,
+    };
 
     async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
@@ -2044,6 +2167,158 @@ mod tests {
                 .proxy_labels,
             labels
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_principal_reuse_rejects_mismatches_without_mutating_proxy_labels() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:exact-principal-{}", Uuid::new_v4()))
+            .expect("valid thread key");
+        let expected_principal = "principal-expected";
+        let mismatched_labels = BTreeMap::from([(
+            "centaur.slack_channel_id".to_owned(),
+            "C-principal-mismatch".to_owned(),
+        )]);
+
+        let created = store
+            .create_or_get_session_with_exact_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+                expected_principal,
+            )
+            .await
+            .expect("create session with principal");
+        assert_eq!(
+            created.iron_control_principal.as_deref(),
+            Some(expected_principal)
+        );
+
+        let error = store
+            .create_or_get_session_with_exact_principal(
+                &thread_key,
+                &HarnessType::ClaudeCode,
+                None,
+                json!({}),
+                mismatched_labels.clone(),
+                "principal-mismatch",
+            )
+            .await
+            .expect_err("mismatched principal must fail");
+        assert!(matches!(
+            error,
+            SessionStoreError::PrincipalConflict {
+                existing: Some(existing),
+                requested: Some(requested),
+                ..
+            } if existing == expected_principal && requested == "principal-mismatch"
+        ));
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("get session")
+                .proxy_labels,
+            BTreeMap::new(),
+            "a principal-mismatched reuse must not update proxy labels"
+        );
+
+        let matching_labels = BTreeMap::from([(
+            "centaur.slack_channel_id".to_owned(),
+            "C-principal-match".to_owned(),
+        )]);
+        let matched = store
+            .create_or_get_session_with_exact_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                matching_labels.clone(),
+                expected_principal,
+            )
+            .await
+            .expect("matching principal may reuse the session");
+        assert_eq!(matched.proxy_labels, matching_labels);
+
+        let unbound_thread_key =
+            ThreadKey::parse(format!("test:exact-unbound-principal-{}", Uuid::new_v4()))
+                .expect("valid thread key");
+        let unbound_labels = BTreeMap::from([(
+            "centaur.slack_channel_id".to_owned(),
+            "C-exact-unbound".to_owned(),
+        )]);
+        store
+            .create_or_get_session(
+                &unbound_thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("create unbound session");
+        let error = store
+            .create_or_get_session_with_exact_principal(
+                &unbound_thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                unbound_labels.clone(),
+                "principal-on-unbound-session",
+            )
+            .await
+            .expect_err("unbound session and requested principal must conflict");
+        assert!(matches!(
+            error,
+            SessionStoreError::PrincipalConflict {
+                existing: None,
+                requested: Some(requested),
+                ..
+            } if requested == "principal-on-unbound-session"
+        ));
+        assert_eq!(
+            store
+                .get_session(&unbound_thread_key)
+                .await
+                .expect("get unbound session")
+                .proxy_labels,
+            BTreeMap::new(),
+            "an unbound/principal mismatch must not update proxy labels"
+        );
+
+        let claimed = store
+            .create_or_get_session_with_principal(
+                &unbound_thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                unbound_labels.clone(),
+                "principal-on-unbound-session",
+            )
+            .await
+            .expect("ordinary session registration may atomically claim a legacy unbound row");
+        assert_eq!(
+            claimed.iron_control_principal.as_deref(),
+            Some("principal-on-unbound-session")
+        );
+        assert_eq!(claimed.proxy_labels, unbound_labels);
+
+        let error = store
+            .create_or_get_session_with_principal(
+                &unbound_thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+                "principal-after-claim",
+            )
+            .await
+            .expect_err("an ordinary session may not overwrite a claimed principal");
+        assert!(matches!(error, SessionStoreError::PrincipalConflict { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

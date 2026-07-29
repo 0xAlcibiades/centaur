@@ -78,6 +78,15 @@ class RequestRpc(FakeRpc):
 
 
 class WorkflowHostTests(unittest.TestCase):
+    def test_rpc_rejects_oversized_outbound_message(self) -> None:
+        host = load_workflow_host()
+        host.WORKFLOW_HOST_MAX_MESSAGE_BYTES = 64
+
+        with self.assertRaisesRegex(
+            host.ProtocolError, "workflow host protocol message exceeds 64 bytes"
+        ):
+            asyncio.run(host.RpcClient().write({"value": "x" * 128}))
+
     def test_workflow_api_modules_are_importable(self) -> None:
         load_workflow_host()
 
@@ -319,6 +328,22 @@ class WorkflowHostTests(unittest.TestCase):
         self.assertEqual(calls, ["postgresql://example/db"] * 3)
         self.assertEqual(sleeps, [0.25, 0.5])
 
+    def test_read_stdin_reports_protocol_failure(self) -> None:
+        host = load_workflow_host()
+
+        async def read_failure():
+            reader = asyncio.StreamReader(limit=32)
+            queue = asyncio.Queue()
+            reader.feed_data(b"{" + (b"x" * 64) + b"}\n")
+            reader.feed_eof()
+            await host.read_stdin(reader, queue)
+            return await queue.get()
+
+        failure = asyncio.run(read_failure())
+
+        self.assertIsInstance(failure, host.StdinReadFailure)
+        self.assertEqual(failure.message, "workflow host stdin protocol failed")
+
     def test_workflow_result_includes_grouping_identifiers(self) -> None:
         host = load_workflow_host()
         pool = FakePool()
@@ -509,6 +534,170 @@ class WorkflowHostProcessTests(unittest.IsolatedAsyncioTestCase):
                     process.kill()
                     await process.wait()
                 process.stdin.close()
+
+    async def test_large_context_response_completes_workflow(self) -> None:
+        host_path = Path(__file__).resolve().parents[1] / "workflow_host.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_dir = Path(tmp)
+            (workflow_dir / "agent_workflow.py").write_text(
+                "WORKFLOW_NAME = 'agent_workflow'\n"
+                "async def handler(inp, ctx):\n"
+                "    result = await ctx.agent_turn('inspect')\n"
+                "    return {'result_length': len(result['result_text'])}\n"
+            )
+            env = os.environ.copy()
+            env["WORKFLOW_DIRS"] = str(workflow_dir)
+            env.pop("DATABASE_URL", None)
+            env.pop("WORKFLOW_ENABLE_MODE", None)
+            env.pop("WORKFLOW_ALLOWED_NAMES", None)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(host_path),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            try:
+                process.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "workflow.start",
+                                "workflow_name": "agent_workflow",
+                                "run_id": "run-123",
+                                "task_id": "task-456",
+                                "input": {},
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await process.stdin.drain()
+
+                request = json.loads(
+                    (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+                )
+                self.assertEqual(request["type"], "ctx.agent_turn")
+                result_text = "x" * (128 * 1024)
+                process.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "ctx.response",
+                                "request_id": request["request_id"],
+                                "ok": True,
+                                "value": {"result_text": result_text},
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await process.stdin.drain()
+
+                response = json.loads(
+                    (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+                )
+                self.assertEqual(response["type"], "workflow.result")
+                self.assertEqual(response["result"]["result_length"], len(result_text))
+                self.assertEqual(await asyncio.wait_for(process.wait(), timeout=5), 0)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                process.stdin.close()
+
+    async def test_stdin_eof_cancels_an_active_rpc_and_exits(self) -> None:
+        host_path = Path(__file__).resolve().parents[1] / "workflow_host.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_dir = Path(tmp)
+            (workflow_dir / "agent_workflow.py").write_text(
+                "WORKFLOW_NAME = 'agent_workflow'\n"
+                "async def handler(inp, ctx):\n"
+                "    return await ctx.agent_turn('inspect')\n"
+            )
+            env = os.environ.copy()
+            env["WORKFLOW_DIRS"] = str(workflow_dir)
+            env.pop("DATABASE_URL", None)
+            env.pop("WORKFLOW_ENABLE_MODE", None)
+            env.pop("WORKFLOW_ALLOWED_NAMES", None)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(host_path),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            try:
+                process.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "workflow.start",
+                                "workflow_name": "agent_workflow",
+                                "run_id": "run-123",
+                                "task_id": "task-456",
+                                "input": {},
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await process.stdin.drain()
+
+                request = json.loads(
+                    (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+                )
+                self.assertEqual(request["type"], "ctx.agent_turn")
+                process.stdin.close()
+                await process.stdin.wait_closed()
+
+                response = json.loads(
+                    (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+                )
+                self.assertEqual(response["type"], "host.error")
+                self.assertIn("stdin closed", response["message"])
+                self.assertEqual(await asyncio.wait_for(process.wait(), timeout=5), 1)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+
+    async def test_protocol_error_is_terminal(self) -> None:
+        host_path = Path(__file__).resolve().parents[1] / "workflow_host.py"
+        env = os.environ.copy()
+        env.pop("DATABASE_URL", None)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(host_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        try:
+            process.stdin.write(b'{"type":"unknown"}\n')
+            await process.stdin.drain()
+
+            response = json.loads(
+                (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+            )
+
+            self.assertEqual(response["type"], "host.error")
+            self.assertIn("unknown message type", response["message"])
+            self.assertEqual(await asyncio.wait_for(process.wait(), timeout=5), 1)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            process.stdin.close()
 
 
 if __name__ == "__main__":

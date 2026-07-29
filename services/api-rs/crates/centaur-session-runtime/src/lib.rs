@@ -1343,6 +1343,52 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_or_get_session_bound_to_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_id: &str,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "bound session principal_id is required".to_owned(),
+            ));
+        }
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            Some(principal_id),
+        )
+        .await
+    }
+
+    async fn create_or_get_session_inner(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        bound_principal_id: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1352,6 +1398,7 @@ impl SessionRuntime {
             thread_key = %thread_key,
             harness_type = %harness_type,
             iron_control_enabled = self.iron_control.is_some(),
+            bound_principal = bound_principal_id.is_some(),
         );
         set_span_parent_trace(
             &span,
@@ -1366,50 +1413,120 @@ impl SessionRuntime {
                 thread_key = %thread_key,
                 harness_type = %harness_type,
                 iron_control_enabled = self.iron_control.is_some(),
+                bound_principal = bound_principal_id.is_some(),
                 "creating or loading session"
             );
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
-            let (registered_principal, desired_capabilities) =
-                if let Some(registrar) = &self.iron_control {
-                    let principal = registrar
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
-                        .await?;
-                    let desired_capabilities = sandbox_capabilities_from_principal(&principal);
-                    (Some(principal), desired_capabilities)
-                } else {
-                    (None, SessionSandboxCapabilities::default_enabled())
+            let (effective_principal, desired_capabilities) =
+                match (&self.iron_control, bound_principal_id) {
+                    (Some(registrar), Some(principal_id)) => {
+                        let principal = registrar.get_principal(principal_id).await?;
+                        let desired_capabilities = sandbox_capabilities_from_principal(&principal);
+                        (Some(principal), desired_capabilities)
+                    }
+                    (Some(registrar), None) => {
+                        let principal = registrar
+                            .register_session(thread_key.as_str(), Some(&session_metadata))
+                            .await?;
+                        let desired_capabilities = sandbox_capabilities_from_principal(&principal);
+                        (Some(principal), desired_capabilities)
+                    }
+                    (None, Some(_)) => {
+                        return Err(SessionRuntimeError::BadRequest(
+                            "bound session principals require Iron Control".to_owned(),
+                        ));
+                    }
+                    (None, None) => (None, SessionSandboxCapabilities::default_enabled()),
                 };
             let persona_resolution =
                 self.resolve_persona_for_create(persona_id, &desired_capabilities)?;
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
             }
-            let session = match self
-                .store
-                .create_or_get_session(
-                    thread_key,
-                    harness_type,
-                    persona_resolution.persona_id.as_deref(),
-                    session_metadata.clone(),
-                    proxy_labels.clone(),
-                )
-                .await
-            {
-                Ok(session) => session,
-                Err(SessionStoreError::PersonaConflict { existing, .. })
-                    if persona_id.is_none() && persona_resolution.defaulted =>
-                {
+            let principal_id = effective_principal
+                .as_ref()
+                .map(|principal| principal.id.as_str());
+            let create_result = match (principal_id, bound_principal_id.is_some()) {
+                (Some(principal_id), true) => {
+                    self.store
+                        .create_or_get_session_with_exact_principal(
+                            thread_key,
+                            harness_type,
+                            persona_resolution.persona_id.as_deref(),
+                            session_metadata.clone(),
+                            proxy_labels.clone(),
+                            principal_id,
+                        )
+                        .await
+                }
+                (Some(principal_id), false) => {
+                    self.store
+                        .create_or_get_session_with_principal(
+                            thread_key,
+                            harness_type,
+                            persona_resolution.persona_id.as_deref(),
+                            session_metadata.clone(),
+                            proxy_labels.clone(),
+                            principal_id,
+                        )
+                        .await
+                }
+                (None, _) => {
                     self.store
                         .create_or_get_session(
                             thread_key,
                             harness_type,
-                            existing.as_deref(),
-                            default_metadata(None),
-                            BTreeMap::new(),
+                            persona_resolution.persona_id.as_deref(),
+                            session_metadata.clone(),
+                            proxy_labels.clone(),
                         )
-                        .await?
+                        .await
+                }
+            };
+            let session = match create_result {
+                Ok(session) => session,
+                Err(SessionStoreError::PersonaConflict { existing, .. })
+                    if persona_id.is_none() && persona_resolution.defaulted =>
+                {
+                    match (principal_id, bound_principal_id.is_some()) {
+                        (Some(principal_id), true) => {
+                            self.store
+                                .create_or_get_session_with_exact_principal(
+                                    thread_key,
+                                    harness_type,
+                                    existing.as_deref(),
+                                    default_metadata(None),
+                                    BTreeMap::new(),
+                                    principal_id,
+                                )
+                                .await?
+                        }
+                        (Some(principal_id), false) => {
+                            self.store
+                                .create_or_get_session_with_principal(
+                                    thread_key,
+                                    harness_type,
+                                    existing.as_deref(),
+                                    default_metadata(None),
+                                    BTreeMap::new(),
+                                    principal_id,
+                                )
+                                .await?
+                        }
+                        (None, _) => {
+                            self.store
+                                .create_or_get_session(
+                                    thread_key,
+                                    harness_type,
+                                    existing.as_deref(),
+                                    default_metadata(None),
+                                    BTreeMap::new(),
+                                )
+                                .await?
+                        }
+                    }
                 }
                 Err(SessionStoreError::HarnessConflict { existing, .. })
                     if on_harness_conflict == HarnessConflictPolicy::Restart =>
@@ -1439,28 +1556,6 @@ impl SessionRuntime {
                         }),
                     )
                     .await?;
-            }
-            if let Some(principal) = registered_principal {
-                // Persist the principal OID on the session row so a resumed session
-                // can recreate its sandbox after a restart without re-deriving it.
-                let session = self
-                    .store
-                    .set_iron_control_principal(thread_key, Some(&principal.id))
-                    .await?;
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_create_or_get_completed",
-                    thread_key = %thread_key,
-                    harness_type = %harness_type,
-                    status = %session.status,
-                    iron_control_principal_persisted = true,
-                    harness_switched,
-                    "session ready"
-                );
-                return Ok(CreateOrGetSessionOutcome {
-                    session,
-                    harness_switched,
-                });
             }
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -2738,7 +2833,9 @@ impl SessionRuntime {
             return Ok(SessionSandboxCapabilities::default_enabled());
         };
         let Some(registrar) = &self.iron_control else {
-            return Ok(SessionSandboxCapabilities::default_enabled());
+            return Err(SessionRuntimeError::BadRequest(
+                "session has an Iron Control principal, but Iron Control is disabled".to_owned(),
+            ));
         };
         let principal = registrar.get_principal(principal_id).await?;
         Ok(sandbox_capabilities_from_principal(&principal))
