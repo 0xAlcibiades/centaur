@@ -383,8 +383,8 @@ from the resulting credential: `add` derives a unique human-readable label, and
 `relogin` discovers and replaces the matching canonical account. Autorotate
 enforces one active enrollment per exact signed Slack workspace/member owner, so
 the flow recovers after a Slackbot restart and works with multiple replicas.
-Pending recovery includes the enrollment ID, action, account label, expiry, and
-private device link/code.
+Pending recovery includes the enrollment ID, action, expiry, and private device
+link/code; the resolved account label may appear only after authentication.
 Once authorization reaches importing, owner recovery returns the same
 non-secret metadata without the link or code; Slackbot continues polling by
 enrollment ID and reports that canonical credential import is in progress.

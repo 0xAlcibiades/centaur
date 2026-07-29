@@ -299,10 +299,12 @@ describe('Autorotate Slack command', () => {
           action: 'add',
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
-        return Response.json({
+        const start: Record<string, unknown> = {
           ...startEnrollmentResponse('team-codex'),
           auth_json: { refresh_token: 'must-not-render' }
-        }, { status: 201 })
+        }
+        delete start.account_label
+        return Response.json(start, { status: 201 })
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
         return Response.json({
@@ -482,9 +484,11 @@ describe('Autorotate Slack command', () => {
           action: 'relogin',
           owner: `slack:${TEAM_ID}:${USER_ID}`
         })
-        return Response.json(startEnrollmentResponse('livermore-ci-legacy', {
+        const start = startEnrollmentResponse('livermore-ci-legacy', {
           action: 'relogin'
-        }), { status: 201 })
+        })
+        delete start.account_label
+        return Response.json(start, { status: 201 })
       }
       if (url.endsWith('/v1/operator/enrollments/enr_abcdefgh')) {
         return Response.json(enrollmentStatusResponse('completed', {

@@ -76,7 +76,7 @@ type EnrollmentAccount = {
 type StartEnrollmentResponse = {
   enrollment_id: string
   action: EnrollmentAction
-  account_label: string
+  account_label?: string
   verification_url?: string
   user_code?: string
   expires_at: string
@@ -1024,7 +1024,7 @@ function formatActiveEnrollment(
   enrollment: StartEnrollmentResponse | EnrollmentStatusResponse
 ): string {
   if (enrollment.status === 'importing') {
-    const label = 'account_label' in enrollment
+    const label = 'account_label' in enrollment && typeof enrollment.account_label === 'string'
       ? ` for \`${escapeSlackText(enrollment.account_label)}\``
       : ''
     return `Codex login${label} is authorized and importing the canonical credential.`
@@ -1104,7 +1104,7 @@ function validateStartEnrollment(payload: JsonObject): StartEnrollmentResponse {
     typeof enrollmentId !== 'string'
     || !ENROLLMENT_ID_PATTERN.test(enrollmentId)
     || (action !== 'add' && action !== 'relogin')
-    || !safeAccountLabel(accountLabel)
+    || (accountLabel !== undefined && !safeAccountLabel(accountLabel))
     || typeof expiresAt !== 'string'
     || !safeTimestamp(expiresAt)
     || (status !== 'pending' && status !== 'importing')
@@ -1121,7 +1121,7 @@ function validateStartEnrollment(payload: JsonObject): StartEnrollmentResponse {
   return {
     enrollment_id: enrollmentId,
     action,
-    account_label: accountLabel,
+    ...(typeof accountLabel === 'string' ? { account_label: accountLabel } : {}),
     ...(typeof verificationUrl === 'string' ? { verification_url: verificationUrl } : {}),
     ...(typeof userCode === 'string' ? { user_code: userCode } : {}),
     expires_at: expiresAt,
