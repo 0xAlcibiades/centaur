@@ -133,6 +133,18 @@ mod tests {
     }
 
     #[test]
+    fn reaps_workflow_run_sandbox_past_max_lifetime() {
+        let now = SystemTime::now();
+        let sandbox = observed(centaur_sandbox_core::SandboxStatus::Running)
+            .with_component(Some("workflow-run".to_owned()))
+            .with_created_at(Some(now - Duration::from_secs(100_000)));
+
+        let reason = reap_reason(&sandbox, now, &config(Some(Duration::from_secs(86_400))));
+
+        assert_eq!(reason, Some("max_lifetime"));
+    }
+
+    #[test]
     fn reaps_suspended_sandbox_past_max_lifetime() {
         let now = SystemTime::now();
         let sandbox = observed(centaur_sandbox_core::SandboxStatus::Suspended)

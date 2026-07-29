@@ -6,6 +6,8 @@ use tracing::{info, warn};
 
 use crate::{RuntimeContext, SessionRuntimeError, record_idle_pause};
 
+const WORKFLOW_RUN_COMPONENT: &str = "workflow-run";
+
 #[derive(Clone, Copy, Debug)]
 pub struct SessionSandboxCleanupConfig {
     /// How often to sweep. `None` disables the cleanup worker entirely.
@@ -171,6 +173,9 @@ fn orphan_reap_eligible(sandbox: &ObservedSandbox, referenced: &BTreeSet<String>
     if referenced.contains(sandbox.id.as_str()) {
         return false;
     }
+    if sandbox.component.as_deref() == Some(WORKFLOW_RUN_COMPONENT) {
+        return false;
+    }
     !matches!(
         sandbox.status,
         SandboxStatus::Created | SandboxStatus::Stopped | SandboxStatus::Gone
@@ -189,6 +194,14 @@ mod tests {
         ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
+    fn observed_with_component(
+        id: &str,
+        status: SandboxStatus,
+        component: Option<&str>,
+    ) -> ObservedSandbox {
+        observed(id, status).with_component(component.map(str::to_owned))
+    }
+
     #[test]
     fn orphan_reap_requires_two_consecutive_passes() {
         let observed = [observed("asbx-1", SandboxStatus::Running)];
@@ -202,6 +215,49 @@ mod tests {
             select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
             vec!["asbx-1".to_owned()]
         );
+    }
+
+    #[test]
+    fn orphan_reap_skips_workflow_runs_but_keeps_other_orphans_eligible() {
+        let observed = [
+            observed_with_component(
+                "asbx-session",
+                SandboxStatus::Running,
+                Some("session-sandbox"),
+            ),
+            observed_with_component("asbx-warm", SandboxStatus::Running, Some("session-sandbox")),
+            observed_with_component(
+                "asbx-unknown",
+                SandboxStatus::Unknown("backend state".to_owned()),
+                None,
+            ),
+            observed_with_component(
+                "asbx-workflow-run",
+                SandboxStatus::Running,
+                Some(WORKFLOW_RUN_COMPONENT),
+            ),
+        ];
+        let expected = BTreeSet::from([
+            "asbx-session".to_owned(),
+            "asbx-unknown".to_owned(),
+            "asbx-warm".to_owned(),
+        ]);
+        let mut pending = BTreeSet::new();
+
+        assert_eq!(
+            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
+            Vec::<String>::new()
+        );
+        assert_eq!(&pending, &expected);
+        assert_eq!(
+            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
+            expected.iter().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
+            expected.iter().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(&pending, &expected);
     }
 
     #[test]

@@ -36,6 +36,7 @@ mod tools;
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
+const COMPONENT_LABEL: &str = "centaur.ai/component";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const API_SERVER_ENABLED_LABEL: &str = "centaur.ai/api-server-enabled";
@@ -220,6 +221,7 @@ impl AgentSandboxBackend {
         let pod = self.get_pod(id).await?;
         let status = sandbox_status_from_pod(replicas, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
+            .with_component(sandbox_component(sandbox))
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox)))
     }
@@ -524,6 +526,15 @@ fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
         .get(PAUSED_AT_ANNOTATION)?;
     let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+fn sandbox_component(sandbox: &crd::Sandbox) -> Option<String> {
+    sandbox
+        .metadata
+        .labels
+        .as_ref()?
+        .get(COMPONENT_LABEL)
+        .cloned()
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
@@ -971,6 +982,19 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn reads_component_label_from_sandbox_metadata() {
+        let spec = SandboxSpec::new("centaur-agent:latest").label(COMPONENT_LABEL, "workflow-run");
+        let sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-workflow"),
+            &spec,
+            &AgentSandboxConfig::new("centaur"),
+        )
+        .unwrap();
+
+        assert_eq!(sandbox_component(&sandbox).as_deref(), Some("workflow-run"));
     }
 
     #[test]
