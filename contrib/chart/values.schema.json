@@ -378,6 +378,10 @@
             "operatorSlackTeamIds": {
               "type": "array",
               "items": { "type": "string" }
+            },
+            "operatorSlackUserIds": {
+              "type": "array",
+              "items": { "type": "string" }
             }
           }
         },
