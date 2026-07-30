@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime},
@@ -27,8 +27,8 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SandboxCapacityCandidate, SessionEventListener, SessionStoreError,
-    default_metadata,
+    OwnedTerminalEvent, PgSessionStore, SandboxCapacityCandidate, SessionEventListener,
+    SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -44,7 +44,7 @@ use thiserror::Error;
 use tokio::{
     io,
     sync::Mutex,
-    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
+    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout, timeout_at},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use tracing::{Instrument, Span, debug, error, info, info_span, warn};
@@ -66,8 +66,21 @@ const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const COMPLETED_OUTPUT_ID_CAPACITY: usize = 256;
+#[cfg(not(test))]
+const EXECUTION_ADOPTION_IO_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const EXECUTION_ADOPTION_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const STDOUT_OWNER_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STDOUT_OWNER_RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const STDOUT_OWNER_RENEWER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STDOUT_OWNER_RENEWER_STOP_TIMEOUT: Duration = Duration::from_millis(250);
 /// A live execution can briefly have no sandbox while it moves from queued
 /// through warm-sandbox assignment. A periodic adoption scan must not fail a
 /// young row it observes in that window.
@@ -86,13 +99,67 @@ type SandboxSpecFactory = Arc<
 >;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
+type SharedStdoutPumpState = Arc<Mutex<StdoutPumpState>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
-type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type WeakLockRegistry<T> = Arc<DashMap<String, Weak<RegisteredLock<T>>>>;
+type SharedRegisteredLock<T> = Arc<RegisteredLock<T>>;
+type SessionPipeOpenLocks = WeakLockRegistry<Mutex<()>>;
+type SessionOutputGates = WeakLockRegistry<tokio::sync::RwLock<()>>;
+type SessionPipeOpenLock = SharedRegisteredLock<Mutex<()>>;
+type SessionOutputGate = SharedRegisteredLock<tokio::sync::RwLock<()>>;
 type ToolHostCallLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type SessionTitleThreadSet = Arc<DashSet<ThreadKey>>;
+type StdoutOwnerRenewalRegistry = Arc<DashMap<String, Arc<StdoutOwnerRenewal>>>;
 type SessionTitleGenerator = Arc<
     dyn Fn(String) -> BoxFuture<'static, Result<String, SessionTitleGenerationError>> + Send + Sync,
 >;
+
+struct StdoutOwnerRenewal {
+    generation: Uuid,
+    cancel: tokio::sync::watch::Sender<bool>,
+    stopped: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    renew_now: tokio::sync::Notify,
+    #[cfg(test)]
+    renew_db_started: tokio::sync::Notify,
+}
+
+impl StdoutOwnerRenewal {
+    async fn wait_stopped(&self) {
+        let mut stopped = self.stopped.subscribe();
+        while !*stopped.borrow_and_update() {
+            if stopped.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct RegisteredLock<T> {
+    key: String,
+    lock: T,
+    registry: Weak<DashMap<String, Weak<RegisteredLock<T>>>>,
+}
+
+impl<T> std::ops::Deref for RegisteredLock<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<T> Drop for RegisteredLock<T> {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let self_ptr = self as *const Self;
+        registry.remove_if(&self.key, |_, current| {
+            std::ptr::eq(current.as_ptr(), self_ptr)
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -100,6 +167,7 @@ pub struct SessionRuntime {
     sandbox_runtime: SandboxRuntime,
     sandbox_pipes: SessionPipeMap,
     sandbox_pipe_open_locks: SessionPipeOpenLocks,
+    sandbox_output_gates: SessionOutputGates,
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
@@ -110,10 +178,18 @@ pub struct SessionRuntime {
     session_title_rerun_requested: SessionTitleThreadSet,
     capacity: Option<Arc<SandboxCapacityController>>,
     stdout_owner_id: String,
+    stdout_owner_claim_gate: Arc<Mutex<()>>,
+    stdout_owner_renewals: StdoutOwnerRenewalRegistry,
     /// Set once a shutdown handoff begins; fences new stdout-owner claims
     /// so an execution cannot start on a control plane that is about to
     /// exit and release its leases.
     shutting_down: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_adoption_root_persistence: Arc<AtomicBool>,
+    #[cfg(test)]
+    stdout_owner_claim_db_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    stdout_owner_release_started: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +448,35 @@ pub struct ToolHostCallOutput {
 #[derive(Clone)]
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
+    output_state: SharedStdoutPumpState,
+    output_gate: SessionOutputGate,
+    stdout_alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    output_gate_read_wait_started: Arc<tokio::sync::Notify>,
+}
+
+impl SessionPipe {
+    async fn output_read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        #[cfg(not(test))]
+        {
+            self.output_gate.read().await
+        }
+        #[cfg(test)]
+        {
+            let read = self.output_gate.read();
+            tokio::pin!(read);
+            let mut wait_reported = false;
+            futures_util::future::poll_fn(|cx| {
+                let poll = read.as_mut().poll(cx);
+                if poll.is_pending() && !wait_reported {
+                    self.output_gate_read_wait_started.notify_one();
+                    wait_reported = true;
+                }
+                poll
+            })
+            .await
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -406,6 +511,7 @@ struct RuntimeContext {
     sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
     stdout_owner_id: String,
+    stdout_owner_renewals: StdoutOwnerRenewalRegistry,
 }
 
 struct SandboxCapacityController {
@@ -797,6 +903,7 @@ impl SessionRuntime {
             sandbox_runtime,
             sandbox_pipes: Arc::new(DashMap::new()),
             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
+            sandbox_output_gates: Arc::new(DashMap::new()),
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
@@ -807,7 +914,15 @@ impl SessionRuntime {
             session_title_rerun_requested: Arc::new(DashSet::new()),
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
+            stdout_owner_claim_gate: Arc::new(Mutex::new(())),
+            stdout_owner_renewals: Arc::new(DashMap::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_adoption_root_persistence: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            stdout_owner_claim_db_started: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            stdout_owner_release_started: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -931,6 +1046,7 @@ impl SessionRuntime {
             sandbox_pipes: self.sandbox_pipes.clone(),
             execution_spans: self.execution_spans.clone(),
             stdout_owner_id: self.stdout_owner_id.clone(),
+            stdout_owner_renewals: self.stdout_owner_renewals.clone(),
         }
     }
 
@@ -1183,17 +1299,32 @@ impl SessionRuntime {
     }
 
     async fn claim_stdout_owner(&self, execution_id: &str) -> Result<(), SessionRuntimeError> {
+        let _claim_guard = self.stdout_owner_claim_gate.lock().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::ShuttingDown);
         }
+        if !stop_stdout_owner_renewer(&self.stdout_owner_renewals, execution_id).await {
+            return Err(SessionRuntimeError::StdoutOwnerRenewerStopTimeout {
+                execution_id: execution_id.to_owned(),
+            });
+        }
+        #[cfg(test)]
+        self.stdout_owner_claim_db_started.notify_one();
         let claimed = self
             .store
             .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
             .await?;
         if !claimed {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(SessionRuntimeError::ShuttingDown);
+            }
             return Err(SessionRuntimeError::BadRequest(format!(
                 "execution {execution_id} stdout is owned by another control plane process"
             )));
+        }
+        if self.shutting_down.load(Ordering::SeqCst) {
+            self.abandon_stdout_owner(execution_id).await;
+            return Err(SessionRuntimeError::ShuttingDown);
         }
         spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
         Ok(())
@@ -1203,14 +1334,77 @@ impl SessionRuntime {
         &self,
         execution_id: &str,
     ) -> Result<bool, SessionRuntimeError> {
+        let _claim_guard = self.stdout_owner_claim_gate.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
+        if !stop_stdout_owner_renewer(&self.stdout_owner_renewals, execution_id).await {
+            return Err(SessionRuntimeError::StdoutOwnerRenewerStopTimeout {
+                execution_id: execution_id.to_owned(),
+            });
+        }
+        #[cfg(test)]
+        self.stdout_owner_claim_db_started.notify_one();
         let claimed = self
             .store
             .claim_expired_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
             .await?;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            if claimed {
+                self.abandon_stdout_owner(execution_id).await;
+            }
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
         if claimed {
             spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
         }
         Ok(claimed)
+    }
+
+    async fn abandon_stdout_owner(&self, execution_id: &str) -> bool {
+        if !stop_stdout_owner_renewer(&self.stdout_owner_renewals, execution_id).await {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_stdout_owner_renewer_stop_timeout",
+                execution_id,
+                stdout_owner_id = %self.stdout_owner_id,
+                "stdout owner renewer did not stop; leaving the lease fenced"
+            );
+            return false;
+        }
+        #[cfg(test)]
+        self.stdout_owner_release_started.notify_one();
+        match timeout(
+            STDOUT_OWNER_RELEASE_TIMEOUT,
+            self.store
+                .release_stdout_owner(execution_id, &self.stdout_owner_id),
+        )
+        .await
+        {
+            Ok(Ok(released)) => released,
+            Ok(Err(error)) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_stdout_owner_release_failed",
+                    execution_id,
+                    stdout_owner_id = %self.stdout_owner_id,
+                    %error,
+                    "failed to release abandoned stdout owner lease; it will expire naturally"
+                );
+                false
+            }
+            Err(_) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_stdout_owner_release_timeout",
+                    execution_id,
+                    stdout_owner_id = %self.stdout_owner_id,
+                    timeout_ms = duration_millis_u64(STDOUT_OWNER_RELEASE_TIMEOUT),
+                    "timed out releasing abandoned stdout owner lease; it will expire naturally"
+                );
+                false
+            }
+        }
     }
 
     /// Attach an iron-control registrar so each new session upserts its
@@ -2071,8 +2265,9 @@ impl SessionRuntime {
             execution_trace_span.record("centaur.sandbox_id", sandbox_id.as_str());
             execution_trace_span.record("sandbox_id", sandbox_id.as_str());
 
+            let output_state = stdout_state_for_execution(&session, &execution.execution_id);
             let pipe = match self
-                .ensure_session_pipe(thread_key, &sandbox_id)
+                .ensure_session_pipe_with_output_state(thread_key, &sandbox_id, output_state)
                 .instrument(execution_trace_span.clone())
                 .await
             {
@@ -2145,34 +2340,30 @@ impl SessionRuntime {
         execution_id: &str,
         error: &SessionRuntimeError,
     ) {
-        self.execution_spans.lock().await.remove(execution_id);
         let error_message = error.to_string();
+        let payload = json!({
+            "execution_id": execution_id,
+            "thread_key": thread_key.as_str(),
+            "error": error_message,
+        });
         let execution = match self
             .store
-            .fail_execution_if_active_and_stdout_owner(
+            .terminalize_execution_and_append_event_if_stdout_owner(
                 execution_id,
                 &self.stdout_owner_id,
-                &error_message,
+                OwnedTerminalEvent::Failed {
+                    error: error_message,
+                    payload,
+                },
             )
             .await
         {
-            Ok(Some(execution)) => execution,
+            Ok(Some((execution, _))) => execution,
             Ok(None) => return,
             Err(_) => return,
         };
-        let _ = self
-            .store
-            .append_event(
-                thread_key,
-                Some(execution_id),
-                "session.execution_failed",
-                json!({
-                    "execution_id": execution_id,
-                    "thread_key": thread_key.as_str(),
-                    "error": error_message,
-                }),
-            )
-            .await;
+        stop_terminal_stdout_owner_renewer(&self.context(), execution_id).await;
+        self.execution_spans.lock().await.remove(execution_id);
         record_finished_execution_metric(
             &self.store,
             thread_key,
@@ -2331,7 +2522,11 @@ impl SessionRuntime {
                 .map_err(|error| format!("get session: {error}"))?;
 
             if let Some(sandbox_id) = session.sandbox_id.as_deref() {
-                match self.ensure_session_pipe(thread_key, sandbox_id).await {
+                let output_state = stdout_state_for_execution(&session, execution_id);
+                match self
+                    .ensure_session_pipe_with_output_state(thread_key, sandbox_id, output_state)
+                    .await
+                {
                     Ok(pipe) => return Ok(pipe),
                     Err(error)
                         if is_transient_steering_startup_error(&error)
@@ -2942,6 +3137,53 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         sandbox_id: &str,
     ) -> Result<SessionPipe, SessionRuntimeError> {
+        self.ensure_session_pipe_with_output_state(
+            thread_key,
+            sandbox_id,
+            StdoutPumpState::default(),
+        )
+        .await
+    }
+
+    fn sandbox_pipe_open_lock(&self, sandbox_id: &str) -> SessionPipeOpenLock {
+        registered_lock_from_registry(&self.sandbox_pipe_open_locks, sandbox_id, || Mutex::new(()))
+    }
+
+    fn sandbox_output_gate(&self, sandbox_id: &str) -> SessionOutputGate {
+        output_gate_from_registry(&self.sandbox_output_gates, sandbox_id)
+    }
+
+    async fn persist_adopted_root_thread_id(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        root_thread_id: &str,
+    ) -> Result<Option<Session>, SessionStoreError> {
+        #[cfg(test)]
+        if self
+            .fail_adoption_root_persistence
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(SessionStoreError::InvalidPersistedValue(
+                "injected adoption root persistence failure".to_owned(),
+            ));
+        }
+        self.store
+            .update_harness_thread_id_if_stdout_owner(
+                thread_key,
+                execution_id,
+                &self.stdout_owner_id,
+                Some(root_thread_id),
+            )
+            .await
+    }
+
+    async fn ensure_session_pipe_with_output_state(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+        output_state: StdoutPumpState,
+    ) -> Result<SessionPipe, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.pipe.ensure",
             component = COMPONENT_SESSION_RUNTIME,
@@ -2952,44 +3194,30 @@ impl SessionRuntime {
             sandbox_id,
         );
         let result = async {
-            if let Some(pipe) = self
-                .sandbox_pipes
-                .get(sandbox_id)
-                .map(|entry| entry.clone())
-            {
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_pipe_reused",
-                    thread_key = %thread_key,
-                    sandbox_id,
-                    "reusing session pipe"
-                );
-                return Ok(pipe);
-            }
-
-            let open_lock = {
-                let entry = self
-                    .sandbox_pipe_open_locks
-                    .entry(sandbox_id.to_owned())
-                    .or_insert_with(|| Arc::new(Mutex::new(())));
-                entry.clone()
-            };
+            let output_gate = self.sandbox_output_gate(sandbox_id);
+            let open_lock = self.sandbox_pipe_open_lock(sandbox_id);
             let _open_guard = open_lock.lock().await;
 
-            if let Some(pipe) = self
+            let output_state = if let Some(pipe) = self
                 .sandbox_pipes
                 .get(sandbox_id)
                 .map(|entry| entry.clone())
             {
-                info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_pipe_reused",
-                    thread_key = %thread_key,
-                    sandbox_id,
-                    "reusing session pipe"
-                );
-                return Ok(pipe);
-            }
+                pipe.output_state.lock().await.merge_from(output_state);
+                if pipe.stdout_alive.load(Ordering::Acquire) {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_pipe_reused",
+                        thread_key = %thread_key,
+                        sandbox_id,
+                        "reusing session pipe"
+                    );
+                    return Ok(pipe);
+                }
+                pipe.output_state.clone()
+            } else {
+                Arc::new(Mutex::new(output_state))
+            };
 
             let io = self
                 .sandbox_runtime
@@ -2997,7 +3225,7 @@ impl SessionRuntime {
                 .open_io(&SandboxId::new(sandbox_id))
                 .await?
                 .into_parts();
-            let pipe = session_pipe_from_stdin(io.stdin);
+            let pipe = session_pipe_from_stdin(io.stdin, output_state.clone(), output_gate);
 
             self.sandbox_pipes
                 .insert(sandbox_id.to_owned(), pipe.clone());
@@ -3099,6 +3327,10 @@ impl SessionRuntime {
         state: &mut OrphanAdoptionState,
         pre_sandbox_grace: Option<Duration>,
     ) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            state.deferred.clear();
+            return;
+        }
         let executions = match self.store.list_active_executions_with_ownership().await {
             Ok(executions) => executions,
             Err(error) => {
@@ -3217,6 +3449,9 @@ impl SessionRuntime {
         record_deferral: bool,
         pre_sandbox_grace: Option<Duration>,
     ) -> Result<OrphanAdoption, SessionRuntimeError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
         let thread_key = &execution.thread_key;
         let execution_id = execution.execution_id.as_str();
         if execution.status == ExecutionStatus::Queued {
@@ -3294,6 +3529,12 @@ impl SessionRuntime {
             .await;
             return Ok(OrphanAdoption::Failed);
         }
+        // An existing pump may still be attached while its previous owner
+        // lease is expired. Fence its line processing before claiming the
+        // execution, then keep the fence through recorded replay and state
+        // merge so child output cannot terminalize against an unseeded state.
+        let output_gate = self.sandbox_output_gate(sandbox_id);
+        let _output_guard = output_gate.write().await;
         if !self.claim_expired_stdout_owner(execution_id).await? {
             // Deferrals repeat on every periodic scan while another control
             // plane pumps the execution; only the first observation is worth
@@ -3313,19 +3554,35 @@ impl SessionRuntime {
             return Ok(OrphanAdoption::Deferred);
         }
 
+        let since = execution.started_at.unwrap_or(execution.created_at);
+        if let Some(max_duration) = max_duration_from_execution(execution) {
+            let elapsed = SystemTime::now()
+                .duration_since(SystemTime::from(since))
+                .unwrap_or_default();
+            spawn_max_duration_failure(
+                self.context(),
+                thread_key.clone(),
+                execution.execution_id.clone(),
+                max_duration.saturating_sub(elapsed),
+                idle_timeout_from_execution(execution),
+            );
+        }
+        let adoption_io_deadline = Instant::now() + EXECUTION_ADOPTION_IO_TIMEOUT;
+
         // The turn may have finished while no control plane was attached. An
         // attach stream cannot replay that output, but the backend's recorded
         // history (pod logs) can.
-        let since = execution.started_at.unwrap_or(execution.created_at);
-        let lines = match self
-            .sandbox_runtime
-            .manager
-            .read_output_since(&id, Some(SystemTime::from(since)))
-            .await
+        let lines = match timeout_at(
+            adoption_io_deadline,
+            self.sandbox_runtime
+                .manager
+                .read_output_since(&id, Some(SystemTime::from(since))),
+        )
+        .await
         {
-            Ok(lines) => lines,
-            Err(SandboxError::Unsupported { .. }) => Vec::new(),
-            Err(error) => {
+            Ok(Ok(lines)) => lines,
+            Ok(Err(SandboxError::Unsupported { .. })) => Vec::new(),
+            Ok(Err(error)) => {
                 warn!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "execution_adoption_log_read_failed",
@@ -3337,8 +3594,93 @@ impl SessionRuntime {
                 );
                 Vec::new()
             }
+            Err(_) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_log_read_timed_out",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    timeout_ms = duration_millis_u64(EXECUTION_ADOPTION_IO_TIMEOUT),
+                    "recorded sandbox output read timed out; releasing adoption ownership for retry"
+                );
+                self.abandon_stdout_owner(execution_id).await;
+                return Ok(OrphanAdoption::Deferred);
+            }
         };
-        if let Some(terminal) = terminal_output_from_lines(&lines) {
+        let mut output_state = stdout_state_for_execution(&session, execution_id);
+        if session.harness_type != HarnessType::Nanocodex
+            && let Some(durable_root) = session.harness_thread_id.as_deref()
+            && let Some(repaired_root) =
+                legacy_corrupted_root_repair_candidate(&lines, durable_root)
+        {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_adoption_root_repaired",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                durable_root,
+                repaired_root,
+                "repairing a legacy child-corrupted harness thread id from recorded execution evidence"
+            );
+            output_state.set_authoritative_root_thread_id(execution_id, &repaired_root);
+        }
+        let terminal = output_state.replay_recorded_output(execution_id, &lines);
+        if let Some(root_thread_id) = output_state.root_thread_id(execution_id) {
+            match self
+                .persist_adopted_root_thread_id(thread_key, execution_id, root_thread_id)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_adoption_stdout_owner_lost",
+                        thread_key = %thread_key,
+                        execution_id,
+                        sandbox_id,
+                        "adoption lost stdout ownership before root persistence; deferring without attaching"
+                    );
+                    self.abandon_stdout_owner(execution_id).await;
+                    return Ok(OrphanAdoption::Deferred);
+                }
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_adoption_thread_id_persist_failed",
+                        thread_key = %thread_key,
+                        execution_id,
+                        sandbox_id,
+                        %error,
+                        "failed to persist root harness thread id recovered during adoption; releasing ownership for retry"
+                    );
+                    self.abandon_stdout_owner(execution_id).await;
+                    return Err(SessionRuntimeError::Store(error));
+                }
+            }
+        }
+        if let Some(terminal) = terminal {
+            if !record_terminal_output(
+                &self.context(),
+                thread_key,
+                sandbox_id,
+                execution_id,
+                terminal,
+            )
+            .await?
+            {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_stdout_owner_lost",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    "adoption lost stdout ownership before recorded terminal persistence"
+                );
+                self.abandon_stdout_owner(execution_id).await;
+                return Ok(OrphanAdoption::Deferred);
+            }
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "execution_adopted",
@@ -3357,26 +3699,36 @@ impl SessionRuntime {
                     json!({ "sandbox_id": sandbox_id, "mode": "recorded_output" }),
                 )
                 .await;
-            record_terminal_output(
-                &self.context(),
-                thread_key,
-                sandbox_id,
-                execution_id,
-                terminal,
-            )
-            .await?;
             return Ok(OrphanAdoption::Adopted);
         }
 
         // No terminal in the recorded output: treat the turn as still in
         // flight. Re-attach the stdout pump and re-arm the remaining
         // max-duration budget so an adopted-but-silent turn stays bounded.
-        if let Err(error) = self.ensure_session_pipe(thread_key, sandbox_id).await {
-            let _ = self
-                .store
-                .release_stdout_owner(execution_id, &self.stdout_owner_id)
-                .await;
-            return Err(error);
+        match timeout_at(
+            adoption_io_deadline,
+            self.ensure_session_pipe_with_output_state(thread_key, sandbox_id, output_state),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                self.abandon_stdout_owner(execution_id).await;
+                return Err(error);
+            }
+            Err(_) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_attach_timed_out",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    timeout_ms = duration_millis_u64(EXECUTION_ADOPTION_IO_TIMEOUT),
+                    "sandbox attach timed out; releasing adoption ownership for retry"
+                );
+                self.abandon_stdout_owner(execution_id).await;
+                return Ok(OrphanAdoption::Deferred);
+            }
         }
         info!(
             component = COMPONENT_SESSION_RUNTIME,
@@ -3396,18 +3748,6 @@ impl SessionRuntime {
                 json!({ "sandbox_id": sandbox_id, "mode": "live_attach" }),
             )
             .await;
-        if let Some(max_duration) = max_duration_from_execution(execution) {
-            let elapsed = SystemTime::now()
-                .duration_since(SystemTime::from(since))
-                .unwrap_or_default();
-            spawn_max_duration_failure(
-                self.context(),
-                thread_key.clone(),
-                execution.execution_id.clone(),
-                max_duration.saturating_sub(elapsed),
-                idle_timeout_from_execution(execution),
-            );
-        }
         Ok(OrphanAdoption::Adopted)
     }
 
@@ -3418,12 +3758,38 @@ impl SessionRuntime {
         sandbox_id: &str,
         detail: &str,
     ) {
-        let _ = self
-            .store
-            .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
-            .await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let claimed = self.claim_expired_stdout_owner(execution_id).await;
+        match claimed {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_fail_owner_lost",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    "orphan failure lost stdout ownership before terminal persistence"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_fail_claim_failed",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    %error,
+                    "failed to claim orphaned execution for terminal persistence"
+                );
+                return;
+            }
+        }
         let error = format!("execution orphaned by control plane restart; {detail}");
-        if let Err(record_error) = record_terminal_output(
+        match record_terminal_output(
             &self.context(),
             thread_key,
             sandbox_id,
@@ -3432,14 +3798,23 @@ impl SessionRuntime {
         )
         .await
         {
-            warn!(
+            Ok(true) => {}
+            Ok(false) => warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_adoption_fail_owner_lost",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                "orphan failure lost stdout ownership before terminal persistence"
+            ),
+            Err(record_error) => warn!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "execution_adoption_fail_record_failed",
                 thread_key = %thread_key,
                 execution_id,
                 error = %record_error,
                 "failed to record orphaned execution failure"
-            );
+            ),
         }
     }
 
@@ -3456,6 +3831,7 @@ impl SessionRuntime {
         // this point would otherwise claim a lease that outlives the
         // process, stranding it until the lease TTL expires.
         self.shutting_down.store(true, Ordering::SeqCst);
+        let _claim_guard = self.stdout_owner_claim_gate.lock().await;
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
@@ -3476,6 +3852,13 @@ impl SessionRuntime {
             };
             match count {
                 Ok(0) => {
+                    if !stop_all_stdout_owner_renewers(&self.stdout_owner_renewals).await {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "execution_handoff_renewer_stop_timeout",
+                            "timed out stopping a stdout-owner renewer during idle shutdown"
+                        );
+                    }
                     info!(
                         component = COMPONENT_SESSION_RUNTIME,
                         event = "execution_handoff_idle",
@@ -3505,6 +3888,14 @@ impl SessionRuntime {
                 }
             }
             sleep(EXECUTION_HANDOFF_POLL_INTERVAL).await;
+        }
+        if !stop_all_stdout_owner_renewers(&self.stdout_owner_renewals).await {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_handoff_renewer_stop_timeout",
+                "timed out stopping a stdout-owner renewer; leaving leases fenced"
+            );
+            return;
         }
         let released = tokio::time::timeout(
             EXECUTION_HANDOFF_DB_TIMEOUT,
@@ -3995,7 +4386,7 @@ enum StdoutPumpEnd {
 
 struct StdoutPumpLoop {
     ctx: RuntimeContext,
-    open_lock: Arc<Mutex<()>>,
+    open_lock: SessionPipeOpenLock,
     thread_key: ThreadKey,
     sandbox_id: String,
     pipe: SessionPipe,
@@ -4017,9 +4408,72 @@ enum ReattachOutcome {
     Dead(String),
 }
 
-fn session_pipe_from_stdin(stdin: SandboxWrite) -> SessionPipe {
+fn stdout_state_for_execution(session: &Session, execution_id: &str) -> StdoutPumpState {
+    let mut output_state = StdoutPumpState::default();
+    // Codex app-server reuses one durable thread across turns. Nanocodex uses
+    // a fresh request id for every run, so its persisted id is observability
+    // state only and must never be seeded into a later execution.
+    if session.harness_type != HarnessType::Nanocodex
+        && let Some(harness_thread_id) = session.harness_thread_id.as_deref()
+    {
+        output_state.set_authoritative_root_thread_id(execution_id, harness_thread_id);
+    }
+    output_state
+}
+
+fn registered_lock_from_registry<T, F>(
+    registry: &WeakLockRegistry<T>,
+    key: &str,
+    make_lock: F,
+) -> SharedRegisteredLock<T>
+where
+    F: FnOnce() -> T,
+{
+    match registry.entry(key.to_owned()) {
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            if let Some(lock) = entry.get().upgrade() {
+                lock
+            } else {
+                let lock = Arc::new(RegisteredLock {
+                    key: key.to_owned(),
+                    lock: make_lock(),
+                    registry: Arc::downgrade(registry),
+                });
+                entry.insert(Arc::downgrade(&lock));
+                lock
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let lock = Arc::new(RegisteredLock {
+                key: key.to_owned(),
+                lock: make_lock(),
+                registry: Arc::downgrade(registry),
+            });
+            entry.insert(Arc::downgrade(&lock));
+            lock
+        }
+    }
+}
+
+fn output_gate_from_registry(
+    output_gates: &SessionOutputGates,
+    sandbox_id: &str,
+) -> SessionOutputGate {
+    registered_lock_from_registry(output_gates, sandbox_id, || tokio::sync::RwLock::new(()))
+}
+
+fn session_pipe_from_stdin(
+    stdin: SandboxWrite,
+    output_state: SharedStdoutPumpState,
+    output_gate: SessionOutputGate,
+) -> SessionPipe {
     SessionPipe {
         stdin: Arc::new(Mutex::new(FramedWrite::new(stdin, LinesCodec::new()))),
+        output_state,
+        output_gate,
+        stdout_alive: Arc::new(AtomicBool::new(true)),
+        #[cfg(test)]
+        output_gate_read_wait_started: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -4060,8 +4514,16 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
         let mut last_reattach_detail = "stdout reattach attempts exhausted".to_owned();
 
         'pump: loop {
-            let result =
-                run_stdout_pump(ctx.clone(), thread_key.clone(), &sandbox_id, stdout, guard).await;
+            let result = run_stdout_pump(
+                ctx.clone(),
+                thread_key.clone(),
+                &sandbox_id,
+                stdout,
+                guard,
+                &pipe,
+            )
+            .await;
+            pipe.stdout_alive.store(false, Ordering::Release);
             let (execution, lines_pumped) = match result {
                 Ok(StdoutPumpEnd::Idle) => break,
                 Ok(StdoutPumpEnd::EofActiveExecution {
@@ -4093,7 +4555,7 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
                 }
             };
 
-            if recover_detached_terminal_output(&ctx, &thread_key, &sandbox_id, &execution)
+            if recover_detached_terminal_output(&ctx, &thread_key, &sandbox_id, &execution, &pipe)
                 .await
                 .unwrap_or_else(|error| {
                     warn!(
@@ -4193,13 +4655,14 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
             }
         }
 
+        let _open_guard = open_lock.lock().await;
         remove_pipe_if_current(&ctx.sandbox_pipes, &sandbox_id, &pipe);
     });
 }
 
 async fn reattach_session_pipe(
     ctx: &RuntimeContext,
-    open_lock: &Arc<Mutex<()>>,
+    open_lock: &SessionPipeOpenLock,
     sandbox_id: &str,
     pipe: &SessionPipe,
 ) -> ReattachOutcome {
@@ -4217,7 +4680,11 @@ async fn reattach_session_pipe(
         Ok(status) if status.can_open_io() => match ctx.manager.open_io(&id).await {
             Ok(io) => {
                 let parts = io.into_parts();
-                let new_pipe = session_pipe_from_stdin(parts.stdin);
+                let new_pipe = session_pipe_from_stdin(
+                    parts.stdin,
+                    pipe.output_state.clone(),
+                    pipe.output_gate.clone(),
+                );
                 ctx.sandbox_pipes
                     .insert(sandbox_id.to_owned(), new_pipe.clone());
                 spawn_stderr_drain(sandbox_id.to_owned(), parts.stderr);
@@ -4246,6 +4713,7 @@ async fn recover_detached_terminal_output(
     thread_key: &ThreadKey,
     sandbox_id: &str,
     execution: &SessionExecution,
+    pipe: &SessionPipe,
 ) -> Result<bool, SessionRuntimeError> {
     let since = execution.started_at.unwrap_or(execution.created_at);
     let id = SandboxId::new(sandbox_id);
@@ -4270,10 +4738,34 @@ async fn recover_detached_terminal_output(
         }
     };
 
-    let Some(terminal) = terminal_output_from_lines(&lines) else {
+    let _output_guard = pipe.output_read_guard().await;
+    let live_output_state = pipe.output_state.lock().await.clone();
+    let terminal =
+        replay_detached_recorded_output(&live_output_state, &execution.execution_id, &lines);
+    let Some(terminal) = terminal else {
         return Ok(false);
     };
 
+    if !record_terminal_output(
+        ctx,
+        thread_key,
+        sandbox_id,
+        &execution.execution_id,
+        terminal,
+    )
+    .await?
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_stdout_owner_lost",
+            thread_key = %thread_key,
+            execution_id = %execution.execution_id,
+            sandbox_id,
+            stdout_owner_id = %ctx.stdout_owner_id,
+            "detached stdout recovery lost ownership before terminal persistence"
+        );
+        return Ok(true);
+    }
     info!(
         component = COMPONENT_SESSION_RUNTIME,
         event = "session_stdout_pump_recovered",
@@ -4292,15 +4784,60 @@ async fn recover_detached_terminal_output(
             json!({ "sandbox_id": sandbox_id, "mode": "recorded_output" }),
         )
         .await;
-    record_terminal_output(
-        ctx,
-        thread_key,
-        sandbox_id,
-        &execution.execution_id,
-        terminal,
-    )
-    .await?;
     Ok(true)
+}
+
+fn replay_detached_recorded_output(
+    live_output_state: &StdoutPumpState,
+    execution_id: &str,
+    lines: &[String],
+) -> Option<TerminalOutput> {
+    let mut recorded_output_state = StdoutPumpState::default();
+    if let Some(root_thread_id) = live_output_state.root_thread_id(execution_id) {
+        // The live pump observed this execution's root before the detach. A
+        // later recorded slice can start with a child thread.
+        recorded_output_state.set_authoritative_root_thread_id(execution_id, root_thread_id);
+    }
+    let mut terminal = recorded_output_state.replay_recorded_output(execution_id, lines);
+    if let Some(TerminalOutput::Completed { result_text, .. }) = terminal.as_mut()
+        && let Some(live_final_answer) = live_output_state
+            .final_answer_text_by_execution
+            .get(execution_id)
+            .filter(|text| !text.is_empty())
+    {
+        let recorded_is_canonical = recorded_output_state
+            .canonical_final_answer_by_execution
+            .contains(execution_id);
+        let live_is_canonical = live_output_state
+            .canonical_final_answer_by_execution
+            .contains(execution_id);
+        if !recorded_is_canonical {
+            *result_text = if live_is_canonical {
+                Some(live_final_answer.clone())
+            } else if let Some(recorded_fragment) = result_text.as_deref() {
+                Some(merge_answer_fragments(live_final_answer, recorded_fragment))
+            } else {
+                Some(live_final_answer.clone())
+            };
+        }
+    }
+    terminal
+}
+
+fn merge_answer_fragments(live: &str, recorded: &str) -> String {
+    if recorded.starts_with(live) {
+        return recorded.to_owned();
+    }
+    if live.starts_with(recorded) {
+        return live.to_owned();
+    }
+    for (start, _) in live.char_indices() {
+        let suffix = &live[start..];
+        if let Some(remainder) = recorded.strip_prefix(suffix) {
+            return format!("{live}{remainder}");
+        }
+    }
+    format!("{live}{recorded}")
 }
 
 async fn fail_detached_execution(
@@ -4338,7 +4875,9 @@ async fn run_stdout_pump(
     sandbox_id: &str,
     stdout: SandboxRead,
     _guard: SandboxIoGuard,
+    pipe: &SessionPipe,
 ) -> Result<StdoutPumpEnd, SessionRuntimeError> {
+    let output_state = &pipe.output_state;
     let span = info_span!(
         "centaur.api_rs.session.stdout_pump",
         component = COMPONENT_SESSION_RUNTIME,
@@ -4363,47 +4902,48 @@ async fn run_stdout_pump(
             sandbox_id,
             "session stdout pump started"
         );
-        let mut output_state = StdoutPumpState::default();
-        let mut lost_stdout_ownership = HashSet::new();
         let mut line_count = 0_u64;
         while let Some(line) = stdout.next().await {
             let line = match line {
                 Ok(line) => line,
                 Err(error) => {
+                    pipe.stdout_alive.store(false, Ordering::Release);
                     let message = stdout_pump_error_message(&error);
                     record_stdout_pump_failure(&ctx, &thread_key, sandbox_id, message).await?;
                     return Ok(StdoutPumpEnd::Idle);
                 }
             };
+            let _output_guard = pipe.output_read_guard().await;
             line_count += 1;
             let output_value = serde_json::from_str::<Value>(&line).ok();
-            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line)
-                && let Err(error) = ctx
-                    .store
-                    .update_harness_thread_id(&thread_key, Some(&harness_thread_id))
-                    .await
-            {
-                warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
-            }
             let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
             let execution_id = active_execution
                 .as_ref()
                 .map(|execution| execution.execution_id.as_str());
-            let Some(output_execution_id) = output_state.execution_for_line(execution_id, &line)
-            else {
-                continue;
+            let (output_execution_id, should_record_first_token, harness_thread_id) = {
+                let mut output_state = output_state.lock().await;
+                let Some(output_execution_id) =
+                    output_state.execution_for_line(execution_id, &line)
+                else {
+                    continue;
+                };
+                let should_record_first_token = output_state
+                    .should_record_first_token(&output_execution_id, output_value.as_ref());
+                let harness_thread_id =
+                    harness_thread_id_from_output_line(&line).filter(|harness_thread_id| {
+                        output_state.root_thread_id(&output_execution_id)
+                            == Some(harness_thread_id.as_str())
+                    });
+                (
+                    output_execution_id,
+                    should_record_first_token,
+                    harness_thread_id,
+                )
             };
-            if lost_stdout_ownership.contains(&output_execution_id) {
-                continue;
-            }
             let first_token_execution = active_execution
                 .as_ref()
                 .filter(|execution| {
-                    execution.execution_id == output_execution_id
-                        && output_state.should_record_first_token(
-                            &output_execution_id,
-                            output_value.as_ref(),
-                        )
+                    execution.execution_id == output_execution_id && should_record_first_token
                 })
                 .cloned();
             let execution_span = ctx
@@ -4412,7 +4952,7 @@ async fn run_stdout_pump(
                 .await
                 .get(&output_execution_id)
                 .cloned();
-            let output_span = output_state.stdout_span_for_execution(
+            let output_span = output_state.lock().await.stdout_span_for_execution(
                 execution_span.as_ref(),
                 &thread_key,
                 sandbox_id,
@@ -4430,24 +4970,62 @@ async fn run_stdout_pump(
                     execution_id = %output_execution_id,
                     sandbox_id,
                     stdout_owner_id = %ctx.stdout_owner_id,
-                    "stdout pump no longer owns execution output; suppressing further rows"
+                    "stdout pump no longer owns execution output; later rows may retry after adoption"
                 );
-                lost_stdout_ownership.insert(output_execution_id.clone());
-                output_state.forget(&output_execution_id);
+                output_state.lock().await.forget(&output_execution_id);
                 continue;
             };
+            if active_execution
+                .as_ref()
+                .is_some_and(|execution| execution.execution_id == output_execution_id)
+                && let Some(harness_thread_id) = harness_thread_id
+            {
+                match ctx
+                    .store
+                    .update_harness_thread_id_if_stdout_owner(
+                        &thread_key,
+                        &output_execution_id,
+                        &ctx.stdout_owner_id,
+                        Some(&harness_thread_id),
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_stdout_owner_lost",
+                            thread_key = %thread_key,
+                            execution_id = %output_execution_id,
+                            sandbox_id,
+                            stdout_owner_id = %ctx.stdout_owner_id,
+                            "stdout pump lost ownership before harness thread persistence"
+                        );
+                        output_state.lock().await.forget(&output_execution_id);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
+                            %thread_key,
+                            %harness_thread_id,
+                            %error,
+                            "failed to persist harness thread id"
+                        );
+                    }
+                }
+            }
             if let Some(execution) = first_token_execution {
                 record_first_token_observation(
                     &ctx,
                     &thread_key,
                     &execution,
                     &output_event,
-                    &mut output_state,
+                    output_state,
                 )
                 .await;
             }
             if let Some(value) = output_value.as_ref() {
-                output_state.record_codex_app_server_spans(
+                output_state.lock().await.record_codex_app_server_spans(
                     &output_span,
                     &thread_key,
                     sandbox_id,
@@ -4455,11 +5033,19 @@ async fn run_stdout_pump(
                     value,
                 );
             }
-            if let Some(execution) = active_execution
-                && execution.execution_id == output_execution_id
-                && let Some(terminal) = output_state.observe(&output_execution_id, &line)
+            let terminal = if active_execution
+                .as_ref()
+                .is_some_and(|execution| execution.execution_id == output_execution_id)
             {
-                record_terminal_output(
+                output_state
+                    .lock()
+                    .await
+                    .observe(&output_execution_id, &line)
+            } else {
+                None
+            };
+            if let Some(terminal) = terminal {
+                let terminalized = record_terminal_output(
                     &ctx,
                     &thread_key,
                     sandbox_id,
@@ -4468,10 +5054,23 @@ async fn run_stdout_pump(
                 )
                 .instrument(output_span)
                 .await?;
-                ctx.execution_spans.lock().await.remove(&output_execution_id);
-                output_state.forget(&output_execution_id);
+                if terminalized {
+                    ctx.execution_spans.lock().await.remove(&output_execution_id);
+                    output_state.lock().await.forget(&output_execution_id);
+                } else {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_owner_lost",
+                        thread_key = %thread_key,
+                        execution_id = %output_execution_id,
+                        sandbox_id,
+                        stdout_owner_id = %ctx.stdout_owner_id,
+                        "stdout pump lost ownership before terminal persistence; retaining state for adoption"
+                    );
+                }
             }
         }
+        pipe.stdout_alive.store(false, Ordering::Release);
         let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
         ctx.store
             .append_event(
@@ -4512,29 +5111,33 @@ async fn record_stdout_pump_failure(
     let active_execution = ctx.store.active_execution_for_thread(thread_key).await?;
     let execution_id = active_execution
         .as_ref()
-        .map(|execution| execution.execution_id.as_str());
-    ctx.store
-        .append_event(
-            thread_key,
-            execution_id,
-            "session.stdout_pump_failed",
-            json!({
-                "sandbox_id": sandbox_id,
-                "error": error.as_str(),
-                "terminalized_execution": execution_id.is_some(),
-            }),
-        )
-        .await?;
-    if let Some(execution) = active_execution {
+        .map(|execution| execution.execution_id.clone());
+    let terminalized_execution = if let Some(execution) = active_execution {
         record_terminal_output(
             ctx,
             thread_key,
             sandbox_id,
             &execution.execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error: error.clone(),
+            },
+        )
+        .await?
+    } else {
+        false
+    };
+    ctx.store
+        .append_event(
+            thread_key,
+            execution_id.as_deref(),
+            "session.stdout_pump_failed",
+            json!({
+                "sandbox_id": sandbox_id,
+                "error": error.as_str(),
+                "terminalized_execution": terminalized_execution,
+            }),
         )
         .await?;
-    }
     Ok(())
 }
 
@@ -4543,7 +5146,7 @@ async fn record_first_token_observation(
     thread_key: &ThreadKey,
     execution: &SessionExecution,
     output_event: &SessionEvent,
-    output_state: &mut StdoutPumpState,
+    output_state: &SharedStdoutPumpState,
 ) {
     match ctx
         .store
@@ -4551,7 +5154,10 @@ async fn record_first_token_observation(
         .await
     {
         Ok(true) => {
-            output_state.mark_first_token_recorded(&execution.execution_id);
+            output_state
+                .lock()
+                .await
+                .mark_first_token_recorded(&execution.execution_id);
             return;
         }
         Ok(false) => {}
@@ -4568,7 +5174,10 @@ async fn record_first_token_observation(
     }
 
     let Some(latency) = first_token_latency(execution, output_event) else {
-        output_state.mark_first_token_recorded(&execution.execution_id);
+        output_state
+            .lock()
+            .await
+            .mark_first_token_recorded(&execution.execution_id);
         return;
     };
     let harness_label = match ctx.store.get_session(thread_key).await {
@@ -4606,7 +5215,10 @@ async fn record_first_token_observation(
         );
     }
     record_session_first_token_latency(&harness_label, latency);
-    output_state.mark_first_token_recorded(&execution.execution_id);
+    output_state
+        .lock()
+        .await
+        .mark_first_token_recorded(&execution.execution_id);
     info!(
         component = COMPONENT_SESSION_RUNTIME,
         event = "session_first_token_observed",
@@ -4627,18 +5239,172 @@ fn first_token_latency(
     (output_event.created_at - started_at).try_into().ok()
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StdoutPumpState {
     final_answer_text_by_execution: HashMap<String, String>,
+    canonical_final_answer_by_execution: HashSet<String>,
     first_token_recorded_by_execution: HashSet<String>,
     root_thread_id_by_execution: HashMap<String, String>,
+    authoritative_root_by_execution: HashSet<String>,
+    request_execution_by_id: HashMap<String, String>,
+    completed_request_execution_by_id: HashMap<String, String>,
+    completed_request_order: VecDeque<(String, String)>,
     turn_execution_by_id: HashMap<String, String>,
+    completed_turn_execution_by_id: HashMap<String, String>,
+    completed_turn_order: VecDeque<(String, String)>,
     item_execution_by_id: HashMap<String, String>,
+    completed_item_execution_by_id: HashMap<String, String>,
+    completed_item_order: VecDeque<(String, String)>,
     tool_call_by_id: HashMap<String, ToolCallLabels>,
     stdout_span_by_execution: HashMap<String, Span>,
 }
 
 impl StdoutPumpState {
+    fn merge_from(&mut self, incoming: Self) {
+        for (execution_id, text) in incoming.final_answer_text_by_execution {
+            if text.is_empty()
+                || self
+                    .canonical_final_answer_by_execution
+                    .contains(&execution_id)
+            {
+                continue;
+            }
+            if incoming
+                .canonical_final_answer_by_execution
+                .contains(&execution_id)
+            {
+                self.final_answer_text_by_execution
+                    .insert(execution_id.clone(), text);
+                self.canonical_final_answer_by_execution
+                    .insert(execution_id);
+                continue;
+            }
+            let current = self
+                .final_answer_text_by_execution
+                .entry(execution_id)
+                .or_default();
+            if current.is_empty()
+                || text.starts_with(current.as_str())
+                || text.len() > current.len()
+            {
+                *current = text;
+            }
+        }
+        self.first_token_recorded_by_execution
+            .extend(incoming.first_token_recorded_by_execution);
+        for (execution_id, root_thread_id) in incoming.root_thread_id_by_execution {
+            if incoming
+                .authoritative_root_by_execution
+                .contains(&execution_id)
+            {
+                self.root_thread_id_by_execution
+                    .insert(execution_id.clone(), root_thread_id);
+                self.authoritative_root_by_execution.insert(execution_id);
+            } else if !self.authoritative_root_by_execution.contains(&execution_id) {
+                self.root_thread_id_by_execution
+                    .entry(execution_id)
+                    .or_insert(root_thread_id);
+            }
+        }
+        for (output_id, execution_id) in incoming.completed_request_order {
+            if incoming.completed_request_execution_by_id.get(&output_id) != Some(&execution_id) {
+                continue;
+            }
+            remember_completed_output_id(
+                &mut self.completed_request_execution_by_id,
+                &mut self.completed_request_order,
+                output_id,
+                execution_id,
+            );
+        }
+        for (output_id, execution_id) in incoming.completed_turn_order {
+            if incoming.completed_turn_execution_by_id.get(&output_id) != Some(&execution_id) {
+                continue;
+            }
+            remember_completed_output_id(
+                &mut self.completed_turn_execution_by_id,
+                &mut self.completed_turn_order,
+                output_id,
+                execution_id,
+            );
+        }
+        for (output_id, execution_id) in incoming.completed_item_order {
+            if incoming.completed_item_execution_by_id.get(&output_id) != Some(&execution_id) {
+                continue;
+            }
+            remember_completed_output_id(
+                &mut self.completed_item_execution_by_id,
+                &mut self.completed_item_order,
+                output_id,
+                execution_id,
+            );
+        }
+        for (request_id, execution_id) in incoming.request_execution_by_id {
+            self.completed_request_execution_by_id.remove(&request_id);
+            self.completed_request_order
+                .retain(|(known_id, _)| known_id != &request_id);
+            self.request_execution_by_id
+                .insert(request_id, execution_id);
+        }
+        for (turn_id, execution_id) in incoming.turn_execution_by_id {
+            self.completed_turn_execution_by_id.remove(&turn_id);
+            self.completed_turn_order
+                .retain(|(known_id, _)| known_id != &turn_id);
+            self.turn_execution_by_id.insert(turn_id, execution_id);
+        }
+        for (item_id, execution_id) in incoming.item_execution_by_id {
+            self.completed_item_execution_by_id.remove(&item_id);
+            self.completed_item_order
+                .retain(|(known_id, _)| known_id != &item_id);
+            self.item_execution_by_id.insert(item_id, execution_id);
+        }
+        self.tool_call_by_id.extend(incoming.tool_call_by_id);
+        for (execution_id, span) in incoming.stdout_span_by_execution {
+            self.stdout_span_by_execution
+                .entry(execution_id)
+                .or_insert(span);
+        }
+    }
+
+    fn replay_recorded_output(
+        &mut self,
+        execution_id: &str,
+        lines: &[String],
+    ) -> Option<TerminalOutput> {
+        // A durable Codex app-server root is authoritative on later turns,
+        // whose log slice may contain only child thread starts. Nanocodex does
+        // not seed its per-run request id, so its first recorded run start is
+        // still discovered here.
+        if !self.authoritative_root_by_execution.contains(execution_id)
+            && let Some(root_thread_id) = lines.iter().find_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|value| root_thread_id_from_output(&value))
+            })
+        {
+            self.root_thread_id_by_execution
+                .insert(execution_id.to_owned(), root_thread_id);
+        }
+        self.replay_output_lines(execution_id, lines)
+    }
+
+    fn replay_output_lines(
+        &mut self,
+        execution_id: &str,
+        lines: &[String],
+    ) -> Option<TerminalOutput> {
+        for line in lines {
+            let Some(output_execution_id) = self.execution_for_line(Some(execution_id), line)
+            else {
+                continue;
+            };
+            if let Some(terminal) = self.observe(&output_execution_id, line) {
+                return Some(terminal);
+            }
+        }
+        None
+    }
+
     fn execution_for_line(
         &mut self,
         active_execution_id: Option<&str>,
@@ -4681,13 +5447,18 @@ impl StdoutPumpState {
             return None;
         }
         if let Some(update) = output_line_final_answer_text(&value) {
-            let text = self
-                .final_answer_text_by_execution
-                .entry(execution_id.to_owned())
-                .or_default();
             match update {
-                FinalAnswerTextUpdate::Append(delta) => text.push_str(&delta),
-                FinalAnswerTextUpdate::Replace(canonical) => *text = canonical,
+                FinalAnswerTextUpdate::Append(delta) => self
+                    .final_answer_text_by_execution
+                    .entry(execution_id.to_owned())
+                    .or_default()
+                    .push_str(&delta),
+                FinalAnswerTextUpdate::Replace(canonical) => {
+                    self.final_answer_text_by_execution
+                        .insert(execution_id.to_owned(), canonical);
+                    self.canonical_final_answer_by_execution
+                        .insert(execution_id.to_owned());
+                }
             }
         }
         terminal_output(
@@ -4736,18 +5507,56 @@ impl StdoutPumpState {
 
     fn forget(&mut self, execution_id: &str) {
         self.final_answer_text_by_execution.remove(execution_id);
+        self.canonical_final_answer_by_execution
+            .remove(execution_id);
         self.first_token_recorded_by_execution.remove(execution_id);
         self.root_thread_id_by_execution.remove(execution_id);
+        self.authoritative_root_by_execution.remove(execution_id);
+        let request_ids_to_forget = self
+            .request_execution_by_id
+            .iter()
+            .filter(|&(_request_id, mapped_execution_id)| mapped_execution_id == execution_id)
+            .map(|(request_id, _mapped_execution_id)| request_id.clone())
+            .collect::<Vec<_>>();
+        let turn_ids_to_forget = self
+            .turn_execution_by_id
+            .iter()
+            .filter(|&(_turn_id, mapped_execution_id)| mapped_execution_id == execution_id)
+            .map(|(turn_id, _mapped_execution_id)| turn_id.clone())
+            .collect::<Vec<_>>();
         let tool_ids_to_forget = self
             .item_execution_by_id
             .iter()
             .filter(|&(_item_id, mapped_execution_id)| mapped_execution_id == execution_id)
             .map(|(item_id, _mapped_execution_id)| item_id.clone())
             .collect::<Vec<_>>();
-        self.turn_execution_by_id
-            .retain(|_, mapped_execution_id| mapped_execution_id != execution_id);
-        self.item_execution_by_id
-            .retain(|_, mapped_execution_id| mapped_execution_id != execution_id);
+        for request_id in request_ids_to_forget {
+            self.request_execution_by_id.remove(&request_id);
+            remember_completed_output_id(
+                &mut self.completed_request_execution_by_id,
+                &mut self.completed_request_order,
+                request_id,
+                execution_id.to_owned(),
+            );
+        }
+        for turn_id in turn_ids_to_forget {
+            self.turn_execution_by_id.remove(&turn_id);
+            remember_completed_output_id(
+                &mut self.completed_turn_execution_by_id,
+                &mut self.completed_turn_order,
+                turn_id,
+                execution_id.to_owned(),
+            );
+        }
+        for item_id in &tool_ids_to_forget {
+            self.item_execution_by_id.remove(item_id);
+            remember_completed_output_id(
+                &mut self.completed_item_execution_by_id,
+                &mut self.completed_item_order,
+                item_id.clone(),
+                execution_id.to_owned(),
+            );
+        }
         self.stdout_span_by_execution.remove(execution_id);
         for item_id in tool_ids_to_forget {
             self.tool_call_by_id.remove(&item_id);
@@ -4785,13 +5594,29 @@ impl StdoutPumpState {
     }
 
     fn known_execution_for_value(&self, value: &Value) -> Option<String> {
+        if let Some(request_id) = output_request_id(value)
+            && let Some(execution_id) = self
+                .request_execution_by_id
+                .get(request_id)
+                .or_else(|| self.completed_request_execution_by_id.get(request_id))
+        {
+            return Some(execution_id.clone());
+        }
         for turn_id in turn_ids(value) {
-            if let Some(execution_id) = self.turn_execution_by_id.get(&turn_id) {
+            if let Some(execution_id) = self
+                .turn_execution_by_id
+                .get(&turn_id)
+                .or_else(|| self.completed_turn_execution_by_id.get(&turn_id))
+            {
                 return Some(execution_id.clone());
             }
         }
         for item_id in item_ids(value) {
-            if let Some(execution_id) = self.item_execution_by_id.get(&item_id) {
+            if let Some(execution_id) = self
+                .item_execution_by_id
+                .get(&item_id)
+                .or_else(|| self.completed_item_execution_by_id.get(&item_id))
+            {
                 return Some(execution_id.clone());
             }
         }
@@ -4799,11 +5624,24 @@ impl StdoutPumpState {
     }
 
     fn remember_value_execution(&mut self, value: &Value, execution_id: &str) {
+        if let Some(request_id) = output_request_id(value) {
+            self.completed_request_execution_by_id.remove(request_id);
+            self.completed_request_order
+                .retain(|(known_id, _)| known_id != request_id);
+            self.request_execution_by_id
+                .insert(request_id.to_owned(), execution_id.to_owned());
+        }
         for turn_id in turn_ids(value) {
+            self.completed_turn_execution_by_id.remove(&turn_id);
+            self.completed_turn_order
+                .retain(|(known_id, _)| known_id != &turn_id);
             self.turn_execution_by_id
                 .insert(turn_id, execution_id.to_owned());
         }
         for item_id in item_ids(value) {
+            self.completed_item_execution_by_id.remove(&item_id);
+            self.completed_item_order
+                .retain(|(known_id, _)| known_id != &item_id);
             self.item_execution_by_id
                 .insert(item_id, execution_id.to_owned());
         }
@@ -4811,16 +5649,58 @@ impl StdoutPumpState {
 
     fn remember_root_thread_id(&mut self, value: &Value, execution_id: &str) {
         if let Some(thread_id) = root_thread_id_from_output(value) {
+            self.seed_root_thread_id_if_absent(execution_id, &thread_id);
+        }
+    }
+
+    fn seed_root_thread_id_if_absent(&mut self, execution_id: &str, thread_id: &str) {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
             self.root_thread_id_by_execution
                 .entry(execution_id.to_owned())
-                .or_insert(thread_id);
+                .or_insert_with(|| thread_id.to_owned());
         }
+    }
+
+    fn set_authoritative_root_thread_id(&mut self, execution_id: &str, thread_id: &str) {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            self.root_thread_id_by_execution
+                .insert(execution_id.to_owned(), thread_id.to_owned());
+            self.authoritative_root_by_execution
+                .insert(execution_id.to_owned());
+        }
+    }
+
+    fn root_thread_id(&self, execution_id: &str) -> Option<&str> {
+        self.root_thread_id_by_execution
+            .get(execution_id)
+            .map(String::as_str)
     }
 
     fn is_root_thread_event(&self, execution_id: &str, value: &Value) -> bool {
         self.root_thread_id_by_execution
             .get(execution_id)
             .is_none_or(|thread_id| output_belongs_to_thread(value, thread_id))
+    }
+}
+
+fn remember_completed_output_id(
+    completed: &mut HashMap<String, String>,
+    order: &mut VecDeque<(String, String)>,
+    output_id: String,
+    execution_id: String,
+) {
+    order.retain(|(known_id, _)| known_id != &output_id);
+    completed.insert(output_id.clone(), execution_id.clone());
+    order.push_back((output_id, execution_id));
+    while order.len() > COMPLETED_OUTPUT_ID_CAPACITY {
+        let Some((expired_id, expired_execution_id)) = order.pop_front() else {
+            break;
+        };
+        if completed.get(&expired_id) == Some(&expired_execution_id) {
+            completed.remove(&expired_id);
+        }
     }
 }
 
@@ -5225,20 +6105,13 @@ async fn record_terminal_output(
     sandbox_id: &str,
     execution_id: &str,
     terminal: TerminalOutput,
-) -> Result<(), SessionRuntimeError> {
+) -> Result<bool, SessionRuntimeError> {
     let mut failure_class = None;
-    let (terminal_execution, terminal_status) = match terminal {
+    let (owned_terminal, terminal_status) = match terminal {
         TerminalOutput::Completed {
             reason,
             result_text,
         } => {
-            let Some(execution) = ctx
-                .store
-                .complete_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id)
-                .await?
-            else {
-                return Ok(());
-            };
             let mut payload = json!({
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
@@ -5249,70 +6122,46 @@ async fn record_terminal_output(
             {
                 object.insert("result_text".to_owned(), json!(result_text));
             }
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_completed",
-                    payload,
-                )
-                .await?;
-            (execution, "completed")
+            (OwnedTerminalEvent::Completed { payload }, "completed")
         }
-        TerminalOutput::Cancelled { reason } => {
-            let Some(execution) = ctx
-                .store
-                .cancel_execution_if_active_and_stdout_owner(
-                    execution_id,
-                    &ctx.stdout_owner_id,
-                    reason,
-                )
-                .await?
-            else {
-                return Ok(());
-            };
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_cancelled",
-                    json!({
-                        "execution_id": execution_id,
-                        "thread_key": thread_key.as_str(),
-                        "reason": reason,
-                    }),
-                )
-                .await?;
-            (execution, "cancelled")
-        }
+        TerminalOutput::Cancelled { reason } => (
+            OwnedTerminalEvent::Cancelled {
+                reason: reason.to_owned(),
+                payload: json!({
+                    "execution_id": execution_id,
+                    "thread_key": thread_key.as_str(),
+                    "reason": reason,
+                }),
+            },
+            "cancelled",
+        ),
         TerminalOutput::Failed { error } => {
             failure_class = Some(terminal_failure_class(&error));
-            let Some(execution) = ctx
-                .store
-                .fail_execution_if_active_and_stdout_owner(
-                    execution_id,
-                    &ctx.stdout_owner_id,
-                    &error,
-                )
-                .await?
-            else {
-                return Ok(());
-            };
-            ctx.store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_failed",
-                    json!({
+            (
+                OwnedTerminalEvent::Failed {
+                    payload: json!({
                         "execution_id": execution_id,
                         "thread_key": thread_key.as_str(),
                         "error": error.as_str(),
                     }),
-                )
-                .await?;
-            (execution, "failed")
+                    error,
+                },
+                "failed",
+            )
         }
     };
+    let Some((terminal_execution, _)) = ctx
+        .store
+        .terminalize_execution_and_append_event_if_stdout_owner(
+            execution_id,
+            &ctx.stdout_owner_id,
+            owned_terminal,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    stop_terminal_stdout_owner_renewer(ctx, execution_id).await;
     ctx.execution_spans.lock().await.remove(execution_id);
     if let Err(error) = ctx
         .store
@@ -5346,7 +6195,7 @@ async fn record_terminal_output(
             idle_timeout,
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_max_duration_failure(
@@ -5373,14 +6222,53 @@ fn spawn_max_duration_failure(
 }
 
 fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let (stopped, _) = tokio::sync::watch::channel(false);
+    let renewal = Arc::new(StdoutOwnerRenewal {
+        generation: Uuid::new_v4(),
+        cancel,
+        stopped,
+        #[cfg(test)]
+        renew_now: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        renew_db_started: tokio::sync::Notify::new(),
+    });
+    ctx.stdout_owner_renewals
+        .insert(execution_id.clone(), renewal.clone());
+    let registry = ctx.stdout_owner_renewals.clone();
     tokio::spawn(async move {
         loop {
-            sleep(STDOUT_OWNER_RENEW_INTERVAL).await;
-            match ctx
+            #[cfg(not(test))]
+            {
+                tokio::select! {
+                    biased;
+                    changed = cancelled.changed() => {
+                        if changed.is_err() || *cancelled.borrow() {
+                            break;
+                        }
+                    }
+                    _ = sleep(STDOUT_OWNER_RENEW_INTERVAL) => {}
+                }
+            }
+            #[cfg(test)]
+            {
+                tokio::select! {
+                    biased;
+                    changed = cancelled.changed() => {
+                        if changed.is_err() || *cancelled.borrow() {
+                            break;
+                        }
+                    }
+                    _ = renewal.renew_now.notified() => {}
+                    _ = sleep(STDOUT_OWNER_RENEW_INTERVAL) => {}
+                }
+                renewal.renew_db_started.notify_one();
+            }
+            let renewed = ctx
                 .store
                 .renew_stdout_owner(&execution_id, &ctx.stdout_owner_id, STDOUT_OWNER_LEASE)
-                .await
-            {
+                .await;
+            match renewed {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -5396,7 +6284,72 @@ fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
                 }
             }
         }
+        renewal.stopped.send_replace(true);
+        registry.remove_if(&execution_id, |_, current| {
+            current.generation == renewal.generation
+        });
     });
+}
+
+async fn stop_stdout_owner_renewer(
+    registry: &StdoutOwnerRenewalRegistry,
+    execution_id: &str,
+) -> bool {
+    let renewal = registry
+        .get(execution_id)
+        .map(|entry| Arc::clone(entry.value()));
+    let Some(renewal) = renewal else {
+        return true;
+    };
+    let _ = renewal.cancel.send(true);
+    if timeout(STDOUT_OWNER_RENEWER_STOP_TIMEOUT, renewal.wait_stopped())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    registry.remove_if(execution_id, |_, current| {
+        current.generation == renewal.generation
+    });
+    true
+}
+
+async fn stop_all_stdout_owner_renewers(registry: &StdoutOwnerRenewalRegistry) -> bool {
+    let renewals = registry
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect::<Vec<_>>();
+    for (_, renewal) in &renewals {
+        let _ = renewal.cancel.send(true);
+    }
+    if timeout(STDOUT_OWNER_RENEWER_STOP_TIMEOUT, async {
+        for (_, renewal) in &renewals {
+            renewal.wait_stopped().await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    for (execution_id, renewal) in renewals {
+        registry.remove_if(&execution_id, |_, current| {
+            current.generation == renewal.generation
+        });
+    }
+    true
+}
+
+async fn stop_terminal_stdout_owner_renewer(ctx: &RuntimeContext, execution_id: &str) {
+    if !stop_stdout_owner_renewer(&ctx.stdout_owner_renewals, execution_id).await {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_stdout_owner_renewer_stop_timeout",
+            execution_id,
+            stdout_owner_id = %ctx.stdout_owner_id,
+            "terminal execution's stdout owner renewer did not stop promptly"
+        );
+    }
 }
 
 async fn record_max_duration_failure(
@@ -5408,13 +6361,25 @@ async fn record_max_duration_failure(
 ) -> Result<(), SessionRuntimeError> {
     let max_duration_ms = duration_millis_u64(max_duration);
     let error = format!("execution exceeded max_duration_ms={max_duration_ms}");
-    let Some(execution) = ctx
+    let payload = json!({
+        "execution_id": execution_id,
+        "thread_key": thread_key.as_str(),
+        "error": error,
+        "reason": "max_duration_exceeded",
+        "max_duration_ms": max_duration_ms,
+    });
+    let Some((execution, _)) = ctx
         .store
-        .fail_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id, &error)
+        .terminalize_execution_and_append_event_if_stdout_owner(
+            execution_id,
+            &ctx.stdout_owner_id,
+            OwnedTerminalEvent::Failed { error, payload },
+        )
         .await?
     else {
         return Ok(());
     };
+    stop_terminal_stdout_owner_renewer(ctx, execution_id).await;
     ctx.execution_spans.lock().await.remove(execution_id);
     if let Err(error) = ctx.store.touch_session_sandbox_activity(thread_key).await {
         warn!(
@@ -5426,20 +6391,6 @@ async fn record_max_duration_failure(
             "failed to touch sandbox activity after max duration"
         );
     }
-    ctx.store
-        .append_event(
-            thread_key,
-            Some(execution_id),
-            "session.execution_failed",
-            json!({
-                "execution_id": execution_id,
-                "thread_key": thread_key.as_str(),
-                "error": error,
-                "reason": "max_duration_exceeded",
-                "max_duration_ms": max_duration_ms,
-            }),
-        )
-        .await?;
     record_finished_execution_metric(
         &ctx.store,
         thread_key,
@@ -5831,6 +6782,7 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     match error {
         SessionRuntimeError::BadRequest(_) => "bad_request",
         SessionRuntimeError::ShuttingDown => "shutting_down",
+        SessionRuntimeError::StdoutOwnerRenewerStopTimeout { .. } => "stdout_owner",
         SessionRuntimeError::Store(_) => "store",
         SessionRuntimeError::Sandbox(SandboxError::NotFound(_)) => "sandbox_not_found",
         SessionRuntimeError::Sandbox(SandboxError::Unsupported { .. }) => "sandbox_unsupported",
@@ -5978,7 +6930,7 @@ fn completed_terminal_output_with_fallback(
 ) -> TerminalOutput {
     let result_text = terminal_payload_text(value).trim().to_owned();
     let result_text = if result_text.is_empty() {
-        fallback_text.trim().to_owned()
+        fallback_text.to_owned()
     } else {
         result_text
     };
@@ -6035,7 +6987,18 @@ fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate>
     if matches!(method, Some("item/agentMessage/delta"))
         || matches!(event_type, Some("item.agentMessage.delta"))
     {
-        let text = terminal_payload_text(value).trim().to_owned();
+        let text = [
+            value.get("delta"),
+            value.get("params").and_then(|params| params.get("delta")),
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("delta")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
         return (!text.is_empty()).then_some(FinalAnswerTextUpdate::Append(text));
     }
     if event_type == Some("assistant") {
@@ -6685,20 +7648,29 @@ fn harness_thread_id_from_output_line(line: &str) -> Option<String> {
     root_thread_id_from_output(&value)
 }
 
-fn root_thread_id_from_output(value: &Value) -> Option<String> {
-    let method = value.get("method").and_then(Value::as_str);
-    let event_type = value.get("type").and_then(Value::as_str);
-    if event_type == Some("run.started") {
-        return value
-            .get("request_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|request_id| !request_id.is_empty())
-            .map(ToOwned::to_owned);
+fn legacy_corrupted_root_repair_candidate(lines: &[String], durable_root: &str) -> Option<String> {
+    let started_threads = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| thread_started_id_from_output(&value))
+        .collect::<Vec<_>>();
+    let candidate = started_threads.first()?.trim();
+    if candidate.is_empty() || candidate == durable_root {
+        return None;
     }
+    started_threads
+        .iter()
+        .skip(1)
+        .any(|thread_id| thread_id == durable_root)
+        .then(|| candidate.to_owned())
+}
+
+fn thread_started_id_from_output(value: &Value) -> Option<String> {
+    let method = value.get("method").and_then(Value::as_str);
     if method == Some("thread/started") {
         return string_at_path(value, &["params", "thread", "id"]);
     }
+    let event_type = value.get("type").and_then(Value::as_str);
     if event_type != Some("thread.started") {
         return None;
     }
@@ -6711,7 +7683,38 @@ fn root_thread_id_from_output(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn root_thread_id_from_output(value: &Value) -> Option<String> {
+    let method = value.get("method").and_then(Value::as_str);
+    let event_type = value.get("type").and_then(Value::as_str);
+    if event_type == Some("run.started") {
+        return value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|request_id| !request_id.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    if method == Some("thread/started") {
+        return thread_started_id_from_output(value);
+    }
+    if event_type != Some("thread.started") {
+        return None;
+    }
+    thread_started_id_from_output(value)
+}
+
+fn output_request_id(value: &Value) -> Option<&str> {
+    value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+}
+
 fn output_belongs_to_thread(value: &Value, root_thread_id: &str) -> bool {
+    if let Some(request_id) = output_request_id(value) {
+        return request_id == root_thread_id;
+    }
     let event_thread_id = [
         &["thread_id"][..],
         &["threadId"][..],
@@ -6919,44 +7922,14 @@ fn max_duration_from_execution(execution: &SessionExecution) -> Option<Duration>
         .and_then(|value| nonzero_duration_millis(value).ok())
 }
 
-/// Folds recorded sandbox output the same way the live stdout pump does,
-/// returning the first terminal outcome (with its accumulated final answer)
-/// if the recorded history already contains the end of the turn.
-fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
-    let mut root_thread_id = None;
-    let mut final_answer_text = String::new();
-    for line in lines {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if root_thread_id.is_none() {
-            root_thread_id = root_thread_id_from_output(&value);
-        }
-        if root_thread_id
-            .as_deref()
-            .is_some_and(|thread_id| !output_belongs_to_thread(&value, thread_id))
-        {
-            continue;
-        }
-        if let Some(update) = output_line_final_answer_text(&value) {
-            match update {
-                FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
-                FinalAnswerTextUpdate::Replace(canonical) => final_answer_text = canonical,
-            }
-        }
-        if let Some(terminal) = terminal_output(&value, &final_answer_text) {
-            return Some(terminal);
-        }
-    }
-    None
-}
-
 #[derive(Debug, Error)]
 pub enum SessionRuntimeError {
     #[error("{0}")]
     BadRequest(String),
     #[error("control plane is shutting down")]
     ShuttingDown,
+    #[error("timed out stopping stdout owner renewal for execution {execution_id}")]
+    StdoutOwnerRenewerStopTimeout { execution_id: String },
     #[error(transparent)]
     Store(#[from] SessionStoreError),
     #[error(transparent)]
@@ -7906,10 +8879,11 @@ mod tests {
     }
 
     #[test]
-    fn stdout_state_waits_for_root_turn_after_subagent_completion() {
+    fn stdout_state_replay_waits_for_root_turn_after_subagent_completion() {
         let lines = [
             r#"{"method":"thread/started","params":{"thread":{"id":"root-thread"}}}"#,
             r#"{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"root-turn"}}}"#,
+            r#"{"method":"thread/started","params":{"thread":{"id":"child-thread"}}}"#,
             r#"{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}"#,
             r#"{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"id":"child-answer","type":"agentMessage","phase":"final_answer","text":"Child answer."}}}"#,
             r#"{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}"#,
@@ -7917,37 +8891,426 @@ mod tests {
             r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed"}}}"#,
         ];
         let mut state = StdoutPumpState::default();
+        let recorded = lines[..2]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect::<Vec<_>>();
 
-        for line in &lines[..5] {
+        assert_eq!(state.replay_recorded_output("exe-1", &recorded), None);
+        assert_eq!(state.root_thread_id("exe-1"), Some("root-thread"));
+
+        for line in &lines[2..6] {
             assert_eq!(
                 state.execution_for_line(Some("exe-1"), line),
                 Some("exe-1".to_owned())
             );
             assert_eq!(state.observe("exe-1", line), None);
         }
-        let child_only = lines[..5]
+        assert_eq!(
+            state.root_thread_id("exe-1"),
+            Some("root-thread"),
+            "a child thread start must not replace the replayed root"
+        );
+        let child_only = lines[..6]
             .iter()
             .map(|line| (*line).to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(terminal_output_from_lines(&child_only), None);
+        assert_eq!(
+            StdoutPumpState::default().replay_recorded_output("recorded-output", &child_only),
+            None
+        );
 
         assert_eq!(
-            state.execution_for_line(Some("exe-1"), lines[5]),
+            state.execution_for_line(Some("exe-1"), lines[6]),
             Some("exe-1".to_owned())
         );
-        assert_eq!(state.observe("exe-1", lines[5]), None);
+        assert_eq!(state.observe("exe-1", lines[6]), None);
         assert_eq!(
-            state.execution_for_line(Some("exe-1"), lines[6]),
+            state.execution_for_line(Some("exe-1"), lines[7]),
             Some("exe-1".to_owned())
         );
         let expected = Some(TerminalOutput::Completed {
             reason: "turn_completed",
             result_text: Some("Root answer.".to_owned()),
         });
-        assert_eq!(state.observe("exe-1", lines[6]), expected);
+        assert_eq!(state.observe("exe-1", lines[7]), expected);
         assert_eq!(
-            terminal_output_from_lines(&lines.map(str::to_owned)),
+            StdoutPumpState::default()
+                .replay_recorded_output("recorded-output", &lines.map(str::to_owned)),
             expected
+        );
+    }
+
+    #[test]
+    fn stdout_state_preserves_authoritative_durable_root_for_child_only_history() {
+        let root_started =
+            r#"{"method":"thread/started","params":{"thread":{"id":"recorded-root"}}}"#;
+        let mut replayed = StdoutPumpState::default();
+        replayed.seed_root_thread_id_if_absent("exe-replayed", "stale-durable-child");
+        assert_eq!(
+            replayed.replay_recorded_output("exe-replayed", &[root_started.to_owned()]),
+            None
+        );
+        assert_eq!(
+            replayed.root_thread_id("exe-replayed"),
+            Some("recorded-root"),
+            "recorded first-root identity must win over the durable fallback"
+        );
+
+        let child_completed = r#"{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}"#;
+        let root_completed = r#"{"method":"turn/completed","params":{"threadId":"durable-root","turn":{"id":"root-turn","status":"completed"}}}"#;
+        let mut fallback = StdoutPumpState::default();
+        fallback.set_authoritative_root_thread_id("exe-fallback", "durable-root");
+        assert_eq!(
+            fallback.replay_recorded_output(
+                "exe-fallback",
+                &[
+                    r#"{"method":"thread/started","params":{"thread":{"id":"child-thread"}}}"#
+                        .to_owned(),
+                    child_completed.to_owned(),
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            fallback.root_thread_id("exe-fallback"),
+            Some("durable-root"),
+            "child-only recorded output must not replace the durable root"
+        );
+        assert_eq!(
+            fallback.replay_output_lines("exe-fallback", &[root_completed.to_owned()]),
+            Some(TerminalOutput::Completed {
+                reason: "turn_completed",
+                result_text: None,
+            })
+        );
+    }
+
+    #[test]
+    fn stdout_state_keeps_nanocodex_runs_separate_by_request_id() {
+        let mut state = StdoutPumpState::default();
+        let first_started =
+            r#"{"protocol_version":1,"request_id":"nano-1","seq":1,"type":"run.started"}"#;
+        let first_terminal = r#"{"protocol_version":1,"request_id":"nano-1","seq":2,"type":"run.completed","payload":{"status":"completed"}}"#;
+        let second_started =
+            r#"{"protocol_version":1,"request_id":"nano-2","seq":1,"type":"run.started"}"#;
+        let second_answer = r#"{"protocol_version":1,"request_id":"nano-2","seq":2,"type":"assistant.delta","payload":{"text":"Second answer."}}"#;
+        let second_terminal = r#"{"protocol_version":1,"request_id":"nano-2","seq":3,"type":"run.completed","payload":{"status":"completed"}}"#;
+
+        assert_eq!(
+            state.execution_for_line(Some("exe-1"), first_started),
+            Some("exe-1".to_owned())
+        );
+        assert_eq!(state.observe("exe-1", first_started), None);
+        assert_eq!(
+            state.execution_for_line(Some("exe-1"), first_terminal),
+            Some("exe-1".to_owned())
+        );
+        assert!(state.observe("exe-1", first_terminal).is_some());
+        state.forget("exe-1");
+
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), second_started),
+            Some("exe-2".to_owned())
+        );
+        assert_eq!(state.observe("exe-2", second_started), None);
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), first_terminal),
+            None,
+            "a delayed terminal from the first request must not finish the second execution"
+        );
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), second_answer),
+            Some("exe-2".to_owned())
+        );
+        assert_eq!(state.observe("exe-2", second_answer), None);
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), second_terminal),
+            Some("exe-2".to_owned())
+        );
+        assert_eq!(
+            state.observe("exe-2", second_terminal),
+            Some(TerminalOutput::Completed {
+                reason: "run_completed",
+                result_text: Some("Second answer.".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn stdout_state_keeps_completed_codex_turn_and_item_ids_bounded() {
+        let mut state = StdoutPumpState::default();
+        state.set_authoritative_root_thread_id("exe-1", "root-thread");
+        let first_started = r#"{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"turn-old"}}}"#;
+        let first_answer = r#"{"method":"item/completed","params":{"threadId":"root-thread","turnId":"turn-old","item":{"id":"item-old","type":"agentMessage","phase":"final_answer","text":"First."}}}"#;
+        let first_terminal = r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"turn-old","status":"completed"}}}"#;
+        for line in [first_started, first_answer, first_terminal] {
+            assert_eq!(
+                state.execution_for_line(Some("exe-1"), line),
+                Some("exe-1".to_owned())
+            );
+            state.observe("exe-1", line);
+        }
+        state.forget("exe-1");
+        state.set_authoritative_root_thread_id("exe-2", "root-thread");
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), first_answer),
+            None,
+            "a late item from the prior turn must not attach to the new execution"
+        );
+        assert_eq!(
+            state.execution_for_line(Some("exe-2"), first_terminal),
+            None,
+            "a late prior-turn terminal must not finish the new execution"
+        );
+
+        for index in 0..(COMPLETED_OUTPUT_ID_CAPACITY + 16) {
+            let execution_id = format!("exe-bounded-{index}");
+            let value = json!({
+                "request_id": format!("request-{index}"),
+                "turnId": format!("turn-{index}"),
+                "itemId": format!("item-{index}"),
+            });
+            state.remember_value_execution(&value, &execution_id);
+            state.forget(&execution_id);
+        }
+        assert!(state.completed_request_execution_by_id.len() <= COMPLETED_OUTPUT_ID_CAPACITY);
+        assert!(state.completed_turn_execution_by_id.len() <= COMPLETED_OUTPUT_ID_CAPACITY);
+        assert!(state.completed_item_execution_by_id.len() <= COMPLETED_OUTPUT_ID_CAPACITY);
+        assert!(
+            !state
+                .completed_request_execution_by_id
+                .contains_key("request-0")
+        );
+        assert!(
+            state
+                .completed_request_execution_by_id
+                .contains_key(&format!("request-{}", COMPLETED_OUTPUT_ID_CAPACITY + 15))
+        );
+    }
+
+    #[test]
+    fn pipe_lock_registries_reuse_live_locks_and_reap_released_sandboxes() {
+        let output_gates: SessionOutputGates = Arc::new(DashMap::new());
+        let first = output_gate_from_registry(&output_gates, "sandbox-first");
+        let first_again = output_gate_from_registry(&output_gates, "sandbox-first");
+        assert!(
+            Arc::ptr_eq(&first, &first_again),
+            "concurrent users of one sandbox must share the same fence"
+        );
+        drop(first_again);
+        drop(first);
+        assert!(
+            !output_gates.contains_key("sandbox-first"),
+            "the final gate holder must remove its registry entry"
+        );
+
+        let second = output_gate_from_registry(&output_gates, "sandbox-second");
+        assert_eq!(output_gates.len(), 1);
+        assert!(output_gates.contains_key("sandbox-second"));
+        let second_again = output_gate_from_registry(&output_gates, "sandbox-second");
+        assert!(Arc::ptr_eq(&second, &second_again));
+
+        let open_locks: SessionPipeOpenLocks = Arc::new(DashMap::new());
+        let open_lock =
+            registered_lock_from_registry(&open_locks, "sandbox-open", || Mutex::new(()));
+        let open_lock_again =
+            registered_lock_from_registry(&open_locks, "sandbox-open", || Mutex::new(()));
+        assert!(Arc::ptr_eq(&open_lock, &open_lock_again));
+        drop(open_lock_again);
+        drop(open_lock);
+        assert!(
+            open_locks.is_empty(),
+            "the final pipe-open lock holder must remove its registry entry"
+        );
+
+        for _ in 0..64 {
+            let racing_gates: SessionOutputGates = Arc::new(DashMap::new());
+            let retiring = output_gate_from_registry(&racing_gates, "sandbox-race");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let drop_barrier = barrier.clone();
+            let dropper = std::thread::spawn(move || {
+                drop_barrier.wait();
+                drop(retiring);
+            });
+            barrier.wait();
+            let replacement = output_gate_from_registry(&racing_gates, "sandbox-race");
+            dropper.join().expect("join retiring gate drop");
+            let registered = racing_gates
+                .get("sandbox-race")
+                .and_then(|entry| entry.upgrade())
+                .expect("replacement gate must remain registered");
+            assert!(
+                Arc::ptr_eq(&replacement, &registered),
+                "retiring gate cleanup must not remove a concurrent replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_replay_uses_live_answer_only_for_terminal_only_log_slice() {
+        let answer = r#"{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"id":"root-answer","type":"agentMessage","phase":"final_answer","text":"Root answer."}}}"#;
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed"}}}"#;
+        let mut live = StdoutPumpState::default();
+        live.set_authoritative_root_thread_id("exe-1", "root-thread");
+        assert_eq!(live.observe("exe-1", answer), None);
+
+        let expected = Some(TerminalOutput::Completed {
+            reason: "turn_completed",
+            result_text: Some("Root answer.".to_owned()),
+        });
+        assert_eq!(
+            replay_detached_recorded_output(&live, "exe-1", &[terminal.to_owned()]),
+            expected
+        );
+        assert_eq!(
+            replay_detached_recorded_output(
+                &live,
+                "exe-1",
+                &[answer.to_owned(), terminal.to_owned()],
+            ),
+            expected,
+            "overlapping recorded output must not duplicate the live answer"
+        );
+
+        let mut live_prefix = StdoutPumpState::default();
+        live_prefix.set_authoritative_root_thread_id("exe-2", "root-thread");
+        let prefix = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn-2","itemId":"root-answer-2","delta":"Hello wor"}"#;
+        let suffix = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn-2","itemId":"root-answer-2","delta":"ld."}"#;
+        let suffix_terminal = r#"{"type":"turn.completed","threadId":"root-thread","turn":{"id":"root-turn-2","status":"completed"}}"#;
+        assert_eq!(live_prefix.observe("exe-2", prefix), None);
+        assert_eq!(
+            replay_detached_recorded_output(
+                &live_prefix,
+                "exe-2",
+                &[suffix.to_owned(), suffix_terminal.to_owned()],
+            ),
+            Some(TerminalOutput::Completed {
+                reason: "turn_completed",
+                result_text: Some("Hello world.".to_owned()),
+            }),
+            "a truncated recorded suffix must combine with the live prefix"
+        );
+    }
+
+    #[test]
+    fn streamed_answer_deltas_preserve_boundary_whitespace_during_live_and_recovery() {
+        let prefix = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":"Hello "}"#;
+        let suffix = r#"{"method":"item/agentMessage/delta","params":{"threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":"world"}}"#;
+        let terminal = r#"{"type":"turn.completed","threadId":"root-thread","turn":{"id":"root-turn","status":"completed"}}"#;
+        let expected = Some(TerminalOutput::Completed {
+            reason: "turn_completed",
+            result_text: Some("Hello world".to_owned()),
+        });
+
+        let mut live = StdoutPumpState::default();
+        live.set_authoritative_root_thread_id("exe-live", "root-thread");
+        assert_eq!(live.observe("exe-live", prefix), None);
+        assert_eq!(live.observe("exe-live", suffix), None);
+        assert_eq!(live.observe("exe-live", terminal), expected);
+
+        let first_word = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":"Hello"}"#;
+        let whitespace = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":" \n"}"#;
+        let mut whitespace_chunks = StdoutPumpState::default();
+        whitespace_chunks.set_authoritative_root_thread_id("exe-whitespace", "root-thread");
+        assert_eq!(
+            whitespace_chunks.observe("exe-whitespace", first_word),
+            None
+        );
+        assert_eq!(
+            whitespace_chunks.observe("exe-whitespace", whitespace),
+            None
+        );
+        assert_eq!(whitespace_chunks.observe("exe-whitespace", suffix), None);
+        assert_eq!(
+            whitespace_chunks.observe("exe-whitespace", terminal),
+            Some(TerminalOutput::Completed {
+                reason: "turn_completed",
+                result_text: Some("Hello \nworld".to_owned()),
+            }),
+            "a whitespace-only delta chunk must remain byte-exact"
+        );
+
+        for (execution_id, delta, expected_text) in [
+            (
+                "exe-leading-trailing",
+                r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":" leading "}"#,
+                " leading ",
+            ),
+            (
+                "exe-whitespace-only",
+                r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":" \n\t"}"#,
+                " \n\t",
+            ),
+        ] {
+            let mut exact = StdoutPumpState::default();
+            exact.set_authoritative_root_thread_id(execution_id, "root-thread");
+            assert_eq!(exact.observe(execution_id, delta), None);
+            assert_eq!(
+                exact.observe(execution_id, terminal),
+                Some(TerminalOutput::Completed {
+                    reason: "turn_completed",
+                    result_text: Some(expected_text.to_owned()),
+                }),
+                "bare completion must preserve accumulated delta bytes"
+            );
+        }
+
+        let mut detached = StdoutPumpState::default();
+        detached.set_authoritative_root_thread_id("exe-detached", "root-thread");
+        assert_eq!(detached.observe("exe-detached", prefix), None);
+        assert_eq!(
+            replay_detached_recorded_output(
+                &detached,
+                "exe-detached",
+                &[suffix.to_owned(), terminal.to_owned()],
+            ),
+            expected,
+            "detached recovery must retain whitespace from the live prefix"
+        );
+
+        let mut detached_whitespace = StdoutPumpState::default();
+        detached_whitespace
+            .set_authoritative_root_thread_id("exe-detached-whitespace", "root-thread");
+        let whitespace_only = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":" \n\t"}"#;
+        assert_eq!(
+            detached_whitespace.observe("exe-detached-whitespace", whitespace_only),
+            None
+        );
+        assert_eq!(
+            replay_detached_recorded_output(
+                &detached_whitespace,
+                "exe-detached-whitespace",
+                &[terminal.to_owned()],
+            ),
+            Some(TerminalOutput::Completed {
+                reason: "turn_completed",
+                result_text: Some(" \n\t".to_owned()),
+            }),
+            "terminal-only detached recovery must preserve a whitespace-only live delta"
+        );
+    }
+
+    #[test]
+    fn legacy_root_repair_requires_recorded_root_then_persisted_child() {
+        let root_then_child = vec![
+            r#"{"method":"thread/started","params":{"thread":{"id":"root-thread"}}}"#.to_owned(),
+            r#"{"method":"thread/started","params":{"thread":{"id":"child-thread"}}}"#.to_owned(),
+        ];
+        assert_eq!(
+            legacy_corrupted_root_repair_candidate(&root_then_child, "child-thread"),
+            Some("root-thread".to_owned())
+        );
+        assert_eq!(
+            legacy_corrupted_root_repair_candidate(
+                &[
+                    r#"{"method":"thread/started","params":{"thread":{"id":"child-thread"}}}"#
+                        .to_owned()
+                ],
+                "child-thread",
+            ),
+            None,
+            "child-only later-turn history must preserve the durable root"
         );
     }
 
@@ -8549,8 +9912,8 @@ mod tests {
 }
 
 /// Integration tests for orphaned-execution adoption. They need a real
-/// Postgres; set `SESSION_RUNTIME_TEST_DATABASE_URL` to run them (they skip
-/// silently otherwise, mirroring `ABSURD_TEST_DATABASE_URL` in absurd-sdk).
+/// Postgres; set `SESSION_RUNTIME_TEST_DATABASE_URL` or the CI-standard
+/// `SESSION_SQLX_TEST_DATABASE_URL` to run them.
 #[cfg(test)]
 mod adoption_tests {
     use std::{
@@ -8573,6 +9936,13 @@ mod adoption_tests {
     struct MockBackend {
         ios: Mutex<VecDeque<SandboxIo>>,
         recorded_output: std::sync::Mutex<Vec<String>>,
+        block_recorded_output: AtomicBool,
+        recorded_output_read_started: tokio::sync::Notify,
+        recorded_output_read_release: tokio::sync::Notify,
+        recorded_output_read_count: AtomicUsize,
+        block_open_io: AtomicBool,
+        open_io_started: tokio::sync::Notify,
+        open_io_release: tokio::sync::Notify,
         open_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
         observed_statuses: std::sync::Mutex<BTreeMap<String, SandboxStatus>>,
@@ -8589,6 +9959,13 @@ mod adoption_tests {
             Self {
                 ios: Mutex::new(VecDeque::new()),
                 recorded_output: std::sync::Mutex::new(recorded_output),
+                block_recorded_output: AtomicBool::new(false),
+                recorded_output_read_started: tokio::sync::Notify::new(),
+                recorded_output_read_release: tokio::sync::Notify::new(),
+                recorded_output_read_count: AtomicUsize::new(0),
+                block_open_io: AtomicBool::new(false),
+                open_io_started: tokio::sync::Notify::new(),
+                open_io_release: tokio::sync::Notify::new(),
                 open_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
                 observed_statuses: std::sync::Mutex::new(BTreeMap::new()),
@@ -8611,6 +9988,34 @@ mod adoption_tests {
 
         fn set_recorded_output(&self, recorded_output: Vec<String>) {
             *self.recorded_output.lock().unwrap() = recorded_output;
+        }
+
+        fn block_next_recorded_output_read(&self) {
+            self.block_recorded_output.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_recorded_output_read(&self) {
+            self.recorded_output_read_started.notified().await;
+        }
+
+        fn release_recorded_output_read(&self) {
+            self.recorded_output_read_release.notify_one();
+        }
+
+        fn recorded_output_reads(&self) -> usize {
+            self.recorded_output_read_count.load(Ordering::SeqCst)
+        }
+
+        fn block_next_open_io(&self) {
+            self.block_open_io.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_open_io(&self) {
+            self.open_io_started.notified().await;
+        }
+
+        fn release_open_io(&self) {
+            self.open_io_release.notify_one();
         }
 
         fn set_status(&self, status: SandboxStatus) {
@@ -8673,6 +10078,10 @@ mod adoption_tests {
 
         async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
             self.open_count.fetch_add(1, Ordering::SeqCst);
+            if self.block_open_io.swap(false, Ordering::SeqCst) {
+                self.open_io_started.notify_one();
+                self.open_io_release.notified().await;
+            }
             self.ios
                 .lock()
                 .await
@@ -8685,6 +10094,12 @@ mod adoption_tests {
             _id: &SandboxId,
             _since: Option<SystemTime>,
         ) -> SandboxResult<Vec<String>> {
+            self.recorded_output_read_count
+                .fetch_add(1, Ordering::SeqCst);
+            if self.block_recorded_output.swap(false, Ordering::SeqCst) {
+                self.recorded_output_read_started.notify_one();
+                self.recorded_output_read_release.notified().await;
+            }
             Ok(self.recorded_output.lock().unwrap().clone())
         }
 
@@ -8782,9 +10197,43 @@ mod adoption_tests {
         output.into_bytes()
     }
 
+    const ROOT_THREAD_STARTED_LINE: &str =
+        r#"{"method":"thread/started","params":{"thread":{"id":"root-thread"}}}"#;
+    const ROOT_TURN_STARTED_LINE: &str = r#"{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"root-turn"}}}"#;
+    const ROOT_ANSWER_LINE: &str = r#"{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"id":"root-answer","type":"agentMessage","phase":"final_answer","text":"Root answer."}}}"#;
+    const ROOT_COMPLETED_LINE: &str = r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed"}}}"#;
+    const CHILD_THREAD_STARTED_LINE: &str =
+        r#"{"method":"thread/started","params":{"thread":{"id":"child-thread"}}}"#;
+    const CHILD_TURN_STARTED_LINE: &str = r#"{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}"#;
+    const CHILD_ANSWER_LINE: &str = r#"{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"id":"child-answer","type":"agentMessage","phase":"final_answer","text":"Child answer."}}}"#;
+    const CHILD_COMPLETED_LINE: &str = r#"{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}"#;
+    const ROOT_START_LINES: [&str; 2] = [ROOT_THREAD_STARTED_LINE, ROOT_TURN_STARTED_LINE];
+    const ROOT_TERMINAL_LINES: [&str; 2] = [ROOT_ANSWER_LINE, ROOT_COMPLETED_LINE];
+    const CHILD_LINES: [&str; 4] = [
+        CHILD_THREAD_STARTED_LINE,
+        CHILD_TURN_STARTED_LINE,
+        CHILD_ANSWER_LINE,
+        CHILD_COMPLETED_LINE,
+    ];
+
+    fn output_bytes(lines: &[&str]) -> Vec<u8> {
+        let mut output = lines.join("\n");
+        output.push('\n');
+        output.into_bytes()
+    }
+
+    fn owned_output_lines(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
     async fn test_store() -> Option<PgSessionStore> {
-        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
-            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("SESSION_SQLX_TEST_DATABASE_URL"))
+        else {
+            eprintln!(
+                "skipping: SESSION_RUNTIME_TEST_DATABASE_URL and \
+                 SESSION_SQLX_TEST_DATABASE_URL are not set"
+            );
             return None;
         };
         let store = PgSessionStore::connect(&url)
@@ -8881,6 +10330,54 @@ mod adoption_tests {
         }
     }
 
+    async fn wait_for_execution_event(
+        store: &PgSessionStore,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        event_type: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let events = store
+                .list_events_after(thread_key, 0, Some(execution_id), 1000)
+                .await
+                .expect("list execution events");
+            if events.iter().any(|event| event.event_type == event_type) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {event_type} on {execution_id}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_output_line(
+        store: &PgSessionStore,
+        thread_key: &ThreadKey,
+        expected_line: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let events = store
+                .list_events_after(thread_key, 0, None, 1000)
+                .await
+                .expect("list events");
+            if events.iter().any(|event| {
+                event.event_type == SESSION_OUTPUT_LINE_EVENT
+                    && event.payload.as_str() == Some(expected_line)
+            }) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for output line {expected_line}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn wait_for_session_title(
         store: &PgSessionStore,
         thread_key: &ThreadKey,
@@ -8913,10 +10410,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execution_scoped_event_stream_completes_after_terminal_event() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:stream-close-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, None, false).await;
@@ -8991,10 +10488,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn append_messages_generates_missing_session_title_once() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key = ThreadKey::parse(format!("test:title-{}", uuid::Uuid::new_v4())).unwrap();
         store
             .create_or_get_session(
@@ -9167,10 +10664,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capability_mismatch_replaces_existing_sandbox() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:cap-replace-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -9251,10 +10748,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_default_capabilities_skip_warm_pool() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:cap-warm-skip-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -9324,10 +10821,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn existing_running_sandbox_ensures_proxy_before_reuse() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:proxy-reuse-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -9379,10 +10876,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capacity_pressure_pauses_oldest_idle_assigned_sandbox() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         backend.set_observed_status(
@@ -9539,11 +11036,12 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workflow_cleanup_stops_and_clears_owned_sandbox() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let sandbox_id = format!("sbx-owned-{}", uuid::Uuid::new_v4());
         let thread_key =
             ThreadKey::parse(format!("test:wf-cleanup-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -9561,11 +11059,11 @@ mod adoption_tests {
             .await
             .expect("create session");
         store
-            .update_sandbox_id(&thread_key, Some("sbx-owned"))
+            .update_sandbox_id(&thread_key, Some(&sandbox_id))
             .await
             .expect("set sandbox id");
         store
-            .insert_ready_warm_sandbox("sbx-owned", "test-workload")
+            .insert_ready_warm_sandbox(&sandbox_id, "test-workload")
             .await
             .expect("insert warm sandbox");
         assert_eq!(
@@ -9573,14 +11071,14 @@ mod adoption_tests {
                 .claim_ready_warm_sandbox("test-workload", thread_key.as_str())
                 .await
                 .expect("claim warm sandbox"),
-            Some("sbx-owned".to_owned())
+            Some(sandbox_id.clone())
         );
         assert!(
             store
                 .list_referenced_sandbox_ids()
                 .await
                 .expect("list referenced sandboxes")
-                .contains(&"sbx-owned".to_owned())
+                .contains(&sandbox_id)
         );
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
@@ -9590,8 +11088,8 @@ mod adoption_tests {
             .await
             .expect("cleanup workflow sandboxes");
 
-        assert_eq!(report.stopped, vec!["sbx-owned".to_owned()]);
-        assert_eq!(backend.stopped(), vec!["sbx-owned".to_owned()]);
+        assert_eq!(report.stopped, vec![sandbox_id.clone()]);
+        assert_eq!(backend.stopped(), vec![sandbox_id.clone()]);
         assert_eq!(
             store.get_session(&thread_key).await.unwrap().sandbox_id,
             None
@@ -9601,7 +11099,7 @@ mod adoption_tests {
                 .list_referenced_sandbox_ids()
                 .await
                 .expect("list referenced sandboxes")
-                .contains(&"sbx-owned".to_owned())
+                .contains(&sandbox_id)
         );
         let all = events(&store, &thread_key).await;
         assert!(all.iter().any(|event| {
@@ -9613,10 +11111,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workflow_cleanup_preserves_explicit_unowned_thread_key() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
         let thread_key =
             ThreadKey::parse(format!("test:wf-explicit-{}", uuid::Uuid::new_v4())).unwrap();
@@ -9655,10 +11153,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workflow_cleanup_clears_owned_sandbox_when_backend_reports_missing() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
         let thread_key =
             ThreadKey::parse(format!("test:wf-missing-{}", uuid::Uuid::new_v4())).unwrap();
@@ -9698,10 +11196,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_failure_replaces_sandbox_and_preserves_harness_thread_id() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:resume-failed-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -9759,14 +11257,18 @@ mod adoption_tests {
             all.iter()
                 .any(|event| event.event_type == "session.sandbox_resume_failed")
         );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize test execution");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_pipe_ensure_opens_one_io_per_sandbox() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:pipe-race-{}", uuid::Uuid::new_v4())).unwrap();
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
@@ -9788,19 +11290,24 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_eof_recovers_terminal_output_from_recorded_logs() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout ownership");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-recorded")
             .await
@@ -9809,6 +11316,7 @@ mod adoption_tests {
         drop(stdout);
 
         wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        wait_for_event(&store, &thread_key, "session.stdout_pump_recovered").await;
         let all = events(&store, &thread_key).await;
         assert!(
             all.iter()
@@ -9838,13 +11346,14 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_eof_reattaches_and_delivers_late_terminal_output() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (first_io, mut first_stdout, _first_stdin) = mock_io();
@@ -9853,6 +11362,10 @@ mod adoption_tests {
         backend.push_io(second_io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout ownership");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-reattach")
             .await
@@ -9888,20 +11401,1140 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stdout_eof_fails_when_sandbox_no_longer_accepts_io() {
+    async fn stdout_reattach_preserves_root_state_across_child_terminal() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-root-state-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-root-state"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (first_io, mut first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout ownership");
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-root-state")
+            .await
+            .expect("open initial pipe");
+        first_stdout
+            .write_all(&output_bytes(&ROOT_START_LINES))
+            .await
+            .unwrap();
+        wait_for_output_line(&store, &thread_key, ROOT_TURN_STARTED_LINE).await;
+        backend.set_recorded_output(owned_output_lines(&CHILD_LINES));
+        drop(first_stdout);
+
+        wait_for_event(&store, &thread_key, "session.stdout_pump_reattached").await;
+        second_stdout
+            .write_all(&output_bytes(&CHILD_LINES))
+            .await
+            .unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load active execution")
+            .expect("child terminal must leave root execution active");
+        assert_eq!(active.execution_id, execution_id);
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(
+            session.harness_thread_id.as_deref(),
+            Some("root-thread"),
+            "child thread start must not replace the root harness thread id"
+        );
+
+        second_stdout
+            .write_all(&output_bytes(&ROOT_TERMINAL_LINES))
+            .await
+            .unwrap();
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Root answer.")
+        );
+        assert_eq!(backend.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_eof_reconnect_preserves_root_prefix_and_output_identity_state() {
         let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-reconnect-state-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-eof-reconnect"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (first_io, mut first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout ownership");
+        let first_pipe = runtime
+            .ensure_session_pipe(&thread_key, "sbx-eof-reconnect")
+            .await
+            .expect("open initial pipe");
+        let prefix = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":"Hello "}"#;
+        first_stdout
+            .write_all(&output_bytes(&[
+                ROOT_THREAD_STARTED_LINE,
+                ROOT_TURN_STARTED_LINE,
+                prefix,
+            ]))
+            .await
+            .unwrap();
+        wait_for_output_line(&store, &thread_key, prefix).await;
+
+        backend.block_next_recorded_output_read();
+        drop(first_stdout);
+        backend.wait_for_recorded_output_read().await;
+        assert!(
+            !first_pipe.stdout_alive.load(Ordering::Acquire),
+            "eof must mark the old pipe dead before recorded recovery"
+        );
+
+        let session = store.get_session(&thread_key).await.expect("get session");
+        let replacement = runtime
+            .ensure_session_pipe_with_output_state(
+                &thread_key,
+                "sbx-eof-reconnect",
+                stdout_state_for_execution(&session, &execution_id),
+            )
+            .await
+            .expect("event-stream reconnect should replace the dead pipe");
+        assert!(
+            !Arc::ptr_eq(&first_pipe.stdin, &replacement.stdin),
+            "event-stream reconnect must replace the dead transport"
+        );
+        assert!(
+            Arc::ptr_eq(&first_pipe.output_state, &replacement.output_state),
+            "dead-pipe replacement must retain the shared stdout state"
+        );
+        assert!(
+            Arc::ptr_eq(&first_pipe.output_gate, &replacement.output_gate),
+            "replacement and retiring pumps must remain behind one output fence"
+        );
+
+        second_stdout
+            .write_all(&output_bytes(&CHILD_LINES))
+            .await
+            .unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load active execution")
+            .expect("child terminal must not finish the root execution");
+        assert_eq!(active.execution_id, execution_id);
+
+        let suffix = r#"{"type":"item.agentMessage.delta","threadId":"root-thread","turnId":"root-turn","itemId":"root-answer","delta":"world"}"#;
+        second_stdout
+            .write_all(&output_bytes(&[suffix, ROOT_COMPLETED_LINE]))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+        backend.release_recorded_output_read();
+
+        let completed = store
+            .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+            .await
+            .expect("list execution events")
+            .into_iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Hello world"),
+            "the replacement pump must retain the pre-eof answer prefix"
+        );
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(session.harness_thread_id.as_deref(), Some("root-thread"));
+        assert_eq!(backend.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reused_pipe_seeds_durable_root_for_second_codex_turn() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:reused-root-state-{}", uuid::Uuid::new_v4())).unwrap();
+        let first_execution =
+            orphaned_execution(&store, &thread_key, Some("sbx-reused-root"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&first_execution)
+            .await
+            .expect("claim first stdout owner");
+        let first_session = store.get_session(&thread_key).await.expect("get session");
+        runtime
+            .ensure_session_pipe_with_output_state(
+                &thread_key,
+                "sbx-reused-root",
+                stdout_state_for_execution(&first_session, &first_execution),
+            )
+            .await
+            .expect("open first-turn pipe");
+
+        let first_lines = [
+            ROOT_THREAD_STARTED_LINE,
+            ROOT_TURN_STARTED_LINE,
+            ROOT_ANSWER_LINE,
+            ROOT_COMPLETED_LINE,
+        ];
+        stdout.write_all(&output_bytes(&first_lines)).await.unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &first_execution,
+            "session.execution_completed",
+        )
+        .await;
+
+        let created = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create second execution");
+        let second_execution = created.execution.execution_id;
+        store
+            .mark_execution_running(&second_execution)
+            .await
+            .expect("mark second execution running");
+        runtime
+            .claim_stdout_owner(&second_execution)
+            .await
+            .expect("claim second stdout owner");
+        let second_session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(
+            second_session.harness_thread_id.as_deref(),
+            Some("root-thread")
+        );
+        runtime
+            .ensure_session_pipe_with_output_state(
+                &thread_key,
+                "sbx-reused-root",
+                stdout_state_for_execution(&second_session, &second_execution),
+            )
+            .await
+            .expect("reuse pipe for second turn");
+
+        stdout.write_all(&output_bytes(&CHILD_LINES)).await.unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load active execution")
+            .expect("child terminal must not finish second root turn");
+        assert_eq!(active.execution_id, second_execution);
+
+        let second_answer = r#"{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn-2","item":{"id":"root-answer-2","type":"agentMessage","phase":"final_answer","text":"Second root answer."}}}"#;
+        let second_completed = r#"{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn-2","status":"completed"}}}"#;
+        stdout
+            .write_all(&output_bytes(&[second_answer, second_completed]))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &second_execution,
+            "session.execution_completed",
+        )
+        .await;
+        let completed = store
+            .list_events_after(&thread_key, 0, Some(&second_execution), 1000)
+            .await
+            .expect("list second execution events")
+            .into_iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("second completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Second root answer.")
+        );
+        assert_eq!(backend.opens(), 1, "second turn must reuse the pipe");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eof_liveness_prevents_new_turn_from_reusing_dead_pipe() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:dead-pipe-turn-{}", uuid::Uuid::new_v4())).unwrap();
+        let first_execution =
+            orphaned_execution(&store, &thread_key, Some("sbx-dead-pipe-turn"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (first_io, mut first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&first_execution)
+            .await
+            .expect("claim first stdout owner");
+        let first_pipe = runtime
+            .ensure_session_pipe(&thread_key, "sbx-dead-pipe-turn")
+            .await
+            .expect("open first pipe");
+        first_stdout
+            .write_all(&output_bytes(&[
+                ROOT_THREAD_STARTED_LINE,
+                ROOT_TURN_STARTED_LINE,
+                ROOT_ANSWER_LINE,
+                ROOT_COMPLETED_LINE,
+            ]))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &first_execution,
+            "session.execution_completed",
+        )
+        .await;
+        drop(first_stdout);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while first_pipe.stdout_alive.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stdout eof liveness transition"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let created = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create second execution");
+        let second_execution = created.execution.execution_id;
+        store
+            .mark_execution_running(&second_execution)
+            .await
+            .expect("mark second execution running");
+        runtime
+            .claim_stdout_owner(&second_execution)
+            .await
+            .expect("claim second stdout owner");
+        let session = store.get_session(&thread_key).await.expect("get session");
+        let second_pipe = runtime
+            .ensure_session_pipe_with_output_state(
+                &thread_key,
+                "sbx-dead-pipe-turn",
+                stdout_state_for_execution(&session, &second_execution),
+            )
+            .await
+            .expect("open live pipe for second turn");
+        assert!(
+            !Arc::ptr_eq(&first_pipe.stdin, &second_pipe.stdin),
+            "a dead stdout pipe must never be reused"
+        );
+        assert_eq!(backend.opens(), 2);
+
+        second_stdout
+            .write_all(&completed_output_bytes("Second turn completed."))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &second_execution,
+            "session.execution_completed",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_merges_recovered_state_into_existing_pipe_after_owner_loss() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-existing-pipe-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-existing"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-adopt-existing")
+            .await
+            .expect("open pipe before adoption");
+
+        // With no stdout owner, the first line is rejected. Adoption must be
+        // able to reclaim this same pump rather than leaving it permanently
+        // suppressed after that loss.
+        stdout
+            .write_all(&output_bytes(&[ROOT_THREAD_STARTED_LINE]))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+                .await
+                .expect("list pre-adoption events")
+                .iter()
+                .all(|event| event.event_type != SESSION_OUTPUT_LINE_EVENT),
+            "unowned pump must not append output"
+        );
+
+        store
+            .update_harness_thread_id(&thread_key, Some("root-thread"))
+            .await
+            .expect("persist durable root before restart adoption");
+        backend.set_recorded_output(owned_output_lines(&[ROOT_ANSWER_LINE]));
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load orphan")
+            .expect("orphan remains active");
+        assert_eq!(
+            runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+                .expect("adopt existing pipe"),
+            OrphanAdoption::Adopted
+        );
+        assert_eq!(
+            backend.opens(),
+            1,
+            "adoption must merge into the existing pipe"
+        );
+
+        stdout.write_all(&output_bytes(&CHILD_LINES)).await.unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load active execution")
+            .expect("child terminal must leave adopted execution active");
+        assert_eq!(active.execution_id, execution_id);
+
+        stdout
+            .write_all(&output_bytes(&[ROOT_COMPLETED_LINE]))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+        let completed = store
+            .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+            .await
+            .expect("list adopted execution events")
+            .into_iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("adopted completion event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Root answer."),
+            "recorded final-answer state must survive the existing-pipe merge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_fences_existing_pump_until_recovered_root_is_merged() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-gated-pipe-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-gated"), true).await;
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            owned_output_lines(&ROOT_START_LINES),
+        ));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        let pipe = runtime
+            .ensure_session_pipe(&thread_key, "sbx-adopt-gated")
+            .await
+            .expect("open pipe before adoption");
+        store
+            .update_harness_thread_id(&thread_key, Some("root-thread"))
+            .await
+            .expect("persist durable root");
+        backend.block_next_recorded_output_read();
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load orphan")
+            .expect("orphan remains active");
+        let adoption_runtime = runtime.clone();
+        let adoption = tokio::spawn(async move {
+            adoption_runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+        });
+        backend.wait_for_recorded_output_read().await;
+
+        let pump_read_wait = pipe.output_gate_read_wait_started.notified();
+        stdout.write_all(&output_bytes(&CHILD_LINES)).await.unwrap();
+        timeout(Duration::from_secs(2), pump_read_wait)
+            .await
+            .expect("pump must reach the blocked output-gate read");
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+                .await
+                .expect("list gated events")
+                .iter()
+                .all(|event| event.event_type != SESSION_OUTPUT_LINE_EVENT),
+            "the pump must stay fenced while adoption reads and seeds recorded state"
+        );
+        assert_eq!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load active execution")
+                .expect("child terminal must not race adoption")
+                .execution_id,
+            execution_id
+        );
+
+        backend.release_recorded_output_read();
+        assert_eq!(
+            adoption
+                .await
+                .expect("join adoption")
+                .expect("adopt existing pump"),
+            OrphanAdoption::Adopted
+        );
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+        assert!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load active execution")
+                .is_some(),
+            "child terminal must remain non-terminal after recovered root merge"
+        );
+        stdout
+            .write_all(&output_bytes(&ROOT_TERMINAL_LINES))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_writer_fences_detached_eof_recovery_until_root_merge() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-gated-eof-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-gated-eof"), true).await;
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            owned_output_lines(&ROOT_START_LINES),
+        ));
+        let (first_io, first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim initial stdout owner");
+        let pipe = runtime
+            .ensure_session_pipe(&thread_key, "sbx-adopt-gated-eof")
+            .await
+            .expect("open pipe before adoption");
+        expire_stdout_lease(&store, &execution_id).await;
+
+        backend.block_next_recorded_output_read();
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load orphan")
+            .expect("orphan remains active");
+        let adoption_runtime = runtime.clone();
+        let adoption = tokio::spawn(async move {
+            adoption_runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+        });
+        backend.wait_for_recorded_output_read().await;
+        assert_eq!(backend.recorded_output_reads(), 1);
+
+        backend.set_recorded_output(owned_output_lines(&CHILD_LINES));
+        let recovery_wait = pipe.output_gate_read_wait_started.notified();
+        drop(first_stdout);
+        timeout(Duration::from_secs(2), recovery_wait)
+            .await
+            .expect("detached recovery must reach the blocked output-gate read");
+        assert_eq!(
+            backend.recorded_output_reads(),
+            2,
+            "detached recovery may read logs but must wait before replaying them"
+        );
+        assert!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load fenced execution")
+                .is_some(),
+            "child-only detached replay must not terminalize behind adoption's writer fence"
+        );
+
+        backend.set_recorded_output(owned_output_lines(&ROOT_START_LINES));
+        backend.release_recorded_output_read();
+        assert_eq!(
+            adoption
+                .await
+                .expect("join adoption")
+                .expect("adopt after eof"),
+            OrphanAdoption::Adopted
+        );
+
+        second_stdout
+            .write_all(&output_bytes(&CHILD_LINES))
+            .await
+            .unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+        assert!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load active execution")
+                .is_some(),
+            "child terminal must remain non-terminal after adoption seeds the root"
+        );
+        second_stdout
+            .write_all(&output_bytes(&ROOT_TERMINAL_LINES))
+            .await
+            .unwrap();
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+        assert_eq!(backend.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_io_deadline_releases_fence_and_owner_without_guessing_root() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+
+        let log_thread =
+            ThreadKey::parse(format!("test:adopt-log-timeout-{}", uuid::Uuid::new_v4())).unwrap();
+        let log_execution =
+            orphaned_execution(&store, &log_thread, Some("sbx-adopt-log-timeout"), true).await;
+        store
+            .update_harness_thread_id(&log_thread, Some("legacy-child"))
+            .await
+            .expect("persist legacy child-corrupted root");
+        let log_backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            vec![
+                ROOT_THREAD_STARTED_LINE.to_owned(),
+                r#"{"method":"thread/started","params":{"thread":{"id":"legacy-child"}}}"#
+                    .to_owned(),
+            ],
+        ));
+        let log_runtime = runtime_with(&store, log_backend.clone());
+        let log_gate = log_runtime.sandbox_output_gate("sbx-adopt-log-timeout");
+        log_backend.block_next_recorded_output_read();
+        let orphan = store
+            .active_execution_for_thread(&log_thread)
+            .await
+            .expect("load log-timeout orphan")
+            .expect("log-timeout orphan remains active");
+        let adoption_runtime = log_runtime.clone();
+        let adoption = tokio::spawn(async move {
+            adoption_runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+        });
+        log_backend.wait_for_recorded_output_read().await;
+        let gate_read = log_gate.read();
+        tokio::pin!(gate_read);
+        assert!(
+            timeout(Duration::from_millis(50), gate_read.as_mut())
+                .await
+                .is_err(),
+            "recorded-output recovery must hold the writer fence"
+        );
+        assert_eq!(
+            timeout(
+                EXECUTION_ADOPTION_IO_TIMEOUT + Duration::from_secs(2),
+                adoption,
+            )
+            .await
+            .expect("log-timeout adoption must stay bounded")
+            .expect("join log-timeout adoption")
+            .expect("log-timeout adoption result"),
+            OrphanAdoption::Deferred
+        );
+        let gate_read = timeout(Duration::from_millis(250), gate_read)
+            .await
+            .expect("log timeout must release the writer fence");
+        drop(gate_read);
+        log_backend.release_recorded_output_read();
+        assert_eq!(
+            store
+                .get_session(&log_thread)
+                .await
+                .expect("get log-timeout session")
+                .harness_thread_id
+                .as_deref(),
+            Some("legacy-child"),
+            "timed-out recorded output must not repair a root from unseen evidence"
+        );
+        let log_successor = runtime_with(&store, log_backend);
+        assert!(
+            log_successor
+                .claim_expired_stdout_owner(&log_execution)
+                .await
+                .expect("claim released log-timeout owner"),
+            "a successor must be able to claim immediately after log timeout"
+        );
+        store
+            .fail_execution_if_active(&log_execution, "test cleanup")
+            .await
+            .expect("terminalize log-timeout execution");
+
+        let attach_thread = ThreadKey::parse(format!(
+            "test:adopt-attach-timeout-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let attach_execution = orphaned_execution(
+            &store,
+            &attach_thread,
+            Some("sbx-adopt-attach-timeout"),
+            true,
+        )
+        .await;
+        let attach_backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        attach_backend.push_io(io).await;
+        attach_backend.block_next_open_io();
+        let attach_runtime = runtime_with(&store, attach_backend.clone());
+        let attach_gate = attach_runtime.sandbox_output_gate("sbx-adopt-attach-timeout");
+        let orphan = store
+            .active_execution_for_thread(&attach_thread)
+            .await
+            .expect("load attach-timeout orphan")
+            .expect("attach-timeout orphan remains active");
+        let adoption_runtime = attach_runtime.clone();
+        let adoption = tokio::spawn(async move {
+            adoption_runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+        });
+        attach_backend.wait_for_open_io().await;
+        let gate_read = attach_gate.read();
+        tokio::pin!(gate_read);
+        assert!(
+            timeout(Duration::from_millis(50), gate_read.as_mut())
+                .await
+                .is_err(),
+            "sandbox attach must remain inside the writer fence"
+        );
+        assert_eq!(
+            timeout(
+                EXECUTION_ADOPTION_IO_TIMEOUT + Duration::from_secs(2),
+                adoption,
+            )
+            .await
+            .expect("attach-timeout adoption must stay bounded")
+            .expect("join attach-timeout adoption")
+            .expect("attach-timeout adoption result"),
+            OrphanAdoption::Deferred
+        );
+        let gate_read = timeout(Duration::from_millis(250), gate_read)
+            .await
+            .expect("attach timeout must release the writer fence");
+        drop(gate_read);
+        attach_backend.release_open_io();
+        assert!(
+            attach_runtime
+                .sandbox_pipes
+                .get("sbx-adopt-attach-timeout")
+                .is_none(),
+            "a cancelled attach must not publish a partial pipe"
+        );
+        assert!(
+            attach_runtime.sandbox_pipe_open_locks.is_empty(),
+            "a cancelled attach must reap its per-sandbox open lock"
+        );
+        let attach_successor = runtime_with(&store, attach_backend);
+        assert!(
+            attach_successor
+                .claim_expired_stdout_owner(&attach_execution)
+                .await
+                .expect("claim released attach-timeout owner"),
+            "a successor must be able to claim immediately after attach timeout"
+        );
+        store
+            .fail_execution_if_active(&attach_execution, "test cleanup")
+            .await
+            .expect("terminalize attach-timeout execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_release_timeout_stops_renewer_before_lease_expires() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!(
+            "test:adopt-release-timeout-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-release-timeout"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.block_next_recorded_output_read();
+        let runtime = runtime_with(&store, backend.clone());
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load release-timeout orphan")
+            .expect("release-timeout orphan remains active");
+        let adoption_runtime = runtime.clone();
+        let adoption = tokio::spawn(async move {
+            adoption_runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+        });
+        backend.wait_for_recorded_output_read().await;
+        assert!(
+            runtime.stdout_owner_renewals.contains_key(&execution_id),
+            "adoption must renew ownership while backend recovery is in flight"
+        );
+
+        sqlx::query(
+            "update session_executions \
+             set stdout_owner_lease_expires_at = clock_timestamp() + interval '300 milliseconds' \
+             where execution_id = $1",
+        )
+        .bind(&execution_id)
+        .execute(store.pool())
+        .await
+        .expect("shorten adoption lease");
+        let mut row_lock = store.pool().begin().await.expect("begin owner row lock");
+        sqlx::query(
+            "select execution_id from session_executions where execution_id = $1 for update",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *row_lock)
+        .await
+        .expect("lock owner row");
+
+        timeout(
+            EXECUTION_ADOPTION_IO_TIMEOUT + Duration::from_secs(1),
+            runtime.stdout_owner_release_started.notified(),
+        )
+        .await
+        .expect("adoption must reach bounded owner release");
+        assert!(
+            !runtime.stdout_owner_renewals.contains_key(&execution_id),
+            "the renewer must stop before a possibly blocked release starts"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), adoption)
+                .await
+                .expect("blocked release must stay bounded")
+                .expect("join release-timeout adoption")
+                .expect("release-timeout adoption result"),
+            OrphanAdoption::Deferred
+        );
+        row_lock.rollback().await.expect("release owner row lock");
+        backend.release_recorded_output_read();
+
+        assert!(
+            store
+                .claim_expired_stdout_owner(
+                    &execution_id,
+                    "peer-control-plane",
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("peer claims naturally expired lease"),
+            "a failed owner release must become claimable by lease expiry"
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize release-timeout execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_root_persistence_error_releases_owner_without_attaching() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!(
+            "test:adopt-root-store-error-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-root-error"), true).await;
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            owned_output_lines(&ROOT_START_LINES),
+        ));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .fail_adoption_root_persistence
+            .store(true, Ordering::SeqCst);
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load root-persistence orphan")
+            .expect("root-persistence orphan remains active");
+
+        let error = runtime
+            .adopt_orphaned_execution(&orphan, false, None)
+            .await
+            .expect_err("root persistence failure must stop adoption");
+        assert!(
+            matches!(
+                error,
+                SessionRuntimeError::Store(SessionStoreError::InvalidPersistedValue(_))
+            ),
+            "unexpected adoption error: {error}"
+        );
+        assert_eq!(
+            backend.opens(),
+            0,
+            "adoption must not attach with a process-local-only recovered root"
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("get root-persistence session")
+                .harness_thread_id,
+            None
+        );
+
+        let successor = runtime_with(&store, backend);
+        assert!(
+            successor
+                .claim_expired_stdout_owner(&execution_id)
+                .await
+                .expect("successor claims released root-persistence execution"),
+            "root persistence failure must release ownership for retry"
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize root-persistence execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lease_losing_pump_does_not_persist_harness_thread_id() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:lost-owner-root-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-lost-owner-root"), true).await;
+        store
+            .claim_stdout_owner(&execution_id, "peer-control-plane", Duration::from_secs(60))
+            .await
+            .expect("claim peer stdout owner");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-lost-owner-root")
+            .await
+            .expect("open losing pump");
+        stdout
+            .write_all(&output_bytes(&[ROOT_THREAD_STARTED_LINE]))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(
+            session.harness_thread_id, None,
+            "a pump that cannot append as stdout owner must not persist its inferred root"
+        );
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+                .await
+                .expect("list execution events")
+                .iter()
+                .all(|event| event.event_type != SESSION_OUTPUT_LINE_EVENT),
+            "peer-owned output must not be appended"
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize peer-owned execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_owner_pump_failure_does_not_claim_terminalization() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!(
+            "test:expired-pump-failure-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-expired-pump"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim pump owner")
+        );
+        expire_stdout_lease(&store, &execution_id).await;
+
+        record_stdout_pump_failure(
+            &runtime.context(),
+            &thread_key,
+            "sbx-expired-pump",
+            "sandbox stdout line exceeded codec maximum length".to_owned(),
+        )
+        .await
+        .expect("record honest pump failure");
+
+        let all = store
+            .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+            .await
+            .expect("list pump-failure events");
+        let pump_failure = all
+            .iter()
+            .find(|event| event.event_type == "session.stdout_pump_failed")
+            .expect("pump-failure diagnostic");
+        assert_eq!(
+            pump_failure.payload["terminalized_execution"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            all.iter()
+                .all(|event| event.event_type != "session.execution_failed"),
+            "an expired owner must not emit a terminal failure event"
+        );
+        assert!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load active execution")
+                .is_some(),
+            "the diagnostic must not claim a rejected terminal transition"
+        );
+
+        let successor = runtime_with(&store, backend);
+        assert!(
+            successor
+                .claim_expired_stdout_owner(&execution_id)
+                .await
+                .expect("successor claims expired execution")
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize expired-pump execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_fails_when_sandbox_no_longer_accepts_io() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
         let thread_key =
             ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout ownership");
         runtime
             .ensure_session_pipe(&thread_key, "sbx-gone")
             .await
@@ -9934,10 +12567,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn adopts_finished_turn_from_recorded_sandbox_output() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-logs-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -9975,10 +12608,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn adopts_live_when_recorded_output_has_no_terminal() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-live-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10009,11 +12642,129 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fails_orphans_whose_sandbox_is_gone() {
+    async fn adoption_replays_root_state_before_live_child_terminal() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-root-state-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-adopt-root"), true).await;
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            owned_output_lines(&ROOT_START_LINES),
+        ));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.adopt_orphaned_executions().await;
+        assert_eq!(backend.opens(), 1);
+
+        stdout.write_all(&output_bytes(&CHILD_LINES)).await.unwrap();
+        wait_for_output_line(&store, &thread_key, CHILD_COMPLETED_LINE).await;
+
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load active execution")
+            .expect("child terminal must leave adopted root execution active");
+        assert_eq!(active.execution_id, execution_id);
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(
+            session.harness_thread_id.as_deref(),
+            Some("root-thread"),
+            "recorded root identity must survive live child output"
+        );
+
+        stdout
+            .write_all(&output_bytes(&ROOT_TERMINAL_LINES))
+            .await
+            .unwrap();
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Root answer.")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_repairs_legacy_child_corrupted_durable_root() {
         let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:repair-legacy-root-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-repair-root"), true).await;
+        store
+            .update_harness_thread_id(&thread_key, Some("child-thread"))
+            .await
+            .expect("persist legacy child-corrupted root");
+
+        let recorded = ROOT_START_LINES
+            .into_iter()
+            .chain(CHILD_LINES)
+            .chain(ROOT_TERMINAL_LINES)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, recorded));
+        let runtime = runtime_with(&store, backend.clone());
+        let orphan = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("load orphan")
+            .expect("orphan remains active");
+        assert_eq!(
+            runtime
+                .adopt_orphaned_execution(&orphan, false, None)
+                .await
+                .expect("adopt recorded execution"),
+            OrphanAdoption::Adopted
+        );
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(
+            session.harness_thread_id.as_deref(),
+            Some("root-thread"),
+            "recorded root-before-child evidence must repair the legacy durable child id"
+        );
+        let completed = store
+            .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+            .await
+            .expect("list execution events")
+            .into_iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Root answer.")
+        );
+        assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fails_orphans_whose_sandbox_is_gone() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
         let thread_key =
             ThreadKey::parse(format!("test:adopt-gone-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10042,10 +12793,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fails_queued_orphans_that_never_received_input() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-queued-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), false).await;
@@ -10072,10 +12823,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn periodic_scan_skips_young_pre_sandbox_executions_until_grace_passes() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-young-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), false).await;
@@ -10140,10 +12891,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn adopts_deferred_execution_after_lease_expires() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-deferred-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10187,11 +12938,11 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn periodic_scan_ignores_executions_owned_by_this_process() {
+    async fn periodic_scan_ignores_live_self_owner_then_adopts_it_after_expiry() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-own-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10227,18 +12978,169 @@ mod adoption_tests {
             }),
             "self-owned execution must not be touched by the scan"
         );
+
+        backend.set_recorded_output(completed_output_lines(
+            "Recovered after this process lost its lease.",
+        ));
+        expire_stdout_lease(&store, &execution_id).await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
+            .await;
+        wait_for_execution_event(
+            &store,
+            &thread_key,
+            &execution_id,
+            "session.execution_completed",
+        )
+        .await;
+        let completed = store
+            .list_events_after(&thread_key, 0, Some(&execution_id), 1000)
+            .await
+            .expect("list self-owner adoption events")
+            .into_iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("self-owner expiry completion");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Recovered after this process lost its lease."),
+            "the same process must reclaim its expired lease through adoption"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_runtime_reclaim_stops_the_old_renewer_generation() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:renewer-generation-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-renewer-generation"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim initial generation");
+        let first = runtime
+            .stdout_owner_renewals
+            .get(&execution_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("initial renewer");
+
+        expire_stdout_lease(&store, &execution_id).await;
+        assert!(
+            runtime
+                .claim_expired_stdout_owner(&execution_id)
+                .await
+                .expect("reclaim expired same-owner lease")
+        );
+        let second = runtime
+            .stdout_owner_renewals
+            .get(&execution_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("replacement renewer");
+        assert_ne!(first.generation, second.generation);
+        assert!(
+            *first.stopped.borrow(),
+            "the old generation must finish before the database reclaim"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime
+                .stdout_owner_renewals
+                .get(&execution_id)
+                .map(|entry| entry.generation),
+            Some(second.generation),
+            "old-generation cleanup must not remove the replacement"
+        );
+
+        assert!(stop_stdout_owner_renewer(&runtime.stdout_owner_renewals, &execution_id).await);
         store
             .fail_execution_if_active(&execution_id, "test cleanup")
             .await
-            .expect("terminalize execution");
+            .expect("terminalize renewer-generation execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandon_fails_closed_while_a_renewal_is_in_flight() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:renewer-in-flight-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-renewer-in-flight"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim stdout owner");
+        let renewal = runtime
+            .stdout_owner_renewals
+            .get(&execution_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("active renewer");
+
+        let mut row_lock = store.pool().begin().await.expect("begin owner row lock");
+        sqlx::query(
+            "select execution_id from session_executions where execution_id = $1 for update",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *row_lock)
+        .await
+        .expect("lock owner row");
+        renewal.renew_now.notify_one();
+        timeout(Duration::from_secs(1), renewal.renew_db_started.notified())
+            .await
+            .expect("renewer must reach its database update");
+
+        let release_started = runtime.stdout_owner_release_started.notified();
+        tokio::pin!(release_started);
+        assert!(
+            !runtime.abandon_stdout_owner(&execution_id).await,
+            "a blocked renewal must make abandonment fail closed"
+        );
+        assert!(
+            runtime.stdout_owner_renewals.contains_key(&execution_id),
+            "the in-flight generation must stay registered until its update resolves"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), release_started.as_mut())
+                .await
+                .is_err(),
+            "lease release must not start until the renewer is known to be stopped"
+        );
+
+        row_lock.rollback().await.expect("release owner row lock");
+        timeout(Duration::from_secs(1), renewal.wait_stopped())
+            .await
+            .expect("cancelled renewer must stop after its database update");
+        assert!(
+            runtime.abandon_stdout_owner(&execution_id).await,
+            "abandonment may release once the old generation is stopped"
+        );
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, "peer-control-plane", Duration::from_secs(5),)
+                .await
+                .expect("peer claims released owner")
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize in-flight-renewer execution");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawned_adoption_loop_recovers_orphans() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-loop-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10259,10 +13161,10 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn periodic_scans_record_deferral_once() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:adopt-dedup-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
@@ -10314,29 +13216,128 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_handoff_releases_owned_leases() {
+    async fn terminal_paths_stop_stdout_owner_renewers() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        let completed_thread =
+            ThreadKey::parse(format!("test:renewer-completed-{}", uuid::Uuid::new_v4())).unwrap();
+        let completed_execution = orphaned_execution(
+            &store,
+            &completed_thread,
+            Some("sbx-renewer-completed"),
+            true,
+        )
+        .await;
+        runtime
+            .claim_stdout_owner(&completed_execution)
+            .await
+            .expect("claim completed execution");
+        assert!(
+            record_terminal_output(
+                &runtime.context(),
+                &completed_thread,
+                "sbx-renewer-completed",
+                &completed_execution,
+                TerminalOutput::Completed {
+                    reason: "test",
+                    result_text: Some("done".to_owned()),
+                },
+            )
+            .await
+            .expect("record completed terminal")
+        );
+        assert!(
+            !runtime
+                .stdout_owner_renewals
+                .contains_key(&completed_execution)
+        );
+
+        let max_thread =
+            ThreadKey::parse(format!("test:renewer-max-{}", uuid::Uuid::new_v4())).unwrap();
+        let max_execution =
+            orphaned_execution(&store, &max_thread, Some("sbx-renewer-max"), true).await;
+        runtime
+            .claim_stdout_owner(&max_execution)
+            .await
+            .expect("claim max-duration execution");
+        record_max_duration_failure(
+            &runtime.context(),
+            &max_thread,
+            &max_execution,
+            Duration::from_millis(5),
+            None,
+        )
+        .await
+        .expect("record max-duration terminal");
+        assert!(!runtime.stdout_owner_renewals.contains_key(&max_execution));
+
+        let startup_thread =
+            ThreadKey::parse(format!("test:renewer-startup-{}", uuid::Uuid::new_v4())).unwrap();
+        let startup_execution =
+            orphaned_execution(&store, &startup_thread, Some("sbx-renewer-startup"), true).await;
+        runtime
+            .claim_stdout_owner(&startup_execution)
+            .await
+            .expect("claim startup-failure execution");
+        runtime
+            .record_execution_failure(
+                &startup_thread,
+                &startup_execution,
+                &SessionRuntimeError::BadRequest("test startup failure".to_owned()),
+            )
+            .await;
+        assert!(
+            !runtime
+                .stdout_owner_renewals
+                .contains_key(&startup_execution)
+        );
+
+        for (thread_key, execution_id) in [
+            (&completed_thread, &completed_execution),
+            (&max_thread, &max_execution),
+            (&startup_thread, &startup_execution),
+        ] {
+            assert!(
+                store
+                    .list_events_after(thread_key, 0, Some(execution_id), 100)
+                    .await
+                    .expect("read terminal events")
+                    .iter()
+                    .any(|event| is_terminal_execution_event(&event.event_type)),
+                "each terminal status must commit its terminal event"
+            );
+        }
+        assert!(runtime.stdout_owner_renewals.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_handoff_releases_owned_leases() {
         let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
         let thread_key =
             ThreadKey::parse(format!("test:handoff-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let runtime = runtime_with(&store, backend);
-        assert!(
-            store
-                .claim_stdout_owner(
-                    &execution_id,
-                    &runtime.stdout_owner_id,
-                    Duration::from_secs(60)
-                )
-                .await
-                .expect("claim as this control plane")
-        );
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim as this control plane");
+        assert!(runtime.stdout_owner_renewals.contains_key(&execution_id));
 
         runtime.handoff_owned_executions(Duration::ZERO).await;
 
+        assert!(
+            runtime.stdout_owner_renewals.is_empty(),
+            "handoff must stop renewers before releasing leases"
+        );
         wait_for_event(&store, &thread_key, "session.stdout_owner_released").await;
         // The lease is immediately claimable by a peer control plane; without
         // the handoff it would only expire after the lease TTL.
@@ -10354,25 +13355,19 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_handoff_waits_for_executions_to_finish() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:handoff-wait-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let runtime = runtime_with(&store, backend);
-        assert!(
-            store
-                .claim_stdout_owner(
-                    &execution_id,
-                    &runtime.stdout_owner_id,
-                    Duration::from_secs(60)
-                )
-                .await
-                .expect("claim as this control plane")
-        );
+        runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect("claim as this control plane");
 
         // The execution finishes while the drain is waiting; no lease should
         // be released and no handoff event recorded.
@@ -10385,9 +13380,18 @@ mod adoption_tests {
                 .await
                 .expect("complete execution")
         });
-        runtime
-            .handoff_owned_executions(Duration::from_secs(5))
-            .await;
+        let handoff_runtime = runtime.clone();
+        let handoff = tokio::spawn(async move {
+            handoff_runtime
+                .handoff_owned_executions(Duration::from_secs(5))
+                .await;
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            runtime.stdout_owner_renewals.contains_key(&execution_id),
+            "shutdown drain must keep renewing while the execution can still finish"
+        );
+        handoff.await.expect("join shutdown handoff");
         let completed = completer.await.expect("completer task");
         assert!(
             completed.is_some(),
@@ -10400,16 +13404,20 @@ mod adoption_tests {
                 .all(|event| event.event_type != "session.stdout_owner_released"),
             "finished execution must not be handed off"
         );
+        assert!(
+            runtime.stdout_owner_renewals.is_empty(),
+            "shutdown must stop renewers after the drain finishes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_fences_new_stdout_claims() {
+        let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
-        let _serial = TEST_LOCK.lock().await;
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-        let runtime = runtime_with(&store, backend);
+        let runtime = runtime_with(&store, backend.clone());
 
         // Nothing owned: the handoff returns immediately but still flips
         // the shutdown fence.
@@ -10426,9 +13434,118 @@ mod adoption_tests {
             matches!(error, SessionRuntimeError::ShuttingDown),
             "unexpected error: {error}"
         );
+        let error = runtime
+            .claim_expired_stdout_owner(&execution_id)
+            .await
+            .expect_err("adoption claims after shutdown must be rejected");
+        assert!(matches!(error, SessionRuntimeError::ShuttingDown));
+
+        backend.set_recorded_output(completed_output_lines(
+            "A shutting-down runtime must not adopt this.",
+        ));
+        runtime.adopt_orphaned_executions().await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter().all(|event| {
+                event.event_type != "session.execution_adopted"
+                    && event.event_type != "session.execution_completed"
+                    && event.event_type != "session.execution_failed"
+            }),
+            "shutdown must fence adoption scans and orphan-failure claims"
+        );
+        assert!(
+            store
+                .active_execution_for_thread(&thread_key)
+                .await
+                .expect("load shutdown-fenced execution")
+                .is_some()
+        );
         store
             .fail_execution_if_active(&execution_id, "test cleanup")
             .await
             .expect("terminalize execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_handoff_fences_a_claim_already_waiting_in_the_database() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:handoff-claim-race-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        let mut row_lock = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin execution row lock");
+        sqlx::query(
+            "select execution_id from session_executions where execution_id = $1 for update",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *row_lock)
+        .await
+        .expect("lock execution row");
+
+        let claim_runtime = runtime.clone();
+        let claim_execution_id = execution_id.clone();
+        let claim =
+            tokio::spawn(
+                async move { claim_runtime.claim_stdout_owner(&claim_execution_id).await },
+            );
+        timeout(
+            Duration::from_secs(2),
+            runtime.stdout_owner_claim_db_started.notified(),
+        )
+        .await
+        .expect("claim must reach its database update");
+
+        let handoff_runtime = runtime.clone();
+        let handoff = tokio::spawn(async move {
+            handoff_runtime
+                .handoff_owned_executions(Duration::ZERO)
+                .await;
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.shutting_down.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for shutdown fence"
+            );
+            tokio::task::yield_now().await;
+        }
+        row_lock
+            .rollback()
+            .await
+            .expect("release execution row lock");
+
+        let error = claim
+            .await
+            .expect("join in-flight claim")
+            .expect_err("in-flight claim must yield to shutdown");
+        assert!(matches!(error, SessionRuntimeError::ShuttingDown));
+        handoff.await.expect("join handoff");
+        assert_eq!(
+            store
+                .count_executions_with_stdout_owner(&runtime.stdout_owner_id)
+                .await
+                .expect("count post-handoff owners"),
+            0,
+            "no claim may commit after handoff releases this runtime's leases"
+        );
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, "peer-control-plane", Duration::from_secs(5),)
+                .await
+                .expect("peer claims after handoff")
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize claim-race execution");
     }
 }
