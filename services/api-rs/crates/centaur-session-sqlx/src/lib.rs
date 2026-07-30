@@ -15,7 +15,7 @@ use sqlx::{
     types::Json,
 };
 use thiserror::Error;
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
@@ -37,6 +37,53 @@ pub struct ClaimExecutionResult {
     /// `running`. False means another request already claimed it (or it is
     /// terminal), so the caller must not drive the execution.
     pub claimed: bool,
+}
+
+/// The only terminal lifecycle transitions a stdout owner may publish.
+///
+/// The status, resulting session state, and event type are derived from the
+/// variant so callers cannot commit a mismatched terminal record.
+#[derive(Clone, Debug)]
+pub enum OwnedTerminalEvent {
+    Completed { payload: Value },
+    Failed { error: String, payload: Value },
+    Cancelled { reason: String, payload: Value },
+}
+
+impl OwnedTerminalEvent {
+    fn into_parts(
+        self,
+    ) -> (
+        ExecutionStatus,
+        SessionStatus,
+        Option<String>,
+        &'static str,
+        Value,
+    ) {
+        match self {
+            Self::Completed { payload } => (
+                ExecutionStatus::Completed,
+                SessionStatus::Idle,
+                None,
+                "session.execution_completed",
+                payload,
+            ),
+            Self::Failed { error, payload } => (
+                ExecutionStatus::Failed,
+                SessionStatus::Failed,
+                Some(error),
+                "session.execution_failed",
+                payload,
+            ),
+            Self::Cancelled { reason, payload } => (
+                ExecutionStatus::Cancelled,
+                SessionStatus::Idle,
+                Some(reason),
+                "session.execution_cancelled",
+                payload,
+            ),
+        }
+    }
 }
 
 /// An active execution whose stdout-owner lease was released by
@@ -519,7 +566,7 @@ impl PgSessionStore {
             r#"
             select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at,
                    stdout_owner_id,
-                   coalesce(stdout_owner_lease_expires_at > now(), false) as stdout_owner_lease_active
+                   coalesce(stdout_owner_lease_expires_at > clock_timestamp(), false) as stdout_owner_lease_active
             from session_executions
             where status in ($1, $2)
             order by created_at, execution_id
@@ -607,31 +654,42 @@ impl PgSessionStore {
         })
     }
 
+    /// Claims an unowned lease or extends this owner's still-live lease.
+    /// Ordinary claims never revive an expired owner lease.
     pub async fn claim_stdout_owner(
         &self,
         execution_id: &str,
         owner_id: &str,
         lease: Duration,
     ) -> Result<bool, SessionStoreError> {
-        let lease_expires_at = stdout_lease_expires_at(lease);
+        let lease_seconds = lease.as_secs_f64();
         let result = sqlx::query(
             r#"
             update session_executions
             set stdout_owner_id = $2,
-                stdout_owner_lease_expires_at = $3,
+                stdout_owner_lease_expires_at = clock_timestamp() + ($3::float8 * interval '1 second'),
                 updated_at = now()
             where execution_id = $1
               and status in ($4, $5)
               and (
                 stdout_owner_id is null
-                or stdout_owner_id = $2
-                or stdout_owner_lease_expires_at < now()
+                or (
+                    stdout_owner_id = $2
+                    and stdout_owner_lease_expires_at > clock_timestamp()
+                )
+                or (
+                    stdout_owner_id <> $2
+                    and (
+                        stdout_owner_lease_expires_at is null
+                        or stdout_owner_lease_expires_at <= clock_timestamp()
+                    )
+                )
               )
             "#,
         )
         .bind(execution_id)
         .bind(owner_id)
-        .bind(lease_expires_at)
+        .bind(lease_seconds)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
         .execute(&self.pool)
@@ -640,30 +698,34 @@ impl PgSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Claims an unowned or expired lease for recovery adoption. A runtime's
+    /// local output gate makes reclaiming its own expired lease safe here;
+    /// ordinary output writes must still prove a live lease independently.
     pub async fn claim_expired_stdout_owner(
         &self,
         execution_id: &str,
         owner_id: &str,
         lease: Duration,
     ) -> Result<bool, SessionStoreError> {
-        let lease_expires_at = stdout_lease_expires_at(lease);
+        let lease_seconds = lease.as_secs_f64();
         let result = sqlx::query(
             r#"
             update session_executions
             set stdout_owner_id = $2,
-                stdout_owner_lease_expires_at = $3,
+                stdout_owner_lease_expires_at = clock_timestamp() + ($3::float8 * interval '1 second'),
                 updated_at = now()
             where execution_id = $1
               and status in ($4, $5)
               and (
                 stdout_owner_id is null
-                or stdout_owner_lease_expires_at < now()
+                or stdout_owner_lease_expires_at is null
+                or stdout_owner_lease_expires_at <= clock_timestamp()
               )
             "#,
         )
         .bind(execution_id)
         .bind(owner_id)
-        .bind(lease_expires_at)
+        .bind(lease_seconds)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
         .execute(&self.pool)
@@ -678,20 +740,21 @@ impl PgSessionStore {
         owner_id: &str,
         lease: Duration,
     ) -> Result<bool, SessionStoreError> {
-        let lease_expires_at = stdout_lease_expires_at(lease);
+        let lease_seconds = lease.as_secs_f64();
         let result = sqlx::query(
             r#"
             update session_executions
-            set stdout_owner_lease_expires_at = $3,
+            set stdout_owner_lease_expires_at = clock_timestamp() + ($3::float8 * interval '1 second'),
                 updated_at = now()
             where execution_id = $1
               and stdout_owner_id = $2
+              and stdout_owner_lease_expires_at > clock_timestamp()
               and status in ($4, $5)
             "#,
         )
         .bind(execution_id)
         .bind(owner_id)
-        .bind(lease_expires_at)
+        .bind(lease_seconds)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
         .execute(&self.pool)
@@ -825,41 +888,6 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
-    pub async fn complete_execution_if_active_and_stdout_owner(
-        &self,
-        execution_id: &str,
-        owner_id: &str,
-    ) -> Result<Option<SessionExecution>, SessionStoreError> {
-        let row = sqlx::query_as::<_, SessionExecutionRow>(
-            r#"
-            update session_executions
-            set status = $2,
-                completed_at = coalesce(completed_at, now()),
-                stdout_owner_id = null,
-                stdout_owner_lease_expires_at = null,
-                updated_at = now()
-            where execution_id = $1
-              and status in ($3, $4)
-              and stdout_owner_id = $5
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
-            "#,
-        )
-        .bind(execution_id)
-        .bind(ExecutionStatus::Completed.as_ref())
-        .bind(ExecutionStatus::Queued.as_ref())
-        .bind(ExecutionStatus::Running.as_ref())
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        self.set_session_status(&row.thread_key, SessionStatus::Idle)
-            .await?;
-        row.try_into().map(Some)
-    }
-
     pub async fn fail_execution(
         &self,
         execution_id: &str,
@@ -913,13 +941,19 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
-    pub async fn fail_execution_if_active_and_stdout_owner(
+    /// Records an owner-fenced terminal execution transition and its durable
+    /// lifecycle event together. A rejected owner fence produces no state or
+    /// event change; an event write failure rolls the transition back.
+    pub async fn terminalize_execution_and_append_event_if_stdout_owner(
         &self,
         execution_id: &str,
         owner_id: &str,
-        error: &str,
-    ) -> Result<Option<SessionExecution>, SessionStoreError> {
-        let row = sqlx::query_as::<_, SessionExecutionRow>(
+        terminal: OwnedTerminalEvent,
+    ) -> Result<Option<(SessionExecution, SessionEvent)>, SessionStoreError> {
+        let (terminal_status, session_status, error, event_type, payload) = terminal.into_parts();
+
+        let mut tx = self.pool.begin().await?;
+        let execution_row = sqlx::query_as::<_, SessionExecutionRow>(
             r#"
             update session_executions
             set status = $2,
@@ -931,62 +965,78 @@ impl PgSessionStore {
             where execution_id = $1
               and status in ($4, $5)
               and stdout_owner_id = $6
+              and stdout_owner_lease_expires_at > clock_timestamp()
             returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
             "#,
         )
         .bind(execution_id)
-        .bind(ExecutionStatus::Failed.as_ref())
-        .bind(error)
+        .bind(terminal_status.as_ref())
+        .bind(&error)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
         .bind(owner_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        let Some(row) = row else {
+        let Some(execution_row) = execution_row else {
+            tx.commit().await?;
             return Ok(None);
         };
-        self.set_session_status(&row.thread_key, SessionStatus::Failed)
-            .await?;
-        row.try_into().map(Some)
-    }
 
-    pub async fn cancel_execution_if_active_and_stdout_owner(
-        &self,
-        execution_id: &str,
-        owner_id: &str,
-        reason: &str,
-    ) -> Result<Option<SessionExecution>, SessionStoreError> {
-        let row = sqlx::query_as::<_, SessionExecutionRow>(
+        // The partial one-active-execution index makes a successor insert
+        // wait for this transaction once this row leaves its active state.
+        // Updating the session before commit therefore cannot overwrite a
+        // successor's `executing` status; the extra predicate preserves that
+        // invariant even if historical data somehow violates the index.
+        let execution_thread_key = execution_row.thread_key.clone();
+
+        sqlx::query(
             r#"
-            update session_executions
-            set status = $2,
-                error = $3,
-                completed_at = coalesce(completed_at, now()),
-                stdout_owner_id = null,
-                stdout_owner_lease_expires_at = null,
-                updated_at = now()
-            where execution_id = $1
-              and status in ($4, $5)
-              and stdout_owner_id = $6
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            update sessions as s
+            set status = $2, updated_at = now()
+            where s.thread_key = $1
+              and not exists (
+                  select 1
+                  from session_executions active
+                  where active.thread_key = s.thread_key
+                    and active.status in ($3, $4)
+              )
             "#,
         )
-        .bind(execution_id)
-        .bind(ExecutionStatus::Cancelled.as_ref())
-        .bind(reason)
+        .bind(&execution_thread_key)
+        .bind(session_status.as_ref())
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
+        let event_row = match sqlx::query_as::<_, SessionEventRow>(
+            r#"
+            insert into session_events (thread_key, execution_id, event_type, payload)
+            values ($1, $2, $3, $4)
+            returning event_id, thread_key, execution_id, event_type, payload, created_at
+            "#,
+        )
+        .bind(&execution_thread_key)
+        .bind(execution_id)
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error.into());
+            }
         };
-        self.set_session_status(&row.thread_key, SessionStatus::Idle)
-            .await?;
-        row.try_into().map(Some)
+
+        // Convert while the transaction is still open so malformed persisted
+        // data cannot leave a terminal state committed without a usable event.
+        let execution = execution_row.try_into()?;
+        let event = event_row.try_into()?;
+        tx.commit().await?;
+        Ok(Some((execution, event)))
     }
 
     pub async fn append_event(
@@ -1022,22 +1072,23 @@ impl PgSessionStore {
         event_type: &str,
         payload: Value,
     ) -> Result<Option<SessionEvent>, SessionStoreError> {
-        let lease_expires_at = stdout_lease_expires_at(lease);
+        let lease_seconds = lease.as_secs_f64();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             update session_executions
-            set stdout_owner_lease_expires_at = $3,
+            set stdout_owner_lease_expires_at = clock_timestamp() + ($3::float8 * interval '1 second'),
                 updated_at = now()
             where execution_id = $1
               and stdout_owner_id = $2
+              and stdout_owner_lease_expires_at > clock_timestamp()
               and status in ($4, $5)
               and thread_key = $6
             "#,
         )
         .bind(execution_id)
         .bind(owner_id)
-        .bind(lease_expires_at)
+        .bind(lease_seconds)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
         .bind(thread_key.as_str())
@@ -1596,6 +1647,48 @@ impl PgSessionStore {
         row.try_into()
     }
 
+    /// Persists stdout-derived harness state only while the caller still owns
+    /// the execution's live stdout lease. This prevents an expired pump from
+    /// overwriting the root recovered by an adopting control plane.
+    pub async fn update_harness_thread_id_if_stdout_owner(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        owner_id: &str,
+        harness_thread_id: Option<&str>,
+    ) -> Result<Option<Session>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            r#"
+            with owned_execution as materialized (
+                select thread_key, stdout_owner_lease_expires_at
+                from session_executions
+                where execution_id = $2
+                  and stdout_owner_id = $3
+                  and status in ($5, $6)
+                for update
+            )
+            update sessions as session
+            set harness_thread_id = $4,
+                updated_at = now()
+            from owned_execution as execution
+            where session.thread_key = $1
+              and execution.thread_key = session.thread_key
+              and execution.stdout_owner_lease_expires_at > clock_timestamp()
+            returning session.thread_key, session.title, session.sandbox_id, session.sandbox_repo_cache_enabled, session.sandbox_repo_cache_access, session.sandbox_observability_enabled, session.sandbox_api_server_enabled, session.harness_type, session.harness_thread_id, session.persona_id, session.status, session.iron_control_principal, session.proxy_labels, session.sandbox_last_active_at, session.created_at, session.updated_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(execution_id)
+        .bind(owner_id)
+        .bind(harness_thread_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn touch_session_sandbox_activity(
         &self,
         thread_key: &ThreadKey,
@@ -2028,22 +2121,18 @@ pub fn default_metadata(metadata: Option<Value>) -> Value {
     metadata.unwrap_or_else(empty_object)
 }
 
-fn stdout_lease_expires_at(lease: Duration) -> OffsetDateTime {
-    let seconds = i64::try_from(lease.as_secs()).unwrap_or(i64::MAX);
-    OffsetDateTime::now_utc() + TimeDuration::new(seconds, lease.subsec_nanos() as i32)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use centaur_session_core::{HarnessType, ThreadKey};
+    use centaur_session_core::{ExecutionStatus, HarnessType, SessionStatus, ThreadKey};
     use serde_json::json;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
     use super::{
-        IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification, SessionStoreError,
+        IdleSandboxCandidateRow, OwnedTerminalEvent, PgSessionStore, SessionEventNotification,
+        SessionStoreError,
     };
 
     async fn test_store() -> Option<PgSessionStore> {
@@ -2056,6 +2145,135 @@ mod tests {
             .expect("connect test db");
         store.run_migrations().await.expect("run migrations");
         Some(store)
+    }
+
+    async fn running_execution_with_stdout_owner(
+        store: &PgSessionStore,
+        label: &str,
+        owner_id: &str,
+    ) -> (ThreadKey, String) {
+        let thread_key =
+            ThreadKey::parse(format!("test:stdout-owner-{label}-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark running");
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, owner_id, Duration::from_secs(60))
+                .await
+                .expect("claim stdout owner")
+        );
+        (thread_key, execution_id)
+    }
+
+    async fn expire_stdout_owner(store: &PgSessionStore, execution_id: &str) {
+        sqlx::query(
+            r#"
+            update session_executions
+            set stdout_owner_lease_expires_at = clock_timestamp() - interval '1 second',
+                updated_at = now()
+            where execution_id = $1
+            "#,
+        )
+        .bind(execution_id)
+        .execute(store.pool())
+        .await
+        .expect("expire stdout-owner lease");
+    }
+
+    async fn assert_execution_still_active(store: &PgSessionStore, thread_key: &ThreadKey) {
+        let execution = store
+            .active_execution_for_thread(thread_key)
+            .await
+            .expect("read active execution")
+            .expect("expired owner must not terminalize execution");
+        assert_eq!(
+            execution.status,
+            centaur_session_core::ExecutionStatus::Running
+        );
+    }
+
+    async fn cleanup_active_execution(store: &PgSessionStore, execution_id: &str) {
+        assert!(
+            store
+                .fail_execution_if_active(execution_id, "test cleanup")
+                .await
+                .expect("terminalize test execution")
+                .is_some(),
+            "test fixture must still be active during cleanup"
+        );
+    }
+
+    async fn terminalize_completed(
+        store: &PgSessionStore,
+        execution_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<centaur_session_core::SessionExecution>, SessionStoreError> {
+        store
+            .terminalize_execution_and_append_event_if_stdout_owner(
+                execution_id,
+                owner_id,
+                OwnedTerminalEvent::Completed {
+                    payload: json!({"source": "test"}),
+                },
+            )
+            .await
+            .map(|result| result.map(|(execution, _)| execution))
+    }
+
+    async fn terminalize_failed(
+        store: &PgSessionStore,
+        execution_id: &str,
+        owner_id: &str,
+        error: &str,
+    ) -> Result<Option<centaur_session_core::SessionExecution>, SessionStoreError> {
+        store
+            .terminalize_execution_and_append_event_if_stdout_owner(
+                execution_id,
+                owner_id,
+                OwnedTerminalEvent::Failed {
+                    error: error.to_owned(),
+                    payload: json!({"error": error}),
+                },
+            )
+            .await
+            .map(|result| result.map(|(execution, _)| execution))
+    }
+
+    async fn terminalize_cancelled(
+        store: &PgSessionStore,
+        execution_id: &str,
+        owner_id: &str,
+        reason: &str,
+    ) -> Result<Option<centaur_session_core::SessionExecution>, SessionStoreError> {
+        store
+            .terminalize_execution_and_append_event_if_stdout_owner(
+                execution_id,
+                owner_id,
+                OwnedTerminalEvent::Cancelled {
+                    reason: reason.to_owned(),
+                    payload: json!({"reason": reason}),
+                },
+            )
+            .await
+            .map(|result| result.map(|(execution, _)| execution))
     }
 
     #[test]
@@ -2407,7 +2625,7 @@ mod tests {
 
         assert!(
             store
-                .claim_stdout_owner(&execution_id, "owner-a", Duration::from_millis(25))
+                .claim_stdout_owner(&execution_id, "owner-a", Duration::from_secs(60))
                 .await
                 .expect("owner-a claims stdout")
         );
@@ -2417,7 +2635,7 @@ mod tests {
                     &thread_key,
                     &execution_id,
                     "owner-a",
-                    Duration::from_millis(25),
+                    Duration::from_secs(60),
                     "session.output.line",
                     json!("line-from-owner-a"),
                 )
@@ -2431,7 +2649,7 @@ mod tests {
                     &thread_key,
                     &execution_id,
                     "owner-b",
-                    Duration::from_millis(25),
+                    Duration::from_secs(60),
                     "session.output.line",
                     json!("line-from-stale-owner-b"),
                 )
@@ -2440,14 +2658,13 @@ mod tests {
                 .is_none()
         );
         assert!(
-            store
-                .complete_execution_if_active_and_stdout_owner(&execution_id, "owner-b")
+            terminalize_completed(&store, &execution_id, "owner-b")
                 .await
                 .expect("owner-b terminal update is fenced")
                 .is_none()
         );
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        expire_stdout_owner(&store, &execution_id).await;
         assert!(
             store
                 .claim_expired_stdout_owner(&execution_id, "owner-b", Duration::from_secs(5))
@@ -2468,8 +2685,7 @@ mod tests {
                 .expect("expired owner-a append is fenced")
                 .is_none()
         );
-        let completed = store
-            .complete_execution_if_active_and_stdout_owner(&execution_id, "owner-b")
+        let completed = terminalize_completed(&store, &execution_id, "owner-b")
             .await
             .expect("owner-b completes")
             .expect("completion should be recorded");
@@ -2477,6 +2693,773 @@ mod tests {
             completed.status,
             centaur_session_core::ExecutionStatus::Completed
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_stdout_owner_can_renew_append_and_terminalize() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner_id = format!("owner-{}", Uuid::new_v4().simple());
+
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "active-complete", &owner_id).await;
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, &owner_id, Duration::from_secs(60))
+                .await
+                .expect("active owner extends its lease through a repeat claim")
+        );
+        assert!(
+            store
+                .renew_stdout_owner(&execution_id, &owner_id, Duration::from_secs(60))
+                .await
+                .expect("active owner renews")
+        );
+        assert!(
+            store
+                .append_event_if_stdout_owner(
+                    &thread_key,
+                    &execution_id,
+                    &owner_id,
+                    Duration::from_secs(60),
+                    "session.output.line",
+                    json!("line-from-active-owner"),
+                )
+                .await
+                .expect("active owner appends")
+                .is_some()
+        );
+        let completed = terminalize_completed(&store, &execution_id, &owner_id)
+            .await
+            .expect("complete as active owner")
+            .expect("active owner completes");
+        assert_eq!(
+            completed.status,
+            centaur_session_core::ExecutionStatus::Completed
+        );
+
+        let (_, failed_execution_id) =
+            running_execution_with_stdout_owner(&store, "active-fail", &owner_id).await;
+        let failed = terminalize_failed(
+            &store,
+            &failed_execution_id,
+            &owner_id,
+            "expected test failure",
+        )
+        .await
+        .expect("fail as active owner")
+        .expect("active owner fails execution");
+        assert_eq!(failed.status, centaur_session_core::ExecutionStatus::Failed);
+
+        let (_, cancelled_execution_id) =
+            running_execution_with_stdout_owner(&store, "active-cancel", &owner_id).await;
+        let cancelled = terminalize_cancelled(
+            &store,
+            &cancelled_execution_id,
+            &owner_id,
+            "expected test cancellation",
+        )
+        .await
+        .expect("cancel as active owner")
+        .expect("active owner cancels execution");
+        assert_eq!(
+            cancelled.status,
+            centaur_session_core::ExecutionStatus::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminalize_execution_and_event_commits_exact_terminal_lifecycle() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+
+        let cases = [
+            (
+                "complete",
+                OwnedTerminalEvent::Completed {
+                    payload: json!({"completion_reason": "process_exited"}),
+                },
+                ExecutionStatus::Completed,
+                None,
+                "session.execution_completed",
+                json!({"completion_reason": "process_exited"}),
+                SessionStatus::Idle,
+            ),
+            (
+                "fail",
+                OwnedTerminalEvent::Failed {
+                    error: "expected test failure".to_owned(),
+                    payload: json!({"error": "expected test failure"}),
+                },
+                ExecutionStatus::Failed,
+                Some("expected test failure"),
+                "session.execution_failed",
+                json!({"error": "expected test failure"}),
+                SessionStatus::Failed,
+            ),
+            (
+                "cancel",
+                OwnedTerminalEvent::Cancelled {
+                    reason: "expected test cancellation".to_owned(),
+                    payload: json!({"reason": "expected test cancellation"}),
+                },
+                ExecutionStatus::Cancelled,
+                Some("expected test cancellation"),
+                "session.execution_cancelled",
+                json!({"reason": "expected test cancellation"}),
+                SessionStatus::Idle,
+            ),
+        ];
+
+        for (
+            label,
+            terminal,
+            expected_terminal_status,
+            expected_error,
+            expected_event_type,
+            expected_payload,
+            expected_session_status,
+        ) in cases
+        {
+            let owner_id = format!("owner-{label}-{}", Uuid::new_v4().simple());
+            let (thread_key, execution_id) =
+                running_execution_with_stdout_owner(&store, label, &owner_id).await;
+            let (execution, event) = store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &execution_id,
+                    &owner_id,
+                    terminal,
+                )
+                .await
+                .expect("terminal transition and event succeed")
+                .expect("active owner terminalizes execution");
+
+            assert_eq!(execution.status, expected_terminal_status);
+            assert_eq!(execution.error.as_deref(), expected_error);
+            assert_eq!(event.thread_key, thread_key);
+            assert_eq!(event.execution_id.as_deref(), Some(execution_id.as_str()));
+            assert_eq!(event.event_type, expected_event_type);
+            assert_eq!(event.payload, expected_payload);
+            assert_eq!(
+                store
+                    .get_session(&thread_key)
+                    .await
+                    .expect("read terminal session")
+                    .status,
+                expected_session_status
+            );
+            assert_eq!(
+                store
+                    .list_events_after(&thread_key, 0, Some(&execution_id), 100)
+                    .await
+                    .expect("read terminal event"),
+                vec![event],
+                "the returned lifecycle event must be durably committed with the transition"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminalize_execution_and_event_owner_fence_is_a_noop() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let old_owner_id = format!("owner-old-{}", Uuid::new_v4().simple());
+        let new_owner_id = format!("owner-new-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "terminal-fence", &old_owner_id).await;
+
+        assert!(
+            store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &execution_id,
+                    "wrong-owner",
+                    OwnedTerminalEvent::Completed {
+                        payload: json!({"source": "wrong_owner"}),
+                    },
+                )
+                .await
+                .expect("wrong owner is a fenced no-op")
+                .is_none()
+        );
+        assert_execution_still_active(&store, &thread_key).await;
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 100)
+                .await
+                .expect("read events after wrong-owner fence")
+                .is_empty()
+        );
+
+        expire_stdout_owner(&store, &execution_id).await;
+        assert!(
+            store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &execution_id,
+                    &old_owner_id,
+                    OwnedTerminalEvent::Failed {
+                        error: "stale owner must not fail execution".to_owned(),
+                        payload: json!({"source": "expired_owner"}),
+                    },
+                )
+                .await
+                .expect("expired owner is a fenced no-op")
+                .is_none()
+        );
+        assert_execution_still_active(&store, &thread_key).await;
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session after stale owner fence")
+                .status,
+            SessionStatus::Executing
+        );
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 100)
+                .await
+                .expect("read events after stale owner fence")
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .claim_expired_stdout_owner(&execution_id, &new_owner_id, Duration::from_secs(60))
+                .await
+                .expect("new owner adopts expired lease")
+        );
+        assert!(
+            store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &execution_id,
+                    &new_owner_id,
+                    OwnedTerminalEvent::Completed {
+                        payload: json!({"source": "adopter"}),
+                    },
+                )
+                .await
+                .expect("adopter transition succeeds")
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminalize_execution_and_event_rolls_back_when_event_insert_fails() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner_id = format!("owner-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "terminal-event-rollback", &owner_id).await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("test_terminal_event_failure_fn_{suffix}");
+        let trigger_name = format!("test_terminal_event_failure_trigger_{suffix}");
+        let forced_event_type = "session.execution_failed";
+
+        sqlx::query(&format!(
+            r#"
+            create function {function_name}() returns trigger language plpgsql as $$
+            begin
+                if new.event_type = '{forced_event_type}' and new.execution_id = '{execution_id}' then
+                    raise exception 'forced terminal event insert failure';
+                end if;
+                return new;
+            end;
+            $$
+            "#,
+        ))
+        .execute(store.pool())
+        .await
+        .expect("install forced event failure function");
+        sqlx::query(&format!(
+            "create trigger {trigger_name} before insert on session_events for each row execute function {function_name}()"
+        ))
+        .execute(store.pool())
+        .await
+        .expect("install forced event failure trigger");
+
+        let terminal_result = store
+            .terminalize_execution_and_append_event_if_stdout_owner(
+                &execution_id,
+                &owner_id,
+                OwnedTerminalEvent::Failed {
+                    error: "must roll back".to_owned(),
+                    payload: json!({"error": "must roll back"}),
+                },
+            )
+            .await;
+
+        sqlx::query(&format!("drop trigger {trigger_name} on session_events"))
+            .execute(store.pool())
+            .await
+            .expect("remove forced event failure trigger");
+        sqlx::query(&format!("drop function {function_name}()"))
+            .execute(store.pool())
+            .await
+            .expect("remove forced event failure function");
+
+        let error = terminal_result.expect_err("forced event insertion must fail the transaction");
+        assert!(
+            error
+                .to_string()
+                .contains("forced terminal event insert failure"),
+            "the insert failure must reach the caller: {error}"
+        );
+        assert_execution_still_active(&store, &thread_key).await;
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session after rolled-back terminal transition")
+                .status,
+            SessionStatus::Executing
+        );
+        assert!(
+            store
+                .renew_stdout_owner(&execution_id, &owner_id, Duration::from_secs(60))
+                .await
+                .expect("rolled-back terminal transition preserves live owner")
+        );
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 100)
+                .await
+                .expect("read events after rolled-back terminal transition")
+                .is_empty(),
+            "a failed event write must not leave a terminal lifecycle event"
+        );
+
+        assert!(
+            store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &execution_id,
+                    &owner_id,
+                    OwnedTerminalEvent::Completed {
+                        payload: json!({"source": "rollback-test-cleanup"}),
+                    },
+                )
+                .await
+                .expect("owner remains able to terminalize after rollback")
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_transition_cannot_clobber_a_successor_session_status() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner_id = format!("owner-old-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "terminal-successor", &owner_id).await;
+
+        let mut session_lock = store.pool().begin().await.expect("begin session row lock");
+        sqlx::query("select 1 from sessions where thread_key = $1 for update")
+            .bind(thread_key.as_str())
+            .fetch_one(&mut *session_lock)
+            .await
+            .expect("lock session row");
+
+        let terminal_store = store.clone();
+        let terminal_execution_id = execution_id.clone();
+        let terminal_owner_id = owner_id.clone();
+        let mut terminal = tokio::spawn(async move {
+            terminal_store
+                .terminalize_execution_and_append_event_if_stdout_owner(
+                    &terminal_execution_id,
+                    &terminal_owner_id,
+                    OwnedTerminalEvent::Completed {
+                        payload: json!({"source": "contention-test"}),
+                    },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut terminal)
+                .await
+                .is_err(),
+            "the terminal transaction must wait on the session status row"
+        );
+
+        let successor_store = store.clone();
+        let successor_thread_key = thread_key.clone();
+        let mut successor = tokio::spawn(async move {
+            successor_store
+                .create_execution(&successor_thread_key, None, json!({"successor": true}))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut successor)
+                .await
+                .is_err(),
+            "the one-active-execution index must keep a successor out until the terminal transaction commits"
+        );
+
+        session_lock
+            .commit()
+            .await
+            .expect("release session row lock");
+        assert!(
+            terminal
+                .await
+                .expect("terminal task completes")
+                .expect("terminal transaction succeeds")
+                .is_some(),
+            "the original owner must terminalize the old execution"
+        );
+        let successor_execution = successor
+            .await
+            .expect("successor task completes")
+            .expect("successor insert succeeds after terminal commit")
+            .execution;
+        store
+            .mark_execution_running(&successor_execution.execution_id)
+            .await
+            .expect("mark successor running");
+
+        let active = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .expect("read successor execution")
+            .expect("successor remains active");
+        assert_eq!(active.execution_id, successor_execution.execution_id);
+        assert_eq!(active.status, ExecutionStatus::Running);
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session after successor begins")
+                .status,
+            SessionStatus::Executing,
+            "the old terminal transition must not overwrite the successor's executing session state"
+        );
+        assert!(
+            store
+                .list_events_after(&thread_key, 0, Some(&execution_id), 100)
+                .await
+                .expect("read old terminal event")
+                .iter()
+                .any(|event| event.event_type == "session.execution_completed"),
+            "the old terminal event must commit before the successor can start"
+        );
+        cleanup_active_execution(&store, &successor_execution.execution_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_stdout_owner_cannot_mutate_before_adoption() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner_id = format!("owner-{}", Uuid::new_v4().simple());
+
+        let (_, claim_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-claim", &owner_id).await;
+        expire_stdout_owner(&store, &claim_execution_id).await;
+        assert!(
+            !store
+                .claim_stdout_owner(&claim_execution_id, &owner_id, Duration::from_secs(60))
+                .await
+                .expect("expired owner cannot reclaim its own lease")
+        );
+        assert!(
+            store
+                .claim_expired_stdout_owner(
+                    &claim_execution_id,
+                    &owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("same runtime adopts its expired lease during recovery")
+        );
+        let adopted = terminalize_completed(&store, &claim_execution_id, &owner_id)
+            .await
+            .expect("same-runtime adopter terminalizes")
+            .expect("same-runtime adopter owns a live lease");
+        assert_eq!(
+            adopted.status,
+            centaur_session_core::ExecutionStatus::Completed
+        );
+
+        let (renew_thread_key, renew_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-renew", &owner_id).await;
+        expire_stdout_owner(&store, &renew_execution_id).await;
+        assert!(
+            !store
+                .renew_stdout_owner(&renew_execution_id, &owner_id, Duration::from_secs(60))
+                .await
+                .expect("expired owner renewal is rejected")
+        );
+        assert_execution_still_active(&store, &renew_thread_key).await;
+        cleanup_active_execution(&store, &renew_execution_id).await;
+
+        let (append_thread_key, append_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-append", &owner_id).await;
+        expire_stdout_owner(&store, &append_execution_id).await;
+        assert!(
+            store
+                .append_event_if_stdout_owner(
+                    &append_thread_key,
+                    &append_execution_id,
+                    &owner_id,
+                    Duration::from_secs(60),
+                    "session.output.line",
+                    json!("line-from-expired-owner"),
+                )
+                .await
+                .expect("expired owner append is rejected")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_events_after(&append_thread_key, 0, Some(&append_execution_id), 100)
+                .await
+                .expect("read output events")
+                .is_empty(),
+            "a rejected expired-owner write must not insert an output event"
+        );
+        assert_execution_still_active(&store, &append_thread_key).await;
+        cleanup_active_execution(&store, &append_execution_id).await;
+
+        let (complete_thread_key, complete_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-complete", &owner_id).await;
+        expire_stdout_owner(&store, &complete_execution_id).await;
+        assert!(
+            terminalize_completed(&store, &complete_execution_id, &owner_id)
+                .await
+                .expect("expired owner completion is rejected")
+                .is_none()
+        );
+        assert_execution_still_active(&store, &complete_thread_key).await;
+        cleanup_active_execution(&store, &complete_execution_id).await;
+
+        let (fail_thread_key, fail_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-fail", &owner_id).await;
+        expire_stdout_owner(&store, &fail_execution_id).await;
+        assert!(
+            terminalize_failed(
+                &store,
+                &fail_execution_id,
+                &owner_id,
+                "stale owner must not fail execution",
+            )
+            .await
+            .expect("expired owner failure is rejected")
+            .is_none()
+        );
+        assert_execution_still_active(&store, &fail_thread_key).await;
+        cleanup_active_execution(&store, &fail_execution_id).await;
+
+        let (cancel_thread_key, cancel_execution_id) =
+            running_execution_with_stdout_owner(&store, "expired-cancel", &owner_id).await;
+        expire_stdout_owner(&store, &cancel_execution_id).await;
+        assert!(
+            terminalize_cancelled(
+                &store,
+                &cancel_execution_id,
+                &owner_id,
+                "stale owner must not cancel execution",
+            )
+            .await
+            .expect("expired owner cancellation is rejected")
+            .is_none()
+        );
+        assert_execution_still_active(&store, &cancel_thread_key).await;
+        cleanup_active_execution(&store, &cancel_execution_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_owner_terminal_write_cannot_win_an_adoption_race() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let old_owner_id = format!("owner-old-{}", Uuid::new_v4().simple());
+        let new_owner_id = format!("owner-new-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "adoption-race", &old_owner_id).await;
+        expire_stdout_owner(&store, &execution_id).await;
+
+        let (claimed, stale_completion) = tokio::join!(
+            store.claim_expired_stdout_owner(&execution_id, &new_owner_id, Duration::from_secs(60)),
+            terminalize_completed(&store, &execution_id, &old_owner_id),
+        );
+        assert!(claimed.expect("new owner claims expired lease"));
+        assert!(
+            stale_completion
+                .expect("stale owner completion is rejected")
+                .is_none(),
+            "an expired owner cannot terminalize while an adopter claims the row"
+        );
+        assert_execution_still_active(&store, &thread_key).await;
+
+        let completed = terminalize_completed(&store, &execution_id, &new_owner_id)
+            .await
+            .expect("new owner terminalizes")
+            .expect("new owner owns a live lease");
+        assert_eq!(
+            completed.status,
+            centaur_session_core::ExecutionStatus::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_owner_fences_harness_thread_id_updates() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let old_owner_id = format!("owner-old-{}", Uuid::new_v4().simple());
+        let new_owner_id = format!("owner-new-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "harness-thread", &old_owner_id).await;
+
+        let root_a = store
+            .update_harness_thread_id_if_stdout_owner(
+                &thread_key,
+                &execution_id,
+                &old_owner_id,
+                Some("root-a"),
+            )
+            .await
+            .expect("active owner persists root")
+            .expect("active owner owns the root write");
+        assert_eq!(root_a.harness_thread_id.as_deref(), Some("root-a"));
+
+        expire_stdout_owner(&store, &execution_id).await;
+        assert!(
+            store
+                .update_harness_thread_id_if_stdout_owner(
+                    &thread_key,
+                    &execution_id,
+                    &old_owner_id,
+                    Some("stale-root"),
+                )
+                .await
+                .expect("expired root write is rejected")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session after stale root write")
+                .harness_thread_id
+                .as_deref(),
+            Some("root-a")
+        );
+
+        assert!(
+            store
+                .claim_expired_stdout_owner(&execution_id, &new_owner_id, Duration::from_secs(60))
+                .await
+                .expect("new owner adopts expired lease")
+        );
+        assert!(
+            store
+                .update_harness_thread_id_if_stdout_owner(
+                    &thread_key,
+                    &execution_id,
+                    &old_owner_id,
+                    Some("stale-root-after-adoption"),
+                )
+                .await
+                .expect("old owner remains fenced after adoption")
+                .is_none()
+        );
+        let root_b = store
+            .update_harness_thread_id_if_stdout_owner(
+                &thread_key,
+                &execution_id,
+                &new_owner_id,
+                Some("root-b"),
+            )
+            .await
+            .expect("adopter persists root")
+            .expect("adopter owns the root write");
+        assert_eq!(root_b.harness_thread_id.as_deref(), Some("root-b"));
+        let completed = terminalize_completed(&store, &execution_id, &new_owner_id)
+            .await
+            .expect("adopter terminalizes test execution")
+            .expect("adopter keeps its lease through cleanup");
+        assert_eq!(
+            completed.status,
+            centaur_session_core::ExecutionStatus::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_owner_root_write_rechecks_lease_after_waiting_on_execution_row() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner_id = format!("owner-{}", Uuid::new_v4().simple());
+        let (thread_key, execution_id) =
+            running_execution_with_stdout_owner(&store, "root-write-lock", &owner_id).await;
+        sqlx::query(
+            r#"
+            update session_executions
+            set stdout_owner_lease_expires_at = clock_timestamp() + interval '1 second',
+                updated_at = now()
+            where execution_id = $1
+            "#,
+        )
+        .bind(&execution_id)
+        .execute(store.pool())
+        .await
+        .expect("shorten owner lease");
+
+        let mut lock = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin row-lock transaction");
+        sqlx::query("select 1 from session_executions where execution_id = $1 for update")
+            .bind(&execution_id)
+            .fetch_one(&mut *lock)
+            .await
+            .expect("lock execution row");
+
+        let update_store = store.clone();
+        let update_thread_key = thread_key.clone();
+        let update_execution_id = execution_id.clone();
+        let update_owner_id = owner_id.clone();
+        let mut root_update = tokio::spawn(async move {
+            update_store
+                .update_harness_thread_id_if_stdout_owner(
+                    &update_thread_key,
+                    &update_execution_id,
+                    &update_owner_id,
+                    Some("stale-root"),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut root_update)
+                .await
+                .is_err(),
+            "the guarded root write must wait on the execution fence"
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        lock.commit().await.expect("release execution row lock");
+
+        assert!(
+            root_update
+                .await
+                .expect("root write task completes")
+                .expect("root write query succeeds")
+                .is_none(),
+            "the lease must be rechecked after the row-lock wait"
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read session after expired root write")
+                .harness_thread_id,
+            None
+        );
+        cleanup_active_execution(&store, &execution_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
