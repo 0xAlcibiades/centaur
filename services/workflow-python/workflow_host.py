@@ -187,10 +187,11 @@ def has_workflow_name_assignment(path: Path) -> bool:
     return False
 
 
-def discover_workflows() -> dict[str, RegisteredWorkflow]:
+def discover_workflows_with_candidate_count() -> tuple[dict[str, RegisteredWorkflow], int]:
     dirs = workflow_dirs()
     configure_workflow_import_paths(dirs)
     discovered: dict[str, RegisteredWorkflow] = {}
+    candidate_count = 0
     for directory in dirs:
         for path in sorted(directory.rglob("*.py")):
             if path.name == "__init__.py" or path.name.startswith("_"):
@@ -204,12 +205,18 @@ def discover_workflows() -> dict[str, RegisteredWorkflow]:
                 continue
             if registered is None:
                 continue
+            candidate_count += 1
             if not workflow_enabled(registered.workflow_name):
                 continue
             if registered.workflow_name in discovered:
                 raise RuntimeError(f"duplicate workflow name {registered.workflow_name!r}")
             discovered[registered.workflow_name] = registered
-    return discovered
+    return discovered, candidate_count
+
+
+def discover_workflows() -> dict[str, RegisteredWorkflow]:
+    workflows, _ = discover_workflows_with_candidate_count()
+    return workflows
 
 
 def coerce_value(value: Any, target_type: type) -> Any:
@@ -410,9 +417,10 @@ async def read_stdin(
 
 
 def discovery_payload() -> dict[str, Any]:
-    workflows = discover_workflows()
+    workflows, candidate_count = discover_workflows_with_candidate_count()
     return {
         "type": "workflow.discovery",
+        "candidate_count": candidate_count,
         "workflows": [
             {
                 "workflow_name": workflow.workflow_name,

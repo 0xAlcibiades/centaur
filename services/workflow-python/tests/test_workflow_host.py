@@ -103,6 +103,31 @@ class WorkflowHostTests(unittest.TestCase):
         self.assertEqual(error.to_dict()["status_code"], 422)
         self.assertIn("INVALID", str(error))
 
+    def test_discovery_reports_candidates_excluded_by_allowlist(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_path = Path(tmp) / "python_workflow.py"
+            workflow_path.write_text(
+                "WORKFLOW_NAME = 'python_workflow'\n"
+                "def handler(inp, ctx):\n"
+                "    return {'ok': True}\n"
+            )
+            with (
+                patch.object(host, "workflow_dirs", return_value=[Path(tmp)]),
+                patch.dict(
+                    os.environ,
+                    {
+                        "WORKFLOW_ENABLE_MODE": "allowlist",
+                        "WORKFLOW_ALLOWED_NAMES": "agent_turn",
+                    },
+                    clear=False,
+                ),
+            ):
+                payload = host.discovery_payload()
+
+        self.assertEqual(payload["candidate_count"], 1)
+        self.assertEqual(payload["workflows"], [])
+
     def test_step_accepts_step_kind_and_binds_tool_manager_rpc(self) -> None:
         host = load_workflow_host()
         from api import app as workflow_app

@@ -56,6 +56,12 @@ const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const WORKFLOW_HOST_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
+const NATIVE_WORKFLOWS: [NativeWorkflow; 4] = [
+    NativeWorkflow::Echo,
+    NativeWorkflow::SleepEcho,
+    NativeWorkflow::AgentTurn,
+    NativeWorkflow::ToolAndSlack,
+];
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
 const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
 /// How many consecutive reconcile passes a workflow must be missing from
@@ -127,6 +133,35 @@ struct WorkflowEnablement {
 enum WorkflowEnableMode {
     All,
     Allowlist,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWorkflow {
+    Echo,
+    SleepEcho,
+    AgentTurn,
+    ToolAndSlack,
+}
+
+impl NativeWorkflow {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "echo" => Some(Self::Echo),
+            "sleep_echo" => Some(Self::SleepEcho),
+            "agent_turn" => Some(Self::AgentTurn),
+            "tool_and_slack" => Some(Self::ToolAndSlack),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Echo => "echo",
+            Self::SleepEcho => "sleep_echo",
+            Self::AgentTurn => "agent_turn",
+            Self::ToolAndSlack => "tool_and_slack",
+        }
+    }
 }
 
 impl WorkflowEnablement {
@@ -1804,6 +1839,8 @@ struct PythonWorkflowDiscovery {
 #[derive(Debug, Deserialize)]
 struct PythonWorkflowDiscoveryPayload {
     workflows: Vec<PythonWorkflowDiscovery>,
+    #[serde(default)]
+    candidate_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1812,12 +1849,16 @@ struct PythonWorkflowMetadata {
     schedules: Vec<Value>,
     workflow_names: BTreeSet<String>,
     principals: BTreeSet<String>,
+    candidate_count: usize,
 }
 
 fn metadata_from_discovery_payload(
     payload: PythonWorkflowDiscoveryPayload,
 ) -> PythonWorkflowMetadata {
-    let mut metadata = PythonWorkflowMetadata::default();
+    let mut metadata = PythonWorkflowMetadata {
+        candidate_count: payload.candidate_count.max(payload.workflows.len()),
+        ..PythonWorkflowMetadata::default()
+    };
     for workflow in payload.workflows {
         metadata
             .workflow_names
@@ -2051,7 +2092,7 @@ fn spawn_workflow_metadata_reconciler(
             )
             .await
             {
-                Ok((metadata, schedules)) => {
+                Ok((metadata, schedules, known_workflow_names)) => {
                     if let Err(error) = record_workflow_queue_metrics(
                         &mut queue_metrics,
                         [
@@ -2060,14 +2101,20 @@ fn spawn_workflow_metadata_reconciler(
                             (WORKFLOW_ETL_QUEUE, &workflow_clients.etl),
                             (WORKFLOW_ETL_BACKFILL_QUEUE, &workflow_clients.etl_backfill),
                         ],
-                        &metadata.workflow_names,
+                        &known_workflow_names,
                     )
                     .await
                     {
                         warn!(%error, "failed to record workflow queue metrics");
                     }
                     if let Err(error) = reaper
-                        .reap(&workflow_clients, &schedule_client, &metadata, &schedules)
+                        .reap(
+                            &workflow_clients,
+                            &schedule_client,
+                            &metadata,
+                            &known_workflow_names,
+                            &schedules,
+                        )
                         .await
                     {
                         warn!(%error, "failed to reap removed workflow tasks");
@@ -2089,11 +2136,13 @@ async fn reconcile_workflow_metadata_once(
     (
         PythonWorkflowMetadata,
         BTreeMap<String, RegisteredWorkflowSchedule>,
+        BTreeSet<String>,
     ),
     WorkflowRuntimeError,
 > {
     let enablement = WorkflowEnablement::from_env()?;
     let discovery = discover_python_workflow_metadata().await?;
+    let known_workflow_names = reaper_known_workflow_names(&discovery, &enablement);
     let next_webhooks = build_webhook_registry(&discovery, &enablement)?;
     let next_schedules = build_schedule_registry(&discovery, &enablement)?;
     if let Some(sandbox) = workflow_host_sandbox {
@@ -2123,7 +2172,7 @@ async fn reconcile_workflow_metadata_once(
         schedule_count = discovery.schedules.len(),
         "reconciled workflow metadata"
     );
-    Ok((discovery, next_schedules))
+    Ok((discovery, next_schedules, known_workflow_names))
 }
 
 /// Cancels queued/running runs and pending schedule ticks that reference a
@@ -2307,6 +2356,7 @@ impl RemovedWorkflowReaper {
         workflow_clients: &WorkflowQueueClients,
         schedule_client: &Client,
         metadata: &PythonWorkflowMetadata,
+        known_workflow_names: &BTreeSet<String>,
         schedules: &BTreeMap<String, RegisteredWorkflowSchedule>,
     ) -> Result<(), WorkflowRuntimeError> {
         if self.threshold == 0 {
@@ -2314,7 +2364,7 @@ impl RemovedWorkflowReaper {
         }
         // An empty discovery result almost certainly means WORKFLOW_DIRS is
         // missing or broken; never treat that as "every workflow was deleted".
-        if metadata.workflow_names.is_empty() {
+        if metadata.candidate_count == 0 {
             warn!("workflow discovery returned no workflows; skipping removed-workflow reaping");
             return Ok(());
         }
@@ -2338,7 +2388,7 @@ impl RemovedWorkflowReaper {
             .collect::<Vec<_>>();
         let stale_runs = select_stale_cancellations(
             &run_keyed,
-            &metadata.workflow_names,
+            known_workflow_names,
             &mut self.workflow_miss_counts,
             self.threshold,
         );
@@ -2393,6 +2443,20 @@ impl RemovedWorkflowReaper {
         }
         Ok(())
     }
+}
+
+fn reaper_known_workflow_names(
+    metadata: &PythonWorkflowMetadata,
+    enablement: &WorkflowEnablement,
+) -> BTreeSet<String> {
+    let mut names = metadata.workflow_names.clone();
+    names.extend(
+        NATIVE_WORKFLOWS
+            .into_iter()
+            .filter(|workflow| enablement.is_enabled(workflow.name()))
+            .map(|workflow| workflow.name().to_owned()),
+    );
+    names
 }
 
 /// Returns `(task_id, name)` for every non-terminal task in the queue, where
@@ -2808,8 +2872,8 @@ async fn run_centaur_workflow_inner(
     WorkflowEnablement::from_env()
         .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
         .map_err(absurd_error)?;
-    match input.workflow_name.as_str() {
-        "echo" => {
+    match NativeWorkflow::from_name(input.workflow_name.as_str()) {
+        Some(NativeWorkflow::Echo) => {
             let output = ctx
                 .step("echo", || async {
                     Ok(json!({
@@ -2827,7 +2891,7 @@ async fn run_centaur_workflow_inner(
                 output,
             })
         }
-        "sleep_echo" => {
+        Some(NativeWorkflow::SleepEcho) => {
             let sleep_ms = input
                 .input
                 .get("sleep_ms")
@@ -2846,7 +2910,7 @@ async fn run_centaur_workflow_inner(
                 output,
             })
         }
-        "agent_turn" => {
+        Some(NativeWorkflow::AgentTurn) => {
             let prompt = input
                 .input
                 .get("prompt")
@@ -2915,7 +2979,7 @@ async fn run_centaur_workflow_inner(
                 output: serde_json::to_value(agent).map_err(absurd::Error::Json)?,
             })
         }
-        "tool_and_slack" => {
+        Some(NativeWorkflow::ToolAndSlack) => {
             let slack_channel = input
                 .input
                 .get("slack_channel")
@@ -2955,7 +3019,7 @@ async fn run_centaur_workflow_inner(
                 }),
             })
         }
-        _ => {
+        None => {
             let workflow_name = input.workflow_name.clone();
             let output = run_python_workflow_host(
                 input,
@@ -5321,6 +5385,7 @@ mod tests {
                 "manual_workflow".to_owned()
             ])
         );
+        assert_eq!(metadata.candidate_count, 2);
         assert_eq!(metadata.schedules.len(), 1);
         assert_eq!(
             metadata.schedules[0].get("workflow_name"),
@@ -5657,6 +5722,25 @@ mod tests {
             metadata.principals.iter().cloned().collect::<Vec<_>>(),
             vec!["allowed_workflow".to_owned()]
         );
+        assert_eq!(metadata.candidate_count, 2);
+    }
+
+    #[test]
+    fn builtin_only_allowlist_preserves_nonempty_discovery_signal() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "candidate_count": 1,
+            "workflows": [],
+        }))
+        .unwrap();
+        let metadata = metadata_from_discovery_payload(payload);
+        let enablement = WorkflowEnablement::allowlist("agent_turn");
+
+        assert!(metadata.workflow_names.is_empty());
+        assert_eq!(metadata.candidate_count, 1);
+        assert_eq!(
+            reaper_known_workflow_names(&metadata, &enablement),
+            BTreeSet::from(["agent_turn".to_owned()])
+        );
     }
 
     #[test]
@@ -5752,6 +5836,61 @@ mod tests {
         // No active tasks reference the name anymore (e.g. all cancelled).
         assert!(select_stale_cancellations(&[], &BTreeSet::new(), &mut counts, 2).is_empty());
         assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn removed_workflow_reaper_keeps_enabled_builtin_workflows() {
+        let metadata = PythonWorkflowMetadata {
+            workflow_names: BTreeSet::from(["python_workflow".to_owned()]),
+            candidate_count: 1,
+            ..PythonWorkflowMetadata::default()
+        };
+        let known = reaper_known_workflow_names(&metadata, &WorkflowEnablement::all());
+        let active = NATIVE_WORKFLOWS
+            .into_iter()
+            .map(|workflow| {
+                (
+                    format!("run-{}", workflow.name()),
+                    workflow.name().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut counts = BTreeMap::new();
+
+        assert!(known.contains("python_workflow"));
+        for workflow in NATIVE_WORKFLOWS {
+            assert_eq!(NativeWorkflow::from_name(workflow.name()), Some(workflow));
+            assert!(known.contains(workflow.name()));
+        }
+        for _ in 0..4 {
+            assert!(select_stale_cancellations(&active, &known, &mut counts, 3).is_empty());
+        }
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn removed_workflow_reaper_respects_builtin_allowlist() {
+        let metadata = PythonWorkflowMetadata {
+            candidate_count: 1,
+            ..PythonWorkflowMetadata::default()
+        };
+        for workflow in NATIVE_WORKFLOWS {
+            let known = reaper_known_workflow_names(
+                &metadata,
+                &WorkflowEnablement::allowlist(workflow.name()),
+            );
+            assert_eq!(known, BTreeSet::from([workflow.name().to_owned()]));
+        }
+
+        let known = reaper_known_workflow_names(&metadata, &WorkflowEnablement::allowlist("echo"));
+        let active = [("run-agent-turn".to_owned(), "agent_turn".to_owned())];
+        let mut counts = BTreeMap::new();
+
+        assert!(!known.contains("agent_turn"));
+        assert_eq!(
+            select_stale_cancellations(&active, &known, &mut counts, 1),
+            ["run-agent-turn".to_owned()]
+        );
     }
 
     #[test]
