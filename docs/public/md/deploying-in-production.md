@@ -351,30 +351,28 @@ slackbotv2:
     credentialsSecretName: centaur-autorotate
     operatorSlackTeamIds:
       - T0123456789
-    operatorSlackUserIds:
-      - U0123456789
 ```
 
-Both allowlists must match the signed Slack request. Copy member IDs from Slack
-profiles; obtain the workspace ID from Slack's `auth.test` response or the
-workspace administration page. `credentialsSecretName` must not name the
-shared Centaur infrastructure Secret.
+The workspace allowlist must match the signed Slack request. Obtain the workspace
+ID from Slack's `auth.test` response or the workspace administration page.
+`credentialsSecretName` must not name the shared Centaur infrastructure Secret.
 
-Allowlisted operators can run every `/autorotate` subcommand from any Slack
-conversation; a direct message is not required. Slackbot sends the immediate
-acknowledgement and device-login follow-ups through Slack's ephemeral response
-path, so a device link and code are returned in the invoking channel without
-entering a Centaur session, sandbox, tool result, or database.
+Every member of an allowed workspace can run every `/autorotate` subcommand from
+any Slack conversation; a direct message is not required. Slackbot sends the
+immediate acknowledgement and device-login follow-ups through Slack's ephemeral
+response path, so a device link and code are returned in the invoking channel
+without entering a Centaur session, sandbox, tool result, or database.
 
-`/autorotate status` is the operator view. It is plain text, with one multi-line
+`/autorotate status` is the workspace view. It is plain text, with one multi-line
 block per account. The first line contains its email and label; the following
 lines report `state: usable` or `state: unusable`, an explicit reason such as
-`available`, `in use`, `out of rate limits`, or `refresh token revoked`, the
-five-hour and weekly usage percentages and reset times, the observation time,
-and next availability. Unknown or not-yet-observed windows remain unknown
-rather than being reported as zero; the broker also expires reset-less
-telemetry after 15 minutes. The response contains no account IDs, provider
-subjects, ownership, refresh tokens, or other auth data.
+`available`, `out of rate limits`, or `refresh token revoked`, the five-hour and
+weekly usage percentages and reset times, the observation time, and next
+availability. A healthy account with an active shared lease is still available
+now; its lease expiry is not a capacity boundary. Unknown or not-yet-observed
+windows remain unknown rather than being reported as zero; the broker also
+expires reset-less telemetry after 15 minutes. The response contains no account
+IDs, provider subjects, ownership, refresh tokens, or other auth data.
 
 `/autorotate login` is the only enrollment command. It has no target, label,
 or email argument: after the operator completes the stock Codex device login,

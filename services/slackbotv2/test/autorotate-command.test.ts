@@ -9,6 +9,7 @@ import type { SlackbotV2Fetch } from '../src/types'
 const SIGNING_SECRET = 'slack-signing-secret'
 const TEAM_ID = 'T123456789'
 const USER_ID = 'U123456789'
+const OTHER_USER_ID = 'U987654321'
 const RESPONSE_URL = 'https://hooks.slack.test/commands/response-secret'
 
 type FetchCall = {
@@ -149,7 +150,6 @@ function testHandler(
     fetch: fetchFn,
     logger: logger(logs),
     operatorSlackTeamIds: [TEAM_ID],
-    operatorSlackUserIds: [USER_ID],
     operatorToken: 'operator-secret',
     pollIntervalMs: 1,
     requestTimeoutMs: 1_000,
@@ -187,7 +187,6 @@ describe('Autorotate Slack command', () => {
       autorotateOperatorToken: 'operator-secret',
       autorotateSlackResponseUrlHosts: ['hooks.slack.test'],
       autorotateSlackTeamIds: [TEAM_ID],
-      autorotateSlackUserIds: [USER_ID],
       autorotateUrl: 'https://autorotate.example.test/broker/',
       botToken: 'xoxb-test',
       fetch: fetchFn,
@@ -231,21 +230,36 @@ describe('Autorotate Slack command', () => {
     expect(calls).toEqual([])
   })
 
-  it('requires both the configured Slack workspace and member', async () => {
-    const handler = testHandler(async () => {
-      throw new Error('must not fetch')
+  it('allows every valid member of the configured workspace and rejects other workspaces', async () => {
+    let brokerRequests = 0
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/accounts')) {
+        brokerRequests += 1
+        return Response.json({ accounts: [operatorAccount()] })
+      }
+      if (url === RESPONSE_URL) return new Response('', { status: 200 })
+      throw new Error(`unexpected request: ${url} ${init?.method ?? 'GET'}`)
     })
 
-    const response = await handleAndWait(
+    const allowed = await handleAndWait(
       handler,
-      commandRequest('status', { userId: 'U999999999' })
+      commandRequest('status', { userId: OTHER_USER_ID })
+    )
+    expect(await allowed.json()).toMatchObject({ text: 'Checking Codex account status…' })
+    expect(brokerRequests).toBe(1)
+
+    const denied = await handleAndWait(
+      handler,
+      commandRequest('status', { teamId: 'T999999999', userId: OTHER_USER_ID })
     )
 
-    expect(response.status).toBe(200)
-    expect(await response.json()).toEqual({
+    expect(denied.status).toBe(200)
+    expect(await denied.json()).toEqual({
       response_type: 'ephemeral',
       text: 'You are not authorized to operate the Codex account pool.'
     })
+    expect(brokerRequests).toBe(1)
   })
 
   it('advertises only status and login in ephemeral help', async () => {
@@ -300,7 +314,7 @@ describe('Autorotate Slack command', () => {
         expect(new Headers(init?.headers).get('authorization')).toBe('Bearer operator-secret')
         expect(body).toEqual({
           action: 'relogin',
-          owner: `slack:${TEAM_ID}:${USER_ID}`
+          owner: `slack:${TEAM_ID}:${OTHER_USER_ID}`
         })
         const start: Record<string, unknown> = {
           ...startEnrollmentResponse('team-codex'),
@@ -323,7 +337,7 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     }, logs)
 
-    const response = await handleAndWait(handler, commandRequest('login'))
+    const response = await handleAndWait(handler, commandRequest('login', { userId: OTHER_USER_ID }))
 
     expect(await response.json()).toEqual({
       response_type: 'ephemeral',
@@ -525,7 +539,15 @@ describe('Autorotate Slack command', () => {
     expect(slackText).toContain('5h: unknown')
     expect(slackText).toContain('weekly: unknown')
     expect(slackText).toContain('observed: unknown')
-    expect(slackText).toContain('next available: 2026-07-29 21:00 UTC')
+    const writerBlock = slackText.slice(
+      slackText.indexOf('writer@example.test'),
+      slackText.indexOf('available@example.test')
+    )
+    expect(writerBlock).toContain('state: usable')
+    expect(writerBlock).toContain('reason: available')
+    expect(writerBlock).toContain('next available: now')
+    expect(writerBlock).not.toContain('in use')
+    expect(writerBlock).not.toContain('2026-07-29 21:00 UTC')
     expect(slackText.indexOf('broken@example.test')).toBeLessThan(
       slackText.indexOf('reconcile@example.test')
     )
