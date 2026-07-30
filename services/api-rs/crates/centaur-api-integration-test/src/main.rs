@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     let line = line!() + 1;
     record_result(
         &mut results,
-        "Workflows API runs added workflows and cancels removed workflows",
+        "Workflows API runs Python workflows with agent turns and cancels removed workflows",
         line,
         test_workflows_api(&http, &base_url).await,
     );
@@ -534,6 +534,38 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         bail!("completed workflow output did not echo input: {completed_run}");
     }
 
+    let agent_run_id = create_workflow_run(
+        http,
+        base_url,
+        &workflow_name,
+        json!({
+            "case": "agent-turn-workflow-run",
+            "agent_turn": true,
+            "model": TEST_MODEL,
+        }),
+    )
+    .await
+    .context("create workflow run with an agent turn")?;
+    let agent_run = wait_for_workflow_run_status(http, base_url, &agent_run_id, &["completed"])
+        .await
+        .context("wait for workflow run with an agent turn to complete")?;
+    let agent_result = agent_run
+        .pointer("/result/output/agent_result")
+        .context("agent-turn workflow run missing agent result")?;
+    if agent_result.get("status").and_then(Value::as_str) != Some("completed") {
+        bail!("agent-turn workflow did not complete its agent session: {agent_run}");
+    }
+    let result_text = agent_result
+        .get("result_text")
+        .and_then(Value::as_str)
+        .context("agent-turn workflow result missing result text")?;
+    if !result_text.contains("PONG")
+        || !result_text.contains(TEST_MODEL)
+        || !result_text.contains("harness=codex")
+    {
+        bail!("agent-turn workflow returned unexpected result: {agent_run}");
+    }
+
     let removed_run_id = create_workflow_run(
         http,
         base_url,
@@ -602,6 +634,19 @@ SCHEDULE = {{
 
 
 async def handler(params, ctx):
+    if params.get("agent_turn"):
+        agent_result = await ctx.agent_turn(
+            "Reply with PONG, the model, and the harness.",
+            model=params.get("model"),
+            idle_timeout_ms=5_000,
+            max_duration_ms=15_000,
+        )
+        return {{
+            "workflow_name": ctx.workflow_name,
+            "received": params,
+            "agent_result": agent_result,
+        }}
+
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
         await asyncio.sleep(sleep_ms / 1000)
