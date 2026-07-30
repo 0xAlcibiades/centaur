@@ -183,6 +183,15 @@ spec:
             # matches regardless of what Host the sync request carried.
             - name: CENTAUR_CONSOLE_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
+{{- if $console.mppSignerUrl }}
+            - name: MPP_SIGNER_URL
+              value: {{ $console.mppSignerUrl | quote }}
+            - name: MPP_SIGNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sMPP_SIGNER_TOKEN" $prefix }}
+{{- end }}
 {{- if $console.publicUrl }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}

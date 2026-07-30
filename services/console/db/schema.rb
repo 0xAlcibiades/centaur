@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_30_190000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -194,6 +194,34 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
     t.index ["mcp_oauth_client_id"], name: "index_mcp_oauth_authorization_codes_on_mcp_oauth_client_id"
     t.index ["principal_id"], name: "index_mcp_oauth_authorization_codes_on_principal_id"
     t.index ["user_id"], name: "index_mcp_oauth_authorization_codes_on_user_id"
+  end
+
+  create_table "mpp_access_keys", force: :cascade do |t|
+    t.string "access_key_address", null: false
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.jsonb "key_authorization", default: {}, null: false
+    t.string "key_handle", null: false
+    t.datetime "revoked_at"
+    t.datetime "updated_at", null: false
+    t.bigint "user_identity_id", null: false
+    t.string "wallet_address", null: false
+    t.index ["key_handle"], name: "index_mpp_access_keys_on_key_handle", unique: true
+    t.index ["user_identity_id"], name: "index_mpp_access_keys_on_user_identity_id", unique: true, where: "(revoked_at IS NULL)"
+  end
+
+  create_table "mpp_wallet_links", force: :cascade do |t|
+    t.string "access_key_address", null: false
+    t.string "access_key_public_key", null: false
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.string "key_handle", null: false
+    t.string "token_digest", null: false
+    t.datetime "updated_at", null: false
+    t.datetime "used_at"
+    t.bigint "user_identity_id", null: false
+    t.index ["token_digest"], name: "index_mpp_wallet_links_on_token_digest", unique: true
+    t.index ["user_identity_id"], name: "index_mpp_wallet_links_on_user_identity_id"
   end
 
   create_table "mcp_oauth_clients", force: :cascade do |t|
@@ -499,6 +527,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_27_233739) do
   add_foreign_key "mcp_oauth_refresh_tokens", "mcp_oauth_clients"
   add_foreign_key "mcp_oauth_refresh_tokens", "principals"
   add_foreign_key "mcp_oauth_refresh_tokens", "users"
+  add_foreign_key "mpp_access_keys", "user_identities"
+  add_foreign_key "mpp_wallet_links", "user_identities"
   add_foreign_key "oauth_apps", "users", column: "created_by_id"
   add_foreign_key "oauth_token_secrets", "users", column: "created_by_id"
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"

@@ -1328,6 +1328,20 @@ fn iron_proxy_env_vars(
         env_var("IRON_CONTROL_PLANE_URL", &sync.control_url),
     );
     env.insert(
+        "IRON_RESPONSE_RETRY_HANDLER_URL".to_owned(),
+        env_var(
+            "IRON_RESPONSE_RETRY_HANDLER_URL",
+            &format!(
+                "{}/api/v1/proxy/mpp/authorize",
+                sync.control_url.trim_end_matches('/')
+            ),
+        ),
+    );
+    env.insert(
+        "IRON_RESPONSE_RETRY_STATUSES".to_owned(),
+        env_var("IRON_RESPONSE_RETRY_STATUSES", "402"),
+    );
+    env.insert(
         "IRON_PROXY_TOKEN".to_owned(),
         env_var("IRON_PROXY_TOKEN", &sync.token),
     );
@@ -2523,6 +2537,34 @@ mod tests {
             .and_then(|var| var.value.as_deref());
 
         assert_eq!(timeout, Some("120s"));
+    }
+
+    #[test]
+    fn managed_proxy_env_routes_response_retries_to_control_plane() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let sync = ProxySyncEnv {
+            proxy_id: "proxy-id".to_owned(),
+            control_url: "https://console.example/".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let env = iron_proxy_env_vars(&iron_proxy, &resolved(), &sync);
+        let handler_url = env
+            .iter()
+            .find(|var| var.name == "IRON_RESPONSE_RETRY_HANDLER_URL")
+            .and_then(|var| var.value.as_deref());
+
+        assert_eq!(
+            handler_url,
+            Some("https://console.example/api/v1/proxy/mpp/authorize")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|var| var.name == "IRON_RESPONSE_RETRY_STATUSES")
+                .and_then(|var| var.value.as_deref()),
+            Some("402")
+        );
     }
 
     #[test]

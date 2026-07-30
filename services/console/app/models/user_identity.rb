@@ -7,6 +7,9 @@ class UserIdentity < ApplicationRecord
 
   belongs_to :user
 
+  has_one :mpp_access_key, -> { current }, dependent: :destroy
+  has_many :mpp_wallet_links, dependent: :destroy
+
   PROVIDERS = %w[google slack].freeze
   SLACK_PROVIDER = "slack".freeze
 

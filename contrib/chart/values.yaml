@@ -100,6 +100,10 @@ toolServer:
 console:
   enabled: false
   replicaCount: 1
+  # Trusted service that generates Tempo access keys, verifies wallet Key
+  # Authorizations, and signs bounded MPP Credentials. Private keys remain in
+  # that service; Console stores only its opaque key handle.
+  mppSignerUrl: ""
   # Public URL users reach in a browser (e.g. https://console.example.com), used
   # as CENTAUR_CONSOLE_PUBLIC_URL. Set this when console is exposed behind
   # Tailscale/Ingress so MCP OAuth issuer metadata and JWT validation agree.

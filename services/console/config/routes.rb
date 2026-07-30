@@ -41,6 +41,7 @@ Rails.application.routes.draw do
   root "console#principals"
   get "console/principals", to: "console#principals", as: :console_principals
   namespace :console do
+    resource :mpp_wallet, only: %i[create destroy]
     get  "principals/new", to: "principals#new",    as: :new_principal
     post "principals",     to: "principals#create", as: :create_principal
   end
@@ -216,6 +217,7 @@ Rails.application.routes.draw do
 
       # Called by iron-proxy instances (proxy bearer auth, not ApiKey auth).
       post "proxy/sync", to: "proxy_sync#create"
+      post "proxy/mpp/authorize", to: "proxy_mpp_authorizations#create"
 
       # Called from inside sandboxes through their assigned iron-proxy. The
       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
@@ -223,6 +225,9 @@ Rails.application.routes.draw do
       get "sandbox/oauth_apps", to: "sandbox_oauth_apps#index"
     end
   end
+
+  get "mpp/connect/:token", to: "mpp_wallet_links#show", as: :mpp_wallet_link
+  patch "mpp/connect/:token", to: "mpp_wallet_links#update"
 
   # OAuth consent flow, keyed by the app's well-known slug (/oauth/google/start).
   # Requires an active console session; the provider is derived from the app.
