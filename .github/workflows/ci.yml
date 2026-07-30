@@ -164,7 +164,7 @@ jobs:
           RUN_MIGRATIONS: "true"
           RUST_LOG: info
           WORKFLOW_DIRS: ${{ runner.temp }}/api-integration-workflows
-          WORKFLOW_HOST_SANDBOX: "false"
+          WORKFLOW_HOST_SANDBOX: "true"
           WORKFLOW_REAP_REMOVED_AFTER_TICKS: "1"
           WORKFLOW_RECONCILE_INTERVAL_SECS: "1"
         run: |

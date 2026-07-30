@@ -209,16 +209,17 @@ def coerce_value(value: Any, target_type: type) -> Any:
         return value
     if not isinstance(value, dict):
         return value
-    fields = {field.name for field in dataclasses.fields(target_type)}
+    fields = {field.name: field for field in dataclasses.fields(target_type)}
     try:
         hints = typing.get_type_hints(target_type)
     except Exception:
         hints = {}
     coerced = {}
     for key, raw in value.items():
-        if key not in fields:
+        field = fields.get(key)
+        if field is None:
             continue
-        hint = hints.get(key)
+        hint = hints.get(key, field.type)
         if isinstance(hint, type) and dataclasses.is_dataclass(hint) and isinstance(raw, dict):
             coerced[key] = coerce_value(raw, hint)
         else:
@@ -392,24 +393,33 @@ def discovery_payload() -> dict[str, Any]:
 
 async def main() -> int:
     rpc = RpcClient()
-    stdin_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    stdin_queue: asyncio.Queue[dict[str, Any] | ProtocolError | None] = asyncio.Queue()
     completion_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     active_workflow: asyncio.Task[dict[str, Any]] | None = None
 
     async def read_stdin() -> None:
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        transport: asyncio.ReadTransport | None = None
         try:
+            loop = asyncio.get_running_loop()
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
             while True:
                 line = await reader.readline()
                 if line == b"":
                     await stdin_queue.put(None)
                     return
-                await stdin_queue.put(json.loads(line))
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ProtocolError("workflow host input must be a JSON object")
+                await stdin_queue.put(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await stdin_queue.put(ProtocolError(f"invalid workflow host input: {exc}"))
         finally:
-            transport.close()
+            if transport is not None:
+                transport.close()
 
     stdin_reader = asyncio.create_task(read_stdin())
     stdin_get = asyncio.create_task(stdin_queue.get())
@@ -445,6 +455,9 @@ async def main() -> int:
                 if active_workflow is not None:
                     continue
                 return 0
+            if isinstance(message, ProtocolError):
+                await rpc.write({"type": "host.error", "message": str(message)})
+                return 1
             message_type = message.get("type")
             try:
                 if message_type == "ctx.response":
