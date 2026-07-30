@@ -43,7 +43,6 @@ const options: SlackbotV2Options = {
   autorotateUrl: optionalEnv('SLACKBOTV2_AUTOROTATE_URL'),
   autorotateOperatorToken: optionalEnv('AUTOROTATE_OPERATOR_TOKEN'),
   autorotateSlackTeamIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS'),
-  autorotateSlackUserIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS'),
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
   channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>

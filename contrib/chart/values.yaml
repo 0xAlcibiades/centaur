@@ -487,7 +487,7 @@ slackbotv2:
   autoJoinCreatedChannels: false
   # Signed, pre-session `/autorotate` Slack command. Every subcommand can be
   # invoked from any Slack conversation, but responses remain ephemeral and are
-  # available only to the exact workspace/member allowlists below. Observer and
+  # available to every member of an allowed workspace. Observer and
   # operator tokens come from a dedicated Secret so no broker administration
   # credential enters Slack, a sandbox, or the shared infra Secret.
   autorotate:
@@ -497,7 +497,6 @@ slackbotv2:
     observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
     operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
     operatorSlackTeamIds: []
-    operatorSlackUserIds: []
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
   mcpPublicUrl: "http://localhost:3000"

@@ -270,7 +270,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     fetch: options.fetch,
     logger,
     operatorSlackTeamIds: options.autorotateSlackTeamIds,
-    operatorSlackUserIds: options.autorotateSlackUserIds,
     operatorToken: options.autorotateOperatorToken,
     pollIntervalMs: options.autorotatePollIntervalMs,
     responseUrlHosts: options.autorotateSlackResponseUrlHosts,

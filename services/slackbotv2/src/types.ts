@@ -143,8 +143,6 @@ export type SlackbotV2Options = {
   autorotateOperatorToken?: string
   /** Slack workspace IDs allowed to use the Autorotate command. */
   autorotateSlackTeamIds?: readonly string[]
-  /** Slack member IDs allowed to use the Autorotate command. */
-  autorotateSlackUserIds?: readonly string[]
   /** Test/development override for Slack response URL host validation. */
   autorotateSlackResponseUrlHosts?: readonly string[]
   /** Device-enrollment polling interval. */

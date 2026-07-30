@@ -130,7 +130,6 @@ type AutorotateSlackOptions = {
   fetch?: SlackbotV2Fetch
   logger: Logger
   operatorSlackTeamIds?: readonly string[]
-  operatorSlackUserIds?: readonly string[]
   operatorToken?: string
   pollIntervalMs?: number
   requestTimeoutMs?: number
@@ -312,7 +311,7 @@ export function createAutorotateSlackCommandHandler(
 
       const teamId = form.get('team_id')?.trim() ?? ''
       const userId = form.get('user_id')?.trim() ?? ''
-      if (!authorizedOperator(options, teamId, userId)) {
+      if (!authorizedWorkspace(options, teamId, userId)) {
         return ephemeralResponse('You are not authorized to operate the Codex account pool.')
       }
       if (!client) {
@@ -848,14 +847,10 @@ function helpText(): string {
 function formatStatus(accounts: readonly AutorotateAccount[]): string {
   if (accounts.length === 0) return 'Codex accounts: 0 usable / 0\n\nNo accounts.'
   const sorted = [...accounts].sort(compareAccounts)
-  const usable = accounts.filter(account =>
-    account.availability === 'available' || account.availability === 'in_use'
-  ).length
+  const usable = accounts.filter(isUsableAccount).length
   const accountBlocks = sorted.map(account => {
     const email = account.email ? escapeSlackText(account.email) : 'email unknown'
-    const state = account.availability === 'available' || account.availability === 'in_use'
-      ? 'usable'
-      : 'unusable'
+    const state = isUsableAccount(account) ? 'usable' : 'unusable'
     return [
       `${email} [${escapeSlackText(account.label)}]`,
       `  state: ${state}`,
@@ -926,7 +921,7 @@ function accountReason(account: AutorotateAccount): string {
     case 'available':
       return 'available'
     case 'in_use':
-      return 'in use'
+      return 'available'
     case 'rate_limited':
       return 'out of rate limits'
     case 'login_required':
@@ -999,13 +994,17 @@ function limitsObservedAt(account: AutorotateAccount): string {
 }
 
 function nextAvailable(account: AutorotateAccount): string {
-  if (account.availability === 'available') return 'now'
+  if (isUsableAccount(account)) return 'now'
   if (account.availability === 'login_required') return 'run /autorotate login'
   if (account.availability === 'reconciliation_required') return 'operator reconciliation required'
   if (account.availability === 'disabled') return 'operator action required'
   return account.next_available_at
     ? formatUtcTimestamp(account.next_available_at)
     : 'unknown'
+}
+
+function isUsableAccount(account: AutorotateAccount): boolean {
+  return account.availability === 'available' || account.availability === 'in_use'
 }
 
 function formatUtcTimestamp(value: string): string {
@@ -1369,15 +1368,14 @@ function validSlackSignature(
     && timingSafeEqual(actualBuffer, expectedBuffer)
 }
 
-function authorizedOperator(
+function authorizedWorkspace(
   options: AutorotateSlackOptions,
   teamId: string,
   userId: string
 ): boolean {
   if (!SLACK_TEAM_ID_PATTERN.test(teamId) || !SLACK_MEMBER_ID_PATTERN.test(userId)) return false
   const teams = new Set(options.operatorSlackTeamIds ?? [])
-  const users = new Set(options.operatorSlackUserIds ?? [])
-  return teams.has(teamId) && users.has(userId)
+  return teams.has(teamId)
 }
 
 function safeResponseUrl(
