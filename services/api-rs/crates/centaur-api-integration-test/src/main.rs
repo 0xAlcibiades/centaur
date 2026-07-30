@@ -566,6 +566,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         bail!("agent-turn workflow returned unexpected result: {agent_run}");
     }
 
+    let started_marker = workflow_dir.join(format!("{workflow_name}.started"));
     let removed_run_id = create_workflow_run(
         http,
         base_url,
@@ -573,6 +574,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "case": "removed-workflow-run",
             "sleep_ms": 60_000,
+            "started_marker_path": started_marker,
         }),
     )
     .await
@@ -580,6 +582,9 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     wait_for_workflow_run_status(http, base_url, &removed_run_id, &["running"])
         .await
         .context("wait for long-running workflow run to start")?;
+    wait_for_file(&started_marker)
+        .await
+        .context("wait for long-running workflow handler to start")?;
 
     fs::remove_file(&workflow_path)
         .with_context(|| format!("remove workflow file {}", workflow_path.display()))?;
@@ -592,6 +597,17 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         .context("wait for removed workflow run to be cancelled")?;
 
     Ok(())
+}
+
+async fn wait_for_file(path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    bail!("file {} was not created before timeout", path.display())
 }
 
 fn integration_workflow_dir() -> Result<PathBuf> {
@@ -649,6 +665,10 @@ async def handler(params, ctx):
 
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
+        started_marker_path = str(params.get("started_marker_path") or "")
+        if started_marker_path:
+            with open(started_marker_path, "w") as marker:
+                marker.write("started")
         await asyncio.sleep(sleep_ms / 1000)
     return {{
         "workflow_name": ctx.workflow_name,
