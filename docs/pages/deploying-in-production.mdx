@@ -327,7 +327,7 @@ Register the command once in the existing Slack app using Slack's
    - **Command:** `/autorotate`
    - **Request URL:** `https://<your-host>/api/slack/commands`
    - **Short description:** `Manage the Codex account pool`
-   - **Usage hint:** `status | accounts | add | relogin`
+   - **Usage hint:** `status | login`
 3. Save the command and reinstall the app if Slack prompts you. The app's
    existing `SLACK_SIGNING_SECRET` validates requests; no Autorotate credential
    is configured in Slack.
@@ -367,30 +367,40 @@ workspace administration page. `credentialsSecretName` must not name the
 shared Centaur infrastructure Secret.
 
 Allowlisted operators can run every `/autorotate` subcommand from any Slack
-conversation. Slackbot sends both the immediate acknowledgement and every
-follow-up through Slack's ephemeral response path, so account emails, device
-links, and device codes are visible only to the invoking operator. `/autorotate
-status` shows aggregate capacity. `/autorotate accounts` shows the operator-safe
-account list: label, email, enabled/disabled/dead status, rate-limit end, and
-whether login is required. It never includes account IDs, provider subjects,
-ownership, usage, or auth data.
+conversation; a direct message is not required. Slackbot sends the immediate
+acknowledgement and device-login follow-ups through Slack's ephemeral response
+path, so a device link and code are returned in the invoking channel without
+entering a Centaur session, sandbox, tool result, or database.
 
-`/autorotate add` and `/autorotate relogin` return the ephemeral device link and
-code, poll the broker, and replace that response when enrollment reaches a
-terminal state. Neither command accepts an account label or email. After the
-operator authenticates with stock Codex, Autorotate reads the verified identity
-from the resulting credential: `add` derives a unique human-readable label, and
-`relogin` discovers and replaces the matching canonical account. Autorotate
-enforces one active enrollment per exact signed Slack workspace/member owner, so
-the flow recovers after a Slackbot restart and works with multiple replicas.
-Pending recovery includes the enrollment ID, action, expiry, and ephemeral device
-link/code; the resolved account label may appear only after authentication.
-Once authorization reaches importing, owner recovery returns the same
-non-secret metadata without the link or code; Slackbot continues polling by
-enrollment ID and reports that canonical credential import is in progress.
-Completion accepts only the nested account label, email, and account status.
-The device code, link, and Slack response URL remain visible only to the invoking
-operator and are never stored in a Centaur session or tool event.
+`/autorotate status` is the operator view. It is plain text, with one multi-line
+block per account. The first line contains its email and label; the following
+lines report `state: usable` or `state: unusable`, an explicit reason such as
+`available`, `in use`, `out of rate limits`, or `refresh token revoked`, the
+five-hour and weekly usage percentages and reset times, the observation time,
+and next availability. Unknown or not-yet-observed windows remain unknown
+rather than being reported as zero; the broker also expires reset-less
+telemetry after 15 minutes. The response contains no account IDs, provider
+subjects, ownership, refresh tokens, or other auth data.
+
+`/autorotate login` is the only enrollment command. It has no target, label,
+or email argument: after the operator completes the stock Codex device login,
+Autorotate identifies the provider account from canonical stock auth and uses
+the verified email as an independent safety fence and label source. A
+previously unknown provider identity creates a new canonical account; a known
+identity refreshes its existing account. The command reuses the owner's active
+enrollment after a Slackbot restart and works with multiple replicas. Pending
+recovery includes the enrollment expiry and ephemeral device link/code; after
+import starts it reports non-secret progress, then completes with the canonical
+account label, email, and usability.
+
+This Slack status schema requires Autorotate broker v0.4.7 or newer. Deploy the
+broker before the corresponding Slackbot image.
+
+Route an all-accounts-unusable pool outage to the production paging channel:
+no new Autorotate lease can start in that state. Route an individual account's
+login or reconciliation requirement to the low-priority alert channel; it is
+actionable capacity maintenance, not a production page while the pool still has
+usable accounts.
 
 Sandboxes get observer-only access through `autorotate status`. The command
 calls Console's assigned-sandbox endpoint and can never start enrollment or

@@ -139,9 +139,7 @@ export type SlackbotV2Options = {
   autoJoinCreatedChannels?: boolean
   /** Autorotate broker URL used only by the signed, pre-session Slack command handler. */
   autorotateUrl?: string
-  /** Observer-only Autorotate token used for aggregate pool status. */
-  autorotateObserverToken?: string
-  /** Operator-scoped token used only to create and inspect device enrollment sessions. */
+  /** Operator-scoped token used only for account status and device enrollment sessions. */
   autorotateOperatorToken?: string
   /** Slack workspace IDs allowed to use the Autorotate command. */
   autorotateSlackTeamIds?: readonly string[]
