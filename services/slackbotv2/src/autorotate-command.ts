@@ -939,16 +939,27 @@ function accountReason(account: AutorotateAccount): string {
 }
 
 function rateLimitRows(account: AutorotateAccount): string[] {
-  return [
-    { fallback: 'primary', window: account.primary },
-    { fallback: 'secondary', window: account.secondary }
-  ]
-    .map(({ fallback, window }) => ({
-      label: rateLimitLabel(window, fallback),
-      rank: rateLimitRank(window, fallback),
-      window
-    }))
-    .sort((left, right) => left.rank - right.rank)
+  const primary = {
+    label: rateLimitLabel(account.primary, 'primary'),
+    window: account.primary
+  }
+  const secondary = {
+    label: rateLimitLabel(account.secondary, 'secondary'),
+    window: account.secondary
+  }
+
+  if (primary.label === secondary.label) {
+    if (!primary.window) {
+      primary.label = otherCanonicalRateLimit(secondary.label)
+    } else if (!secondary.window) {
+      secondary.label = otherCanonicalRateLimit(primary.label)
+    } else {
+      secondary.label = 'secondary'
+    }
+  }
+
+  return [primary, secondary]
+    .sort((left, right) => rateLimitRank(left.label) - rateLimitRank(right.label))
     .map(({ label, window }) => `  ${label}: ${formatRateLimitWindow(window)}`)
 }
 
@@ -959,11 +970,15 @@ function rateLimitLabel(window: RateLimitWindow | null, fallback: string): strin
   return fallback
 }
 
-function rateLimitRank(window: RateLimitWindow | null, fallback: string): number {
-  if (!window) return fallback === 'primary' ? 0 : 1
-  if (window.window_minutes === 300) return 0
-  if (window.window_minutes === 10_080) return 1
-  return fallback === 'primary' ? 2 : 3
+function otherCanonicalRateLimit(label: string): string {
+  return label === 'weekly' ? '5h' : 'weekly'
+}
+
+function rateLimitRank(label: string): number {
+  if (label === '5h') return 0
+  if (label === 'weekly') return 1
+  if (label === 'primary') return 2
+  return 3
 }
 
 function formatRateLimitWindow(window: RateLimitWindow | null): string {

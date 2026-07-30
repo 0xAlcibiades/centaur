@@ -547,6 +547,80 @@ describe('Autorotate Slack command', () => {
     expect(slackText).not.toContain('refresh_token')
   })
 
+  it('keeps 5h and weekly quota rows distinct when only one window is known', async () => {
+    const responses: string[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/accounts')) {
+        return Response.json({
+          accounts: [
+            operatorAccount({
+              label: 'weekly-only',
+              email: 'a-weekly@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              primary: {
+                used_percent: 0,
+                resets_at: '2026-08-06T01:42:00Z',
+                window_minutes: 10_080
+              }
+            }),
+            operatorAccount({
+              label: 'reversed-windows',
+              email: 'b-reversed@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              primary: {
+                used_percent: 10,
+                resets_at: '2026-08-06T01:42:00Z',
+                window_minutes: 10_080
+              },
+              secondary: {
+                used_percent: 20,
+                resets_at: '2026-07-30T05:00:00Z',
+                window_minutes: 300
+              }
+            }),
+            operatorAccount({
+              label: 'five-hour-only',
+              email: 'z-five-hour@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              secondary: {
+                used_percent: 25,
+                resets_at: '2026-07-30T05:00:00Z',
+                window_minutes: 300
+              }
+            })
+          ]
+        })
+      }
+      if (url === RESPONSE_URL && init?.body) {
+        responses.push((JSON.parse(String(init.body)) as { text: string }).text)
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('status'))
+
+    const slackText = responses.at(-1) ?? ''
+    const weeklyOnly = slackText.slice(
+      slackText.indexOf('a-weekly@example.test'),
+      slackText.indexOf('b-reversed@example.test')
+    )
+    const reversed = slackText.slice(
+      slackText.indexOf('b-reversed@example.test'),
+      slackText.indexOf('z-five-hour@example.test')
+    )
+    const fiveHourOnly = slackText.slice(slackText.indexOf('z-five-hour@example.test'))
+    expect(weeklyOnly).toContain('5h: unknown')
+    expect(weeklyOnly).toContain('weekly: 0% used; resets 2026-08-06 01:42 UTC')
+    expect(weeklyOnly.match(/weekly:/g)).toHaveLength(1)
+    expect(reversed.indexOf('5h: 20% used')).toBeLessThan(
+      reversed.indexOf('weekly: 10% used')
+    )
+    expect(fiveHourOnly).toContain('5h: 25% used; resets 2026-07-30 05:00 UTC')
+    expect(fiveHourOnly).toContain('weekly: unknown')
+    expect(fiveHourOnly.match(/5h:/g)).toHaveLength(1)
+  })
+
   it('rejects malformed or contradictory operator account status fields', async () => {
     const reset = '2026-07-29T22:00:00Z'
     const invalidAccounts = [
