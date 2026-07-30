@@ -9,19 +9,7 @@ const MAX_RESPONSE_BYTES = 64 * 1024
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000
 const DEFAULT_POLL_INTERVAL_MS = 5_000
 const DEFAULT_ENROLLMENT_LIFETIME_MS = 15 * 60_000
-const STATUS_FIELDS = [
-  'generated_at',
-  'total',
-  'healthy',
-  'available',
-  'limited',
-  'login_required',
-  'disabled',
-  'leased',
-  'removed',
-  'next_available_at',
-  'pending_enrollments'
-] as const
+const MAX_STATUS_TEXT_CHARS = 35_000
 const START_ENROLLMENT_FIELDS = [
   'enrollment_id',
   'action',
@@ -44,26 +32,25 @@ const ACCOUNT_FIELDS = [
   'email',
   'status',
   'limited_until',
-  'login_required'
+  'login_required',
+  'reconciliation_required',
+  'active_writer',
+  'availability',
+  'unusable_reason',
+  'limits_observed_at',
+  'primary',
+  'secondary',
+  'next_available_at'
+] as const
+const RATE_LIMIT_FIELDS = [
+  'used_percent',
+  'resets_at',
+  'window_minutes'
 ] as const
 const ENROLLMENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/
 const SLACK_MEMBER_ID_PATTERN = /^[UW][A-Z0-9]+$/i
 const SLACK_TEAM_ID_PATTERN = /^T[A-Z0-9]+$/i
 const OPENAI_DEVICE_LOGIN_HOSTS = new Set(['auth.openai.com'])
-
-type AutorotateStatus = {
-  generated_at?: string
-  total?: number
-  healthy?: number
-  available?: number
-  limited?: number
-  login_required?: number
-  disabled?: number
-  leased?: number
-  removed?: number
-  next_available_at?: string | null
-  pending_enrollments?: number
-}
 
 type EnrollmentAction = 'add' | 'relogin'
 type EnrollmentStatus = 'pending' | 'importing' | 'completed' | 'failed' | 'cancelled' | 'expired'
@@ -92,11 +79,34 @@ type EnrollmentStatusResponse = {
 }
 
 type AutorotateAccount = {
+  active_writer: boolean
+  availability: 'available' | 'in_use' | 'rate_limited' | 'login_required' | 'reconciliation_required' | 'disabled'
   label: string
   email: string | null
   status: 'enabled' | 'disabled' | 'dead'
   limited_until: string | null
+  limits_observed_at: string | null
   login_required: boolean
+  next_available_at: string | null
+  primary: RateLimitWindow | null
+  reconciliation_required: boolean
+  secondary: RateLimitWindow | null
+  unusable_reason: AccountUnusableReason | null
+}
+
+type AccountUnusableReason =
+  | 'refresh_token_expired'
+  | 'refresh_token_reused'
+  | 'refresh_token_revoked'
+  | 'account_mismatch'
+  | 'login_required'
+  | 'reconciliation_required'
+  | 'operator_reported'
+
+type RateLimitWindow = {
+  resets_at: string | null
+  used_percent: number
+  window_minutes: number | null
 }
 
 type ActiveEnrollmentState = 'starting' | 'monitoring' | 'cancel_requested' | 'cancelling'
@@ -110,15 +120,15 @@ type ActiveEnrollment = {
   state: ActiveEnrollmentState
 }
 
-type CreateEnrollmentInput =
-  | { action: 'add'; expected_email?: string; label?: string; owner: string }
-  | { action: 'relogin'; account?: string; expected_email?: string; owner: string }
+type CreateEnrollmentInput = {
+  action: 'relogin'
+  owner: string
+}
 
 type AutorotateSlackOptions = {
   brokerUrl?: string
   fetch?: SlackbotV2Fetch
   logger: Logger
-  observerToken?: string
   operatorSlackTeamIds?: readonly string[]
   operatorSlackUserIds?: readonly string[]
   operatorToken?: string
@@ -149,7 +159,6 @@ class AutorotateClient {
 
   constructor(
     brokerUrl: string,
-    private readonly observerToken: string,
     private readonly operatorToken: string,
     fetchFn: SlackbotV2Fetch,
     requestTimeoutMs: number
@@ -157,11 +166,6 @@ class AutorotateClient {
     this.baseUrl = parseBrokerUrl(brokerUrl)
     this.fetchFn = fetchFn
     this.requestTimeoutMs = requestTimeoutMs
-  }
-
-  async status(): Promise<AutorotateStatus> {
-    const payload = await this.request('GET', 'v1/status', this.observerToken)
-    return selectFields(payload, STATUS_FIELDS) as AutorotateStatus
   }
 
   async createEnrollment(input: CreateEnrollmentInput): Promise<StartEnrollmentResponse> {
@@ -290,7 +294,6 @@ export function createAutorotateSlackCommandHandler(
   const client = brokerUrl
     ? new AutorotateClient(
         brokerUrl,
-        options.observerToken?.trim() ?? '',
         options.operatorToken?.trim() ?? '',
         fetchFn,
         requestTimeoutMs
@@ -321,18 +324,11 @@ export function createAutorotateSlackCommandHandler(
       const owner = `slack:${teamId}:${userId}`
       if (command.kind === 'help') return ephemeralResponse(helpText())
       if (command.kind === 'status') {
-        waitUntil(
-          respondWithStatus(client, form, options, fetchFn)
-        )
-        return ephemeralResponse('Checking the Codex account pool…')
-      }
-
-      if (command.kind === 'accounts') {
         const responseUrl = safeResponseUrl(form.get('response_url'), options)
         if (!responseUrl) {
           return ephemeralResponse('Slack did not provide a safe ephemeral response channel.')
         }
-        waitUntil(respondWithAccounts(client, responseUrl, options, fetchFn))
+        waitUntil(respondWithStatus(client, responseUrl, options, fetchFn))
         return ephemeralResponse('Checking Codex account status…')
       }
 
@@ -363,7 +359,6 @@ export function createAutorotateSlackCommandHandler(
             activeEnrollments,
             actorKey,
             client,
-            command,
             fetchFn,
             options,
             pollIntervalMs,
@@ -429,28 +424,6 @@ export function createAutorotateSlackCommandHandler(
 
 async function respondWithStatus(
   client: AutorotateClient,
-  form: URLSearchParams,
-  options: AutorotateSlackOptions,
-  fetchFn: SlackbotV2Fetch
-): Promise<void> {
-  const responseUrl = safeResponseUrl(form.get('response_url'), options)
-  if (!responseUrl) return
-  try {
-    const status = await client.status()
-    await postSlackResponse(fetchFn, responseUrl, formatStatus(status), options.requestTimeoutMs)
-  } catch (error) {
-    safeCommandWarning(options.logger, 'slackbotv2_autorotate_status_failed', error)
-    await postSlackResponse(
-      fetchFn,
-      responseUrl,
-      'Autorotate status is temporarily unavailable.',
-      options.requestTimeoutMs
-    )
-  }
-}
-
-async function respondWithAccounts(
-  client: AutorotateClient,
   responseUrl: string,
   options: AutorotateSlackOptions,
   fetchFn: SlackbotV2Fetch
@@ -460,11 +433,11 @@ async function respondWithAccounts(
     await postSlackResponse(
       fetchFn,
       responseUrl,
-      formatAccounts(accounts),
+      formatStatus(accounts),
       options.requestTimeoutMs
     )
   } catch (error) {
-    safeCommandWarning(options.logger, 'slackbotv2_autorotate_accounts_failed', error)
+    safeCommandWarning(options.logger, 'slackbotv2_autorotate_status_failed', error)
     await postSlackResponse(
       fetchFn,
       responseUrl,
@@ -479,46 +452,17 @@ async function startAndMonitorEnrollment(input: {
   activeEnrollments: Map<string, ActiveEnrollment>
   actorKey: string
   client: AutorotateClient
-  command: Extract<ParsedCommand, { kind: 'login' }>
   fetchFn: SlackbotV2Fetch
   options: AutorotateSlackOptions
   pollIntervalMs: number
   responseUrl: string
 }): Promise<void> {
   try {
-    const reloginAccount = input.command.action === 'relogin' && input.command.account
-      ? await findReloginAccount(input.client, input.command)
-      : null
-    const reloginExpectedEmail = input.command.action === 'relogin'
-      ? input.command.expectedEmail ?? reloginAccount?.email ?? undefined
-      : undefined
-    const createInput: CreateEnrollmentInput = input.command.action === 'relogin'
-      ? {
-          action: 'relogin',
-          owner: input.active.owner,
-          ...(input.command.account ? { account: input.command.account } : {}),
-          ...(reloginExpectedEmail ? { expected_email: reloginExpectedEmail } : {})
-        }
-      : {
-          action: 'add',
-          owner: input.active.owner,
-          ...(input.command.label ? { label: input.command.label } : {}),
-          ...(input.command.expectedEmail
-            ? { expected_email: input.command.expectedEmail }
-            : {})
-        }
-    const enrollment = await input.client.createEnrollment(createInput)
-    const expectedLabel = createInput.action === 'add' ? createInput.label : createInput.account
-    if (
-      enrollment.action !== createInput.action
-      || (expectedLabel !== undefined && enrollment.account_label !== expectedLabel)
-    ) {
-      throw new AutorotateError(
-        'Autorotate returned an existing enrollment for this owner',
-        409,
-        'enrollment_already_active'
-      )
+    const createInput: CreateEnrollmentInput = {
+      action: 'relogin',
+      owner: input.active.owner
     }
+    const enrollment = await input.client.createEnrollment(createInput)
     const enrollmentId = enrollment.enrollment_id
     const expiresAtMs = Date.parse(enrollment.expires_at)
     input.active.enrollmentId = enrollmentId
@@ -567,7 +511,7 @@ async function startAndMonitorEnrollment(input: {
       input.fetchFn,
       input.responseUrl,
       enrollment.status === 'pending'
-        ? formatDeviceCode(enrollment, reloginAccount)
+        ? formatDeviceCode(enrollment)
         : formatActiveEnrollment(enrollment),
       input.options.requestTimeoutMs
     )
@@ -655,7 +599,7 @@ async function monitorEnrollment(
   await postSlackResponse(
     fetchFn,
     active.responseUrl,
-    'Codex device login expired. Run `/autorotate add` or `/autorotate relogin` to start again.',
+    'Codex device login expired. Run `/autorotate login` to start again.',
     options.requestTimeoutMs
   )
 }
@@ -874,150 +818,191 @@ function activeEnrollmentFromBroker(
 type ParsedCommand =
   | { kind: 'help' }
   | { kind: 'status' }
-  | { kind: 'accounts' }
-  | { kind: 'login'; action: 'add'; expectedEmail?: string; label?: string }
-  | { kind: 'login'; action: 'relogin'; account?: string; expectedEmail?: string }
+  | { kind: 'login' }
   | { kind: 'login_status' }
   | { kind: 'login_cancel' }
 
 function parseCommand(text: string): ParsedCommand {
   const parts = text.trim().split(/\s+/).filter(Boolean)
-  if (parts.length === 1 && parts[0]?.toLowerCase() === 'status') return { kind: 'status' }
-  if (parts.length === 1 && parts[0]?.toLowerCase() === 'accounts') return { kind: 'accounts' }
-  if (parts.length === 1 && parts[0]?.toLowerCase() === 'add') {
-    return { kind: 'login', action: 'add' }
+  const root = parts[0]?.toLowerCase()
+  if (parts.length === 1 && (root === 'status' || root === 'accounts')) {
+    return { kind: 'status' }
   }
-  if (parts.length === 1 && parts[0]?.toLowerCase() === 'relogin') {
-    return { kind: 'login', action: 'relogin' }
+  if (parts.length === 1 && (root === 'login' || root === 'add' || root === 'relogin')) {
+    return { kind: 'login' }
   }
-  if (parts[0]?.toLowerCase() !== 'login') return { kind: 'help' }
+  if (root !== 'login') return { kind: 'help' }
   if (parts.length === 2 && parts[1]?.toLowerCase() === 'status') return { kind: 'login_status' }
   if (parts.length === 2 && parts[1]?.toLowerCase() === 'cancel') return { kind: 'login_cancel' }
-  if (parts[1]?.toLowerCase() === 'relogin') {
-    return parseReloginCommand(text) ?? { kind: 'help' }
-  }
-  if (parts.length > 3) return { kind: 'help' }
-
-  const label = parts[1]
-  const expectedEmail = parts[2]
-  if (label && !/^[A-Za-z0-9._-]{1,64}$/.test(label)) return { kind: 'help' }
-  if (expectedEmail && !safeEmail(expectedEmail)) return { kind: 'help' }
-  return {
-    kind: 'login',
-    action: 'add',
-    ...(label ? { label } : {}),
-    ...(expectedEmail ? { expectedEmail } : {})
-  }
-}
-
-function parseReloginCommand(
-  text: string
-): (Extract<ParsedCommand, { action: 'relogin'; kind: 'login' }> & { account: string }) | null {
-  const match = /^\s*login\s+relogin\s+([\s\S]+?)\s*$/i.exec(text)
-  if (!match?.[1]) return null
-  const rest = match[1]
-  let account: string
-  let expectedEmail: string | undefined
-  if (rest.startsWith('"')) {
-    const end = jsonStringEnd(rest)
-    if (end === null) return null
-    try {
-      const parsed: unknown = JSON.parse(rest.slice(0, end))
-      if (typeof parsed !== 'string') return null
-      account = parsed
-    } catch {
-      return null
-    }
-    const remainder = rest.slice(end).trim()
-    if (remainder) {
-      if (/\s/.test(remainder)) return null
-      expectedEmail = remainder
-    }
-  } else {
-    const parts = rest.split(/\s+/)
-    if (parts.length > 2 || !parts[0] || !/^[A-Za-z0-9._-]{1,128}$/.test(parts[0])) {
-      return null
-    }
-    account = parts[0]
-    expectedEmail = parts[1]
-  }
-  if (!safeAccountLabel(account) || (expectedEmail && !safeEmail(expectedEmail))) return null
-  return {
-    kind: 'login',
-    action: 'relogin',
-    account,
-    ...(expectedEmail ? { expectedEmail } : {})
-  }
-}
-
-function jsonStringEnd(value: string): number | null {
-  let escaped = false
-  for (let index = 1; index < value.length; index += 1) {
-    const character = value[index]
-    if (escaped) {
-      escaped = false
-    } else if (character === '\\') {
-      escaped = true
-    } else if (character === '"') {
-      return index + 1
-    }
-  }
-  return null
+  return { kind: 'help' }
 }
 
 function helpText(): string {
   return [
-    '*Autorotate commands*',
-    '• `/autorotate status` — redacted pool health and capacity',
-    '• `/autorotate accounts` — account health, emails, and labels',
-    '• `/autorotate add` — add the Codex account you authenticate',
-    '• `/autorotate relogin` — repair the Codex account you authenticate'
+    'Autorotate commands',
+    '`/autorotate status` — account usability and rate limits',
+    '`/autorotate login` — add or refresh the account you authenticate'
   ].join('\n')
 }
 
-function formatStatus(status: AutorotateStatus): string {
-  return [
-    '*Codex account pool*',
-    `Available: ${safeCount(status.available)} / ${safeCount(status.total)}`,
-    `Healthy: ${safeCount(status.healthy)} · Leased: ${safeCount(status.leased)} · Limited: ${safeCount(status.limited)}`,
-    `Login required: ${safeCount(status.login_required)} · Disabled: ${safeCount(status.disabled)} · Pending logins: ${safeCount(status.pending_enrollments)}`,
-    safeTimestamp(status.next_available_at)
-      ? `Next account available: ${safeTimestamp(status.next_available_at)}`
-      : null
-  ].filter(Boolean).join('\n')
+function formatStatus(accounts: readonly AutorotateAccount[]): string {
+  if (accounts.length === 0) return 'Codex accounts: 0 usable / 0\n\nNo accounts.'
+  const sorted = [...accounts].sort(compareAccounts)
+  const usable = accounts.filter(account =>
+    account.availability === 'available' || account.availability === 'in_use'
+  ).length
+  const accountBlocks = sorted.map(account => {
+    const email = account.email ? escapeSlackText(account.email) : 'email unknown'
+    const state = account.availability === 'available' || account.availability === 'in_use'
+      ? 'usable'
+      : 'unusable'
+    return [
+      `${email} [${escapeSlackText(account.label)}]`,
+      `  state: ${state}`,
+      `  reason: ${accountReason(account)}`,
+      ...rateLimitRows(account),
+      `  observed: ${limitsObservedAt(account)}`,
+      `  next available: ${nextAvailable(account)}`
+    ].join('\n')
+  })
+  let text = `Codex accounts: ${usable} usable / ${accounts.length}`
+  let included = 0
+  for (const block of accountBlocks) {
+    const candidate = `${text}\n\n${block}`
+    const remaining = accountBlocks.length - included - 1
+    const suffix = remaining > 0 ? statusTruncationText(remaining) : ''
+    if (candidate.length + suffix.length > MAX_STATUS_TEXT_CHARS) break
+    text = candidate
+    included += 1
+  }
+  const omitted = accountBlocks.length - included
+  return omitted > 0 ? text + statusTruncationText(omitted) : text
 }
 
-function formatAccounts(accounts: readonly AutorotateAccount[]): string {
-  if (accounts.length === 0) return '*Codex accounts*\nNo active accounts.'
-  return [
-    '*Codex accounts*',
-    ...accounts.map(account => {
-      const email = account.email ? escapeSlackText(account.email) : 'email unknown'
-      const limitedUntil = safeTimestamp(account.limited_until)
-      const condition = account.login_required
-        ? `:red_circle: *UNUSABLE* — login required · status ${account.status}`
-        : account.status !== 'enabled'
-          ? `:red_circle: *UNUSABLE* — status ${account.status}`
-          : limitedUntil
-            ? `:large_yellow_circle: *LIMITED* — rate limited until ${limitedUntil}`
-            : ':large_green_circle: *AVAILABLE*'
-      return `• ${condition}\n  ${email} — \`${escapeSlackText(account.label)}\``
-    })
-  ].join('\n')
+function statusTruncationText(omitted: number): string {
+  return `\n\n${omitted} more account${omitted === 1 ? '' : 's'} not shown.`
 }
 
-function formatDeviceCode(
-  enrollment: StartEnrollmentResponse,
-  reloginAccount: AutorotateAccount | null = null
-): string {
+const ACCOUNT_AVAILABILITY_ORDER: Record<AutorotateAccount['availability'], number> = {
+  login_required: 0,
+  reconciliation_required: 1,
+  rate_limited: 2,
+  in_use: 3,
+  available: 4,
+  disabled: 5
+}
+
+function compareAccounts(left: AutorotateAccount, right: AutorotateAccount): number {
+  const availability = ACCOUNT_AVAILABILITY_ORDER[left.availability]
+    - ACCOUNT_AVAILABILITY_ORDER[right.availability]
+  if (availability !== 0) return availability
+  const leftIdentity = (left.email ?? left.label).toLowerCase()
+  const rightIdentity = (right.email ?? right.label).toLowerCase()
+  if (leftIdentity < rightIdentity) return -1
+  if (leftIdentity > rightIdentity) return 1
+  return left.label < right.label ? -1 : left.label > right.label ? 1 : 0
+}
+
+function accountReason(account: AutorotateAccount): string {
+  if (account.unusable_reason) {
+    switch (account.unusable_reason) {
+      case 'refresh_token_expired':
+        return 'refresh token expired'
+      case 'refresh_token_reused':
+        return 'refresh token reused'
+      case 'refresh_token_revoked':
+        return 'refresh token revoked'
+      case 'account_mismatch':
+        return 'account mismatch'
+      case 'login_required':
+        return 'login required'
+      case 'reconciliation_required':
+        return 'reconciliation required'
+      case 'operator_reported':
+        return 'reported unusable by operator'
+    }
+  }
+  switch (account.availability) {
+    case 'available':
+      return 'available'
+    case 'in_use':
+      return 'in use'
+    case 'rate_limited':
+      return 'out of rate limits'
+    case 'login_required':
+      return 'login required'
+    case 'reconciliation_required':
+      return 'reconciliation required'
+    case 'disabled':
+      return 'disabled by operator'
+  }
+}
+
+function rateLimitRows(account: AutorotateAccount): string[] {
+  return [
+    { fallback: 'primary', window: account.primary },
+    { fallback: 'secondary', window: account.secondary }
+  ]
+    .map(({ fallback, window }) => ({
+      label: rateLimitLabel(window, fallback),
+      rank: rateLimitRank(window, fallback),
+      window
+    }))
+    .sort((left, right) => left.rank - right.rank)
+    .map(({ label, window }) => `  ${label}: ${formatRateLimitWindow(window)}`)
+}
+
+function rateLimitLabel(window: RateLimitWindow | null, fallback: string): string {
+  if (!window) return fallback === 'primary' ? '5h' : 'weekly'
+  if (window.window_minutes === 300) return '5h'
+  if (window.window_minutes === 10_080) return 'weekly'
+  return fallback
+}
+
+function rateLimitRank(window: RateLimitWindow | null, fallback: string): number {
+  if (!window) return fallback === 'primary' ? 0 : 1
+  if (window.window_minutes === 300) return 0
+  if (window.window_minutes === 10_080) return 1
+  return fallback === 'primary' ? 2 : 3
+}
+
+function formatRateLimitWindow(window: RateLimitWindow | null): string {
+  if (!window) return 'unknown'
+  const resetsAt = window.resets_at ? formatUtcTimestamp(window.resets_at) : 'unknown'
+  return `${formatPercent(window.used_percent)} used; resets ${resetsAt}`
+}
+
+function formatPercent(value: number): string {
+  return `${Object.is(value, -0) ? '0' : String(value)}%`
+}
+
+function limitsObservedAt(account: AutorotateAccount): string {
+  if (!account.primary && !account.secondary) return 'unknown'
+  return account.limits_observed_at
+    ? formatUtcTimestamp(account.limits_observed_at)
+    : 'unknown'
+}
+
+function nextAvailable(account: AutorotateAccount): string {
+  if (account.availability === 'available') return 'now'
+  if (account.availability === 'login_required') return 'run /autorotate login'
+  if (account.availability === 'reconciliation_required') return 'operator reconciliation required'
+  if (account.availability === 'disabled') return 'operator action required'
+  return account.next_available_at
+    ? formatUtcTimestamp(account.next_available_at)
+    : 'unknown'
+}
+
+function formatUtcTimestamp(value: string): string {
+  return `${new Date(value).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+}
+
+function formatDeviceCode(enrollment: StartEnrollmentResponse): string {
   const verificationUrl = safeVerificationUrl(enrollment.verification_url)
   const userCode = safeUserCode(enrollment.user_code)
   if (!verificationUrl || !userCode) throw new AutorotateError('invalid device authorization')
   return [
     '*Codex device login*',
-    reloginAccount
-      ? `Reauthenticating \`${escapeSlackText(reloginAccount.label)}\` (${reloginAccount.email ? escapeSlackText(reloginAccount.email) : 'email unknown'}).`
-      : null,
     `Open <${verificationUrl}|the OpenAI device login page> and enter: \`${userCode}\``,
     safeTimestamp(enrollment.expires_at) ? `Expires: ${safeTimestamp(enrollment.expires_at)}` : null,
     'This ephemeral response will be replaced when login completes.'
@@ -1039,28 +1024,6 @@ function formatActiveEnrollment(
   return 'Codex login is still waiting for device authorization.'
 }
 
-async function findReloginAccount(
-  client: AutorotateClient,
-  command: Extract<ParsedCommand, { action: 'relogin'; kind: 'login' }>
-): Promise<AutorotateAccount> {
-  if (!command.account) {
-    throw new AutorotateError('relogin account was not specified')
-  }
-  const accounts = await client.accounts()
-  const account = accounts.find(candidate => candidate.label === command.account)
-  if (!account) {
-    throw new AutorotateError('relogin account was not found', 404, 'account_not_found')
-  }
-  if (
-    command.expectedEmail
-    && account.email
-    && command.expectedEmail.toLowerCase() !== account.email.toLowerCase()
-  ) {
-    throw new AutorotateError('relogin email did not match', 409, 'email_mismatch')
-  }
-  return account
-}
-
 function loginFailureText(error: unknown): string {
   const code = error instanceof AutorotateError ? error.code : undefined
   return enrollmentFailureText(
@@ -1072,11 +1035,11 @@ function loginFailureText(error: unknown): string {
 function enrollmentFailureText(errorCode: string | null | undefined, fallback: string): string {
   switch (errorCode) {
     case 'account_not_found':
-      return 'No existing account matched that Codex login. Use `/autorotate add` to add it instead.'
+      return 'Autorotate could not add or refresh that Codex account. Run `/autorotate login` to try again.'
     case 'account_busy':
       return 'That Codex account is already being reauthenticated. Try again after the active login finishes.'
     case 'account_mismatch':
-      return 'Autorotate could not safely match that Codex login. Check `/autorotate accounts` and try again.'
+      return 'Autorotate could not safely match that Codex login. Check `/autorotate status` and try again.'
     case 'enrollment_already_active':
       return 'Another Codex login is already active. Wait for it to finish, or try again after it expires.'
     case 'email_mismatch':
@@ -1093,11 +1056,11 @@ function formatTerminalEnrollment(enrollment: EnrollmentStatusResponse): string 
     case 'cancelled':
       return 'Codex device login was cancelled.'
     case 'expired':
-      return 'Codex device login expired. Run `/autorotate add` or `/autorotate relogin` to start again.'
+      return 'Codex device login expired. Run `/autorotate login` to start again.'
     case 'failed':
       return enrollmentFailureText(
         enrollment.error_code,
-        'Codex device login failed. Run `/autorotate add` or `/autorotate relogin` to try again.'
+        'Codex device login failed. Run `/autorotate login` to try again.'
       )
     default:
       return 'Codex device login failed.'
@@ -1202,22 +1165,132 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
   const status = payload.status
   const limitedUntil = payload.limited_until
   const loginRequired = payload.login_required
+  const reconciliationRequired = payload.reconciliation_required
+  const activeWriter = payload.active_writer
+  const availability = payload.availability
+  const unusableReason = payload.unusable_reason
+  const limitsObservedAt = payload.limits_observed_at
+  const primary = validateRateLimitWindow(payload.primary)
+  const secondary = validateRateLimitWindow(payload.secondary)
+  const nextAvailableAt = payload.next_available_at
   if (
-    typeof label !== 'string'
+    !ACCOUNT_FIELDS.every(field => Object.hasOwn(payload, field))
     || !safeAccountLabel(label)
     || (email !== null && !safeEmail(email))
     || !isAccountStatus(status)
-    || (limitedUntil !== null && limitedUntil !== undefined && !safeTimestamp(limitedUntil))
+    || (limitedUntil !== null && (typeof limitedUntil !== 'string' || !safeTimestamp(limitedUntil)))
     || typeof loginRequired !== 'boolean'
+    || typeof reconciliationRequired !== 'boolean'
+    || typeof activeWriter !== 'boolean'
+    || !isAccountAvailability(availability)
+    || (unusableReason !== null && !isAccountUnusableReason(unusableReason))
+    || (
+      limitsObservedAt !== null
+      && (typeof limitsObservedAt !== 'string' || !safeTimestamp(limitsObservedAt))
+    )
+    || (
+      nextAvailableAt !== null
+      && (typeof nextAvailableAt !== 'string' || !safeTimestamp(nextAvailableAt))
+    )
+  ) {
+    throw new AutorotateError('Autorotate returned invalid accounts')
+  }
+  const account: AutorotateAccount = {
+    active_writer: activeWriter,
+    availability,
+    label,
+    email,
+    status,
+    limited_until: limitedUntil,
+    limits_observed_at: limitsObservedAt,
+    login_required: loginRequired,
+    next_available_at: nextAvailableAt,
+    primary,
+    reconciliation_required: reconciliationRequired,
+    secondary,
+    unusable_reason: unusableReason
+  }
+  if (!validAccountState(account)) {
+    throw new AutorotateError('Autorotate returned contradictory account status')
+  }
+  return account
+}
+
+function validAccountState(account: AutorotateAccount): boolean {
+  if ((account.primary || account.secondary) && !account.limits_observed_at) return false
+  switch (account.availability) {
+    case 'available':
+      return account.status === 'enabled'
+        && !account.login_required
+        && !account.reconciliation_required
+        && !account.active_writer
+        && account.limited_until === null
+        && account.unusable_reason === null
+        && account.next_available_at === null
+    case 'in_use':
+      return account.status === 'enabled'
+        && !account.login_required
+        && !account.reconciliation_required
+        && account.active_writer
+        && account.limited_until === null
+        && account.unusable_reason === null
+        && account.next_available_at !== null
+    case 'rate_limited':
+      return account.status === 'enabled'
+        && !account.login_required
+        && !account.reconciliation_required
+        && account.limited_until !== null
+        && account.unusable_reason === null
+        && account.next_available_at !== null
+        && Date.parse(account.next_available_at) >= Date.parse(account.limited_until)
+    case 'login_required':
+      return (account.status === 'dead' || account.status === 'disabled')
+        && account.login_required
+        && !account.reconciliation_required
+        && account.unusable_reason !== null
+        && account.next_available_at === null
+    case 'reconciliation_required':
+      return account.status === 'disabled'
+        && !account.login_required
+        && account.reconciliation_required
+        && account.unusable_reason === 'reconciliation_required'
+        && account.next_available_at === null
+    case 'disabled':
+      return account.status === 'disabled'
+        && !account.login_required
+        && !account.reconciliation_required
+        && account.unusable_reason === null
+        && account.next_available_at === null
+  }
+}
+
+function validateRateLimitWindow(value: unknown): RateLimitWindow | null {
+  if (value === null) return null
+  if (!isJsonObject(value)) {
+    throw new AutorotateError('Autorotate returned invalid accounts')
+  }
+  const window = selectFields(value, RATE_LIMIT_FIELDS)
+  const usedPercent = window.used_percent
+  const resetsAt = window.resets_at
+  const windowMinutes = window.window_minutes
+  if (
+    !RATE_LIMIT_FIELDS.every(field => Object.hasOwn(window, field))
+    || typeof usedPercent !== 'number'
+    || !Number.isFinite(usedPercent)
+    || usedPercent < 0
+    || usedPercent > 100
+    || (resetsAt !== null && (typeof resetsAt !== 'string' || !safeTimestamp(resetsAt)))
+    || (
+      windowMinutes !== null
+      && (!Number.isSafeInteger(windowMinutes) || (windowMinutes as number) <= 0)
+    )
   ) {
     throw new AutorotateError('Autorotate returned invalid accounts')
   }
   return {
-    label,
-    email: email ?? null,
-    status: status as AutorotateAccount['status'],
-    limited_until: typeof limitedUntil === 'string' ? limitedUntil : null,
-    login_required: loginRequired
+    resets_at: resetsAt,
+    used_percent: usedPercent,
+    window_minutes: windowMinutes as number | null
   }
 }
 
@@ -1353,6 +1426,27 @@ function isAccountStatus(value: unknown): value is AutorotateAccount['status'] {
   return value === 'enabled' || value === 'disabled' || value === 'dead'
 }
 
+function isAccountAvailability(
+  value: unknown
+): value is AutorotateAccount['availability'] {
+  return value === 'available'
+    || value === 'in_use'
+    || value === 'rate_limited'
+    || value === 'login_required'
+    || value === 'reconciliation_required'
+    || value === 'disabled'
+}
+
+function isAccountUnusableReason(value: unknown): value is AccountUnusableReason {
+  return value === 'refresh_token_expired'
+    || value === 'refresh_token_reused'
+    || value === 'refresh_token_revoked'
+    || value === 'account_mismatch'
+    || value === 'login_required'
+    || value === 'reconciliation_required'
+    || value === 'operator_reported'
+}
+
 function isEnrollmentStatus(value: unknown): value is EnrollmentStatus {
   return value === 'pending'
     || value === 'importing'
@@ -1370,10 +1464,6 @@ function safeTimestamp(value: unknown): string | null {
 
 function isTerminalStatus(value: EnrollmentStatus | undefined): boolean {
   return ['completed', 'expired', 'failed', 'cancelled'].includes(value ?? '')
-}
-
-function safeCount(value: number | undefined): string {
-  return Number.isSafeInteger(value) && (value ?? -1) >= 0 ? String(value) : '—'
 }
 
 function escapeSlackText(value: string): string {
