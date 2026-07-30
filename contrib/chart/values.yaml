@@ -497,6 +497,9 @@ slackbotv2:
     observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
     operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
     operatorSlackTeamIds: []
+    # Old runtimes require this during a chart-first rolling upgrade. Current
+    # runtimes ignore it and authorize every valid member of the workspace.
+    operatorSlackUserIds: []
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
   mcpPublicUrl: "http://localhost:3000"

@@ -113,6 +113,10 @@ spec:
               value: {{ required "slackbotv2.autorotate.url is required when Autorotate commands are enabled" .Values.slackbotv2.autorotate.url | quote }}
             - name: SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS
               value: {{ required "slackbotv2.autorotate.operatorSlackTeamIds must not be empty when Autorotate commands are enabled" (join "," .Values.slackbotv2.autorotate.operatorSlackTeamIds) | quote }}
+{{- if .Values.slackbotv2.autorotate.operatorSlackUserIds }}
+            - name: SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS
+              value: {{ join "," .Values.slackbotv2.autorotate.operatorSlackUserIds | quote }}
+{{- end }}
             - name: AUTOROTATE_OBSERVER_TOKEN
               valueFrom:
                 secretKeyRef:
