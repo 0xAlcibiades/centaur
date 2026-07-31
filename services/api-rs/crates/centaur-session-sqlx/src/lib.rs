@@ -749,6 +749,53 @@ impl PgSessionStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Return the exact targets for a still-current disabled consent revision.
+    /// A reconciler can retain a stale pending snapshot, so this check is the
+    /// ABA fence between a completed drain and a later regrant.
+    pub async fn metadata_trace_drain_targets_if_current(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        disabled_revision: i64,
+    ) -> Result<Option<Vec<MetadataTraceDrainTarget>>, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut tx).await?;
+        let current = sqlx::query_scalar::<_, i64>(
+            r#"
+            select revision from metadata_trace_consents
+            where source = $1 and workspace_id = $2 and user_id = $3
+              and revision = $4 and enabled is false and drain_pending is true
+            for update
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(disabled_revision)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current.is_none() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let targets = match disabled_revision.checked_sub(1) {
+            Some(assignment_revision) => {
+                metadata_trace_drain_targets_in_transaction(
+                    &mut tx,
+                    source,
+                    workspace_id,
+                    user_id,
+                    assignment_revision,
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
+        tx.commit().await?;
+        Ok(Some(targets))
+    }
+
     /// Atomically reserve, apply, and persist a grant result.  A request row
     /// with an incomplete result is never re-applied: it can only have been
     /// written by an older binary, because this method commits the reservation
@@ -2730,6 +2777,52 @@ impl PgSessionStore {
         }))
     }
 
+    /// Clear a pending drain only if the exact disabled revision that claimed
+    /// it is still current. A stale reconciler must not mutate a later grant.
+    pub async fn complete_metadata_trace_drain_if_current_and_empty(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        disabled_revision: i64,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update metadata_trace_consents consent
+            set drain_pending = false, updated_at = now()
+            where source = $1 and workspace_id = $2 and user_id = $3
+              and revision = $7 and enabled is false and drain_pending is true
+              and not exists (
+                  select 1 from sessions
+                  where sandbox_metadata_trace_enabled is true
+                    and sandbox_id is not null
+                    and (
+                        (
+                            sandbox_metadata_trace_source = $4
+                            and sandbox_metadata_trace_workspace_id = $5
+                            and sandbox_metadata_trace_user_id = $6
+                        )
+                        or sandbox_metadata_trace_assignment_epoch is null
+                        or sandbox_metadata_trace_source is null
+                        or sandbox_metadata_trace_workspace_id is null
+                        or sandbox_metadata_trace_user_id is null
+                        or sandbox_metadata_trace_resource_uid is null
+                    )
+              )
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(disabled_revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Acquire the row lock only when the durable assignment still refers to
     /// the sandbox observed by a reconciliation sweep.
     pub async fn lock_sandbox_assignment_for_reconciliation(
@@ -3942,6 +4035,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(targets.len(), 1);
+        assert!(!revoked.enabled);
+        assert!(revoked.drain_pending);
+        assert_eq!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap(),
+            revoked,
+            "the acknowledged revoke must leave its exact drain durable"
+        );
         let old = &targets[0];
         assert!(
             store
@@ -3977,6 +4080,31 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            store
+                .metadata_trace_drain_targets_if_current(
+                    "slack",
+                    &workspace_id,
+                    &user_id,
+                    revoked.revision,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale replica must not claim a completed revoke after regrant"
+        );
+        assert!(
+            !store
+                .complete_metadata_trace_drain_if_current_and_empty(
+                    "slack",
+                    &workspace_id,
+                    &user_id,
+                    revoked.revision,
+                )
+                .await
+                .unwrap(),
+            "a stale drain completion must not mutate the new grant"
+        );
         let (replayed, replay_targets) = store
             .revoke_metadata_trace_consent_idempotent(
                 "slack",
@@ -3999,6 +4127,29 @@ mod tests {
                 .as_deref(),
             Some("sbx-new")
         );
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "delete from metadata_trace_consent_requests
+             where source = 'slack' and workspace_id = $1 and user_id = $2",
+        )
+        .bind(&workspace_id)
+        .bind(&user_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "delete from metadata_trace_consents
+             where source = 'slack' and workspace_id = $1 and user_id = $2",
+        )
+        .bind(&workspace_id)
+        .bind(&user_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

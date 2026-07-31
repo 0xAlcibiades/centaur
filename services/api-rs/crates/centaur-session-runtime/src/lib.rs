@@ -27,9 +27,9 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    MetadataTraceConfigIdentity, MetadataTraceConsent, MetadataTraceReconcilerLease,
-    OwnedTerminalEvent, PgSessionStore, SandboxCapacityCandidate, SessionEventListener,
-    SessionStoreError, default_metadata,
+    MetadataTraceConfigIdentity, MetadataTraceConsent, MetadataTraceDrainTarget,
+    MetadataTraceReconcilerLease, OwnedTerminalEvent, PgSessionStore, SandboxCapacityCandidate,
+    SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -1472,9 +1472,24 @@ impl SessionRuntime {
         user_id: &str,
         idempotency: Option<(&str, String)>,
     ) -> Result<MetadataTraceConsent, SessionRuntimeError> {
+        // The commit is the acknowledgement fence: it disables future traced
+        // input and records the exact assignments that a reconciler must
+        // retire. Backend shutdown is deliberately not on the HTTP path.
+        let (consent, _) = self
+            .revoke_slack_trace_consent_durable(workspace_id, user_id, idempotency)
+            .await?;
+        Ok(consent)
+    }
+
+    async fn revoke_slack_trace_consent_durable(
+        &self,
+        workspace_id: &str,
+        user_id: &str,
+        idempotency: Option<(&str, String)>,
+    ) -> Result<(MetadataTraceConsent, Vec<MetadataTraceDrainTarget>), SessionRuntimeError> {
         let subject = SlackTraceSubject::from_parts(workspace_id, user_id);
         let subject_hash = trace_subject_hash(&subject);
-        let (consent, targets) = match idempotency {
+        Ok(match idempotency {
             Some((key, request_hash)) => {
                 self.store
                     .revoke_metadata_trace_consent_idempotent(
@@ -1492,26 +1507,73 @@ impl SessionRuntime {
                     .revoke_metadata_trace_consent("slack", workspace_id, user_id, &subject_hash)
                     .await?
             }
+        })
+    }
+
+    /// Retire exact sandbox assignments after their revoke has committed. This
+    /// worker may wait for backend shutdown; callers on the acknowledgement
+    /// path must use [`Self::revoke_slack_trace_consent`] instead.
+    async fn drain_slack_trace_consent(
+        &self,
+        pending: &MetadataTraceConsent,
+    ) -> Result<(), SessionRuntimeError> {
+        let workspace_id = &pending.workspace_id;
+        let user_id = &pending.user_id;
+        let Some(targets) = self
+            .store
+            .metadata_trace_drain_targets_if_current(
+                "slack",
+                workspace_id,
+                user_id,
+                pending.revision,
+            )
+            .await?
+        else {
+            // Another replica already completed this revision and may have
+            // regranted consent. Never turn stale drain work into a revoke.
+            return Ok(());
         };
         for target in targets {
             let sandbox_id = SandboxId::new(&target.sandbox_id);
-            let exact_target_present = matches!(
-                self.sandbox_runtime.manager.observe(&sandbox_id).await,
-                Ok(observation) if observation.resource_uid.as_deref() == Some(target.resource_uid.as_str())
-            );
-            if !exact_target_present {
-                // The expected UID is already absent or the name was reused;
-                // never delete a replacement that only shares the sandbox ID.
-                self.sandbox_pipes.remove(&target.sandbox_id);
-                self.store
-                    .clear_metadata_trace_assignment_if_matches(
-                        &target,
-                        "slack",
-                        workspace_id,
-                        user_id,
-                    )
-                    .await?;
-                continue;
+            match self.sandbox_runtime.manager.observe(&sandbox_id).await {
+                Ok(observation)
+                    if observation.status == SandboxStatus::Gone
+                        || observation
+                            .resource_uid
+                            .as_deref()
+                            .is_some_and(|resource_uid| resource_uid != target.resource_uid) =>
+                {
+                    // A missing optional UID is not proof that the exact
+                    // sandbox disappeared. Only Gone or a concrete different
+                    // UID can retire the durable target without a stop.
+                    self.sandbox_pipes.remove(&target.sandbox_id);
+                    self.store
+                        .clear_metadata_trace_assignment_if_matches(
+                            &target,
+                            "slack",
+                            workspace_id,
+                            user_id,
+                        )
+                        .await?;
+                    continue;
+                }
+                Err(SandboxError::NotFound(_)) => {
+                    self.sandbox_pipes.remove(&target.sandbox_id);
+                    self.store
+                        .clear_metadata_trace_assignment_if_matches(
+                            &target,
+                            "slack",
+                            workspace_id,
+                            user_id,
+                        )
+                        .await?;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(sandbox_id = %target.sandbox_id, %error, "metadata trace sandbox drain observation failed");
+                    continue;
+                }
             }
             let drained = match timeout(
                 Duration::from_secs(10),
@@ -1524,8 +1586,10 @@ impl SessionRuntime {
                 Ok(Ok(())) => match self.sandbox_runtime.manager.observe(&sandbox_id).await {
                     Ok(observation) => {
                         observation.status == SandboxStatus::Gone
-                            || observation.resource_uid.as_deref()
-                                != Some(target.resource_uid.as_str())
+                            || observation
+                                .resource_uid
+                                .as_deref()
+                                .is_some_and(|resource_uid| resource_uid != target.resource_uid)
                     }
                     Err(SandboxError::NotFound(_)) => true,
                     Err(_) => false,
@@ -1557,7 +1621,7 @@ impl SessionRuntime {
                 warn!(sandbox_id = %target.sandbox_id, "metadata trace sandbox drain remains pending");
             }
         }
-        if consent.drain_pending {
+        if pending.drain_pending {
             // The request's durable result deliberately remains pending: a
             // replay must return the exact accepted result while it resumes
             // drain work, rather than exposing a later mutation of that
@@ -1565,10 +1629,15 @@ impl SessionRuntime {
             // gone, so future grants are not blocked.
             let _ = self
                 .store
-                .complete_metadata_trace_drain_if_empty("slack", workspace_id, user_id)
+                .complete_metadata_trace_drain_if_current_and_empty(
+                    "slack",
+                    workspace_id,
+                    user_id,
+                    pending.revision,
+                )
                 .await?;
         }
-        Ok(consent)
+        Ok(())
     }
 
     pub fn with_metadata_trace_config(
@@ -1717,8 +1786,7 @@ impl SessionRuntime {
         let mut stopped = 0;
         for pending in self.store.pending_metadata_trace_drains().await? {
             if pending.source == "slack" {
-                self.revoke_slack_trace_consent(&pending.workspace_id, &pending.user_id, None)
-                    .await?;
+                self.drain_slack_trace_consent(&pending).await?;
                 stopped += 1;
             }
         }
@@ -11168,10 +11236,14 @@ mod adoption_tests {
         open_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
         observed_statuses: std::sync::Mutex<BTreeMap<String, SandboxStatus>>,
+        observed_resource_uids: std::sync::Mutex<BTreeMap<String, String>>,
         create_id: String,
         created_specs: std::sync::Mutex<Vec<SandboxSpec>>,
         resume_fails: AtomicBool,
+        observe_fails: AtomicBool,
         stop_fails: AtomicBool,
+        stop_preserves_status: AtomicBool,
+        stop_delay: std::sync::Mutex<Option<Duration>>,
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
@@ -11192,10 +11264,14 @@ mod adoption_tests {
                 open_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
                 observed_statuses: std::sync::Mutex::new(BTreeMap::new()),
+                observed_resource_uids: std::sync::Mutex::new(BTreeMap::new()),
                 create_id: "mock-sbx".to_owned(),
                 created_specs: std::sync::Mutex::new(Vec::new()),
                 resume_fails: AtomicBool::new(false),
+                observe_fails: AtomicBool::new(false),
                 stop_fails: AtomicBool::new(false),
+                stop_preserves_status: AtomicBool::new(false),
+                stop_delay: std::sync::Mutex::new(None),
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
@@ -11253,6 +11329,20 @@ mod adoption_tests {
                 .insert(sandbox_id.to_owned(), status);
         }
 
+        fn set_observed_resource_uid(&self, sandbox_id: &str, resource_uid: &str) {
+            self.observed_resource_uids
+                .lock()
+                .unwrap()
+                .insert(sandbox_id.to_owned(), resource_uid.to_owned());
+        }
+
+        fn clear_observed_resource_uid(&self, sandbox_id: &str) {
+            self.observed_resource_uids
+                .lock()
+                .unwrap()
+                .remove(sandbox_id);
+        }
+
         fn status_of(&self, sandbox_id: &str) -> Option<SandboxStatus> {
             self.observed_statuses
                 .lock()
@@ -11265,12 +11355,28 @@ mod adoption_tests {
             self.resume_fails.store(true, Ordering::SeqCst);
         }
 
+        fn fail_observe(&self) {
+            self.observe_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn allow_observe(&self) {
+            self.observe_fails.store(false, Ordering::SeqCst);
+        }
+
         fn fail_stop(&self) {
             self.stop_fails.store(true, Ordering::SeqCst);
         }
 
         fn allow_stop(&self) {
             self.stop_fails.store(false, Ordering::SeqCst);
+        }
+
+        fn preserve_status_after_stop(&self, preserve: bool) {
+            self.stop_preserves_status.store(preserve, Ordering::SeqCst);
+        }
+
+        fn set_stop_delay(&self, delay: Option<Duration>) {
+            *self.stop_delay.lock().unwrap() = delay;
         }
 
         fn mark_stop_missing(&self, sandbox_id: &str) {
@@ -11343,8 +11449,19 @@ mod adoption_tests {
         }
 
         async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            if self.observe_fails.load(Ordering::SeqCst) {
+                return Err(SandboxError::backend("mock observe failure"));
+            }
             let status = self.status(id).await?;
-            Ok(ObservedSandbox::new(id.clone(), "mock", status))
+            Ok(
+                ObservedSandbox::new(id.clone(), "mock", status).with_resource_uid(
+                    self.observed_resource_uids
+                        .lock()
+                        .unwrap()
+                        .get(id.as_str())
+                        .cloned(),
+                ),
+            )
         }
 
         async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -11353,11 +11470,19 @@ mod adoption_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(id, status)| ObservedSandbox::new(id.as_str(), "mock", status.clone()))
+                .map(|(id, status)| {
+                    ObservedSandbox::new(id.as_str(), "mock", status.clone()).with_resource_uid(
+                        self.observed_resource_uids.lock().unwrap().get(id).cloned(),
+                    )
+                })
                 .collect())
         }
 
         async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            let delay = *self.stop_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.stop_fails.load(Ordering::SeqCst) {
                 return Err(SandboxError::backend("mock stop failure"));
             }
@@ -11365,7 +11490,9 @@ mod adoption_tests {
                 return Err(SandboxError::NotFound(id.as_str().to_owned()));
             }
             self.stopped.lock().unwrap().push(id.as_str().to_owned());
-            self.set_observed_status(id.as_str(), SandboxStatus::Gone);
+            if !self.stop_preserves_status.load(Ordering::SeqCst) {
+                self.set_observed_status(id.as_str(), SandboxStatus::Gone);
+            }
             Ok(())
         }
 
@@ -12150,7 +12277,7 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stalled_traced_send_releases_the_revoke_boundary_at_the_test_cap() {
+    async fn revoke_acknowledges_after_input_fence_before_stalled_exact_drain() {
         let Some(store) = test_store().await else {
             return;
         };
@@ -12216,9 +12343,12 @@ mod adoption_tests {
             .await
             .unwrap();
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_resource_uid("sbx-stall", "uid-stall");
+        backend.set_stop_delay(Some(Duration::from_secs(10)));
         let (io, _stdout, _stdin) = mock_io();
         backend.push_io(io).await;
-        let runtime = runtime_with(&store, backend).with_metadata_trace_config(Some(identity));
+        let runtime =
+            runtime_with(&store, backend.clone()).with_metadata_trace_config(Some(identity));
         let pipe = runtime
             .ensure_session_pipe(&thread_key, "sbx-stall")
             .await
@@ -12241,22 +12371,247 @@ mod adoption_tests {
                 .await
         });
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let revoke_store = store.clone();
+        let revoke_runtime = runtime.clone();
+        let revoke_workspace_id = workspace_id.clone();
+        let revoke_user_id = user_id.clone();
         let revoke = tokio::time::timeout(Duration::from_secs(1), async move {
-            revoke_store
-                .revoke_metadata_trace_consent("slack", &workspace_id, &user_id, "u1")
+            revoke_runtime
+                .revoke_slack_trace_consent(&revoke_workspace_id, &revoke_user_id, None)
                 .await
         })
         .await;
         METADATA_TRACE_INPUT_TEST_TIMEOUT_MS.store(30_000, Ordering::Relaxed);
+        let revoked = revoke
+            .expect("revoke must not wait for a stalled exact stop")
+            .expect("revoke succeeds");
+        assert!(!revoked.enabled);
+        assert!(revoked.drain_pending);
         assert!(
-            revoke.is_ok(),
-            "revoke must not wait for the consent lifetime"
+            backend.stopped().is_empty(),
+            "acknowledgement must not stop"
         );
         assert!(matches!(
             writer.await.unwrap(),
             Err(SessionRuntimeError::MetadataTraceBoundaryChanged)
         ));
+        assert!(
+            store
+                .lock_metadata_trace_input(
+                    &capabilities,
+                    &thread_key,
+                    &execution.execution.execution_id,
+                    "sbx-stall",
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "the committed acknowledgement must fence all later traced input"
+        );
+
+        backend.set_stop_delay(None);
+        runtime
+            .reconcile_active_sandbox_capabilities()
+            .await
+            .expect("reconcile pending drain");
+        assert_eq!(backend.stopped(), vec!["sbx-stall".to_owned()]);
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .is_none(),
+            "reconciliation retires the exact durable assignment"
+        );
+        assert!(
+            !store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+                .drain_pending,
+            "a completed exact drain releases the durable grant fence"
+        );
+        let regranted = store
+            .grant_metadata_trace_consent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap();
+        runtime
+            .drain_slack_trace_consent(&revoked)
+            .await
+            .expect("a stale replica drain is a no-op");
+        assert_eq!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap(),
+            regranted,
+            "a stale reconciler must not revoke a later grant"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_drain_observation_error_keeps_the_exact_assignment_pending() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:trace-observe-{}", uuid::Uuid::new_v4())).unwrap();
+        let workspace_id = format!("T-observe-{}", uuid::Uuid::new_v4());
+        let user_id = format!("U-observe-{}", uuid::Uuid::new_v4());
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let identity = MetadataTraceConfigIdentity {
+            generation: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64,
+            fingerprint: format!("trace-observe-{}", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .unwrap();
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let granted = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        let capabilities = SessionSandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("observe-subject".to_owned()),
+            metadata_trace_consent_revision: Some(granted.revision),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SessionSandboxCapabilities::default_enabled()
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-observe",
+                    &capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-observe",
+                )
+                .await
+                .unwrap()
+        );
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_resource_uid("sbx-observe", "uid-observe");
+        let runtime =
+            runtime_with(&store, backend.clone()).with_metadata_trace_config(Some(identity));
+        let revoked = runtime
+            .revoke_slack_trace_consent(&workspace_id, &user_id, None)
+            .await
+            .unwrap();
+
+        backend.fail_observe();
+        runtime.drain_slack_trace_consent(&revoked).await.unwrap();
+        assert!(backend.stopped().is_empty());
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-observe"),
+            "a transient observation error must not clear a live assignment"
+        );
+        assert!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+                .drain_pending,
+            "a transient observation error must remain retryable"
+        );
+
+        backend.allow_observe();
+        backend.clear_observed_resource_uid("sbx-observe");
+        backend.fail_stop();
+        runtime.drain_slack_trace_consent(&revoked).await.unwrap();
+        assert!(backend.stopped().is_empty());
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-observe"),
+            "an observation without a UID must not clear the durable target"
+        );
+        assert!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+                .drain_pending,
+            "a missing observation UID must remain retryable"
+        );
+
+        backend.allow_stop();
+        backend.preserve_status_after_stop(true);
+        runtime.drain_slack_trace_consent(&revoked).await.unwrap();
+        assert_eq!(backend.stopped(), vec!["sbx-observe".to_owned()]);
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-observe"),
+            "a successful stop without Gone or a concrete replacement UID is not a drain proof"
+        );
+        assert!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+                .drain_pending,
+            "post-stop observation without a UID must remain retryable"
+        );
+
+        backend.preserve_status_after_stop(false);
+        backend.set_observed_resource_uid("sbx-observe", "uid-observe");
+        runtime.drain_slack_trace_consent(&revoked).await.unwrap();
+        assert_eq!(
+            backend.stopped(),
+            vec!["sbx-observe".to_owned(), "sbx-observe".to_owned()]
+        );
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .is_none()
+        );
+        assert!(
+            !store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+                .drain_pending
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

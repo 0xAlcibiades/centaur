@@ -4453,3 +4453,192 @@ mod webhook_tests {
         assert_eq!(response.status(), StatusCode::LOCKED);
     }
 }
+
+#[cfg(test)]
+mod slack_trace_consent_tests {
+    use std::{collections::BTreeMap, future};
+
+    use axum::body::to_bytes;
+    use centaur_sandbox_core::{
+        ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
+        SandboxResult, SandboxStatus,
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    struct StalledExactStopBackend;
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for StalledExactStopBackend {
+        fn name(&self) -> &'static str {
+            "stalled-stop"
+        }
+
+        async fn create(
+            &self,
+            _spec: centaur_sandbox_core::SandboxSpec,
+        ) -> SandboxResult<SandboxHandle> {
+            Err(SandboxError::backend("not used by trace consent DELETE"))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            Err(SandboxError::backend("not used by trace consent DELETE"))
+        }
+
+        async fn read_output_since(
+            &self,
+            _id: &SandboxId,
+            _since: Option<std::time::SystemTime>,
+        ) -> SandboxResult<Vec<String>> {
+            Err(SandboxError::backend("not used by trace consent DELETE"))
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(
+                ObservedSandbox::new(id.clone(), self.name(), SandboxStatus::Running)
+                    .with_resource_uid(Some("uid-stalled".to_owned())),
+            )
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            future::pending().await
+        }
+
+        async fn ensure_iron_control_proxy_resources(
+            &self,
+            _id: &SandboxId,
+            _principal_id: &str,
+            _labels: &BTreeMap<String, String>,
+        ) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test database");
+        store.run_migrations().await.expect("run migrations");
+        Some(store)
+    }
+
+    #[tokio::test]
+    async fn delete_trace_consent_acknowledges_before_a_stalled_exact_stop() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let workspace_id = format!("T{}", Uuid::new_v4().simple().to_string().to_uppercase());
+        let user_id = format!("U{}", Uuid::new_v4().simple().to_string().to_uppercase());
+        let thread_key = ThreadKey::parse(format!("test:trace-delete-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let granted = store
+            .grant_metadata_trace_consent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            update sessions
+            set sandbox_id = 'sbx-stalled',
+                sandbox_metadata_trace_enabled = true,
+                sandbox_metadata_trace_source = 'slack',
+                sandbox_metadata_trace_workspace_id = $2,
+                sandbox_metadata_trace_user_id = $3,
+                sandbox_metadata_trace_consent_revision = $4,
+                sandbox_metadata_trace_resource_uid = 'uid-stalled',
+                sandbox_metadata_trace_assignment_epoch = 'epoch-stalled'
+            where thread_key = $1
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(&workspace_id)
+        .bind(&user_id)
+        .bind(granted.revision)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(
+                std::sync::Arc::new(StalledExactStopBackend),
+                centaur_sandbox_core::SandboxSpec::new("stalled-stop"),
+            ),
+        );
+        let app = build_router_with_app_state(
+            AppState::ready(runtime, None)
+                .with_slack_trace_consent_bearer_secret(Some("trace-test-secret".to_owned())),
+        );
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!(
+                "/api/v1/slack_trace_consents/{workspace_id}/{user_id}"
+            ))
+            .header(header::AUTHORIZATION, "Bearer trace-test-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_millis(100), app.oneshot(request))
+            .await
+            .expect("DELETE must not wait for exact sandbox shutdown")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.pointer("/data/enabled"), Some(&json!(false)));
+        assert_eq!(body.pointer("/data/drain_pending"), Some(&json!(true)));
+        let stored = store
+            .metadata_trace_consent("slack", &workspace_id, &user_id)
+            .await
+            .unwrap();
+        assert!(!stored.enabled);
+        assert!(stored.drain_pending);
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "delete from metadata_trace_consents
+             where source = 'slack' and workspace_id = $1 and user_id = $2",
+        )
+        .bind(&workspace_id)
+        .bind(&user_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+}
