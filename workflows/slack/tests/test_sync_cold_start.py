@@ -128,6 +128,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
         "enqueued": [],
         "finish": [],
         "run_start": [],
+        "seeded": [],
         "widened": [],
     }
     fake_client = client or FakeClient()
@@ -160,6 +161,10 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
         calls["widened"].append(kwargs)
         return False
 
+    async def fake_seed_channel_bootstrap_job(_pool, **kwargs):
+        calls["seeded"].append(kwargs)
+        return True
+
     monkeypatch.setattr(sync, "_client", lambda: fake_client)
     monkeypatch.setattr(sync, "_upsert_channels", _noop)
     monkeypatch.setattr(sync, "_upsert_users", _zero)
@@ -176,6 +181,11 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
         sync,
         "widen_channel_bootstrap_job",
         fake_widen_channel_bootstrap_job,
+    )
+    monkeypatch.setattr(
+        sync,
+        "seed_channel_bootstrap_job",
+        fake_seed_channel_bootstrap_job,
     )
 
     return fake_client, calls
@@ -202,6 +212,7 @@ def test_cold_start_channel_uses_full_lookback_window(monkeypatch):
         }
     ]
     assert calls["enqueued"] == []
+    assert calls["seeded"] == []
     assert calls["widened"] == []
 
 
@@ -225,11 +236,51 @@ def test_watermarked_channel_keeps_incremental_overlap(monkeypatch):
 
     assert result["status"] == "completed"
     assert client.history_calls[0]["oldest"] == "minus:1771000000.000100:3"
-    assert calls["widened"] == [
+    assert calls["seeded"] == [
         {
             "channel_id": "C123",
             "window_oldest": "days:30",
+            "window_latest": "minus:1771000000.000100:3",
             "lookback_days": 30,
+            "thread_lookback_days": 3,
+            "run_id": "slack_sync_wfr_test",
+            "priority": 150,
+        }
+    ]
+    assert calls["widened"] == []
+
+
+def test_watermarked_channel_widens_existing_bootstrap(monkeypatch):
+    monkeypatch.setenv("SLACK_ETL_ENABLED", "true")
+    sync = _load_sync()
+    client, calls = _patch_handler_io(
+        monkeypatch,
+        sync,
+        checkpoint={"watermark_ts": "1771000000.000100", "last_error": ""},
+    )
+
+    async def fake_seed(_pool, **kwargs):
+        calls["seeded"].append(kwargs)
+        return False
+
+    async def fake_widen(_pool, **kwargs):
+        calls["widened"].append(kwargs)
+        return True
+
+    monkeypatch.setattr(sync, "seed_channel_bootstrap_job", fake_seed)
+    monkeypatch.setattr(sync, "widen_channel_bootstrap_job", fake_widen)
+    monkeypatch.setattr(sync, "_ts_minus_days", lambda ts, days: f"minus:{ts}:{days}")
+    monkeypatch.setattr(sync, "_ts_now_minus_days", lambda days: f"days:{days}")
+
+    result = asyncio.run(sync.handler(sync.Input(lookback_days=210), FakeContext()))
+
+    assert result["status"] == "completed"
+    assert len(calls["seeded"]) == 1
+    assert calls["widened"] == [
+        {
+            "channel_id": "C123",
+            "window_oldest": "days:210",
+            "lookback_days": 210,
             "thread_lookback_days": 3,
             "run_id": "slack_sync_wfr_test",
             "priority": 150,

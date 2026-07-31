@@ -43,6 +43,7 @@ from workflows.slack.shared import (
     positive_int,
     record_run_finish,
     record_run_start,
+    seed_channel_bootstrap_job,
     upsert_messages,
     widen_channel_bootstrap_job,
     workflow_run_id_to_sync_run_id,
@@ -674,15 +675,40 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             bootstrap_widened = False
             if checkpoint_watermark is not None and inp.oldest is None:
                 desired_oldest = _ts_now_minus_days(lookback_days)
-                bootstrap_widened = await widen_channel_bootstrap_job(
+                initial_backfill_seeded = await seed_channel_bootstrap_job(
                     ctx._pool,
                     channel_id=channel_id,
                     window_oldest=desired_oldest,
+                    window_latest=str(oldest),
                     lookback_days=lookback_days,
                     thread_lookback_days=thread_lookback_days,
                     run_id=run_id,
                     priority=150,
                 )
+                if not initial_backfill_seeded:
+                    bootstrap_widened = await widen_channel_bootstrap_job(
+                        ctx._pool,
+                        channel_id=channel_id,
+                        window_oldest=desired_oldest,
+                        lookback_days=lookback_days,
+                        thread_lookback_days=thread_lookback_days,
+                        run_id=run_id,
+                        priority=150,
+                    )
+                if initial_backfill_seeded:
+                    record_etl_items_enqueued(
+                        "slack", "channel", "channel_bootstrap_job", 1
+                    )
+                    ctx.log(
+                        "slack_sync_bootstrap_seeded",
+                        channel_id=channel_id,
+                        channel_name=channel_name,
+                        job_type=BACKFILL_JOB_CHANNEL_BOOTSTRAP,
+                        job_key=_bootstrap_backfill_job_key(channel_id),
+                        lookback_days=lookback_days,
+                        window_oldest_ts=desired_oldest,
+                        window_latest_ts=str(oldest),
+                    )
                 if bootstrap_widened:
                     record_etl_items_enqueued(
                         "slack", "channel", "channel_bootstrap_widened_job", 1

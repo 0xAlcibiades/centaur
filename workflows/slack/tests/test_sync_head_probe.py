@@ -174,6 +174,9 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     async def fake_widen(_pool, **_kwargs):
         return False
 
+    async def fake_seed(_pool, **_kwargs):
+        return False
+
     monkeypatch.setattr(sync, "_client", lambda: fake_client)
     monkeypatch.setattr(sync, "_upsert_channels", _noop)
     monkeypatch.setattr(sync, "_upsert_users", _zero)
@@ -187,6 +190,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     monkeypatch.setattr(sync, "record_run_start", _noop)
     monkeypatch.setattr(sync, "record_run_finish", _noop)
     monkeypatch.setattr(sync, "widen_channel_bootstrap_job", fake_widen)
+    monkeypatch.setattr(sync, "seed_channel_bootstrap_job", fake_seed)
 
     return calls
 
