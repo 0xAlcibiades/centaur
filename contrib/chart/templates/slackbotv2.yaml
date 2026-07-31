@@ -21,6 +21,7 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+        checksum/trace-consent-secret: {{ include "centaur.traceConsentSecretChecksum" . }}
 {{- with $slackbotV2MetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -62,6 +63,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: SLACK_TRACE_CONSENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.traceConsentSecretName" . }}
+                  key: {{ required "slackbotv2.traceConsent.apiKeySecretKey is required" .Values.slackbotv2.traceConsent.apiKeySecretKey }}
             - name: SLACKBOTV2_DATABASE_URL
               valueFrom:
                 secretKeyRef:

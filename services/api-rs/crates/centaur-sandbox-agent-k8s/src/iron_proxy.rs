@@ -489,7 +489,7 @@ impl AgentSandboxBackend {
                 continue;
             }
             let patch = owner_reference_patch(&pod.metadata, &owner_reference, None)?;
-            match self.pods().patch(&name, &params, &patch).await {
+            match self.pods().patch(name, &params, &patch).await {
                 Ok(_) => {}
                 Err(err) if is_not_found(&err) || is_conflict(&err) => {}
                 Err(err) => return Err(map_kube_error("adopt iron-proxy pod", err)),
@@ -501,17 +501,14 @@ impl AgentSandboxBackend {
             Err(err) if is_not_found(&err) => None,
             Err(err) => return Err(map_kube_error("get iron-proxy service for adoption", err)),
         };
-        match service_matches {
-            Some(Some(delete_params)) => {
-                let patch =
-                    owner_reference_patch_from_delete_params(delete_params, &owner_reference, None);
-                match self.services().patch(&service_name, &params, &patch).await {
-                    Ok(_) => {}
-                    Err(err) if is_not_found(&err) || is_conflict(&err) => {}
-                    Err(err) => return Err(map_kube_error("adopt iron-proxy service", err)),
-                }
+        if let Some(Some(delete_params)) = service_matches {
+            let patch =
+                owner_reference_patch_from_delete_params(delete_params, &owner_reference, None);
+            match self.services().patch(&service_name, &params, &patch).await {
+                Ok(_) => {}
+                Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                Err(err) => return Err(map_kube_error("adopt iron-proxy service", err)),
             }
-            Some(None) | None => {}
         }
         for name in [
             iron_proxy_sandbox_egress_policy_name(id),
@@ -527,22 +524,16 @@ impl AgentSandboxBackend {
                     ));
                 }
             };
-            match policy_matches {
-                Some(Some(delete_params)) => {
-                    let patch = owner_reference_patch_from_delete_params(
-                        delete_params,
-                        &owner_reference,
-                        None,
-                    );
-                    match self.network_policies().patch(&name, &params, &patch).await {
-                        Ok(_) => {}
-                        Err(err) if is_not_found(&err) || is_conflict(&err) => {}
-                        Err(err) => {
-                            return Err(map_kube_error("adopt iron-proxy network policy", err));
-                        }
+            if let Some(Some(delete_params)) = policy_matches {
+                let patch =
+                    owner_reference_patch_from_delete_params(delete_params, &owner_reference, None);
+                match self.network_policies().patch(&name, &params, &patch).await {
+                    Ok(_) => {}
+                    Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                    Err(err) => {
+                        return Err(map_kube_error("adopt iron-proxy network policy", err));
                     }
                 }
-                Some(None) | None => {}
             }
         }
         Ok(())
@@ -577,7 +568,7 @@ impl AgentSandboxBackend {
             let patch = owner_reference_patch(&pod.metadata, &owner_reference, Some(generation))?;
             match self.pods().patch(name, &params, &patch).await {
                 Ok(_) => {}
-                Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                Err(err) if is_not_found(&err) => {}
                 Err(err) => return Err(map_kube_error("adopt legacy iron-proxy pod", err)),
             }
         }
@@ -621,7 +612,7 @@ impl AgentSandboxBackend {
         let patch = service_generation_patch(&service, owner_reference, generation)?;
         match api.patch(&name, &PatchParams::default(), &patch).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("adopt legacy iron-proxy service", err)),
         }
     }
@@ -645,7 +636,7 @@ impl AgentSandboxBackend {
         let patch = network_policy_generation_patch(&policy, owner_reference, generation)?;
         match api.patch(name, &PatchParams::default(), &patch).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error(
                 "adopt legacy iron-proxy network policy",
                 err,
@@ -1280,9 +1271,9 @@ impl AgentSandboxBackend {
                 let Some(params) = auxiliary_delete_params(&pod.metadata, generation)? else {
                     continue;
                 };
-                match self.pods().delete(&name, &params).await {
+                match self.pods().delete(name, &params).await {
                     Ok(_) => {}
-                    Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                    Err(err) if is_not_found(&err) => {}
                     Err(err) => return Err(map_kube_error("delete iron-proxy pod", err)),
                 }
             }
@@ -1307,7 +1298,7 @@ impl AgentSandboxBackend {
         };
         match api.delete(&name, &params).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete iron-proxy service", err)),
         }
     }
@@ -1333,7 +1324,7 @@ impl AgentSandboxBackend {
         };
         match api.delete(name, &params).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete iron-proxy network policy", err)),
         }
     }

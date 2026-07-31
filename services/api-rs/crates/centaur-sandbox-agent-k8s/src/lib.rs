@@ -59,12 +59,14 @@ const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-princip
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
+const RUNNING_FENCE_ANNOTATION: &str = "centaur.ai/running-fence";
 /// Immutable token tying every same-name auxiliary object to one Sandbox
 /// assignment. It is created before the CR because egress policy objects must
 /// exist before the controller creates the pod, then retained on the CR for
 /// later exact cleanup.
 pub(crate) const AUXILIARY_GENERATION_ANNOTATION: &str = "centaur.ai/auxiliary-generation";
 pub(crate) const AUXILIARY_GENERATION_LABEL: &str = "centaur.ai/auxiliary-generation";
+const AUXILIARY_CLEANUP_FINALIZER: &str = "centaur.ai/auxiliary-cleanup";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -309,15 +311,17 @@ fn remove_proxy_mapping_if_generation(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactStopAction {
-    DeleteSandbox,
-    DeleteProxy,
-    DeleteStatePvc,
+    AcquireCleanupFinalizer,
+    Sandbox,
+    Proxy,
+    StatePvc,
+    ReleaseCleanupFinalizer,
 }
 
 fn exact_stop_actions(
     expected_resource_uid: Option<&str>,
     observed_resource_uid: Option<&str>,
-) -> SandboxResult<[ExactStopAction; 3]> {
+) -> SandboxResult<[ExactStopAction; 5]> {
     if let Some(expected_resource_uid) = expected_resource_uid
         && observed_resource_uid != Some(expected_resource_uid)
     {
@@ -326,14 +330,58 @@ fn exact_stop_actions(
         ));
     }
     Ok([
-        ExactStopAction::DeleteSandbox,
-        ExactStopAction::DeleteProxy,
-        ExactStopAction::DeleteStatePvc,
+        ExactStopAction::AcquireCleanupFinalizer,
+        ExactStopAction::Sandbox,
+        ExactStopAction::Proxy,
+        ExactStopAction::StatePvc,
+        ExactStopAction::ReleaseCleanupFinalizer,
     ])
 }
 
 fn new_auxiliary_generation() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+fn sandbox_has_auxiliary_cleanup_finalizer(sandbox: &crd::Sandbox) -> bool {
+    sandbox
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|finalizer| finalizer == AUXILIARY_CLEANUP_FINALIZER)
+        })
+}
+
+fn sandbox_auxiliary_cleanup_finalizer_patch(
+    sandbox: &crd::Sandbox,
+    present: bool,
+) -> SandboxResult<Value> {
+    let uid = sandbox.metadata.uid.as_deref().ok_or_else(|| {
+        SandboxError::backend("sandbox is missing UID required for cleanup finalizer")
+    })?;
+    let resource_version = sandbox
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            SandboxError::backend(
+                "sandbox is missing resourceVersion required for cleanup finalizer",
+            )
+        })?;
+    let mut finalizers = sandbox.metadata.finalizers.clone().unwrap_or_default();
+    finalizers.retain(|finalizer| finalizer != AUXILIARY_CLEANUP_FINALIZER);
+    if present {
+        finalizers.push(AUXILIARY_CLEANUP_FINALIZER.to_owned());
+    }
+    Ok(json!({
+        "metadata": {
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "finalizers": finalizers,
+        },
+    }))
 }
 
 pub(crate) fn auxiliary_generation_from_sandbox(sandbox: &crd::Sandbox) -> SandboxResult<String> {
@@ -405,6 +453,27 @@ pub(crate) fn auxiliary_delete_params(
     }))
 }
 
+fn exact_sandbox_delete_params(
+    metadata: &ObjectMeta,
+    expected_resource_uid: &str,
+) -> SandboxResult<DeleteParams> {
+    if metadata.uid.as_deref() != Some(expected_resource_uid) {
+        return Err(SandboxError::backend(
+            "sandbox resource UID changed before exact delete",
+        ));
+    }
+    let resource_version = metadata.resource_version.clone().ok_or_else(|| {
+        SandboxError::backend("sandbox is missing resourceVersion required for exact delete")
+    })?;
+    Ok(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(expected_resource_uid.to_owned()),
+            resource_version: Some(resource_version),
+        }),
+        ..DeleteParams::default()
+    })
+}
+
 impl AgentSandboxBackend {
     pub fn new(client: Client, config: AgentSandboxConfig) -> Self {
         Self {
@@ -456,7 +525,11 @@ impl AgentSandboxBackend {
     ) -> SandboxResult<ObservedSandbox> {
         let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        let status = sandbox_status_from_pod(replicas, pod.as_ref());
+        let status = sandbox_status_with_termination(
+            sandbox.metadata.deletion_timestamp.is_some(),
+            replicas,
+            pod.as_ref(),
+        );
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_component(sandbox_component(sandbox))
             .with_resource_uid(sandbox.metadata.uid.clone())
@@ -471,6 +544,96 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox", err))
+    }
+
+    async fn patch_sandbox_exact_merge(
+        &self,
+        id: &SandboxId,
+        resource_version: &str,
+        patch: Value,
+    ) -> SandboxResult<()> {
+        self.patch_sandbox_merge(
+            id,
+            sandbox_merge_patch_with_resource_version(patch, resource_version)?,
+        )
+        .await
+    }
+
+    async fn ensure_auxiliary_cleanup_finalizer(
+        &self,
+        id: &SandboxId,
+        sandbox: crd::Sandbox,
+    ) -> SandboxResult<crd::Sandbox> {
+        if sandbox_has_auxiliary_cleanup_finalizer(&sandbox) {
+            return Ok(sandbox);
+        }
+        if sandbox.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::backend(
+                "terminating sandbox is missing the auxiliary cleanup finalizer",
+            ));
+        }
+        let patch = sandbox_auxiliary_cleanup_finalizer_patch(&sandbox, true)?;
+        self.sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &Patch::Merge(patch))
+            .await
+            .map_err(|err| map_kube_error("install sandbox auxiliary cleanup finalizer", err))
+    }
+
+    async fn release_auxiliary_cleanup_finalizer(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: &str,
+    ) -> SandboxResult<()> {
+        let Some(current) = self.get_sandbox(id).await? else {
+            return Ok(());
+        };
+        if current.metadata.uid.as_deref() != Some(expected_resource_uid)
+            || !sandbox_has_auxiliary_cleanup_finalizer(&current)
+        {
+            return Ok(());
+        }
+        let patch = sandbox_auxiliary_cleanup_finalizer_patch(&current, false)?;
+        match self
+            .sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error(
+                "release sandbox auxiliary cleanup finalizer",
+                err,
+            )),
+        }
+    }
+
+    async fn stop_observed_sandbox(
+        &self,
+        id: &SandboxId,
+        sandbox: crd::Sandbox,
+        expected_resource_uid: &str,
+    ) -> SandboxResult<()> {
+        exact_stop_actions(Some(expected_resource_uid), sandbox.metadata.uid.as_deref())?;
+        let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let sandbox = self.ensure_auxiliary_cleanup_finalizer(id, sandbox).await?;
+        if sandbox.metadata.deletion_timestamp.is_none() {
+            let params = exact_sandbox_delete_params(&sandbox.metadata, expected_resource_uid)?;
+            match self.sandboxes().delete(id.as_str(), &params).await {
+                Ok(_) => {}
+                Err(err) if is_not_found(&err) => {
+                    return Err(SandboxError::backend(
+                        "sandbox disappeared after its auxiliary cleanup finalizer was installed",
+                    ));
+                }
+                Err(err) => return Err(map_kube_error("delete exact sandbox", err)),
+            }
+        }
+        // A deletionTimestamp makes every reuse path terminal while the
+        // finalizer retains the generation needed for retryable exact cleanup.
+        self.delete_iron_proxy_resources(id, &generation).await?;
+        self.delete_state_pvc(id, &generation).await?;
+        self.release_auxiliary_cleanup_finalizer(id, expected_resource_uid)
+            .await
     }
 
     /// Upgrade a pre-generation Sandbox while it still exists. Only resources
@@ -582,7 +745,7 @@ impl AgentSandboxBackend {
             .await
         {
             Ok(_) => Ok(true),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(false),
+            Err(err) if is_not_found(&err) => Ok(false),
             Err(err) => Err(map_kube_error("adopt legacy sandbox pod", err)),
         }
     }
@@ -632,7 +795,7 @@ impl AgentSandboxBackend {
         }));
         match api.patch(&name, &PatchParams::default(), &patch).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("adopt legacy sandbox state pvc", err)),
         }
     }
@@ -653,7 +816,7 @@ impl AgentSandboxBackend {
         };
         match pvc_api.delete(&name, &params).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox state pvc", err)),
         }
     }
@@ -681,11 +844,38 @@ impl AgentSandboxBackend {
     }
 
     async fn attach_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
-        if self.status(id).await? != SandboxStatus::Running {
+        let sandbox = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::NotFound(id.as_str().to_owned()))?;
+        if sandbox.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::NotReady(format!(
+                "agent sandbox {} is terminating",
+                id.as_str()
+            )));
+        }
+        let resource_uid = sandbox.metadata.uid.clone().ok_or_else(|| {
+            SandboxError::backend("sandbox is missing UID required for io attachment")
+        })?;
+        let replicas = sandbox.spec.replicas.unwrap_or(1);
+        let pod = self.get_pod(id).await?.ok_or_else(|| {
+            SandboxError::NotReady(format!("agent sandbox {} has no pod", id.as_str()))
+        })?;
+        if sandbox_status_from_pod(replicas, Some(&pod)) != SandboxStatus::Running {
             return Err(SandboxError::NotReady(format!(
                 "agent sandbox {} is not running",
                 id.as_str()
             )));
+        }
+        if !pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| owners.iter().any(|owner| owner.uid == resource_uid))
+        {
+            return Err(SandboxError::backend(
+                "sandbox pod owner UID does not match the attached Sandbox resource",
+            ));
         }
         let params = AttachParams::default()
             .container(self.config.container_name.clone())
@@ -710,9 +900,38 @@ impl AgentSandboxBackend {
         let stdin = stdin.ok_or_else(|| SandboxError::io("stdin was not attached"))?;
         let stdout = stdout.ok_or_else(|| SandboxError::io("stdout was not attached"))?;
         let stderr = stderr.ok_or_else(|| SandboxError::io("stderr was not attached"))?;
+        let still_attached = self.get_sandbox(id).await?.is_some_and(|current| {
+            current.metadata.deletion_timestamp.is_none()
+                && current.metadata.uid.as_deref() == Some(resource_uid.as_str())
+        });
+        if !still_attached {
+            return Err(SandboxError::backend(
+                "sandbox changed while opening io; refusing to bind a stale trace assignment",
+            ));
+        }
         // Keep kube's attach process alive as long as the returned streams are in use.
-        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached))
+        Ok(SandboxIo::with_guard(stdin, stdout, stderr, attached)
+            .with_resource_uid(Some(resource_uid)))
     }
+}
+
+fn sandbox_merge_patch_with_resource_version(
+    mut patch: Value,
+    resource_version: &str,
+) -> SandboxResult<Value> {
+    let metadata = patch
+        .as_object_mut()
+        .ok_or_else(|| SandboxError::backend("sandbox merge patch must be an object"))?
+        .entry("metadata")
+        .or_insert_with(|| json!({}));
+    metadata
+        .as_object_mut()
+        .ok_or_else(|| SandboxError::backend("sandbox patch metadata must be an object"))?
+        .insert(
+            "resourceVersion".to_owned(),
+            Value::String(resource_version.to_owned()),
+        );
+    Ok(patch)
 }
 
 #[async_trait]
@@ -757,6 +976,9 @@ impl SandboxBackend for AgentSandboxBackend {
                 return Err(map_kube_error("create sandbox", err));
             }
         };
+        let resource_uid = created.metadata.uid.clone().ok_or_else(|| {
+            SandboxError::backend("created Kubernetes sandbox did not include a resource UID")
+        })?;
         // The proxy resources are created before the Sandbox CR (the egress
         // policies must exist before the pod starts), so bind them to it here
         // for cascade deletion. Failure leaves them cleanable by stop() only.
@@ -771,10 +993,20 @@ impl SandboxBackend for AgentSandboxBackend {
             );
         }
         if let Err(err) = self.wait_until_running(&id).await {
-            let _ = self.stop(&id).await;
+            let _ = self.stop_exact(&id, Some(&resource_uid)).await;
             return Err(err);
         }
-        Ok(SandboxHandle::new(id, BACKEND_NAME))
+        let still_created_resource = self.get_sandbox(&id).await?.is_some_and(|sandbox| {
+            sandbox.metadata.deletion_timestamp.is_none()
+                && sandbox.metadata.uid.as_deref() == Some(resource_uid.as_str())
+        });
+        if !still_created_resource {
+            let _ = self.stop_exact(&id, Some(&resource_uid)).await;
+            return Err(SandboxError::backend(
+                "sandbox resource changed before create completed",
+            ));
+        }
+        Ok(SandboxHandle::new(id, BACKEND_NAME).with_resource_uid(Some(resource_uid)))
     }
 
     async fn open_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
@@ -813,7 +1045,11 @@ impl SandboxBackend for AgentSandboxBackend {
         };
         let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        Ok(sandbox_status_from_pod(replicas, pod.as_ref()))
+        Ok(sandbox_status_with_termination(
+            sandbox.metadata.deletion_timestamp.is_some(),
+            replicas,
+            pod.as_ref(),
+        ))
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
@@ -850,22 +1086,10 @@ impl SandboxBackend for AgentSandboxBackend {
         let Some(sandbox) = self.get_sandbox(id).await? else {
             return Ok(());
         };
-        let (_, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
-        match self
-            .sandboxes()
-            .delete(id.as_str(), &DeleteParams::default())
-            .await
-        {
-            Ok(_) => {
-                self.delete_iron_proxy_resources(id, &generation).await?;
-                self.delete_state_pvc(id, &generation).await
-            }
-            Err(err) if is_not_found(&err) => {
-                self.delete_iron_proxy_resources(id, &generation).await?;
-                self.delete_state_pvc(id, &generation).await
-            }
-            Err(err) => Err(map_kube_error("delete sandbox", err)),
-        }
+        let resource_uid = sandbox.metadata.uid.clone().ok_or_else(|| {
+            SandboxError::backend("sandbox is missing UID required for exact cleanup")
+        })?;
+        self.stop_observed_sandbox(id, sandbox, &resource_uid).await
     }
 
     async fn stop_exact(
@@ -877,23 +1101,9 @@ impl SandboxBackend for AgentSandboxBackend {
             let Some(current) = self.get_sandbox(id).await? else {
                 return Ok(());
             };
-            exact_stop_actions(Some(expected_resource_uid), current.metadata.uid.as_deref())?;
-            let (_, generation) = self.ensure_auxiliary_generation(id, current).await?;
-            let params = DeleteParams {
-                preconditions: Some(Preconditions {
-                    uid: Some(expected_resource_uid.to_owned()),
-                    ..Preconditions::default()
-                }),
-                ..DeleteParams::default()
-            };
-            return match self.sandboxes().delete(id.as_str(), &params).await {
-                Ok(_) => {
-                    self.delete_iron_proxy_resources(id, &generation).await?;
-                    self.delete_state_pvc(id, &generation).await
-                }
-                Err(err) if is_not_found(&err) => Ok(()),
-                Err(err) => Err(map_kube_error("delete exact sandbox", err)),
-            };
+            return self
+                .stop_observed_sandbox(id, current, expected_resource_uid)
+                .await;
         }
         self.stop(id).await
     }
@@ -922,7 +1132,46 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
+    async fn pause_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if let Some(expected_resource_uid) = expected_resource_uid {
+            let Some(current) = self.get_sandbox(id).await? else {
+                return Ok(());
+            };
+            exact_stop_actions(Some(expected_resource_uid), current.metadata.uid.as_deref())?;
+            let resource_version =
+                current
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .ok_or_else(|| {
+                        SandboxError::backend(
+                            "sandbox is missing resourceVersion required for exact pause",
+                        )
+                    })?;
+            return self
+                .patch_sandbox_exact_merge(
+                    id,
+                    resource_version,
+                    sandbox_pause_patch(jiff::Timestamp::now()),
+                )
+                .await;
+        }
+        self.pause(id).await
+    }
+
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
+        self.resume_exact(id, None).await
+    }
+
+    async fn resume_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
         // Resume only has the sandbox id, not the spec, so rebind the proxy to
         // the principal recorded at create rather than re-resolving from spec.
         let resolved_iron_proxy = self.resolve_iron_proxy_for_resume(id).await?;
@@ -930,6 +1179,12 @@ impl SandboxBackend for AgentSandboxBackend {
             .get_sandbox(id)
             .await?
             .ok_or_else(|| SandboxError::backend("sandbox disappeared before proxy resume"))?;
+        if sandbox.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::NotReady(
+                "sandbox is terminating before resume".to_owned(),
+            ));
+        }
+        exact_stop_actions(expected_resource_uid, sandbox.metadata.uid.as_deref())?;
         let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
         if let Err(err) = self
             .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref(), &generation)
@@ -950,7 +1205,79 @@ impl SandboxBackend for AgentSandboxBackend {
                 "failed to set ownerReferences on resumed iron-proxy resources"
             );
         }
-        self.patch_sandbox_merge(id, sandbox_resume_patch()).await?;
+        let current = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::backend("sandbox disappeared during proxy resume"))?;
+        if current.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::NotReady(
+                "sandbox began terminating during resume".to_owned(),
+            ));
+        }
+        exact_stop_actions(expected_resource_uid, current.metadata.uid.as_deref())?;
+        if expected_resource_uid.is_some() {
+            let resource_version =
+                current
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .ok_or_else(|| {
+                        SandboxError::backend(
+                            "sandbox is missing resourceVersion required for exact resume",
+                        )
+                    })?;
+            self.patch_sandbox_exact_merge(id, resource_version, sandbox_resume_patch())
+                .await?;
+        } else {
+            self.patch_sandbox_merge(id, sandbox_resume_patch()).await?;
+        }
+        self.wait_until_running(id).await
+    }
+
+    async fn ensure_running_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: &str,
+        fence_nonce: &str,
+    ) -> SandboxResult<()> {
+        let sandbox = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::backend("sandbox disappeared before running fence"))?;
+        if sandbox.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::NotReady(
+                "sandbox is terminating before running fence".to_owned(),
+            ));
+        }
+        exact_stop_actions(Some(expected_resource_uid), sandbox.metadata.uid.as_deref())?;
+        // Auxiliary reconciliation may mutate the CR. Re-read afterward so
+        // the final exact running write carries its current resourceVersion.
+        let _ = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let current = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::backend("sandbox disappeared during running fence"))?;
+        if current.metadata.deletion_timestamp.is_some() {
+            return Err(SandboxError::NotReady(
+                "sandbox began terminating during running fence".to_owned(),
+            ));
+        }
+        exact_stop_actions(Some(expected_resource_uid), current.metadata.uid.as_deref())?;
+        let resource_version = current
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or_else(|| {
+                SandboxError::backend(
+                    "sandbox is missing resourceVersion required for running fence",
+                )
+            })?;
+        self.patch_sandbox_exact_merge(
+            id,
+            resource_version,
+            sandbox_running_fence_patch(fence_nonce),
+        )
+        .await?;
         self.wait_until_running(id).await
     }
 }
@@ -967,6 +1294,16 @@ fn sandbox_resume_patch() -> Value {
     json!({
         "spec": { "replicas": 1 },
         "metadata": { "annotations": { PAUSED_AT_ANNOTATION: null } },
+    })
+}
+
+fn sandbox_running_fence_patch(fence_nonce: &str) -> Value {
+    json!({
+        "spec": { "replicas": 1 },
+        "metadata": { "annotations": {
+            PAUSED_AT_ANNOTATION: null,
+            RUNNING_FENCE_ANNOTATION: fence_nonce,
+        }},
     })
 }
 
@@ -1026,6 +1363,17 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
     }
 }
 
+fn sandbox_status_with_termination(
+    terminating: bool,
+    replicas: i32,
+    pod: Option<&Pod>,
+) -> SandboxStatus {
+    if terminating {
+        return SandboxStatus::Gone;
+    }
+    sandbox_status_from_pod(replicas, pod)
+}
+
 fn pod_ready(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -1062,12 +1410,19 @@ fn build_agent_sandbox_with_generation(
     if spec.capabilities.api_server_enabled {
         labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
     }
+    let metadata_trace_deadline = spec
+        .env
+        .iter()
+        .find(|env| env.name == "CENTAUR_METADATA_TRACE_CONSENT_EXPIRES_AT_UNIX")
+        .and_then(|env| env.value.parse::<i64>().ok())
+        .filter(|deadline| *deadline > 0);
     let metadata_trace = spec.capabilities.metadata_trace_enabled
         && spec
             .labels
             .get("centaur.ai/harness")
             .is_some_and(|harness| harness == "codex")
-        && config.metadata_trace_sidecar.is_some();
+        && config.metadata_trace_sidecar.is_some()
+        && metadata_trace_deadline.is_some();
     if metadata_trace {
         labels.insert(METADATA_TRACE_ENABLED_LABEL.to_owned(), "true".to_owned());
     }
@@ -1218,7 +1573,10 @@ fn build_agent_sandbox_with_generation(
         // This is deliberately an ordinary container, not a restartable init
         // container. A bad trace image or unavailable trace Secret must never
         // keep the Codex container from starting.
-        sidecars.push(metadata_trace_sidecar_json(trace));
+        sidecars.push(metadata_trace_sidecar_json(
+            trace,
+            metadata_trace_deadline.expect("checked above"),
+        ));
         volumes.push(metadata_trace_credentials_volume_json(trace));
         volumes.push(metadata_trace_runtime_volume_json());
         volumes.push(metadata_trace_spool_volume_json());
@@ -1301,6 +1659,9 @@ fn build_agent_sandbox_with_generation(
     let mut sandbox = crd::Sandbox::new(id.as_str(), crd_spec);
     sandbox.metadata.labels = Some(labels);
     sandbox.metadata.annotations = Some(annotations);
+    if auxiliary_generation.is_some() {
+        sandbox.metadata.finalizers = Some(vec![AUXILIARY_CLEANUP_FINALIZER.to_owned()]);
+    }
     Ok(sandbox)
 }
 
@@ -1394,13 +1755,13 @@ fn metadata_trace_credentials_volume_json(config: &MetadataTraceSidecarConfig) -
     })
 }
 
-fn metadata_trace_sidecar_json(config: &MetadataTraceSidecarConfig) -> Value {
+fn metadata_trace_sidecar_json(config: &MetadataTraceSidecarConfig, deadline_unix: i64) -> Value {
     json!({
         "name": "metadata-trace",
         "image": config.image,
         "command": ["/bin/sh", "-ec"],
         "args": [
-            "umask 077\nendpoint=/var/run/autorotate-trace/capability/agent/otlp-endpoint\ncleanup() { rm -f \"$endpoint\"; }\ntrap cleanup EXIT INT TERM\nwhile :; do\n  cleanup\n  if install -d -m 0700 /var/run/autorotate-trace/capability/agent /var/run/autorotate-trace/runtime/agent/credentials /var/run/autorotate-trace/spool && [ -r /var/run/autorotate-trace/source/bearer ] && [ -r /var/run/autorotate-trace/source/pseudonym-key ] && install -m 0600 /var/run/autorotate-trace/source/bearer /var/run/autorotate-trace/runtime/agent/credentials/bearer && install -m 0600 /var/run/autorotate-trace/source/pseudonym-key /var/run/autorotate-trace/runtime/agent/credentials/pseudonym-key; then\n    /usr/local/bin/autorotate-trace-agent || true\n  fi\n  cleanup\n  sleep 5\ndone"
+            "umask 077\nendpoint=/var/run/autorotate-trace/capability/agent/otlp-endpoint\ncleanup() { rm -f \"$endpoint\"; }\ntrap cleanup EXIT INT TERM\nwhile :; do\n  cleanup\n  now=$(date +%s)\n  remaining=$((AUTOROTATE_TRACE_CONSENT_EXPIRES_AT_UNIX - now))\n  [ \"$remaining\" -gt 0 ] || exit 0\n  if install -d -m 0700 /var/run/autorotate-trace/capability/agent /var/run/autorotate-trace/runtime/agent/credentials /var/run/autorotate-trace/spool && [ -r /var/run/autorotate-trace/source/bearer ] && [ -r /var/run/autorotate-trace/source/pseudonym-key ] && install -m 0600 /var/run/autorotate-trace/source/bearer /var/run/autorotate-trace/runtime/agent/credentials/bearer && install -m 0600 /var/run/autorotate-trace/source/pseudonym-key /var/run/autorotate-trace/runtime/agent/credentials/pseudonym-key; then\n    /usr/local/bin/autorotate-trace-agent &\n    agent=$!\n    ( sleep \"$remaining\"; cleanup; kill -KILL \"$agent\" 2>/dev/null || true ) &\n    fence=$!\n    wait \"$agent\" || true\n    kill \"$fence\" 2>/dev/null || true\n  fi\n  cleanup\n  sleep 5\ndone"
         ],
         "env": [
             { "name": "AUTOROTATE_TRACE_LISTEN", "value": "127.0.0.1:0" },
@@ -1410,6 +1771,7 @@ fn metadata_trace_sidecar_json(config: &MetadataTraceSidecarConfig) -> Value {
             { "name": "AUTOROTATE_TRACE_BEARER_TOKEN_FILE", "value": "/var/run/autorotate-trace/runtime/agent/credentials/bearer" },
             { "name": "AUTOROTATE_TRACE_PSEUDONYM_KEY_FILE", "value": "/var/run/autorotate-trace/runtime/agent/credentials/pseudonym-key" },
             { "name": "AUTOROTATE_TRACE_SPOOL_DIR", "value": "/var/run/autorotate-trace/spool" },
+            { "name": "AUTOROTATE_TRACE_CONSENT_EXPIRES_AT_UNIX", "value": deadline_unix.to_string() },
         ],
         "volumeMounts": [
             { "name": "metadata-trace-capability", "mountPath": "/var/run/autorotate-trace/capability" },
@@ -1828,6 +2190,10 @@ mod tests {
         let spec = SandboxSpec::new("centaur-agent:latest")
             .label("centaur.ai/harness", "codex")
             .env(
+                "CENTAUR_METADATA_TRACE_CONSENT_EXPIRES_AT_UNIX",
+                "4102444800",
+            )
+            .env(
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 "authorization=Bearer not-a-token",
             )
@@ -1853,7 +2219,10 @@ mod tests {
         assert!(launcher.contains("install -m 0600"));
         assert!(launcher.contains("while :; do"));
         assert!(launcher.contains("cleanup() { rm -f"));
-        assert!(launcher.contains("/usr/local/bin/autorotate-trace-agent || true"));
+        assert!(launcher.contains("AUTOROTATE_TRACE_CONSENT_EXPIRES_AT_UNIX"));
+        assert!(launcher.contains("sleep \"$remaining\"; cleanup; kill -KILL \"$agent\""));
+        assert!(launcher.contains("kill -KILL \"$agent\""));
+        assert!(launcher.contains("/usr/local/bin/autorotate-trace-agent &"));
         assert!(sidecar.get("restartPolicy").is_none());
         assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
         assert_eq!(
@@ -2009,6 +2378,11 @@ mod tests {
             sandbox_status_from_pod(1, Some(&ready_pod)),
             SandboxStatus::Running
         );
+        assert_eq!(
+            sandbox_status_with_termination(true, 1, Some(&ready_pod)),
+            SandboxStatus::Gone,
+            "an accepted delete is terminal even while its pod remains ready"
+        );
 
         let unready_pod = pod_with_phase_and_ready("Running", false);
         assert_eq!(
@@ -2086,6 +2460,10 @@ mod tests {
                 .map(String::as_str),
             Some("generation-test")
         );
+        assert_eq!(
+            sandbox.metadata.finalizers.as_deref(),
+            Some(&[AUXILIARY_CLEANUP_FINALIZER.to_owned()][..])
+        );
         let value = serde_json::to_value(sandbox).unwrap();
         assert_eq!(
             value["spec"]["volumeClaimTemplates"][0]["metadata"]["annotations"]
@@ -2100,6 +2478,37 @@ mod tests {
             value["spec"]["volumeClaimTemplates"][0]["metadata"]["labels"]
                 [AUXILIARY_GENERATION_LABEL],
             "generation-test"
+        );
+    }
+
+    #[test]
+    fn cleanup_finalizer_patch_is_resource_versioned_and_preserves_other_finalizers() {
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test"),
+            &AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+        sandbox.metadata.uid = Some("uid-old".to_owned());
+        sandbox.metadata.resource_version = Some("17".to_owned());
+        sandbox.metadata.finalizers = Some(vec!["example.com/other".to_owned()]);
+
+        let install = sandbox_auxiliary_cleanup_finalizer_patch(&sandbox, true).unwrap();
+        assert_eq!(install["metadata"]["uid"], "uid-old");
+        assert_eq!(install["metadata"]["resourceVersion"], "17");
+        assert_eq!(
+            install["metadata"]["finalizers"],
+            json!(["example.com/other", AUXILIARY_CLEANUP_FINALIZER])
+        );
+
+        sandbox.metadata.finalizers = Some(vec![
+            "example.com/other".to_owned(),
+            AUXILIARY_CLEANUP_FINALIZER.to_owned(),
+        ]);
+        let release = sandbox_auxiliary_cleanup_finalizer_patch(&sandbox, false).unwrap();
+        assert_eq!(
+            release["metadata"]["finalizers"],
+            json!(["example.com/other"])
         );
     }
 
@@ -2151,15 +2560,184 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|action| match action {
-                    ExactStopAction::DeleteSandbox => "delete-sandbox",
-                    ExactStopAction::DeleteProxy => "delete-proxy",
-                    ExactStopAction::DeleteStatePvc => "delete-pvc",
+                    ExactStopAction::AcquireCleanupFinalizer => "install-cleanup-finalizer",
+                    ExactStopAction::Sandbox => "delete-sandbox",
+                    ExactStopAction::Proxy => "delete-proxy",
+                    ExactStopAction::StatePvc => "delete-pvc",
+                    ExactStopAction::ReleaseCleanupFinalizer => "release-cleanup-finalizer",
                 }),
         );
         assert_eq!(
             calls,
-            vec!["observe", "delete-sandbox", "delete-proxy", "delete-pvc"]
+            vec![
+                "observe",
+                "install-cleanup-finalizer",
+                "delete-sandbox",
+                "delete-proxy",
+                "delete-pvc",
+                "release-cleanup-finalizer",
+            ]
         );
+    }
+
+    #[test]
+    fn exact_pause_patch_carries_the_observed_resource_version() {
+        let patch = sandbox_merge_patch_with_resource_version(
+            sandbox_pause_patch(jiff::Timestamp::now()),
+            "17",
+        )
+        .unwrap();
+
+        assert_eq!(patch["metadata"]["resourceVersion"], "17");
+        assert_eq!(patch["spec"]["replicas"], 0);
+    }
+
+    #[test]
+    fn running_fence_patch_always_changes_the_nonce() {
+        let first = sandbox_running_fence_patch("first");
+        let second = sandbox_running_fence_patch("second");
+
+        assert_eq!(first["spec"]["replicas"], 1);
+        assert_eq!(
+            first["metadata"]["annotations"][RUNNING_FENCE_ANNOTATION],
+            "first"
+        );
+        assert_eq!(
+            second["metadata"]["annotations"][RUNNING_FENCE_ANNOTATION],
+            "second"
+        );
+        assert_ne!(first, second);
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ResourceVersionedRunningFence {
+        resource_version: u64,
+        running: bool,
+        deleted: bool,
+        nonce: Option<String>,
+    }
+
+    impl ResourceVersionedRunningFence {
+        fn pause(&mut self, expected_resource_version: u64) -> Result<(), ()> {
+            if self.resource_version != expected_resource_version {
+                return Err(());
+            }
+            self.running = false;
+            self.resource_version += 1;
+            Ok(())
+        }
+
+        fn fence(&mut self, expected_resource_version: u64, nonce: &str) -> Result<(), ()> {
+            if self.resource_version != expected_resource_version {
+                return Err(());
+            }
+            self.running = true;
+            self.nonce = Some(nonce.to_owned());
+            self.resource_version += 1;
+            Ok(())
+        }
+
+        fn delete(&mut self, expected_resource_version: u64) -> Result<(), ()> {
+            if self.resource_version != expected_resource_version {
+                return Err(());
+            }
+            self.running = false;
+            self.deleted = true;
+            self.resource_version += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_pause_after_successor_fence_conflicts_and_cannot_suspend_it() {
+        let mut resource = ResourceVersionedRunningFence {
+            resource_version: 1,
+            running: true,
+            deleted: false,
+            nonce: None,
+        };
+        // The old pause has RV1 but its caller timed out/died before the API
+        // server applied it. The successor's fenced write wins RV1 first.
+        resource.fence(1, "successor").unwrap();
+        assert_eq!(resource.pause(1), Err(()));
+        assert!(resource.running);
+        assert_eq!(resource.nonce.as_deref(), Some("successor"));
+    }
+
+    #[test]
+    fn delayed_pause_winner_forces_successor_to_refetch_and_fence_new_version() {
+        let mut resource = ResourceVersionedRunningFence {
+            resource_version: 1,
+            running: true,
+            deleted: false,
+            nonce: None,
+        };
+        // The delayed pause wins first; a stale fence at RV1 conflicts. A
+        // retry after re-GET uses RV2 and is the only path back to running.
+        resource.pause(1).unwrap();
+        assert_eq!(resource.fence(1, "stale-successor"), Err(()));
+        assert!(!resource.running);
+        resource.fence(2, "retry-successor").unwrap();
+        assert!(resource.running);
+        assert_eq!(resource.resource_version, 3);
+        assert_eq!(resource.nonce.as_deref(), Some("retry-successor"));
+    }
+
+    #[test]
+    fn abandoned_pause_request_is_safe_once_successor_fence_wins() {
+        let mut resource = ResourceVersionedRunningFence {
+            resource_version: 41,
+            running: true,
+            deleted: false,
+            nonce: None,
+        };
+        // This models a worker crash after submitting pause RV41: no durable
+        // result was recorded, but the delayed request is still RV41.
+        resource.fence(41, "recovered-successor").unwrap();
+        assert_eq!(resource.pause(41), Err(()));
+        assert!(resource.running);
+    }
+
+    #[test]
+    fn delayed_exact_delete_conflicts_after_successor_running_fence() {
+        let mut resource = ResourceVersionedRunningFence {
+            resource_version: 7,
+            running: true,
+            deleted: false,
+            nonce: None,
+        };
+        resource.fence(7, "successor").unwrap();
+        assert_eq!(resource.delete(7), Err(()));
+        assert!(resource.running);
+        assert!(!resource.deleted);
+    }
+
+    #[test]
+    fn exact_delete_winner_prevents_stale_successor_fence() {
+        let mut resource = ResourceVersionedRunningFence {
+            resource_version: 7,
+            running: true,
+            deleted: false,
+            nonce: None,
+        };
+        resource.delete(7).unwrap();
+        assert_eq!(resource.fence(7, "stale-successor"), Err(()));
+        assert!(resource.deleted);
+        assert!(!resource.running);
+    }
+
+    #[test]
+    fn exact_sandbox_delete_requires_uid_and_resource_version() {
+        let metadata = ObjectMeta {
+            uid: Some("uid-1".to_owned()),
+            resource_version: Some("rv-9".to_owned()),
+            ..ObjectMeta::default()
+        };
+        let params = exact_sandbox_delete_params(&metadata, "uid-1").unwrap();
+        let preconditions = params.preconditions.unwrap();
+        assert_eq!(preconditions.uid.as_deref(), Some("uid-1"));
+        assert_eq!(preconditions.resource_version.as_deref(), Some("rv-9"));
+        assert!(exact_sandbox_delete_params(&metadata, "uid-replacement").is_err());
     }
 
     fn auxiliary_metadata(generation: &str, uid: &str, resource_version: &str) -> ObjectMeta {
@@ -2175,11 +2753,15 @@ mod tests {
     }
 
     #[test]
-    fn accepted_exact_delete_cannot_clean_replacement_auxiliaries_or_mapping() {
+    fn auxiliary_cleanup_precedes_cr_delete_and_cannot_clean_replacements() {
         let old_generation = "generation-old";
         let replacement_generation = "generation-replacement";
         let accepted = exact_stop_actions(Some("sandbox-old"), Some("sandbox-old")).unwrap();
-        assert_eq!(accepted[0], ExactStopAction::DeleteSandbox);
+        assert_eq!(accepted[0], ExactStopAction::AcquireCleanupFinalizer);
+        assert_eq!(accepted[1], ExactStopAction::Sandbox);
+        assert_eq!(accepted[2], ExactStopAction::Proxy);
+        assert_eq!(accepted[3], ExactStopAction::StatePvc);
+        assert_eq!(accepted[4], ExactStopAction::ReleaseCleanupFinalizer);
         let old = [
             auxiliary_metadata(old_generation, "proxy-old", "1"),
             auxiliary_metadata(old_generation, "service-old", "2"),
@@ -2200,9 +2782,8 @@ mod tests {
             },
         )]);
 
-        // The old CR's UID-preconditioned delete has already been accepted.
-        // Before cleanup runs, the next assignment precreates same-name
-        // auxiliaries and replaces the recoverable iron-control mapping.
+        // Every auxiliary is selected by the old generation before the CR's
+        // UID-preconditioned delete can remove that durable generation handle.
         assert!(old.iter().all(|metadata| {
             auxiliary_delete_params(metadata, old_generation)
                 .unwrap()

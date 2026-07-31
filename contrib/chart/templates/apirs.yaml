@@ -155,7 +155,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "patch", "watch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["delete", "get", "list", "watch"]
+    verbs: ["delete", "get", "list", "patch", "watch"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "delete", "get", "list", "patch", "watch"]
@@ -210,6 +210,9 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if .Values.slackbotv2.enabled }}
+        checksum/trace-consent-secret: {{ include "centaur.traceConsentSecretChecksum" . }}
+{{- end }}
         checksum/overlay: {{ dict "overlay" .Values.overlay "overlays" .Values.overlays | toJson | sha256sum }}
 {{- with $apiRsMetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
@@ -476,13 +479,21 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
-            # This is intentionally the same narrowly scoped ingress secret
-            # Slackbot uses to call api-rs; it is never forwarded to console.
+{{- end }}
+{{- if .Values.slackbotv2.enabled }}
             - name: SLACKBOT_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
+            # The verified Slack ingress calls api-rs directly for actor
+            # consent. This narrow bearer is not part of the shared infra
+            # Secret and API-only deployments do not mount it.
+            - name: SLACK_TRACE_CONSENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.traceConsentSecretName" . }}
+                  key: {{ required "slackbotv2.traceConsent.apiKeySecretKey is required" .Values.slackbotv2.traceConsent.apiKeySecretKey }}
 {{- end }}
 {{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
 {{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}

@@ -71,6 +71,19 @@ Minimum keys:
 the API process requires it before it can start. Generate a high-entropy value,
 store it in the infra Secret, and reuse the same value in Slackbot.
 
+Trace-consent mutations use a different Secret. Create it before installing the
+chart (the default name is `centaur-trace-consent`):
+
+```sh
+kubectl --namespace centaur create secret generic centaur-trace-consent \
+  --from-literal=SLACK_TRACE_CONSENT_API_KEY="$(openssl rand -hex 32)"
+```
+
+Set `slackbotv2.traceConsent.apiKeySecretName` and
+`slackbotv2.traceConsent.apiKeySecretKey` if your secret uses another name or
+key. It must not be the shared `secretManager.existingSecretName`; rotating it
+changes the pod checksum and rolls api-rs and Slackbot.
+
 For either non-environment 1Password source, create a separate
 `ironProxy.sourceAuth.existingSecretName` Secret. It exposes exactly one key to
 each proxy:
@@ -383,12 +396,14 @@ reads.
 
 Trace consent is Slack-only and always applies to the signed invoking workspace
 and Slack member. It never accepts a workspace or user selector, creates no
-session or dashboard, and uses the same `SLACKBOT_API_KEY` bearer credential as
-the normal Slackbot session API.
+session or dashboard, and uses the dedicated `SLACK_TRACE_CONSENT_API_KEY`
+bearer credential. This value belongs in the separate trace-consent Secret,
+never the shared infra Secret or an `envFrom` mount.
 
 Use `/autorotate trace status` to see your setting. `/autorotate trace on
 [duration]` presents an ephemeral disclosure; only `/autorotate trace confirm
-[duration]` activates the matching grant. `/autorotate trace off` durably
+<token>` activates the matching grant. The duration starts at confirmation,
+not preview. `/autorotate trace off` durably
 fences new intake and reports whether an exact sandbox drain remains pending.
 The default duration is `1h`; whole-minute (`30m`) and whole-hour (`2h`)
 durations are accepted up to `24h`.
@@ -521,6 +536,30 @@ helm upgrade --install centaur contrib/chart \
   --create-namespace \
   -f values.production.yaml
 ```
+
+### Input-delivery ledger cutover
+
+The input-delivery migration is a coordinated API writer cutover, not a rolling
+schema change. It rejects the migration while any execution is `queued` or
+`running`, because an older API writer cannot reconstruct that execution's
+exact stdin payload into the new ledger. Terminal executions do not block the
+cutover and do not acquire a delivery obligation.
+
+1. Stop or drain every previous API writer and ingress that can call the
+   session execute endpoint. Do not allow an old replica to restart.
+2. Use the approved database administrative path to confirm this query returns
+   `0` before running the migration:
+
+   ```sql
+   select count(*)
+   from session_executions
+   where status in ('queued', 'running');
+   ```
+
+3. Run the migration with the new API image, then deploy the new API writers
+   and ingress together. If the preflight is nonzero, keep draining; do not
+   bypass the migration error or attach a newly generated payload to an old
+   execution.
 
 ## 6. Verify the deployment
 

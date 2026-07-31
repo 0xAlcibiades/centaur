@@ -270,6 +270,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const state = options.state ?? createDefaultState(options, logger)
   const autorotateCommands = createAutorotateSlackCommandHandler({
     apiKey: options.apiKey,
+    traceConsentApiKey: options.traceConsentApiKey,
     apiUrl: options.apiUrl,
     brokerUrl: options.autorotateUrl,
     fetch: options.fetch,

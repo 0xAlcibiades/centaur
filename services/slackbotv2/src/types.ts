@@ -142,6 +142,8 @@ export type SlackbotV2BlockActionPayload = {
 export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
+  /** Dedicated bearer for the narrow Slack trace-consent API. */
+  traceConsentApiKey?: string
   apiUrl: string
   assistantStatus?: string
   /**

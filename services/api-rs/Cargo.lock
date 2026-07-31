@@ -1010,7 +1010,9 @@ dependencies = [
  "bytes",
  "centaur-sandbox-core",
  "centaur-sandbox-manager",
+ "libc",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1088,6 +1090,7 @@ dependencies = [
  "centaur-session-core",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror 2.0.19",
  "time",

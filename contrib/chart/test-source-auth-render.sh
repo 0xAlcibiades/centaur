@@ -23,6 +23,52 @@ require_env_value() {
   ' "$file" || fail "$(basename "$file") does not bind $name to $value"
 }
 
+require_env_secret_key_count() {
+  local file="$1"
+  local name="$2"
+  local key="$3"
+  local expected="$4"
+  local count
+  count="$(awk -v name="$name" -v key="key: $key" '
+    $0 ~ "^[[:space:]]*- name: " name "$" { waiting = 1; next }
+    waiting && index($0, key) { count += 1; waiting = 0; next }
+    waiting && $0 ~ "^[[:space:]]*- name:" { waiting = 0 }
+    END { print count + 0 }
+  ' "$file")"
+  [[ "$count" == "$expected" ]] || fail "$(basename "$file") binds $name to $key $count times, expected $expected"
+}
+
+require_resource_verb() {
+  local file="$1"
+  local resource="$2"
+  local verb="$3"
+  awk -v resource="resources: [\"$resource\"]" -v verb="\"$verb\"" '
+    index($0, resource) { waiting = 1; next }
+    waiting && $1 == "verbs:" { found = index($0, verb) > 0; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$file" || fail "$(basename "$file") does not grant $verb on $resource"
+}
+
+deployment_annotation() {
+  local file="$1"
+  local deployment="$2"
+  local annotation="$3"
+  awk -v deployment="$deployment" -v annotation="$annotation" '
+    $0 == "kind: Deployment" { in_deployment = 1; name = ""; next }
+    in_deployment && name == "" && $1 == "name:" { name = $2; next }
+    in_deployment && name == deployment && $1 == annotation ":" { print $2; exit }
+  ' "$file"
+}
+
+trace_checksum_deployments() {
+  local file="$1"
+  awk '
+    $0 == "kind: Deployment" { in_deployment = 1; name = ""; next }
+    in_deployment && name == "" && $1 == "name:" { name = $2; next }
+    in_deployment && $1 == "checksum/trace-consent-secret:" { print name }
+  ' "$file"
+}
+
 render() {
   local name="$1"
   shift
@@ -57,9 +103,41 @@ require_env_value "$test_dir/onepassword-connect.yaml" KUBERNETES_IRON_PROXY_SOU
 require_env_value "$test_dir/onepassword-connect.yaml" KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY connect-token-key
 
 render environment --set ironProxy.secretSource=env
+require_resource_verb "$test_dir/environment.yaml" persistentvolumeclaims patch
 if grep -Fq 'KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_' "$test_dir/environment.yaml"; then
   fail "environment source rendered a non-env source-auth reference"
 fi
+
+# The trace-consent bearer must restart only the two workloads that consume it.
+# A separate annotation keeps unrelated workloads insulated from its rotations.
+render trace-consent-a \
+  --set ironProxy.secretSource=env \
+  --set console.enabled=true \
+  --set-string secretManager.envPrefix=LEAN_ \
+  --set-string slackbotv2.traceConsent.apiKeySecretName=trace-consent-a
+render trace-consent-b \
+  --set ironProxy.secretSource=env \
+  --set console.enabled=true \
+  --set-string secretManager.envPrefix=LEAN_ \
+  --set-string slackbotv2.traceConsent.apiKeySecretName=trace-consent-b
+
+require_env_secret_key_count "$test_dir/trace-consent-a.yaml" SLACKBOT_API_KEY LEAN_SLACKBOT_API_KEY 2
+
+expected_trace_deployments=$'trace-consent-a-centaur-api-rs\ntrace-consent-a-centaur-slackbotv2'
+if [[ "$(trace_checksum_deployments "$test_dir/trace-consent-a.yaml")" != "$expected_trace_deployments" ]]; then
+  fail "trace-consent checksum did not render exclusively on api-rs and slackbotv2"
+fi
+
+for deployment in trace-consent-a-centaur-api-rs trace-consent-a-centaur-slackbotv2; do
+  annotation_a="$(deployment_annotation "$test_dir/trace-consent-a.yaml" "$deployment" checksum/trace-consent-secret)"
+  deployment_b="${deployment/trace-consent-a/trace-consent-b}"
+  annotation_b="$(deployment_annotation "$test_dir/trace-consent-b.yaml" "$deployment_b" checksum/trace-consent-secret)"
+  [[ -n "$annotation_a" && -n "$annotation_b" && "$annotation_a" != "$annotation_b" ]] || fail "$deployment trace-consent checksum did not change with the Secret identity"
+done
+
+console_checksum_a="$(deployment_annotation "$test_dir/trace-consent-a.yaml" trace-consent-a-centaur-console checksum/infra-secrets)"
+console_checksum_b="$(deployment_annotation "$test_dir/trace-consent-b.yaml" trace-consent-b-centaur-console checksum/infra-secrets)"
+[[ -n "$console_checksum_a" && "$console_checksum_a" == "$console_checksum_b" ]] || fail "trace-consent Secret unexpectedly changes console's infra checksum"
 
 if helm template collision "$CHART" \
   --set ironProxy.secretSource=onepassword \

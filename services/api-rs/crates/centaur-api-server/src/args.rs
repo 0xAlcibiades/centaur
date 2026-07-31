@@ -60,15 +60,17 @@ impl Args {
         &self,
     ) -> Result<Option<MetadataTraceConfigIdentity>, ServerError> {
         let config = self.sandbox.metadata_trace_sidecar_config()?;
-        let generation = self
-            .sandbox
-            .metadata_trace_config_generation
-            .ok_or_else(|| {
-                ServerError::UnsupportedConfig(
-                    "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required, including when metadata tracing is disabled, so a disabled generation can retire older traced sandboxes"
-                        .to_owned(),
-                )
-            })?;
+        let Some(generation) = self.sandbox.metadata_trace_config_generation else {
+            // Plain binary/local deployments that have never enabled tracing
+            // must not acquire a retirement generation just to start.
+            if config.is_none() {
+                return Ok(None);
+            }
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required when metadata tracing is enabled"
+                    .to_owned(),
+            ));
+        };
         if generation <= 0 {
             return Err(ServerError::UnsupportedConfig(
                 "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION must be positive".to_owned(),
@@ -137,6 +139,15 @@ impl Args {
     pub(crate) fn slack_trace_consent_bearer_secret(&self) -> Option<String> {
         self.server
             .slack_trace_consent_bearer_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn slack_session_bearer_secret(&self) -> Option<String> {
+        self.server
+            .slack_session_bearer_secret
             .as_deref()
             .map(str::trim)
             .filter(|secret| !secret.is_empty())
@@ -491,11 +502,19 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
-    /// Shared credential used exclusively by the verified Slack ingress when
+    /// Ordinary Slackbot-to-api-rs service credential. It authenticates Slack
+    /// actor metadata on session endpoints, but cannot mutate trace consent.
+    #[arg(
+        long = "slack-session-bearer-secret",
+        env = "SLACKBOT_API_KEY",
+        hide_env_values = true
+    )]
+    slack_session_bearer_secret: Option<String>,
+    /// Dedicated credential used exclusively by the verified Slack ingress when
     /// it relays a member's trace-consent request to api-rs.
     #[arg(
         long = "slack-trace-consent-bearer-secret",
-        env = "SLACKBOT_API_KEY",
+        env = "SLACK_TRACE_CONSENT_API_KEY",
         hide_env_values = true
     )]
     slack_trace_consent_bearer_secret: Option<String>,
@@ -2544,16 +2563,14 @@ mod tests {
     }
 
     #[test]
-    fn metadata_trace_generation_is_required_even_when_disabled() {
+    fn absent_metadata_trace_configuration_does_not_require_a_generation() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
         ])
         .unwrap();
-        let error = args.metadata_trace_config_identity().unwrap_err();
-        assert!(error.to_string().contains("is required"));
-        assert!(error.to_string().contains("disabled"));
+        assert!(args.metadata_trace_config_identity().unwrap().is_none());
     }
 
     #[test]

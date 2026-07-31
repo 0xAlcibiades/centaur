@@ -3304,7 +3304,7 @@ async fn run_python_workflow_host_in_sandbox(
     {
         spec = spec.env("DATABASE_URL", database_url);
     }
-    let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
+    let (sandbox_handle, io) = sandbox.runtime.create_running_io(spec).await?;
     let mut stdin = io.stdin;
     let stderr_task = tokio::spawn(async move {
         let _guard = io.guard;
@@ -3329,8 +3329,8 @@ async fn run_python_workflow_host_in_sandbox(
     )
     .await;
     drop(stdin);
-    if let Err(error) = sandbox.runtime.stop_sandbox(&sandbox_id).await {
-        warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop workflow host sandbox");
+    if let Err(error) = sandbox.runtime.stop_sandbox(&sandbox_handle).await {
+        warn!(sandbox_id = %sandbox_handle.id.as_str(), %error, "failed to stop workflow host sandbox");
     }
     result
 }

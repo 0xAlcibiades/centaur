@@ -59,8 +59,14 @@ pub trait SandboxBackend: Send + Sync {
     async fn stop_exact(
         &self,
         id: &SandboxId,
-        _expected_resource_uid: Option<&str>,
+        expected_resource_uid: Option<&str>,
     ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "stop_exact",
+            });
+        }
         self.stop(id).await
     }
 
@@ -93,6 +99,50 @@ pub trait SandboxBackend: Send + Sync {
     /// Suspend the sandbox while preserving any backend-supported runtime state.
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()>;
 
+    /// Suspend only the resource generation observed by the caller.
+    async fn pause_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "pause_exact",
+            });
+        }
+        self.pause(id).await
+    }
+
     /// Resume a previously suspended sandbox and wait until it can serve I/O.
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()>;
+
+    /// Resume only the resource generation observed by the caller.
+    async fn resume_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "resume_exact",
+            });
+        }
+        self.resume(id).await
+    }
+
+    /// Fence a successor's reuse of a running sandbox generation. Backends
+    /// must make an exact, observable write even when it is already running.
+    async fn ensure_running_exact(
+        &self,
+        _id: &SandboxId,
+        _expected_resource_uid: &str,
+        _fence_nonce: &str,
+    ) -> SandboxResult<()> {
+        Err(crate::SandboxError::Unsupported {
+            backend: self.name(),
+            operation: "ensure_running_exact",
+        })
+    }
 }

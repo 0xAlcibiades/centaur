@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { Logger } from 'chat'
 import type { JsonObject, SlackbotV2Fetch } from './types'
 import { isJsonObject, stringValue } from './utils'
@@ -11,6 +11,7 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000
 const DEFAULT_ENROLLMENT_LIFETIME_MS = 15 * 60_000
 const DEFAULT_TRACE_CONSENT_LIFETIME_MS = 60 * 60_000
 const MAX_TRACE_CONSENT_LIFETIME_MS = 24 * 60 * 60_000
+const TRACE_CONFIRMATION_LIFETIME_MS = 5 * 60_000
 const MAINTENANCE_MUTATION_MAX_RETRIES = 3
 const MAINTENANCE_MUTATION_DEADLINE_MS = 8_000
 const MAINTENANCE_RETRY_BASE_DELAY_MS = 35
@@ -146,6 +147,7 @@ type CreateEnrollmentInput = {
 
 type AutorotateSlackOptions = {
   apiKey?: string
+  traceConsentApiKey?: string
   apiUrl: string
   brokerUrl?: string
   fetch?: SlackbotV2Fetch
@@ -546,9 +548,17 @@ class SlackTraceConsentClient {
   async enable(
     workspaceId: string,
     userId: string,
-    expiresAt: string
+    durationSeconds: number,
+    expectedRevision: number,
+    idempotencyKey: string
   ): Promise<SlackTraceConsent> {
-    return this.request('PUT', workspaceId, userId, { data: { expires_at: expiresAt } })
+    return this.request(
+      'PUT',
+      workspaceId,
+      userId,
+      { data: { duration_seconds: durationSeconds, expected_revision: expectedRevision } },
+      idempotencyKey
+    )
   }
 
   async disable(
@@ -646,7 +656,7 @@ export function createAutorotateSlackCommandHandler(
     : null
   const traceClient = new SlackTraceConsentClient(
     options.apiUrl,
-    options.apiKey?.trim() ?? process.env.SLACKBOT_API_KEY?.trim() ?? '',
+    options.traceConsentApiKey?.trim() ?? process.env.SLACK_TRACE_CONSENT_API_KEY?.trim() ?? '',
     fetchFn,
     requestTimeoutMs
   )
@@ -676,7 +686,23 @@ export function createAutorotateSlackCommandHandler(
       if (command.kind === 'help') return ephemeralResponse(helpText())
       if (isTraceCommand(command)) {
         if (command.kind === 'trace_on_preview') {
-          return ephemeralResponse(traceConsentPreview(command.durationMs))
+          try {
+            const consent = await traceClient.consent(teamId, userId)
+            return ephemeralResponse(traceConsentPreview(
+              command.durationMs,
+              createTraceConfirmation(
+                teamId,
+                userId,
+                command.durationMs,
+                consent.revision,
+                options.signingSecret
+              ),
+              consent
+            ))
+          } catch (error) {
+            safeCommandWarning(options.logger, 'slackbotv2_trace_consent_preview_failed', error)
+            return ephemeralResponse(traceConsentFailure(command.kind))
+          }
         }
         if (command.kind === 'trace_off') {
           try {
@@ -694,7 +720,7 @@ export function createAutorotateSlackCommandHandler(
           return ephemeralResponse(await traceConsentResponse({
             command,
             client: traceClient,
-            requestTimestampSeconds,
+            signingSecret: options.signingSecret,
             userId,
             workspaceId: teamId
           }))
@@ -927,20 +953,45 @@ async function respondWithMaintenance(input: {
 async function traceConsentResponse(input: {
   command: Extract<ParsedCommand, { kind: 'trace_on' | 'trace_status' }>
   client: SlackTraceConsentClient
-  requestTimestampSeconds: number
+  signingSecret: string
   userId: string
   workspaceId: string
 }): Promise<string> {
-  const consent = input.command.kind === 'trace_status'
-    ? await input.client.consent(input.workspaceId, input.userId)
-    : input.command.kind === 'trace_on'
-      ? await input.client.enable(
-          input.workspaceId,
-          input.userId,
-          new Date(input.requestTimestampSeconds * 1000 + input.command.durationMs).toISOString()
-        )
-      : unreachableTraceCommand(input.command)
-  return formatTraceConsent(consent, input.command.kind === 'trace_on')
+  const command = input.command
+  if (command.kind === 'trace_status') {
+    return formatTraceConsent(await input.client.consent(input.workspaceId, input.userId))
+  }
+  const consent = await enableConfirmedTraceConsent({
+    client: input.client,
+    command,
+    signingSecret: input.signingSecret,
+    userId: input.userId,
+    workspaceId: input.workspaceId
+  })
+  return formatTraceConsent(consent, true)
+}
+
+async function enableConfirmedTraceConsent(input: {
+  command: Extract<ParsedCommand, { kind: 'trace_on' }>
+  client: SlackTraceConsentClient
+  signingSecret: string
+  userId: string
+  workspaceId: string
+}): Promise<SlackTraceConsent> {
+  const confirmation = parseTraceConfirmation(
+    input.command.confirmation,
+    input.workspaceId,
+    input.userId,
+    input.signingSecret
+  )
+  if (!confirmation) throw new AutorotateError('Trace confirmation is invalid or expired')
+  return input.client.enable(
+    input.workspaceId,
+    input.userId,
+    Math.floor(confirmation.durationMs / 1000),
+    confirmation.expectedRevision,
+    traceConfirmIdempotencyKey(input.command.confirmation, input.signingSecret)
+  )
 }
 
 function unreachableTraceCommand(command: never): never {
@@ -1327,7 +1378,7 @@ type ParsedCommand =
   | { kind: 'maintenance_resume' }
   | { kind: 'trace_off' }
   | { kind: 'trace_on_preview', durationMs: number }
-  | { kind: 'trace_on', durationMs: number }
+  | { kind: 'trace_on', confirmation: string }
   | { kind: 'trace_status' }
 
 type TraceCommand = Extract<ParsedCommand, { kind: 'trace_off' | 'trace_on_preview' | 'trace_on' | 'trace_status' }>
@@ -1365,15 +1416,16 @@ function parseCommand(text: string): ParsedCommand {
     const action = parts[1]?.toLowerCase()
     if (parts.length === 2 && action === 'status') return { kind: 'trace_status' }
     if (parts.length === 2 && action === 'off') return { kind: 'trace_off' }
-    if ((action === 'on' || action === 'confirm') && (parts.length === 2 || parts.length === 3)) {
+    if (action === 'on' && (parts.length === 2 || parts.length === 3)) {
       const durationMs = parts.length === 2
         ? DEFAULT_TRACE_CONSENT_LIFETIME_MS
         : parseTraceConsentDuration(parts[2] ?? '')
       if (durationMs !== null) {
-        return action === 'on'
-          ? { kind: 'trace_on_preview', durationMs }
-          : { kind: 'trace_on', durationMs }
+        return { kind: 'trace_on_preview', durationMs }
       }
+    }
+    if (action === 'confirm' && parts.length === 3) {
+      return { kind: 'trace_on', confirmation: parts[2] ?? '' }
     }
     return { kind: 'help' }
   }
@@ -1400,7 +1452,7 @@ function helpText(): string {
     '`/autorotate maintenance resume` — operators only; resume the current drain',
     '`/autorotate trace status` — show your trace setting',
     '`/autorotate trace on [duration]` — review a proposed reliability/performance trace grant (default: 1h; max: 24h)',
-    '`/autorotate trace confirm [duration]` — activate the disclosed grant',
+    '`/autorotate trace confirm <token>` — activate the disclosed grant',
     'Trace fields: source, Codex version, pseudonymous execution/thread/account IDs, observed time, event kind, outcome/duration/exit code, token counts, coarse tool category, transport kind/outcome/status class, rate-limit data, and error class; never prompts, responses, tool arguments, or tool output.',
     'Only SSH-key holders can read traces. Producer spool: 24h; archive: 30d; snapshots can survive up to 45d. Revoking or expiry fences future intake; it does not delete retained data.',
     '`/autorotate trace off` — durably fence new trace input; status reports any pending exact sandbox drain'
@@ -1446,13 +1498,97 @@ function formatTraceConsent(consent: SlackTraceConsent, includeDisclosure = fals
   return [status, traceMetadataDisclosure()].join(' ')
 }
 
-function traceConsentPreview(durationMs: number): string {
+function traceConsentPreview(
+  durationMs: number,
+  confirmation: string,
+  current: SlackTraceConsent
+): string {
   const duration = traceConsentDurationLabel(durationMs)
   return [
-    `Trace consent is still off. This would grant metadata collection for ${duration}.`,
+    current.enabled
+      ? `This would replace the current metadata collection setting with ${duration}.`
+      : `This would set metadata collection to ${duration}.`,
     traceMetadataDisclosure(),
-    `To activate this exact ${duration} grant, run \`/autorotate trace confirm ${duration}\`.`
+    `To activate this exact ${duration} grant within 5 minutes, run \`/autorotate trace confirm ${confirmation}\`.`
   ].join(' ')
+}
+
+type TraceConfirmation = {
+  durationMs: number
+  expectedRevision: number
+  expiresAtMs: number
+  nonce: string
+}
+
+function createTraceConfirmation(
+  workspaceId: string,
+  userId: string,
+  durationMs: number,
+  expectedRevision: number,
+  signingSecret: string
+): string {
+  const issuedAtMs = Date.now()
+  const payload = Buffer.from(JSON.stringify({
+    d: durationMs,
+    e: issuedAtMs + TRACE_CONFIRMATION_LIFETIME_MS,
+    i: issuedAtMs,
+    n: randomBytes(12).toString('hex'),
+    r: expectedRevision,
+    u: userId,
+    w: workspaceId
+  })).toString('base64url')
+  const signature = createHmac('sha256', signingSecret).update(`trace-confirm:${payload}`).digest('base64url')
+  return `${payload}.${signature}`
+}
+
+function parseTraceConfirmation(
+  token: string,
+  workspaceId: string,
+  userId: string,
+  signingSecret: string
+): TraceConfirmation | null {
+  const [payload, signature, extra] = token.split('.')
+  if (!payload || !signature || extra) return null
+  const expected = createHmac('sha256', signingSecret).update(`trace-confirm:${payload}`).digest('base64url')
+  const supplied = Buffer.from(signature)
+  const expectedBytes = Buffer.from(expected)
+  if (supplied.length !== expectedBytes.length || !timingSafeEqual(supplied, expectedBytes)) return null
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+    if (!isJsonObject(parsed)) return null
+    const durationMs = parsed.d
+    const expectedRevision = parsed.r
+    const expiresAtMs = parsed.e
+    const issuedAtMs = parsed.i
+    const nonce = parsed.n
+    if (
+      parsed.w !== workspaceId
+      || parsed.u !== userId
+      || typeof durationMs !== 'number'
+      || !Number.isSafeInteger(durationMs)
+      || durationMs <= 0
+      || durationMs > MAX_TRACE_CONSENT_LIFETIME_MS
+      || typeof expectedRevision !== 'number'
+      || !Number.isSafeInteger(expectedRevision)
+      || expectedRevision < 0
+      || typeof expiresAtMs !== 'number'
+      || !Number.isSafeInteger(expiresAtMs)
+      || typeof issuedAtMs !== 'number'
+      || !Number.isSafeInteger(issuedAtMs)
+      || expiresAtMs !== issuedAtMs + TRACE_CONFIRMATION_LIFETIME_MS
+      || expiresAtMs < Date.now()
+      || expiresAtMs > Date.now() + TRACE_CONFIRMATION_LIFETIME_MS + MAX_SLACK_REQUEST_AGE_SECONDS * 1000
+      || typeof nonce !== 'string'
+      || !/^[a-f0-9]{24}$/.test(nonce)
+    ) return null
+    return { durationMs, expectedRevision, expiresAtMs, nonce }
+  } catch {
+    return null
+  }
+}
+
+function traceConfirmIdempotencyKey(token: string, signingSecret: string): string {
+  return `slack-trace-confirm:${createHmac('sha256', signingSecret).update(token).digest('hex')}`
 }
 
 function traceConsentDurationLabel(durationMs: number): string {

@@ -73,6 +73,7 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     codex_nanocodex_rollout_percent: u8,
+    slack_session_bearer_secret: Option<Arc<str>>,
     slack_trace_consent_bearer_secret: Option<Arc<str>>,
 }
 
@@ -89,6 +90,7 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             codex_nanocodex_rollout_percent: 0,
+            slack_session_bearer_secret: None,
             slack_trace_consent_bearer_secret: None,
         }
     }
@@ -103,8 +105,17 @@ impl AppState {
         self
     }
 
+    pub fn with_slack_session_bearer_secret(mut self, secret: Option<String>) -> Self {
+        self.slack_session_bearer_secret = secret.map(Arc::<str>::from);
+        self
+    }
+
     fn slack_trace_consent_bearer_secret(&self) -> Option<Arc<str>> {
         self.slack_trace_consent_bearer_secret.clone()
+    }
+
+    fn slack_session_bearer_secret(&self) -> Option<Arc<str>> {
+        self.slack_session_bearer_secret.clone()
     }
 
     pub fn ready(runtime: SessionRuntime, workflows: Option<WorkflowRuntime>) -> Self {
@@ -379,8 +390,8 @@ struct SlackTraceConsentRequest {
 
 #[derive(Deserialize)]
 struct SlackTraceConsentInput {
-    #[serde(with = "time::serde::rfc3339")]
-    expires_at: OffsetDateTime,
+    duration_seconds: i64,
+    expected_revision: i64,
 }
 
 #[derive(Serialize)]
@@ -410,21 +421,32 @@ async fn put_slack_trace_consent(
 ) -> Result<Response, ApiError> {
     authorize_slack_trace_consent(&headers, &state)?;
     validate_slack_trace_subject(&workspace_id, &user_id)?;
-    let now = OffsetDateTime::now_utc();
-    if request.data.expires_at <= now
-        || request.data.expires_at > now + MAX_SLACK_TRACE_CONSENT_DURATION
+    if request.data.duration_seconds <= 0
+        || request.data.duration_seconds > MAX_SLACK_TRACE_CONSENT_DURATION.whole_seconds()
     {
         return Err(ApiError::BadRequest(
-            "expires_at must be in the future and within 24 hours".to_owned(),
+            "duration_seconds must be positive and at most 24 hours".to_owned(),
         ));
     }
+    // Confirmation time, not preview time, starts the consent lease.  The
+    // idempotency row persists the first resulting expiry for duplicate Slack
+    // deliveries, while its request hash remains stable across retries.
+    let expires_at =
+        OffsetDateTime::now_utc() + time::Duration::seconds(request.data.duration_seconds);
     let consent = state
         .runtime()?
         .set_slack_trace_consent(
             &workspace_id,
             &user_id,
-            request.data.expires_at,
-            trace_consent_idempotency(&headers, format!("PUT:{}", request.data.expires_at))?,
+            expires_at,
+            request.data.expected_revision,
+            required_trace_consent_idempotency(
+                &headers,
+                format!(
+                    "PUT:{}:{}",
+                    request.data.duration_seconds, request.data.expected_revision
+                ),
+            )?,
         )
         .await
         .map_err(trace_consent_runtime_error)?;
@@ -438,20 +460,17 @@ async fn delete_slack_trace_consent(
 ) -> Result<Response, ApiError> {
     authorize_slack_trace_consent(&headers, &state)?;
     validate_slack_trace_subject(&workspace_id, &user_id)?;
+    let idempotency = required_trace_consent_idempotency(&headers, "DELETE".to_owned())?;
     let consent = state
         .runtime()?
-        .revoke_slack_trace_consent(
-            &workspace_id,
-            &user_id,
-            trace_consent_idempotency(&headers, "DELETE".to_owned())?,
-        )
+        .revoke_slack_trace_consent(&workspace_id, &user_id, Some(idempotency))
         .await
         .map_err(trace_consent_runtime_error)?;
     Ok(slack_trace_consent_response(consent))
 }
 
 fn authorize_slack_trace_consent(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
-    if slackbot_bearer_is_exact(headers, state) {
+    if slack_trace_consent_bearer_is_exact(headers, state) {
         return Ok(());
     }
     if state.slack_trace_consent_bearer_secret().is_none() {
@@ -470,7 +489,7 @@ fn trace_actor_metadata_for_request(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Option<Value> {
-    if slackbot_bearer_is_exact(headers, state) {
+    if slack_session_bearer_is_exact(headers, state) {
         return metadata;
     }
     let mut metadata = metadata?;
@@ -481,8 +500,16 @@ fn trace_actor_metadata_for_request(
     Some(metadata)
 }
 
-fn slackbot_bearer_is_exact(headers: &HeaderMap, state: &AppState) -> bool {
-    let Some(secret) = state.slack_trace_consent_bearer_secret() else {
+fn slack_trace_consent_bearer_is_exact(headers: &HeaderMap, state: &AppState) -> bool {
+    bearer_is_exact(headers, state.slack_trace_consent_bearer_secret())
+}
+
+fn slack_session_bearer_is_exact(headers: &HeaderMap, state: &AppState) -> bool {
+    bearer_is_exact(headers, state.slack_session_bearer_secret())
+}
+
+fn bearer_is_exact(headers: &HeaderMap, secret: Option<Arc<str>>) -> bool {
+    let Some(secret) = secret else {
         return false;
     };
     let authorization = headers
@@ -513,6 +540,15 @@ fn trace_consent_idempotency(
         key,
         digest.iter().map(|byte| format!("{byte:02x}")).collect(),
     )))
+}
+
+fn required_trace_consent_idempotency(
+    headers: &HeaderMap,
+    request: String,
+) -> Result<(&str, String), ApiError> {
+    trace_consent_idempotency(headers, request)?.ok_or_else(|| {
+        ApiError::BadRequest("Idempotency-Key is required for trace consent mutations".to_owned())
+    })
 }
 
 fn validate_slack_trace_subject(workspace_id: &str, user_id: &str) -> Result<(), ApiError> {
@@ -546,9 +582,16 @@ fn slack_trace_consent_response(consent: MetadataTraceConsent) -> Response {
 
 fn trace_consent_runtime_error(error: SessionRuntimeError) -> ApiError {
     match error {
-        SessionRuntimeError::Store(SessionStoreError::MetadataTraceIdempotencyConflict) => {
+        SessionRuntimeError::Store(
+            SessionStoreError::MetadataTraceIdempotencyConflict
+            | SessionStoreError::MetadataTraceIdempotencyReplayFenced,
+        ) => ApiError::Conflict(
+            "Idempotency-Key was already used for a different trace consent request".to_owned(),
+        ),
+        SessionRuntimeError::Store(SessionStoreError::MetadataTraceConsentRevisionChanged) => {
             ApiError::Conflict(
-                "Idempotency-Key was already used for a different trace consent request".to_owned(),
+                "trace consent changed after confirmation preview; review and confirm again"
+                    .to_owned(),
             )
         }
         SessionRuntimeError::Store(SessionStoreError::MetadataTraceDrainPending) => {
@@ -863,7 +906,7 @@ mod harness_rollout_tests {
     }
 
     #[test]
-    fn trace_actor_metadata_requires_the_exact_slackbot_bearer() {
+    fn trace_actor_metadata_requires_the_exact_session_bearer() {
         let metadata = || {
             Some(json!({
                 "slack_team_id": "T_CHANNEL",
@@ -873,7 +916,7 @@ mod harness_rollout_tests {
             }))
         };
         let state = AppState::unready()
-            .with_slack_trace_consent_bearer_secret(Some("exact-slackbot-key".to_owned()));
+            .with_slack_session_bearer_secret(Some("exact-slackbot-key".to_owned()));
 
         for headers in [HeaderMap::new(), {
             let mut headers = HeaderMap::new();
@@ -4467,6 +4510,58 @@ mod slack_trace_consent_tests {
 
     use super::*;
 
+    fn bearer_headers(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn session_actor_metadata_uses_only_the_ordinary_slack_key() {
+        let state = AppState::unready()
+            .with_slack_session_bearer_secret(Some("ordinary-session-key".to_owned()))
+            .with_slack_trace_consent_bearer_secret(Some("dedicated-trace-key".to_owned()));
+        let metadata = Some(json!({
+            "slack_actor_team_id": "T123456789",
+            "slack_actor_user_id": "U123456789",
+        }));
+
+        let ordinary = trace_actor_metadata_for_request(
+            metadata.clone(),
+            &bearer_headers("ordinary-session-key"),
+            &state,
+        )
+        .unwrap();
+        assert!(ordinary.get("slack_actor_team_id").is_some());
+        assert!(ordinary.get("slack_actor_user_id").is_some());
+
+        let trace_key = trace_actor_metadata_for_request(
+            metadata,
+            &bearer_headers("dedicated-trace-key"),
+            &state,
+        )
+        .unwrap();
+        assert!(trace_key.get("slack_actor_team_id").is_none());
+        assert!(trace_key.get("slack_actor_user_id").is_none());
+    }
+
+    #[test]
+    fn trace_consent_mutations_use_only_the_dedicated_trace_key() {
+        let state = AppState::unready()
+            .with_slack_session_bearer_secret(Some("ordinary-session-key".to_owned()))
+            .with_slack_trace_consent_bearer_secret(Some("dedicated-trace-key".to_owned()));
+        assert!(
+            authorize_slack_trace_consent(&bearer_headers("dedicated-trace-key"), &state).is_ok()
+        );
+        assert!(matches!(
+            authorize_slack_trace_consent(&bearer_headers("ordinary-session-key"), &state),
+            Err(ApiError::Unauthorized(_))
+        ));
+    }
+
     struct StalledExactStopBackend;
 
     #[async_trait::async_trait]
@@ -4544,6 +4639,26 @@ mod slack_trace_consent_tests {
     }
 
     #[tokio::test]
+    async fn delete_trace_consent_requires_an_idempotency_key() {
+        let app = build_router_with_app_state(
+            AppState::unready()
+                .with_slack_trace_consent_bearer_secret(Some("trace-test-secret".to_owned())),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/slack_trace_consents/T123456789/U123456789")
+                    .header(header::AUTHORIZATION, "Bearer trace-test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn delete_trace_consent_acknowledges_before_a_stalled_exact_stop() {
         let Some(store) = test_store().await else {
             return;
@@ -4609,6 +4724,7 @@ mod slack_trace_consent_tests {
                 "/api/v1/slack_trace_consents/{workspace_id}/{user_id}"
             ))
             .header(header::AUTHORIZATION, "Bearer trace-test-secret")
+            .header("idempotency-key", "trace-delete-stalled")
             .body(Body::empty())
             .unwrap();
         let response = tokio::time::timeout(Duration::from_millis(100), app.oneshot(request))

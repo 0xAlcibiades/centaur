@@ -495,6 +495,11 @@ apiRs:
 slackbotv2:
   enabled: true
   replicaCount: 1
+  # This Secret is deliberately separate from the shared infra Secret.  It is
+  # mounted only as the trace-consent bearer and never via envFrom.
+  traceConsent:
+    apiKeySecretName: centaur-trace-consent
+    apiKeySecretKey: SLACK_TRACE_CONSENT_API_KEY
   image:
     repository: centaur-slackbotv2
     tag: latest

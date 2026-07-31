@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
+use centaur_sandbox_core::{SandboxError, SandboxHandle, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
@@ -66,9 +66,9 @@ impl WarmPoolManager {
         thread_key: &str,
         iron_control_principal: Option<&str>,
         proxy_labels: &BTreeMap<String, String>,
-    ) -> Result<Option<String>, WarmPoolError> {
+    ) -> Result<Option<SandboxHandle>, WarmPoolError> {
         loop {
-            let Some(sandbox_id) = self
+            let Some(claimed) = self
                 .store
                 .claim_ready_warm_sandbox(self.workload_key.as_str(), thread_key)
                 .await?
@@ -76,13 +76,18 @@ impl WarmPoolManager {
                 return Ok(None);
             };
 
+            let sandbox_id = claimed.sandbox_id.clone();
             let id = SandboxId::new(sandbox_id.as_str());
-            let failure = match self.manager.status(&id).await {
+            let failure = match self.manager.observe(&id).await {
                 // Only `Running` accepts `open_io`. `Created` means the
                 // runtime regressed after the replenisher saw it running
                 // (backends wait for readiness before returning from create),
                 // so claiming it would fail at I/O attach.
-                Ok(SandboxStatus::Running) => {
+                Ok(observation)
+                    if observation.status == SandboxStatus::Running
+                        && claimed.resource_uid.is_some()
+                        && observation.resource_uid == claimed.resource_uid =>
+                {
                     if let Some(principal_id) = iron_control_principal
                         && let Err(error) = self
                             .manager
@@ -92,27 +97,36 @@ impl WarmPoolManager {
                         let error_message = error.to_string();
                         let _ = self
                             .store
-                            .mark_warm_sandbox_failed(&sandbox_id, &error_message)
+                            .mark_warm_sandbox_failed_if_matches(&claimed, &error_message)
                             .await;
                         return Err(WarmPoolError::Sandbox(error));
                     }
-                    return Ok(Some(sandbox_id));
+                    return Ok(Some(
+                        SandboxHandle::new(id, observation.backend)
+                            .with_resource_uid(claimed.resource_uid.clone()),
+                    ));
                 }
-                Ok(status) => format!("claimed warm sandbox was not running: {status:?}"),
+                Ok(observation) if observation.status != SandboxStatus::Running => {
+                    format!(
+                        "claimed warm sandbox was not running: {:?}",
+                        observation.status
+                    )
+                }
+                Ok(_) => "claimed warm sandbox resource UID changed or was missing".to_owned(),
                 Err(SandboxError::NotFound(_)) => "claimed warm sandbox was not found".to_owned(),
                 Err(error) => {
                     let error_message = error.to_string();
                     warn!(%sandbox_id, error = %error_message);
                     let _ = self
                         .store
-                        .mark_warm_sandbox_failed(&sandbox_id, &error_message)
+                        .mark_warm_sandbox_failed_if_matches(&claimed, &error_message)
                         .await;
                     return Err(WarmPoolError::Sandbox(error));
                 }
             };
             warn!(%sandbox_id, error = %failure, thread_key);
             self.store
-                .mark_warm_sandbox_failed(&sandbox_id, &failure)
+                .mark_warm_sandbox_failed_if_matches(&claimed, &failure)
                 .await?;
         }
     }
@@ -135,12 +149,24 @@ impl WarmPoolManager {
                 spec.iron_control_principal = Some(principal_id.clone());
             }
             let handle = self.manager.create_running(spec).await?;
+            let resource_uid = handle.resource_uid.as_deref().ok_or_else(|| {
+                WarmPoolError::Sandbox(SandboxError::backend(
+                    "created warm sandbox did not include a stable resource UID",
+                ))
+            })?;
             if let Err(error) = self
                 .store
-                .insert_ready_warm_sandbox(handle.id.as_str(), self.workload_key.as_str())
+                .insert_ready_warm_sandbox(
+                    handle.id.as_str(),
+                    Some(resource_uid),
+                    self.workload_key.as_str(),
+                )
                 .await
             {
-                let _ = self.manager.stop(&handle.id).await;
+                let _ = self
+                    .manager
+                    .stop_exact(&handle.id, Some(resource_uid))
+                    .await;
                 return Err(WarmPoolError::Store(error));
             }
         }
@@ -149,11 +175,20 @@ impl WarmPoolManager {
     }
 
     async fn prune_stale_ready_sandboxes(&self) -> Result<(), WarmPoolError> {
-        for sandbox_id in self.store.list_ready_warm_sandbox_ids().await? {
+        for sandbox in self.store.list_ready_warm_sandboxes().await? {
+            let sandbox_id = sandbox.sandbox_id.clone();
             let id = SandboxId::new(sandbox_id.as_str());
-            let failure = match self.manager.status(&id).await {
-                Ok(SandboxStatus::Running) => continue,
-                Ok(status) => format!("ready warm sandbox was not running: {status:?}"),
+            let failure = match self.manager.observe(&id).await {
+                Ok(observation)
+                    if observation.status == SandboxStatus::Running
+                        && observation.resource_uid == sandbox.resource_uid =>
+                {
+                    continue;
+                }
+                Ok(observation) => format!(
+                    "ready warm sandbox identity was not running or changed: {:?}",
+                    observation.status
+                ),
                 Err(SandboxError::NotFound(_)) => "ready warm sandbox was not found".to_owned(),
                 Err(error) => {
                     let error_message = error.to_string();
@@ -163,22 +198,31 @@ impl WarmPoolManager {
             };
             warn!(%sandbox_id, error = %failure, "marking stale ready warm sandbox failed");
             self.store
-                .mark_warm_sandbox_failed(&sandbox_id, &failure)
+                .mark_warm_sandbox_failed_if_matches(&sandbox, &failure)
                 .await?;
         }
         Ok(())
     }
 
     async fn prune_stale_evicting_sandboxes(&self) -> Result<(), WarmPoolError> {
-        for sandbox_id in self
+        for sandbox in self
             .store
             .list_stale_evicting_warm_sandbox_ids(STALE_EVICTING_WARM_SANDBOX_AGE)
             .await?
         {
+            let sandbox_id = sandbox.sandbox_id.clone();
             let id = SandboxId::new(sandbox_id.as_str());
-            let failure = match self.manager.status(&id).await {
-                Ok(status) if status_consumes_running_slot(&status) => {
-                    match self.manager.stop(&id).await {
+            let failure = match self.manager.observe(&id).await {
+                Ok(observation)
+                    if status_consumes_running_slot(&observation.status)
+                        && observation.resource_uid == sandbox.resource_uid =>
+                {
+                    let Some(resource_uid) = sandbox.resource_uid.as_deref() else {
+                        return Err(WarmPoolError::Sandbox(SandboxError::backend(
+                            "stale evicting warm sandbox was missing a stable resource UID",
+                        )));
+                    };
+                    match self.manager.stop_exact(&id, Some(resource_uid)).await {
                         Ok(()) | Err(SandboxError::NotFound(_)) => {
                             "stale evicting warm sandbox stopped".to_owned()
                         }
@@ -189,7 +233,10 @@ impl WarmPoolManager {
                         }
                     }
                 }
-                Ok(status) => format!("stale evicting warm sandbox was not running: {status:?}"),
+                Ok(observation) => format!(
+                    "stale evicting warm sandbox identity was not running or changed: {:?}",
+                    observation.status
+                ),
                 Err(SandboxError::NotFound(_)) => {
                     "stale evicting warm sandbox was not found".to_owned()
                 }
@@ -201,7 +248,7 @@ impl WarmPoolManager {
             };
             warn!(%sandbox_id, reason = %failure, "marking stale evicting warm sandbox failed");
             self.store
-                .mark_warm_sandbox_failed(&sandbox_id, &failure)
+                .mark_warm_sandbox_failed_if_matches(&sandbox, &failure)
                 .await?;
         }
         Ok(())
@@ -266,11 +313,11 @@ mod tests {
         let fresh_sandbox = format!("fresh-{suffix}");
 
         store
-            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .insert_ready_warm_sandbox(&stale_sandbox, Some(&stale_sandbox), &workload_key)
             .await
             .expect("insert stale warm sandbox row");
         store
-            .insert_ready_warm_sandbox(&old_stale_sandbox, &old_workload_key)
+            .insert_ready_warm_sandbox(&old_stale_sandbox, Some("uid-old-stale"), &old_workload_key)
             .await
             .expect("insert stale warm sandbox row for old workload");
         assert_eq!(
@@ -312,12 +359,13 @@ mod tests {
                 .expect("count ready warm sandboxes"),
             1
         );
-        assert_eq!(
+        assert!(
             store
-                .claim_ready_warm_sandbox(&workload_key, "test-thread")
+                .list_ready_warm_sandboxes()
                 .await
-                .expect("claim ready warm sandbox"),
-            Some(fresh_sandbox)
+                .expect("list ready warm sandboxes")
+                .iter()
+                .any(|sandbox| sandbox.sandbox_id == fresh_sandbox)
         );
         assert_eq!(
             store
@@ -338,7 +386,7 @@ mod tests {
         let stale_sandbox = format!("stale-evicting-{suffix}");
 
         store
-            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .insert_ready_warm_sandbox(&stale_sandbox, Some(&stale_sandbox), &workload_key)
             .await
             .expect("insert stale evicting warm sandbox row");
         sqlx::query(
@@ -445,10 +493,10 @@ mod tests {
                 .unwrap()
                 .insert(self.create_id.clone(), SandboxStatus::Running);
             self.created.lock().unwrap().push(self.create_id.clone());
-            Ok(SandboxHandle::new(
-                SandboxId::new(self.create_id.clone()),
-                self.name(),
-            ))
+            Ok(
+                SandboxHandle::new(SandboxId::new(self.create_id.clone()), self.name())
+                    .with_resource_uid(Some(self.create_id.clone())),
+            )
         }
 
         async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
@@ -468,11 +516,10 @@ mod tests {
         }
 
         async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
-            Ok(ObservedSandbox::new(
-                id.clone(),
-                self.name(),
-                self.status(id).await?,
-            ))
+            Ok(
+                ObservedSandbox::new(id.clone(), self.name(), self.status(id).await?)
+                    .with_resource_uid(Some(id.as_str().to_owned())),
+            )
         }
 
         async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -491,6 +538,17 @@ mod tests {
                 .unwrap()
                 .insert(id.as_str().to_owned(), SandboxStatus::Stopped);
             Ok(())
+        }
+
+        async fn stop_exact(
+            &self,
+            id: &SandboxId,
+            expected_resource_uid: Option<&str>,
+        ) -> SandboxResult<()> {
+            if expected_resource_uid != Some(id.as_str()) {
+                return Err(SandboxError::backend("test resource UID did not match"));
+            }
+            self.stop(id).await
         }
 
         async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {

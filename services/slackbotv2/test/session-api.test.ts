@@ -22,6 +22,7 @@ import type {
 
 type RecordedRequest = {
   body: unknown
+  headers: Headers
   url: string
 }
 
@@ -76,7 +77,7 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
   const fetchFn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input)
     const body = init?.body ? JSON.parse(String(init.body)) : undefined
-    requests.push({ body, url })
+    requests.push({ body, headers: new Headers(init?.headers), url })
     if (url.endsWith('/execute')) {
       return Response.json({
         execution_id: 'exec-1',
@@ -104,6 +105,7 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
 
 function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   return {
+    apiKey: 'ordinary-session-api-secret',
     apiUrl: 'http://api.test',
     botToken: 'xoxb-test',
     fetch: fetchFn,
@@ -179,6 +181,36 @@ function slackMessage(raw: Record<string, unknown>): Message {
 }
 
 describe('Slack actor workspace metadata', () => {
+  test('uses the ordinary Slack API key for session endpoints', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hello')))
+    expect(requests).not.toHaveLength(0)
+    for (const request of requests) {
+      expect(request.headers.get('authorization')).toBe('Bearer ordinary-session-api-secret')
+    }
+  })
+
+  test('keeps each actor boundary in a mixed append batch', async () => {
+    const u1 = await serializeMessage(slackMessage({ team: 'T1' }))
+    const second = slackMessage({ team: 'T2' })
+    second.author.userId = 'U2'
+    const u2 = await serializeMessage(second)
+    const { fetchFn, requests } = fakeApi()
+
+    await forwardToSessionApi(options(fetchFn), forwardInput(u1, {
+      executeMessage: undefined,
+      messages: [u1, u2]
+    }))
+
+    const append = requests.find(request => request.url.endsWith('/messages'))
+    const messages = (append?.body as { messages?: Array<{ metadata?: Record<string, unknown> }> })
+      .messages ?? []
+    expect(messages.map(message => message.metadata)).toEqual([
+      expect.objectContaining({ slack_actor_team_id: 'T1', slack_actor_user_id: 'U1' }),
+      expect.objectContaining({ slack_actor_team_id: 'T2', slack_actor_user_id: 'U2' })
+    ])
+  })
+
   test('keeps a Slack Connect actor workspace separate from the signed host workspace', async () => {
     const message = await serializeMessage(
       slackMessage({ source_team: 'TSOURCE', team: 'TEVENT', user_team: 'TACTOR' }),

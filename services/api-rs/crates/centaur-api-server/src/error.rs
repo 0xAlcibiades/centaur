@@ -64,6 +64,10 @@ impl IntoResponse for ApiError {
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                | SessionRuntimeError::SandboxAssignmentChanged,
+            ) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND
             }
@@ -115,6 +119,16 @@ impl IntoResponse for ApiError {
             body["existing_harness"] = json!(existing);
             body["requested_harness"] = json!(requested);
         }
+        if matches!(
+            &self,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                    | SessionRuntimeError::SandboxAssignmentChanged
+            )
+        ) {
+            body["code"] = json!("input_delivery_conflict");
+            body["retryable"] = json!(true);
+        }
         (status, Json(body)).into_response()
     }
 }
@@ -151,5 +165,16 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn delivery_fence_races_are_retryable_conflicts() {
+        for error in [
+            SessionRuntimeError::MetadataTraceBoundaryChanged,
+            SessionRuntimeError::SandboxAssignmentChanged,
+        ] {
+            let response = ApiError::Runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
     }
 }

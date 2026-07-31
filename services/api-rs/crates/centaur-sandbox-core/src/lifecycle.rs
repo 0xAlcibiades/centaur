@@ -47,6 +47,11 @@ pub struct SandboxHandle {
     pub id: SandboxId,
     /// Name of the backend that owns this sandbox.
     pub backend: String,
+    /// Stable backend resource identity captured by the create operation.
+    /// Callers must use this value, rather than re-observing a reusable name,
+    /// when persisting or cleaning up ownership.
+    #[serde(default)]
+    pub resource_uid: Option<String>,
 }
 
 impl SandboxHandle {
@@ -54,7 +59,13 @@ impl SandboxHandle {
         Self {
             id: id.into(),
             backend: backend.into(),
+            resource_uid: None,
         }
+    }
+
+    pub fn with_resource_uid(mut self, resource_uid: Option<String>) -> Self {
+        self.resource_uid = resource_uid;
+        self
     }
 }
 

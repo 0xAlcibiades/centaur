@@ -108,6 +108,17 @@ function traceConsent(
   }
 }
 
+async function traceConfirmation(
+  handler: ReturnType<typeof createAutorotateSlackCommandHandler>,
+  duration = '1h'
+): Promise<string> {
+  const response = await handleAndWait(handler, commandRequest(`trace on ${duration}`))
+  const body = await response.json() as { text: string }
+  const token = /`\/autorotate trace confirm ([^`\s]+)`/.exec(body.text)?.[1]
+  if (!token) throw new Error('trace preview did not return a confirmation token')
+  return token
+}
+
 function fleetReport(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     generated_at: new Date().toISOString(),
@@ -221,6 +232,7 @@ function testHandler(
 ) {
   return createAutorotateSlackCommandHandler({
     apiKey: 'slackbot-api-secret',
+    traceConsentApiKey: 'trace-consent-api-secret',
     apiUrl: 'https://centaur-api.example.test',
     brokerUrl: 'https://autorotate.example.test/broker/',
     fetch: fetchFn,
@@ -603,7 +615,7 @@ describe('Autorotate Slack command', () => {
     expect(body.text).toContain('/autorotate login')
     expect(body.text).toContain('/autorotate trace status')
     expect(body.text).toContain('/autorotate trace on [duration]')
-    expect(body.text).toContain('/autorotate trace confirm [duration]')
+    expect(body.text).toContain('/autorotate trace confirm <token>')
     expect(body.text).toContain('/autorotate trace off')
     expect(body.text).toContain('default: 1h; max: 24h')
     expect(body.text).toContain('source, Codex version, pseudonymous execution/thread/account IDs')
@@ -627,7 +639,7 @@ describe('Autorotate Slack command', () => {
       calls.push({ body, method: init?.method ?? 'GET', url })
       if (url.includes('/api/v1/slack_trace_consents/')) {
         expect(url).toBe(`https://centaur-api.example.test/api/v1/slack_trace_consents/${TEAM_ID}/${OTHER_USER_ID}`)
-        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer slackbot-api-secret')
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer trace-consent-api-secret')
         expect(init?.cache).toBe('no-store')
         return Response.json(traceConsent({ user_id: OTHER_USER_ID }))
       }
@@ -651,20 +663,20 @@ describe('Autorotate Slack command', () => {
     })
   })
 
-  it('reviews trace consent before activation without calling the API', async () => {
-    const handler = testHandler(async () => {
-      throw new Error('trace review must not call the API')
+  it('reviews trace consent before issuing an activation token', async () => {
+    const handler = testHandler(async input => {
+      if (String(input).includes('/api/v1/slack_trace_consents/')) return Response.json(traceConsent())
+      throw new Error('unexpected trace review request')
     })
 
     const response = await handleAndWait(handler, commandRequest('trace on 90m'))
     const body = await response.json() as { response_type: string; text: string }
 
     expect(body.response_type).toBe('ephemeral')
-    expect(body.text).toContain('Trace consent is still off')
-    expect(body.text).toContain('for 90m')
+    expect(body.text).toContain('This would set metadata collection to 90m')
     expect(body.text).toContain('Codex version')
     expect(body.text).toContain('transport kind/outcome/status class')
-    expect(body.text).toContain('`/autorotate trace confirm 90m`')
+    expect(body.text).toContain('`/autorotate trace confirm ')
   })
 
   it('enables confirmed trace metadata collection for at most 24 hours and reports expiry ephemerally', async () => {
@@ -674,11 +686,10 @@ describe('Autorotate Slack command', () => {
       const body = init?.body ? JSON.parse(String(init.body)) : undefined
       calls.push({ body, method: init?.method ?? 'GET', url })
       if (url.includes('/api/v1/slack_trace_consents/')) {
-        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer slackbot-api-secret')
-        expect(body).toEqual({ data: { expires_at: expect.any(String) } })
-        const expiresAt = (body as { data: { expires_at: string } }).data.expires_at
-        expect(Date.parse(expiresAt) - Date.now()).toBeGreaterThan(89 * 60_000)
-        expect(Date.parse(expiresAt) - Date.now()).toBeLessThanOrEqual(90 * 60_000)
+        if (init?.method === 'GET') return Response.json(traceConsent())
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer trace-consent-api-secret')
+        expect(body).toEqual({ data: { expected_revision: 1, duration_seconds: 5_400 } })
+        const expiresAt = new Date(Date.now() + 90 * 60_000).toISOString()
         return Response.json(traceConsent({
           enabled: true,
           expires_at: expiresAt,
@@ -688,7 +699,8 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    const response = await handleAndWait(handler, commandRequest('trace confirm 90m'))
+    const token = await traceConfirmation(handler, '90m')
+    const response = await handleAndWait(handler, commandRequest(`trace confirm ${token}`))
 
     const body = await response.json() as { response_type: string; text: string }
     expect(body.response_type).toBe('ephemeral')
@@ -701,14 +713,36 @@ describe('Autorotate Slack command', () => {
     expect(body.text).toContain('Only SSH-key holders can read traces')
     expect(body.text).toContain('Producer spool: 24h; archive: 30d; snapshots can survive up to 45d')
     expect(body.text).toContain('Revoking or expiry fences future intake; it does not delete retained data')
-    const upstream = calls.find(call => call.url.includes('/api/v1/slack_trace_consents/'))
+    const upstream = calls.find(call => call.method === 'PUT')
     expect(upstream?.method).toBe('PUT')
+  })
+
+  it('fails closed for cold and actor-mismatched trace confirmations', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      calls.push({ method: init?.method ?? 'GET', url: String(input) })
+      return Response.json(traceConsent())
+    })
+    const token = await traceConfirmation(handler, '90m')
+
+    for (const request of [
+      commandRequest('trace confirm 90m'),
+      commandRequest(`trace confirm ${token}`, { userId: OTHER_USER_ID })
+    ]) {
+      const response = await handleAndWait(handler, request)
+      expect(await response.json()).toMatchObject({
+        text: 'Your Slack trace setting could not be confirmed. Check `/autorotate trace status`.'
+      })
+    }
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ method: 'GET' })
   })
 
   it('defaults trace consent to one hour', async () => {
     const handler = testHandler(async (input, init) => {
       const url = String(input)
       if (url.includes('/api/v1/slack_trace_consents/')) {
+        if (init?.method === 'GET') return Response.json(traceConsent())
         const body = JSON.parse(String(init?.body)) as { data: { expires_at: string } }
         const remainingMs = Date.parse(body.data.expires_at) - Date.now()
         expect(remainingMs).toBeGreaterThan(59 * 60_000)
@@ -721,7 +755,8 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    await handleAndWait(handler, commandRequest('trace confirm'))
+    const token = await traceConfirmation(handler)
+    await handleAndWait(handler, commandRequest(`trace confirm ${token}`))
   })
 
   it('rejects invalid trace duration and target selectors before calling the API', async () => {
@@ -731,7 +766,7 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    for (const command of ['trace on 25h', 'trace confirm 25h', `trace off ${OTHER_USER_ID}`]) {
+    for (const command of ['trace on 25h', `trace off ${OTHER_USER_ID}`]) {
       const response = await handleAndWait(handler, commandRequest(command))
       expect(await response.json()).toMatchObject({ text: expect.stringContaining('Autorotate commands') })
     }
@@ -835,7 +870,7 @@ describe('Autorotate Slack command', () => {
       expect(calls.filter(call => call.url.includes('/api/v1/slack_trace_consents/'))).toHaveLength(1)
       expect(calls.some(call => call.url === RESPONSE_URL)).toBe(false)
       expect(JSON.stringify(logs)).not.toContain('response-secret')
-      expect(JSON.stringify(logs)).not.toContain('slackbot-api-secret')
+      expect(JSON.stringify(logs)).not.toContain('trace-consent-api-secret')
     }
   })
 
@@ -925,23 +960,23 @@ describe('Autorotate Slack command', () => {
     expect(calls[0]).toMatchObject({ method: 'DELETE' })
   })
 
-  it('uses the verified Slack request timestamp for duplicate trace grants', async () => {
+  it('uses one confirmation token as the durable idempotency key for duplicate trace grants', async () => {
     const expiries: string[] = []
     const handler = testHandler(async (input, init) => {
       if (String(input).includes('/api/v1/slack_trace_consents/')) {
-        const body = JSON.parse(String(init?.body)) as { data: { expires_at: string } }
-        expiries.push(body.data.expires_at)
-        return Response.json(traceConsent({ enabled: true, expires_at: body.data.expires_at, revision: 1 }))
+        if (init?.method === 'GET') return Response.json(traceConsent())
+        const body = JSON.parse(String(init?.body)) as { data: { duration_seconds: number } }
+        expiries.push(String(body.data.duration_seconds))
+        return Response.json(traceConsent({ enabled: true, expires_at: new Date().toISOString(), revision: 1 }))
       }
       throw new Error('trace command must return directly to Slack')
     })
-    const timestamp = Math.floor(Date.now() / 1000) - 10
+    const token = await traceConfirmation(handler, '90m')
 
-    await handleAndWait(handler, commandRequest('trace confirm 90m', { timestamp }))
-    await handleAndWait(handler, commandRequest('trace confirm 90m', { timestamp }))
+    await handleAndWait(handler, commandRequest(`trace confirm ${token}`))
+    await handleAndWait(handler, commandRequest(`trace confirm ${token}`))
 
     expect(expiries).toHaveLength(2)
-    expect(expiries[0]).toBe(new Date(timestamp * 1000 + 90 * 60_000).toISOString())
     expect(expiries[1]).toBe(expiries[0])
   })
 

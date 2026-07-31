@@ -27,6 +27,7 @@ async fn main() -> Result<(), ServerError> {
 
     let app_state = AppState::unready()
         .with_codex_nanocodex_rollout_percent(args.codex_nanocodex_rollout_percent())
+        .with_slack_session_bearer_secret(args.slack_session_bearer_secret())
         .with_slack_trace_consent_bearer_secret(args.slack_trace_consent_bearer_secret());
     let app = build_router_with_app_state(app_state.clone());
     let shutdown_state = app_state.clone();
@@ -77,8 +78,14 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     }
     let pool = store.pool().clone();
     let metadata_trace_config = args.metadata_trace_config_identity()?;
-    let should_run_metadata_trace_reconciler =
-        metadata_trace_reconciler_runs(metadata_trace_config.as_ref());
+    validate_metadata_trace_startup(
+        metadata_trace_config.as_ref(),
+        store.has_persisted_metadata_trace_state().await?,
+    )?;
+    let should_run_metadata_trace_reconciler = metadata_trace_reconciler_runs(
+        metadata_trace_config.as_ref(),
+        args.slack_trace_consent_bearer_secret().is_some(),
+    );
     if let Some(identity) = metadata_trace_config.as_ref() {
         // Fail before readiness if this replica is stale or split-brain. A
         // config fingerprint is not an ordering mechanism; the deployment
@@ -156,10 +163,24 @@ fn init_crypto_provider() {
 
 fn metadata_trace_reconciler_runs(
     config: Option<&centaur_session_sqlx::MetadataTraceConfigIdentity>,
+    slack_trace_consent_enabled: bool,
 ) -> bool {
     // A disabled config still fences a prior enabled generation, so this must
     // depend on identity presence rather than the enabled bit or Iron Control.
-    config.is_some()
+    config.is_some() || slack_trace_consent_enabled
+}
+
+fn validate_metadata_trace_startup(
+    config: Option<&centaur_session_sqlx::MetadataTraceConfigIdentity>,
+    has_persisted_trace_state: bool,
+) -> Result<(), ServerError> {
+    if config.is_none() && has_persisted_trace_state {
+        return Err(ServerError::UnsupportedConfig(
+            "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required when this database has metadata trace history; configure a newer disabled generation to retire prior trace assignments"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal Kubernetes
@@ -236,7 +257,7 @@ pub(crate) enum ServerError {
 mod tests {
     use centaur_session_sqlx::MetadataTraceConfigIdentity;
 
-    use super::metadata_trace_reconciler_runs;
+    use super::{metadata_trace_reconciler_runs, validate_metadata_trace_startup};
 
     #[test]
     fn trace_reconciler_starts_without_iron_control_for_disabled_identity() {
@@ -245,7 +266,20 @@ mod tests {
             fingerprint: "disabled-generation".to_owned(),
             enabled: false,
         };
-        assert!(metadata_trace_reconciler_runs(Some(&disabled)));
-        assert!(!metadata_trace_reconciler_runs(None));
+        assert!(metadata_trace_reconciler_runs(Some(&disabled), false));
+        assert!(metadata_trace_reconciler_runs(None, true));
+        assert!(!metadata_trace_reconciler_runs(None, false));
+    }
+
+    #[test]
+    fn trace_history_requires_an_explicit_enabled_or_disabled_generation() {
+        let disabled = MetadataTraceConfigIdentity {
+            generation: 8,
+            fingerprint: "disabled".to_owned(),
+            enabled: false,
+        };
+        assert!(validate_metadata_trace_startup(None, false).is_ok());
+        assert!(validate_metadata_trace_startup(None, true).is_err());
+        assert!(validate_metadata_trace_startup(Some(&disabled), true).is_ok());
     }
 }
