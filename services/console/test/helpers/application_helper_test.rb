@@ -65,6 +65,19 @@ class ApplicationHelperTest < ActionView::TestCase
                      text: "https://github.com/paradigmxyz/centaur/issues/792"
   end
 
+  test "console_markdown restores every inline markdown link" do
+    html = console_markdown(<<~MARKDOWN)
+      Compare [First resource](https://example.com/first),
+      [Second resource](https://example.com/second), and [Third resource](https://example.com/third).
+    MARKDOWN
+
+    assert_select_in html, "a.console-markdown-link", count: 3
+    assert_select_in html, "a.console-markdown-link[href='https://example.com/first']", text: "First resource"
+    assert_select_in html, "a.console-markdown-link[href='https://example.com/second']", text: "Second resource"
+    assert_select_in html, "a.console-markdown-link[href='https://example.com/third']", text: "Third resource"
+    refute_match(/%%MDPH\d+%%/, html)
+  end
+
   test "console_markdown renders gfm tables with alignment" do
     html = console_markdown(<<~MARKDOWN)
       Before the table.
