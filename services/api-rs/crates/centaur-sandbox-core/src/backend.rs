@@ -54,6 +54,16 @@ pub trait SandboxBackend: Send + Sync {
     /// Stop the sandbox and clean up backend-owned runtime resources.
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()>;
 
+    /// Stop only the resource generation observed by the caller. Backends
+    /// without resource UIDs retain the ordinary stop behavior.
+    async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        _expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        self.stop(id).await
+    }
+
     /// Rebind a running sandbox's managed iron-proxy to a different
     /// iron-control principal.
     async fn assign_iron_control_proxy_principal(

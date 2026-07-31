@@ -348,13 +348,14 @@ describe('session event streaming', () => {
 })
 
 describe('session interruption', () => {
-  test('posts interruption reason to the thread interrupt endpoint', async () => {
+  test('posts the external Slack Connect actor with the interruption reason', async () => {
     const { fetchFn, requests } = fakeApi()
 
     const response = await interruptSessionExecution(
       options(fetchFn),
       'slack:C1:1700000000.000100',
-      'Interrupted from Slack by U1'
+      'Interrupted from Slack by U1',
+      { slack_actor_team_id: 'TACTOR', slack_actor_user_id: 'U1' }
     )
 
     expect(response.interrupted).toBe(true)
@@ -362,7 +363,10 @@ describe('session interruption', () => {
     expect(interrupt?.url).toBe(
       'http://api.test/api/session/slack%3AC1%3A1700000000.000100/interrupt'
     )
-    expect(interrupt?.body).toEqual({ reason: 'Interrupted from Slack by U1' })
+    expect(interrupt?.body).toEqual({
+      metadata: { slack_actor_team_id: 'TACTOR', slack_actor_user_id: 'U1' },
+      reason: 'Interrupted from Slack by U1'
+    })
   })
 })
 
@@ -967,8 +971,10 @@ describe('session principal display name', () => {
 	      slack_channel_id?: string
 	      slack_conversation_name?: string
 	      slack_team_id?: string
+	      slack_actor_team_id?: string
 	      slack_user_email?: string
       slack_user_id?: string
+	      slack_actor_user_id?: string
     }
 	  } {
 	    return (requests.find(request => request.url.endsWith('.000100'))?.body ?? {}) as {
@@ -976,8 +982,10 @@ describe('session principal display name', () => {
 	        slack_channel_id?: string
 	        slack_conversation_name?: string
 	        slack_team_id?: string
+	        slack_actor_team_id?: string
 	        slack_user_email?: string
         slack_user_id?: string
+	        slack_actor_user_id?: string
       }
     }
   }
@@ -1139,8 +1147,10 @@ describe('session principal display name', () => {
 	    expect(createBody(requests).metadata?.slack_conversation_name).toBe('Ada Lovelace')
 	    expect(createBody(requests).metadata?.slack_channel_id).toBe('D9')
 	    expect(createBody(requests).metadata?.slack_team_id).toBe('T1')
+	    expect(createBody(requests).metadata?.slack_actor_team_id).toBe('T1')
     expect(createBody(requests).metadata?.slack_user_email).toBe('ada@example.com')
     expect(createBody(requests).metadata?.slack_user_id).toBe('U1')
+    expect(createBody(requests).metadata?.slack_actor_user_id).toBe('U1')
   })
 
   test('falls back to no name when the channel lookup fails', async () => {

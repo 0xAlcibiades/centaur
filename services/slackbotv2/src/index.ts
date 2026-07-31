@@ -588,9 +588,15 @@ async function handleStopCommand(
   const trace = createHandoffTrace(thread, message, 'append')
   traceLog(options, 'slackbotv2_stop_command_started', trace, { trigger })
   const latest = (await thread.state) ?? {}
-  const reason = `Interrupted from Slack by ${slackUserIdForMessage(message) ?? 'unknown user'}`
+  const actorUserId = slackUserIdForMessage(message)
+  const reason = `Interrupted from Slack by ${actorUserId ?? 'unknown user'}`
   try {
-    const response = await interruptSessionExecution(options, thread.id, reason)
+    const serialized = await serializeMessage(message, options)
+    const actorMetadata: JsonObject = {
+      ...(serialized.actorTeamId ? { slack_actor_team_id: serialized.actorTeamId } : {}),
+      ...(actorUserId ? { slack_actor_user_id: actorUserId } : {})
+    }
+    const response = await interruptSessionExecution(options, thread.id, reason, actorMetadata)
     await thread.setState({
       activeExecution: false,
       lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,

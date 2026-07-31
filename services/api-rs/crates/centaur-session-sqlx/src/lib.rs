@@ -10,12 +10,12 @@ use centaur_session_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{
-    FromRow, PgPool,
+    FromRow, PgPool, Transaction,
     postgres::{PgListener, PgPoolOptions},
     types::Json,
 };
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
@@ -23,6 +23,21 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+const METADATA_TRACE_LOCK_TIMEOUT: &str = "5s";
+const METADATA_TRACE_STATEMENT_TIMEOUT: &str = "30s";
+
+async fn set_metadata_trace_transaction_timeouts(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+) -> Result<(), SessionStoreError> {
+    sqlx::query(
+        "select set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(METADATA_TRACE_LOCK_TIMEOUT)
+    .bind(METADATA_TRACE_STATEMENT_TIMEOUT)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -130,6 +145,421 @@ pub struct WorkflowOwnedSandbox {
     pub sandbox_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataTraceConfigIdentity {
+    pub generation: i64,
+    pub fingerprint: String,
+    /// A disabled deployment is still a durable generation. It fences and
+    /// retires traced sandboxes instead of leaving the old sidecar active.
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataTraceReconcilerLease {
+    pub owner_id: String,
+    pub fence: i64,
+}
+
+/// A shared consent and assignment fence held until the caller finishes the
+/// bounded sandbox stdin write. A revoke takes the same consent row FOR UPDATE,
+/// so it cannot commit between authorization and delivery.
+pub struct MetadataTraceInputGuard {
+    transaction: Transaction<'static, sqlx::Postgres>,
+    deadline: OffsetDateTime,
+    _assignment_epoch: String,
+}
+
+impl MetadataTraceInputGuard {
+    /// Database-derived consent deadline captured while the lock is held.
+    pub fn remaining(&self) -> Option<Duration> {
+        let remaining = self.deadline - OffsetDateTime::now_utc();
+        (remaining > TimeDuration::ZERO)
+            .then(|| Duration::from_secs(u64::try_from(remaining.whole_seconds()).unwrap_or(0)))
+    }
+
+    pub async fn commit(self) -> Result<(), SessionStoreError> {
+        self.transaction.commit().await?;
+        Ok(())
+    }
+}
+
+/// The durable, actor-scoped trace-consent record. A missing row is represented
+/// as disabled revision zero and is never materialized by a read.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct MetadataTraceConsent {
+    pub source: String,
+    pub workspace_id: String,
+    pub user_id: String,
+    pub enabled: bool,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    pub revision: i64,
+    pub drain_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataTraceDrainTarget {
+    pub thread_key: ThreadKey,
+    pub sandbox_id: String,
+    pub assignment_epoch: String,
+    pub revision: i64,
+    pub resource_uid: String,
+}
+
+/// The exact consent primary key persisted with a traced assignment. This is
+/// deliberately separate from the one-way subject hash used by the sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataTraceAssignmentActor {
+    pub source: String,
+    pub workspace_id: String,
+    pub user_id: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MetadataTraceConsentRow {
+    source: String,
+    workspace_id: String,
+    user_id: String,
+    enabled: bool,
+    expires_at: Option<OffsetDateTime>,
+    revision: i64,
+    drain_pending: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct MetadataTraceConsentRequestRow {
+    request_hash: String,
+    result_enabled: Option<bool>,
+    result_expires_at: Option<OffsetDateTime>,
+    result_revision: Option<i64>,
+    result_drain_pending: Option<bool>,
+    drain_assignment_revision: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MetadataTraceDrainTargetRow {
+    thread_key: String,
+    sandbox_id: String,
+    assignment_epoch: String,
+    revision: i64,
+    resource_uid: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MetadataTraceAssignmentActorRow {
+    source: String,
+    workspace_id: String,
+    user_id: String,
+    assignment_epoch: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct SandboxAssignmentReconciliationLockRow {
+    sandbox_id: Option<String>,
+    metadata_trace_enabled: bool,
+    metadata_trace_resource_uid: Option<String>,
+}
+
+impl TryFrom<MetadataTraceDrainTargetRow> for MetadataTraceDrainTarget {
+    type Error = SessionStoreError;
+
+    fn try_from(row: MetadataTraceDrainTargetRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            thread_key: parse_persisted(row.thread_key)?,
+            sandbox_id: row.sandbox_id,
+            assignment_epoch: row.assignment_epoch,
+            revision: row.revision,
+            resource_uid: row.resource_uid,
+        })
+    }
+}
+
+impl From<MetadataTraceConsentRow> for MetadataTraceConsent {
+    fn from(row: MetadataTraceConsentRow) -> Self {
+        Self {
+            source: row.source,
+            workspace_id: row.workspace_id,
+            user_id: row.user_id,
+            enabled: row.enabled,
+            expires_at: row.expires_at,
+            revision: row.revision,
+            drain_pending: row.drain_pending,
+        }
+    }
+}
+
+fn metadata_trace_request_result(
+    source: &str,
+    workspace_id: &str,
+    user_id: &str,
+    request: MetadataTraceConsentRequestRow,
+) -> Result<MetadataTraceConsent, SessionStoreError> {
+    let (Some(enabled), Some(revision), Some(drain_pending)) = (
+        request.result_enabled,
+        request.result_revision,
+        request.result_drain_pending,
+    ) else {
+        return Err(SessionStoreError::MetadataTraceIdempotencyIncomplete);
+    };
+    if (enabled && request.result_expires_at.is_none())
+        || (!enabled && request.result_expires_at.is_some())
+    {
+        return Err(SessionStoreError::MetadataTraceIdempotencyIncomplete);
+    }
+    Ok(MetadataTraceConsent {
+        source: source.to_owned(),
+        workspace_id: workspace_id.to_owned(),
+        user_id: user_id.to_owned(),
+        enabled,
+        expires_at: request.result_expires_at,
+        revision,
+        drain_pending,
+    })
+}
+
+async fn persist_metadata_trace_request_result(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    workspace_id: &str,
+    user_id: &str,
+    idempotency_key: &str,
+    consent: &MetadataTraceConsent,
+    drain_assignment_revision: Option<i64>,
+) -> Result<(), SessionStoreError> {
+    sqlx::query(
+        r#"
+        update metadata_trace_consent_requests
+        set result_enabled = $5,
+            result_expires_at = $6,
+            result_revision = $7,
+            result_drain_pending = $8,
+            drain_assignment_revision = $9
+        where source = $1 and workspace_id = $2 and user_id = $3 and idempotency_key = $4
+        "#,
+    )
+    .bind(source)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(idempotency_key)
+    .bind(consent.enabled)
+    .bind(consent.expires_at)
+    .bind(consent.revision)
+    .bind(consent.drain_pending)
+    .bind(drain_assignment_revision)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn grant_metadata_trace_consent_in_transaction(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    workspace_id: &str,
+    user_id: &str,
+    expires_at: OffsetDateTime,
+) -> Result<MetadataTraceConsent, SessionStoreError> {
+    let row = sqlx::query_as::<_, MetadataTraceConsentRow>(
+        r#"
+        insert into metadata_trace_consents (source, workspace_id, user_id, enabled, expires_at, revision, drain_pending)
+        values ($1, $2, $3, true, $4, 1, false)
+        on conflict (source, workspace_id, user_id) do update
+        set enabled = true,
+            expires_at = excluded.expires_at,
+            revision = case when metadata_trace_consents.enabled and metadata_trace_consents.expires_at = excluded.expires_at then metadata_trace_consents.revision else metadata_trace_consents.revision + 1 end,
+            updated_at = now()
+        where not metadata_trace_consents.drain_pending
+        returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#,
+    )
+    .bind(source)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(expires_at)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(Into::into)
+        .ok_or(SessionStoreError::MetadataTraceDrainPending)
+}
+
+async fn metadata_trace_drain_targets_in_transaction(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    workspace_id: &str,
+    user_id: &str,
+    revision: i64,
+) -> Result<Vec<MetadataTraceDrainTarget>, SessionStoreError> {
+    let targets = sqlx::query_as::<_, MetadataTraceDrainTargetRow>(
+        r#"
+        select thread_key, sandbox_id,
+               sandbox_metadata_trace_assignment_epoch as assignment_epoch,
+               sandbox_metadata_trace_consent_revision as revision,
+               sandbox_metadata_trace_resource_uid as resource_uid
+        from sessions
+        where sandbox_metadata_trace_enabled is true
+          and sandbox_metadata_trace_source = $1
+          and sandbox_metadata_trace_workspace_id = $2
+          and sandbox_metadata_trace_user_id = $3
+          and sandbox_metadata_trace_consent_revision = $4
+          and sandbox_id is not null
+          and sandbox_metadata_trace_assignment_epoch is not null
+          and sandbox_metadata_trace_resource_uid is not null
+        "#,
+    )
+    .bind(source)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(revision)
+    .fetch_all(&mut **tx)
+    .await?;
+    targets
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn legacy_metadata_trace_assignment_exists(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+) -> Result<bool, SessionStoreError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+            select 1 from sessions
+            where sandbox_metadata_trace_enabled is true
+              and sandbox_id is not null
+              and (
+                    sandbox_metadata_trace_assignment_epoch is null
+                    or sandbox_metadata_trace_source is null
+                    or sandbox_metadata_trace_workspace_id is null
+                    or sandbox_metadata_trace_user_id is null
+                    or sandbox_metadata_trace_resource_uid is null
+              )
+        )
+        "#,
+    )
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+async fn revoke_metadata_trace_consent_in_transaction(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    workspace_id: &str,
+    user_id: &str,
+    _subject_hash: &str,
+) -> Result<
+    (
+        MetadataTraceConsent,
+        Vec<MetadataTraceDrainTarget>,
+        Option<i64>,
+    ),
+    SessionStoreError,
+> {
+    let consent = sqlx::query_as::<_, MetadataTraceConsentRow>(
+        r#"
+        insert into metadata_trace_consents (source, workspace_id, user_id, enabled, expires_at, revision, drain_pending)
+        values ($1, $2, $3, false, null, 1, false)
+        on conflict (source, workspace_id, user_id) do update
+        set enabled = false, expires_at = null,
+            revision = case when metadata_trace_consents.enabled then metadata_trace_consents.revision + 1 else metadata_trace_consents.revision end,
+            drain_pending = metadata_trace_consents.drain_pending,
+            updated_at = now()
+        returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#,
+    )
+    .bind(source)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let drain_assignment_revision = consent.revision.checked_sub(1);
+    let targets = match drain_assignment_revision {
+        Some(revision) => {
+            metadata_trace_drain_targets_in_transaction(tx, source, workspace_id, user_id, revision)
+                .await?
+        }
+        None => Vec::new(),
+    };
+    let drain_pending = consent.drain_pending
+        || !targets.is_empty()
+        || legacy_metadata_trace_assignment_exists(tx).await?;
+    let consent = sqlx::query_as::<_, MetadataTraceConsentRow>(
+        r#"
+        update metadata_trace_consents
+        set drain_pending = $4, updated_at = now()
+        where source = $1 and workspace_id = $2 and user_id = $3
+        returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#,
+    )
+    .bind(source)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(drain_pending)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((consent.into(), targets, drain_assignment_revision))
+}
+
+/// Holds the session row lock while a reconciler retires a specific sandbox.
+/// Any concurrent replacement waits for this transaction, so it is either
+/// observed before the stop or committed after the old sandbox is cleared.
+pub struct SandboxAssignmentReconciliationLock<'a> {
+    transaction: Transaction<'a, sqlx::Postgres>,
+    thread_key: String,
+    sandbox_id: String,
+    metadata_trace_enabled: bool,
+    metadata_trace_resource_uid: Option<String>,
+}
+
+impl SandboxAssignmentReconciliationLock<'_> {
+    /// The exact backend resource to retire for a traced assignment. A null
+    /// UID is legacy state and must not be deleted by name.
+    pub fn metadata_trace_resource_uid(&self) -> Option<&str> {
+        self.metadata_trace_resource_uid.as_deref()
+    }
+
+    pub fn metadata_trace_enabled(&self) -> bool {
+        self.metadata_trace_enabled
+    }
+
+    pub async fn clear_and_commit(mut self) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set
+                sandbox_id = null,
+                sandbox_repo_cache_enabled = null,
+                sandbox_repo_cache_access = null,
+                sandbox_observability_enabled = null,
+                sandbox_api_server_enabled = null,
+                sandbox_metadata_trace_enabled = null,
+                sandbox_metadata_trace_expires_at = null,
+                sandbox_metadata_trace_subject_hash = null,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = null,
+                sandbox_metadata_trace_config_fingerprint = null,
+                sandbox_metadata_trace_config_generation = null,
+                sandbox_metadata_trace_resource_uid = null,
+                sandbox_last_active_at = null,
+                updated_at = now()
+            where thread_key = $1 and sandbox_id = $2
+            "#,
+        )
+        .bind(&self.thread_key)
+        .bind(&self.sandbox_id)
+        .execute(&mut *self.transaction)
+        .await?;
+        self.transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn rollback(self) -> Result<(), SessionStoreError> {
+        self.transaction.rollback().await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
@@ -159,9 +589,575 @@ impl PgSessionStore {
         &self.pool
     }
 
+    pub async fn lock_metadata_trace_input(
+        &self,
+        expected: &SandboxCapabilities,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        sandbox_id: &str,
+    ) -> Result<Option<MetadataTraceInputGuard>, SessionStoreError> {
+        let mut transaction = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut transaction).await?;
+        let actor = sqlx::query_as::<_, MetadataTraceAssignmentActorRow>(
+            r#"
+            select s.sandbox_metadata_trace_source as source,
+                   s.sandbox_metadata_trace_workspace_id as workspace_id,
+                   s.sandbox_metadata_trace_user_id as user_id,
+                   s.sandbox_metadata_trace_assignment_epoch as assignment_epoch
+            from sessions s join session_executions e on e.thread_key = s.thread_key
+            where e.execution_id = $1
+              and s.thread_key = $2
+              and e.status in ('queued', 'running')
+              and s.sandbox_id = $3
+              and s.sandbox_metadata_trace_enabled is true
+              and s.sandbox_metadata_trace_assignment_epoch is not null
+              and s.sandbox_metadata_trace_source is not null
+              and s.sandbox_metadata_trace_workspace_id is not null
+              and s.sandbox_metadata_trace_user_id is not null
+              and s.sandbox_metadata_trace_subject_hash is not distinct from $4
+              and s.sandbox_metadata_trace_consent_revision is not distinct from $5
+              and s.sandbox_metadata_trace_expires_at is not distinct from $6
+              and s.sandbox_metadata_trace_config_fingerprint is not distinct from $7
+              and s.sandbox_metadata_trace_config_generation is not distinct from $8
+            for share of s, e
+            "#,
+        )
+        .bind(execution_id)
+        .bind(thread_key.as_str())
+        .bind(sandbox_id)
+        .bind(&expected.metadata_trace_subject_hash)
+        .bind(expected.metadata_trace_consent_revision)
+        .bind(expected.metadata_trace_expires_at)
+        .bind(&expected.metadata_trace_config_fingerprint)
+        .bind(expected.metadata_trace_config_generation)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(actor) = actor else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let consent = sqlx::query_as::<_, MetadataTraceConsentRow>(
+            r#"
+            select source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+            from metadata_trace_consents
+            where source = $1 and workspace_id = $2 and user_id = $3
+            for share
+        "#,
+        )
+        .bind(&actor.source)
+        .bind(&actor.workspace_id)
+        .bind(&actor.user_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let now = sqlx::query_scalar::<_, OffsetDateTime>("select clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await?;
+        let valid_consent = consent.as_ref().is_some_and(|consent| {
+            consent.enabled
+                && !consent.drain_pending
+                && consent.revision == expected.metadata_trace_consent_revision.unwrap_or_default()
+                && consent.expires_at.is_some_and(|expiry| expiry > now)
+                && consent.expires_at == expected.metadata_trace_expires_at
+        });
+        if !valid_consent {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let config_active = sqlx::query_scalar::<_, bool>(
+            "select generation = $1 and config_fingerprint = $2 from metadata_trace_config_state where singleton = true for share",
+        )
+        .bind(expected.metadata_trace_config_generation)
+        .bind(&expected.metadata_trace_config_fingerprint)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if config_active != Some(true) {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        Ok(Some(MetadataTraceInputGuard {
+            transaction,
+            deadline: consent
+                .expect("validated above")
+                .expires_at
+                .expect("validated above"),
+            _assignment_epoch: actor.assignment_epoch,
+        }))
+    }
+
+    pub async fn metadata_trace_consent(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+    ) -> Result<MetadataTraceConsent, SessionStoreError> {
+        let row = sqlx::query_as::<_, MetadataTraceConsentRow>(
+            "select source, workspace_id, user_id, enabled, expires_at, revision, drain_pending from metadata_trace_consents where source = $1 and workspace_id = $2 and user_id = $3",
+        )
+        .bind(source).bind(workspace_id).bind(user_id)
+        .fetch_optional(&self.pool).await?;
+        Ok(row.map(Into::into).unwrap_or_else(|| MetadataTraceConsent {
+            source: source.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            user_id: user_id.to_owned(),
+            enabled: false,
+            expires_at: None,
+            revision: 0,
+            drain_pending: false,
+        }))
+    }
+
+    /// Read the durable actor FK only for the exact currently assigned traced
+    /// sandbox. A null legacy FK is not guessed from execution metadata.
+    pub async fn metadata_trace_assignment_actor(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+    ) -> Result<Option<MetadataTraceAssignmentActor>, SessionStoreError> {
+        let row = sqlx::query_as::<_, MetadataTraceAssignmentActorRow>(
+            r#"
+            select sandbox_metadata_trace_source as source,
+                   sandbox_metadata_trace_workspace_id as workspace_id,
+                   sandbox_metadata_trace_user_id as user_id,
+                   sandbox_metadata_trace_assignment_epoch as assignment_epoch
+            from sessions
+            where thread_key = $1
+              and sandbox_id = $2
+              and sandbox_metadata_trace_enabled is true
+              and sandbox_metadata_trace_assignment_epoch is not null
+              and sandbox_metadata_trace_source is not null
+              and sandbox_metadata_trace_workspace_id is not null
+              and sandbox_metadata_trace_user_id is not null
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| MetadataTraceAssignmentActor {
+            source: row.source,
+            workspace_id: row.workspace_id,
+            user_id: row.user_id,
+        }))
+    }
+
+    pub async fn pending_metadata_trace_drains(
+        &self,
+    ) -> Result<Vec<MetadataTraceConsent>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, MetadataTraceConsentRow>(
+            "select source, workspace_id, user_id, enabled, expires_at, revision, drain_pending from metadata_trace_consents where drain_pending is true order by source, workspace_id, user_id",
+        ).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Atomically reserve, apply, and persist a grant result.  A request row
+    /// with an incomplete result is never re-applied: it can only have been
+    /// written by an older binary, because this method commits the reservation
+    /// and result together with the consent mutation.
+    pub async fn grant_metadata_trace_consent_idempotent(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        expires_at: OffsetDateTime,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<MetadataTraceConsent, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut tx).await?;
+        let inserted = sqlx::query(
+            r#"
+            insert into metadata_trace_consent_requests
+                (source, workspace_id, user_id, idempotency_key, request_hash)
+            values ($1, $2, $3, $4, $5)
+            on conflict do nothing
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(idempotency_key)
+        .bind(request_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        let request = sqlx::query_as::<_, MetadataTraceConsentRequestRow>(
+            r#"
+            select request_hash, result_enabled, result_expires_at, result_revision, result_drain_pending, drain_assignment_revision
+            from metadata_trace_consent_requests
+            where source = $1 and workspace_id = $2 and user_id = $3 and idempotency_key = $4
+            for update
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(idempotency_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        if request.request_hash != request_hash {
+            return Err(SessionStoreError::MetadataTraceIdempotencyConflict);
+        }
+        if !inserted {
+            let result = metadata_trace_request_result(source, workspace_id, user_id, request)?;
+            tx.commit().await?;
+            return Ok(result);
+        }
+        let consent = grant_metadata_trace_consent_in_transaction(
+            &mut tx,
+            source,
+            workspace_id,
+            user_id,
+            expires_at,
+        )
+        .await?;
+        persist_metadata_trace_request_result(
+            &mut tx,
+            source,
+            workspace_id,
+            user_id,
+            idempotency_key,
+            &consent,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(consent)
+    }
+
+    /// Upsert a grant in the only mutable owner. PostgreSQL's conflict lock
+    /// makes simultaneous first grants idempotent rather than creating two
+    /// revisions.
+    pub async fn grant_metadata_trace_consent(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<MetadataTraceConsent, SessionStoreError> {
+        let row = sqlx::query_as::<_, MetadataTraceConsentRow>(r#"
+            insert into metadata_trace_consents (source, workspace_id, user_id, enabled, expires_at, revision, drain_pending)
+            values ($1, $2, $3, true, $4, 1, false)
+            on conflict (source, workspace_id, user_id) do update
+            set enabled = true,
+                expires_at = excluded.expires_at,
+                revision = case when metadata_trace_consents.enabled and metadata_trace_consents.expires_at = excluded.expires_at then metadata_trace_consents.revision else metadata_trace_consents.revision + 1 end,
+                updated_at = now()
+            where not metadata_trace_consents.drain_pending
+            returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#).bind(source).bind(workspace_id).bind(user_id).bind(expires_at).fetch_optional(&self.pool).await?;
+        row.map(Into::into)
+            .ok_or(SessionStoreError::MetadataTraceDrainPending)
+    }
+
+    /// Fence all matching assignments in the same transaction as the revoke.
+    /// The caller must stop the returned sandboxes before acknowledging the
+    /// disabled response; `drain_pending` survives a crash in between.
+    pub async fn revoke_metadata_trace_consent(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        _subject_hash: &str,
+    ) -> Result<(MetadataTraceConsent, Vec<MetadataTraceDrainTarget>), SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut tx).await?;
+        let consent = sqlx::query_as::<_, MetadataTraceConsentRow>(r#"
+            insert into metadata_trace_consents (source, workspace_id, user_id, enabled, expires_at, revision, drain_pending)
+            values ($1, $2, $3, false, null, 1, false)
+            on conflict (source, workspace_id, user_id) do update
+            set enabled = false, expires_at = null,
+                revision = case when metadata_trace_consents.enabled then metadata_trace_consents.revision + 1 else metadata_trace_consents.revision end,
+                drain_pending = metadata_trace_consents.drain_pending,
+                updated_at = now()
+            returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#).bind(source).bind(workspace_id).bind(user_id).fetch_one(&mut *tx).await?;
+        let targets = sqlx::query_as::<_, MetadataTraceDrainTargetRow>(r#"
+            select thread_key, sandbox_id, sandbox_metadata_trace_assignment_epoch as assignment_epoch, sandbox_metadata_trace_consent_revision as revision, sandbox_metadata_trace_resource_uid as resource_uid
+            from sessions
+            where sandbox_metadata_trace_enabled is true
+              and sandbox_metadata_trace_source = $1
+              and sandbox_metadata_trace_workspace_id = $2
+              and sandbox_metadata_trace_user_id = $3
+              and sandbox_metadata_trace_consent_revision = $4
+              and sandbox_id is not null
+              and sandbox_metadata_trace_assignment_epoch is not null
+              and sandbox_metadata_trace_resource_uid is not null
+        "#)
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(consent.revision.saturating_sub(1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let targets = targets
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        let drain_pending = consent.drain_pending
+            || !targets.is_empty()
+            || legacy_metadata_trace_assignment_exists(&mut tx).await?;
+        let consent = sqlx::query_as::<_, MetadataTraceConsentRow>(
+            "update metadata_trace_consents set drain_pending = $4, updated_at = now() where source = $1 and workspace_id = $2 and user_id = $3 returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending",
+        ).bind(source).bind(workspace_id).bind(user_id).bind(drain_pending).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok((consent.into(), targets))
+    }
+
+    /// Atomically reserve, revoke, and persist the response.  The physical
+    /// sandbox drain is deliberately outside this transaction; the persisted
+    /// response remains `drain_pending` until a later reconciler proves the
+    /// exact assignments have gone away.
+    pub async fn revoke_metadata_trace_consent_idempotent(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+        subject_hash: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<(MetadataTraceConsent, Vec<MetadataTraceDrainTarget>), SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut tx).await?;
+        let inserted = sqlx::query(
+            r#"
+            insert into metadata_trace_consent_requests
+                (source, workspace_id, user_id, idempotency_key, request_hash)
+            values ($1, $2, $3, $4, $5)
+            on conflict do nothing
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(idempotency_key)
+        .bind(request_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        let request = sqlx::query_as::<_, MetadataTraceConsentRequestRow>(
+            r#"
+            select request_hash, result_enabled, result_expires_at, result_revision, result_drain_pending, drain_assignment_revision
+            from metadata_trace_consent_requests
+            where source = $1 and workspace_id = $2 and user_id = $3 and idempotency_key = $4
+            for update
+            "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(idempotency_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        if request.request_hash != request_hash {
+            return Err(SessionStoreError::MetadataTraceIdempotencyConflict);
+        }
+        if !inserted {
+            let drain_assignment_revision = request.drain_assignment_revision;
+            let consent = metadata_trace_request_result(source, workspace_id, user_id, request)?;
+            let targets = match drain_assignment_revision {
+                Some(revision) => {
+                    metadata_trace_drain_targets_in_transaction(
+                        &mut tx,
+                        source,
+                        workspace_id,
+                        user_id,
+                        revision,
+                    )
+                    .await?
+                }
+                None => Vec::new(),
+            };
+            tx.commit().await?;
+            return Ok((consent, targets));
+        }
+        let (consent, targets, drain_assignment_revision) =
+            revoke_metadata_trace_consent_in_transaction(
+                &mut tx,
+                source,
+                workspace_id,
+                user_id,
+                subject_hash,
+            )
+            .await?;
+        persist_metadata_trace_request_result(
+            &mut tx,
+            source,
+            workspace_id,
+            user_id,
+            idempotency_key,
+            &consent,
+            drain_assignment_revision,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((consent, targets))
+    }
+
     pub async fn run_migrations(&self) -> Result<(), SessionStoreError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
+    }
+
+    /// Make a deployment configuration the sole active trace configuration.
+    /// Generation is a deployment-owned fence: lower generations and a
+    /// different fingerprint at the same generation are rejected.
+    pub async fn activate_metadata_trace_config(
+        &self,
+        identity: &MetadataTraceConfigIdentity,
+    ) -> Result<(), SessionStoreError> {
+        if identity.generation <= 0 {
+            return Err(SessionStoreError::InvalidMetadataTraceGeneration(
+                identity.generation,
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        set_metadata_trace_transaction_timeouts(&mut tx).await?;
+        sqlx::query(
+            r#"
+            insert into metadata_trace_config_state (singleton, generation, config_fingerprint)
+            values (true, $1, $2)
+            on conflict (singleton) do nothing
+            "#,
+        )
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        let current = sqlx::query_as::<_, MetadataTraceConfigStateRow>(
+            r#"
+            select generation, config_fingerprint
+            from metadata_trace_config_state
+            where singleton = true
+            for update
+            "#,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        match current.generation.cmp(&identity.generation) {
+            std::cmp::Ordering::Less => {
+                sqlx::query(
+                    r#"
+                    update metadata_trace_config_state
+                    set generation = $1,
+                        config_fingerprint = $2,
+                        reconciler_owner_id = null,
+                        reconciler_fence = reconciler_fence + 1,
+                        reconciler_lease_expires_at = null,
+                        activated_at = now(),
+                        updated_at = now()
+                    where singleton = true
+                    "#,
+                )
+                .bind(identity.generation)
+                .bind(&identity.fingerprint)
+                .execute(&mut *tx)
+                .await?;
+            }
+            std::cmp::Ordering::Equal if current.config_fingerprint == identity.fingerprint => {}
+            std::cmp::Ordering::Equal => {
+                return Err(SessionStoreError::MetadataTraceConfigConflict {
+                    generation: identity.generation,
+                    existing_fingerprint: current.config_fingerprint,
+                    requested_fingerprint: identity.fingerprint.clone(),
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(SessionStoreError::StaleMetadataTraceGeneration {
+                    active: current.generation,
+                    requested: identity.generation,
+                });
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn metadata_trace_config_is_active(
+        &self,
+        identity: &MetadataTraceConfigIdentity,
+    ) -> Result<bool, SessionStoreError> {
+        let active = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists (
+                select 1 from metadata_trace_config_state
+                where singleton = true
+                  and generation = $1
+                  and config_fingerprint = $2
+            )
+            "#,
+        )
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active)
+    }
+
+    /// Acquire or renew the singleton reconciliation lease. Every acquisition
+    /// advances a fence so an expired owner cannot clear a newer assignment.
+    pub async fn acquire_metadata_trace_reconciler_lease(
+        &self,
+        identity: &MetadataTraceConfigIdentity,
+        owner_id: &str,
+        lease: TimeDuration,
+    ) -> Result<Option<MetadataTraceReconcilerLease>, SessionStoreError> {
+        let row = sqlx::query_as::<_, MetadataTraceLeaseRow>(
+            r#"
+            update metadata_trace_config_state
+            set reconciler_owner_id = $3,
+                reconciler_fence = reconciler_fence + 1,
+                reconciler_lease_expires_at = now() + ($4::float8 * interval '1 second'),
+                updated_at = now()
+            where singleton = true
+              and generation = $1
+              and config_fingerprint = $2
+              and (
+                    reconciler_lease_expires_at is null
+                    or reconciler_lease_expires_at <= now()
+                    or reconciler_owner_id = $3
+              )
+            returning reconciler_owner_id, reconciler_fence
+            "#,
+        )
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .bind(owner_id)
+        .bind(lease.as_seconds_f64())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| MetadataTraceReconcilerLease {
+            owner_id: row.reconciler_owner_id,
+            fence: row.reconciler_fence,
+        }))
+    }
+
+    pub async fn metadata_trace_reconciler_lease_is_active(
+        &self,
+        identity: &MetadataTraceConfigIdentity,
+        lease: &MetadataTraceReconcilerLease,
+    ) -> Result<bool, SessionStoreError> {
+        let active = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists (
+                select 1 from metadata_trace_config_state
+                where singleton = true
+                  and generation = $1
+                  and config_fingerprint = $2
+                  and reconciler_owner_id = $3
+                  and reconciler_fence = $4
+                  and reconciler_lease_expires_at > now()
+            )
+            "#,
+        )
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .bind(&lease.owner_id)
+        .bind(lease.fence)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active)
     }
 
     pub async fn listen_session_events(&self) -> Result<SessionEventListener, SessionStoreError> {
@@ -335,7 +1331,7 @@ impl PgSessionStore {
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
-            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             from sessions
             where thread_key = $1
             "#,
@@ -518,6 +1514,24 @@ impl PgSessionStore {
         row.try_into()
     }
 
+    /// Records the resolved trace boundary after consent lookup but before the
+    /// sandbox receives input. `jsonb ||` preserves ingress metadata while the
+    /// control plane owns the reserved trace fields.
+    pub async fn merge_execution_metadata(
+        &self,
+        execution_id: &str,
+        metadata: Value,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            "update session_executions set metadata = metadata || $2, updated_at = now() where execution_id = $1",
+        )
+        .bind(execution_id)
+        .bind(metadata)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn active_execution_for_thread(
         &self,
         thread_key: &ThreadKey,
@@ -538,6 +1552,55 @@ impl PgSessionStore {
         .await?;
 
         row.map(TryInto::try_into).transpose()
+    }
+
+    /// Atomically fences an input write to one active execution and its full
+    /// trace-consent boundary. The runtime performs this conditional touch
+    /// immediately after console has claimed the actor consent and before it
+    /// writes to the sandbox pipe.
+    pub async fn claim_active_trace_input(
+        &self,
+        execution_id: &str,
+        capabilities: &SandboxCapabilities,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update session_executions
+            set updated_at = now()
+            where execution_id = $1
+              and status in ($2, $3)
+              and coalesce((metadata ->> 'metadata_trace_enabled')::boolean, false) = $4
+              and (metadata ->> 'metadata_trace_subject_hash') is not distinct from $5
+              and (metadata ->> 'metadata_trace_consent_revision')::bigint is not distinct from $6
+              and (metadata ->> 'metadata_trace_expires_at')::timestamptz is not distinct from $7
+              and (metadata ->> 'metadata_trace_config_fingerprint') is not distinct from $8
+              and (metadata ->> 'metadata_trace_config_generation')::bigint is not distinct from $9
+              and (
+                    not $4
+                    or (
+                        (metadata ->> 'metadata_trace_expires_at')::timestamptz > now()
+                        and exists (
+                            select 1 from metadata_trace_config_state
+                            where singleton = true
+                              and generation = $9
+                              and config_fingerprint = $8
+                        )
+                    )
+              )
+            "#,
+        )
+        .bind(execution_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .bind(capabilities.metadata_trace_enabled)
+        .bind(&capabilities.metadata_trace_subject_hash)
+        .bind(capabilities.metadata_trace_consent_revision)
+        .bind(capabilities.metadata_trace_expires_at)
+        .bind(&capabilities.metadata_trace_config_fingerprint)
+        .bind(capabilities.metadata_trace_config_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Lists every execution still marked queued or running. Used at startup
@@ -1190,6 +2253,23 @@ impl PgSessionStore {
         Ok(rows)
     }
 
+    pub async fn list_principal_sandbox_sessions(&self) -> Result<Vec<Session>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            r#"
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            from sessions
+            where sandbox_id is not null
+              and (
+                    iron_control_principal is not null
+                    or sandbox_metadata_trace_enabled is true
+              )
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn list_idle_sandbox_candidates(
         &self,
         idle_backstop: Duration,
@@ -1342,13 +2422,23 @@ impl PgSessionStore {
                 sandbox_repo_cache_access = null,
                 sandbox_observability_enabled = null,
                 sandbox_api_server_enabled = null,
+                sandbox_metadata_trace_enabled = null,
+                sandbox_metadata_trace_expires_at = null,
+                sandbox_metadata_trace_subject_hash = null,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = null,
+                sandbox_metadata_trace_config_fingerprint = null,
+                sandbox_metadata_trace_config_generation = null,
+                sandbox_metadata_trace_resource_uid = null,
                 sandbox_last_active_at = case
                     when $2::text is null then null
                     else now()
                 end,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1374,10 +2464,20 @@ impl PgSessionStore {
                 sandbox_repo_cache_access = $4,
                 sandbox_observability_enabled = $5,
                 sandbox_api_server_enabled = $6,
+                sandbox_metadata_trace_enabled = $7,
+                sandbox_metadata_trace_expires_at = $8,
+                sandbox_metadata_trace_subject_hash = $9,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = $10,
+                sandbox_metadata_trace_config_fingerprint = $11,
+                sandbox_metadata_trace_config_generation = $12,
+                sandbox_metadata_trace_assignment_epoch = case when $7 then md5(random()::text || clock_timestamp()::text) else null end,
                 sandbox_last_active_at = now(),
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1386,10 +2486,112 @@ impl PgSessionStore {
         .bind(capabilities.repo_cache.as_str())
         .bind(capabilities.observability_enabled)
         .bind(capabilities.api_server_enabled)
+        .bind(capabilities.metadata_trace_enabled)
+        .bind(capabilities.metadata_trace_expires_at)
+        .bind(&capabilities.metadata_trace_subject_hash)
+        .bind(capabilities.metadata_trace_consent_revision)
+        .bind(&capabilities.metadata_trace_config_fingerprint)
+        .bind(capabilities.metadata_trace_config_generation)
         .fetch_one(&self.pool)
         .await?;
 
         row.try_into()
+    }
+
+    pub async fn update_sandbox_assignment_if_metadata_trace_config_active(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+        capabilities: &SandboxCapabilities,
+        identity: &MetadataTraceConfigIdentity,
+        expected_sandbox_id: Option<&str>,
+        workspace_id: &str,
+        user_id: &str,
+        resource_uid: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let consent = sqlx::query_scalar::<_, bool>(
+            r#"
+            select enabled and not drain_pending and expires_at > clock_timestamp()
+                   and revision = $3
+            from metadata_trace_consents
+            where source = 'slack' and workspace_id = $1 and user_id = $2
+            for share
+        "#,
+        )
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(capabilities.metadata_trace_consent_revision)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if consent != Some(true) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let config_active = sqlx::query_scalar::<_, bool>(
+            "select generation = $1 and config_fingerprint = $2 from metadata_trace_config_state where singleton = true for share",
+        )
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if config_active != Some(true) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set sandbox_id = $2,
+                sandbox_repo_cache_enabled = $3,
+                sandbox_repo_cache_access = $4,
+                sandbox_observability_enabled = $5,
+                sandbox_api_server_enabled = $6,
+                sandbox_metadata_trace_enabled = $7,
+                sandbox_metadata_trace_expires_at = $8,
+                sandbox_metadata_trace_subject_hash = $9,
+                sandbox_metadata_trace_source = 'slack',
+                sandbox_metadata_trace_workspace_id = $10,
+                sandbox_metadata_trace_user_id = $11,
+                sandbox_metadata_trace_consent_revision = $12,
+                sandbox_metadata_trace_config_fingerprint = $13,
+                sandbox_metadata_trace_config_generation = $14,
+                sandbox_metadata_trace_resource_uid = $15,
+                sandbox_metadata_trace_assignment_epoch = md5(random()::text || clock_timestamp()::text),
+                sandbox_last_active_at = now(),
+                updated_at = now()
+            where thread_key = $1
+              and exists (
+                    select 1 from metadata_trace_config_state
+                    where singleton = true
+                      and generation = $16
+                      and config_fingerprint = $17
+              )
+              and sandbox_id is not distinct from $18
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(sandbox_id)
+        .bind(capabilities.repo_cache_enabled())
+        .bind(capabilities.repo_cache.as_str())
+        .bind(capabilities.observability_enabled)
+        .bind(capabilities.api_server_enabled)
+        .bind(capabilities.metadata_trace_enabled)
+        .bind(capabilities.metadata_trace_expires_at)
+        .bind(&capabilities.metadata_trace_subject_hash)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(capabilities.metadata_trace_consent_revision)
+        .bind(&capabilities.metadata_trace_config_fingerprint)
+        .bind(capabilities.metadata_trace_config_generation)
+        .bind(resource_uid)
+        .bind(identity.generation)
+        .bind(&identity.fingerprint)
+        .bind(expected_sandbox_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn clear_sandbox_id_if_matches(
@@ -1406,6 +2608,17 @@ impl PgSessionStore {
                 sandbox_repo_cache_access = null,
                 sandbox_observability_enabled = null,
                 sandbox_api_server_enabled = null,
+                sandbox_metadata_trace_enabled = null,
+                sandbox_metadata_trace_expires_at = null,
+                sandbox_metadata_trace_subject_hash = null,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = null,
+                sandbox_metadata_trace_config_fingerprint = null,
+                sandbox_metadata_trace_config_generation = null,
+                sandbox_metadata_trace_resource_uid = null,
+                sandbox_metadata_trace_assignment_epoch = null,
                 sandbox_last_active_at = null,
                 updated_at = now()
             where thread_key = $1 and sandbox_id = $2
@@ -1417,6 +2630,146 @@ impl PgSessionStore {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Clear only the exact traced assignment fenced by a revoke. A replacement
+    /// sandbox (including a later re-grant) has a different epoch and survives.
+    pub async fn clear_metadata_trace_assignment_if_matches(
+        &self,
+        target: &MetadataTraceDrainTarget,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            update sessions
+            set sandbox_id = null,
+                sandbox_metadata_trace_enabled = null,
+                sandbox_metadata_trace_expires_at = null,
+                sandbox_metadata_trace_subject_hash = null,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = null,
+                sandbox_metadata_trace_config_fingerprint = null,
+                sandbox_metadata_trace_config_generation = null,
+                sandbox_metadata_trace_resource_uid = null,
+                sandbox_metadata_trace_assignment_epoch = null,
+                sandbox_last_active_at = null,
+                updated_at = now()
+            where thread_key = $1 and sandbox_id = $2
+              and sandbox_metadata_trace_assignment_epoch = $3
+              and sandbox_metadata_trace_source = $4
+              and sandbox_metadata_trace_workspace_id = $5
+              and sandbox_metadata_trace_user_id = $6
+              and sandbox_metadata_trace_consent_revision = $7
+              and sandbox_metadata_trace_resource_uid = $8
+        "#,
+        )
+        .bind(target.thread_key.as_str())
+        .bind(&target.sandbox_id)
+        .bind(&target.assignment_epoch)
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(target.revision)
+        .bind(&target.resource_uid)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn complete_metadata_trace_drain_if_empty(
+        &self,
+        source: &str,
+        workspace_id: &str,
+        user_id: &str,
+    ) -> Result<MetadataTraceConsent, SessionStoreError> {
+        let row = sqlx::query_as::<_, MetadataTraceConsentRow>(
+            r#"
+            update metadata_trace_consents consent
+            set drain_pending = false, updated_at = now()
+            where source = $1 and workspace_id = $2 and user_id = $3
+              and not exists (
+                  select 1 from sessions
+                  where sandbox_metadata_trace_enabled is true
+                    and sandbox_id is not null
+                    and (
+                        (
+                            sandbox_metadata_trace_source = $4
+                            and sandbox_metadata_trace_workspace_id = $5
+                            and sandbox_metadata_trace_user_id = $6
+                        )
+                        or sandbox_metadata_trace_assignment_epoch is null
+                        or sandbox_metadata_trace_source is null
+                        or sandbox_metadata_trace_workspace_id is null
+                        or sandbox_metadata_trace_user_id is null
+                        or sandbox_metadata_trace_resource_uid is null
+                    )
+              )
+            returning source, workspace_id, user_id, enabled, expires_at, revision, drain_pending
+        "#,
+        )
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(source)
+        .bind(workspace_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into).unwrap_or_else(|| MetadataTraceConsent {
+            source: source.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            user_id: user_id.to_owned(),
+            enabled: false,
+            expires_at: None,
+            revision: 0,
+            drain_pending: true,
+        }))
+    }
+
+    /// Acquire the row lock only when the durable assignment still refers to
+    /// the sandbox observed by a reconciliation sweep.
+    pub async fn lock_sandbox_assignment_for_reconciliation(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+    ) -> Result<Option<SandboxAssignmentReconciliationLock<'_>>, SessionStoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let current_assignment = sqlx::query_as::<_, SandboxAssignmentReconciliationLockRow>(
+            r#"
+            select sandbox_id,
+                   sandbox_metadata_trace_enabled is true as metadata_trace_enabled,
+                   case when sandbox_metadata_trace_enabled is true
+                        then sandbox_metadata_trace_resource_uid
+                   end as metadata_trace_resource_uid
+            from sessions
+            where thread_key = $1
+            for update
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        let Some(current_assignment) = current_assignment else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        if current_assignment.sandbox_id.as_deref() != Some(sandbox_id) {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+
+        Ok(Some(SandboxAssignmentReconciliationLock {
+            transaction,
+            thread_key: thread_key.as_str().to_owned(),
+            sandbox_id: sandbox_id.to_owned(),
+            metadata_trace_enabled: current_assignment.metadata_trace_enabled,
+            metadata_trace_resource_uid: current_assignment.metadata_trace_resource_uid,
+        }))
     }
 
     /// Move an existing session onto a different harness. Clears the sandbox
@@ -1437,11 +2790,21 @@ impl PgSessionStore {
                 sandbox_repo_cache_access = null,
                 sandbox_observability_enabled = null,
                 sandbox_api_server_enabled = null,
+                sandbox_metadata_trace_enabled = null,
+                sandbox_metadata_trace_expires_at = null,
+                sandbox_metadata_trace_subject_hash = null,
+                sandbox_metadata_trace_source = null,
+                sandbox_metadata_trace_workspace_id = null,
+                sandbox_metadata_trace_user_id = null,
+                sandbox_metadata_trace_consent_revision = null,
+                sandbox_metadata_trace_config_fingerprint = null,
+                sandbox_metadata_trace_config_generation = null,
+                sandbox_metadata_trace_resource_uid = null,
                 sandbox_last_active_at = null,
                 status = $3,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1466,7 +2829,7 @@ impl PgSessionStore {
             update sessions
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1636,7 +2999,7 @@ impl PgSessionStore {
             update sessions
             set harness_thread_id = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, sandbox_metadata_trace_enabled, sandbox_metadata_trace_expires_at, sandbox_metadata_trace_subject_hash, sandbox_metadata_trace_consent_revision, sandbox_metadata_trace_config_fingerprint, sandbox_metadata_trace_config_generation, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1807,6 +3170,22 @@ pub enum SessionStoreError {
     },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
+    #[error("idempotency key was already used for a different metadata trace consent request")]
+    MetadataTraceIdempotencyConflict,
+    #[error("metadata trace consent request is incomplete and cannot be safely replayed")]
+    MetadataTraceIdempotencyIncomplete,
+    #[error("metadata trace consent is waiting for an earlier sandbox drain")]
+    MetadataTraceDrainPending,
+    #[error("metadata trace generation must be positive, got {0}")]
+    InvalidMetadataTraceGeneration(i64),
+    #[error("metadata trace generation {requested} is stale; active generation is {active}")]
+    StaleMetadataTraceGeneration { active: i64, requested: i64 },
+    #[error("metadata trace generation {generation} has conflicting fingerprints")]
+    MetadataTraceConfigConflict {
+        generation: i64,
+        existing_fingerprint: String,
+        requested_fingerprint: String,
+    },
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,
@@ -1820,6 +3199,18 @@ pub enum SessionStoreError {
 }
 
 #[derive(Debug, FromRow)]
+struct MetadataTraceConfigStateRow {
+    generation: i64,
+    config_fingerprint: String,
+}
+
+#[derive(Debug, FromRow)]
+struct MetadataTraceLeaseRow {
+    reconciler_owner_id: String,
+    reconciler_fence: i64,
+}
+
+#[derive(Debug, FromRow)]
 struct SessionRow {
     thread_key: String,
     title: Option<String>,
@@ -1828,6 +3219,12 @@ struct SessionRow {
     sandbox_repo_cache_access: Option<String>,
     sandbox_observability_enabled: Option<bool>,
     sandbox_api_server_enabled: Option<bool>,
+    sandbox_metadata_trace_enabled: Option<bool>,
+    sandbox_metadata_trace_expires_at: Option<OffsetDateTime>,
+    sandbox_metadata_trace_subject_hash: Option<String>,
+    sandbox_metadata_trace_consent_revision: Option<i64>,
+    sandbox_metadata_trace_config_fingerprint: Option<String>,
+    sandbox_metadata_trace_config_generation: Option<i64>,
     harness_type: String,
     harness_thread_id: Option<String>,
     persona_id: Option<String>,
@@ -1852,12 +3249,24 @@ impl TryFrom<SessionRow> for Session {
                 row.sandbox_repo_cache_access,
                 row.sandbox_observability_enabled,
                 row.sandbox_api_server_enabled,
+                row.sandbox_metadata_trace_enabled,
+                row.sandbox_metadata_trace_expires_at,
+                row.sandbox_metadata_trace_subject_hash,
+                row.sandbox_metadata_trace_consent_revision,
+                row.sandbox_metadata_trace_config_fingerprint,
+                row.sandbox_metadata_trace_config_generation,
             ) {
                 (
                     Some(repo_cache_enabled),
                     repo_cache_access,
                     Some(observability_enabled),
                     Some(api_server_enabled),
+                    metadata_trace_enabled,
+                    metadata_trace_expires_at,
+                    metadata_trace_subject_hash,
+                    metadata_trace_consent_revision,
+                    metadata_trace_config_fingerprint,
+                    metadata_trace_config_generation,
                 ) => Some(SandboxCapabilities {
                     repo_cache: repo_cache_access
                         .as_deref()
@@ -1867,6 +3276,27 @@ impl TryFrom<SessionRow> for Session {
                         }),
                     observability_enabled,
                     api_server_enabled,
+                    metadata_trace_enabled: metadata_trace_enabled.unwrap_or(false),
+                    metadata_trace_expires_at: metadata_trace_enabled
+                        .unwrap_or(false)
+                        .then_some(metadata_trace_expires_at)
+                        .flatten(),
+                    metadata_trace_subject_hash: metadata_trace_enabled
+                        .unwrap_or(false)
+                        .then_some(metadata_trace_subject_hash)
+                        .flatten(),
+                    metadata_trace_consent_revision: metadata_trace_enabled
+                        .unwrap_or(false)
+                        .then_some(metadata_trace_consent_revision)
+                        .flatten(),
+                    metadata_trace_config_fingerprint: metadata_trace_enabled
+                        .unwrap_or(false)
+                        .then_some(metadata_trace_config_fingerprint)
+                        .flatten(),
+                    metadata_trace_config_generation: metadata_trace_enabled
+                        .unwrap_or(false)
+                        .then_some(metadata_trace_config_generation)
+                        .flatten(),
                 }),
                 _ => None,
             },
@@ -2125,13 +3555,18 @@ pub fn default_metadata(metadata: Option<Value>) -> Value {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use centaur_session_core::{ExecutionStatus, HarnessType, SessionStatus, ThreadKey};
+    use centaur_session_core::{
+        ExecutionStatus, HarnessType, SandboxCapabilities, Session, SessionStatus, ThreadKey,
+    };
     use serde_json::json;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
+    static TRACE_CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     use super::{
-        IdleSandboxCandidateRow, OwnedTerminalEvent, PgSessionStore, SessionEventNotification,
+        IdleSandboxCandidateRow, MetadataTraceAssignmentActor, MetadataTraceConfigIdentity,
+        OwnedTerminalEvent, PgSessionStore, SessionEventNotification, SessionRow,
         SessionStoreError,
     };
 
@@ -2276,6 +3711,18 @@ mod tests {
             .map(|result| result.map(|(execution, _)| execution))
     }
 
+    async fn next_trace_generation(store: &PgSessionStore) -> i64 {
+        let active_generation = sqlx::query_scalar::<_, i64>(
+            "select generation from metadata_trace_config_state where singleton = true",
+        )
+        .fetch_optional(store.pool())
+        .await
+        .expect("read current trace generation")
+        .unwrap_or(0);
+        (OffsetDateTime::now_utc().unix_timestamp_nanos() as i64)
+            .max(active_generation.saturating_add(2))
+    }
+
     #[test]
     fn parses_session_event_notification_payload() {
         let notification: SessionEventNotification =
@@ -2287,6 +3734,800 @@ mod tests {
                 thread_key: "cli:test".to_owned(),
                 event_id: 42,
             }
+        );
+    }
+
+    #[test]
+    fn null_trace_columns_decode_as_pre_trace_capabilities_without_backfill() {
+        let now = OffsetDateTime::now_utc();
+        let session: Session = SessionRow {
+            thread_key: "test:legacy-trace-columns".to_owned(),
+            title: None,
+            sandbox_id: Some("sbx-legacy".to_owned()),
+            sandbox_repo_cache_enabled: Some(true),
+            sandbox_repo_cache_access: Some("all".to_owned()),
+            sandbox_observability_enabled: Some(true),
+            sandbox_api_server_enabled: Some(true),
+            sandbox_metadata_trace_enabled: None,
+            sandbox_metadata_trace_expires_at: None,
+            sandbox_metadata_trace_subject_hash: None,
+            sandbox_metadata_trace_consent_revision: None,
+            sandbox_metadata_trace_config_fingerprint: None,
+            sandbox_metadata_trace_config_generation: None,
+            harness_type: "codex".to_owned(),
+            harness_thread_id: None,
+            persona_id: None,
+            status: "idle".to_owned(),
+            iron_control_principal: None,
+            proxy_labels: sqlx::types::Json(BTreeMap::new()),
+            sandbox_last_active_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+        .try_into()
+        .expect("decode legacy row");
+        assert!(!session.sandbox_capabilities.unwrap().metadata_trace_enabled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sandbox_assignment_round_trips_metadata_trace_expiry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:trace-expiry-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("subject-hash".to_owned()),
+            metadata_trace_consent_revision: Some(7),
+            metadata_trace_config_fingerprint: Some("trace-config".to_owned()),
+            metadata_trace_config_generation: Some(1),
+            ..SandboxCapabilities::default_enabled()
+        };
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-trace-expiry", &capabilities)
+            .await
+            .expect("persist sandbox assignment");
+
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read sandbox assignment")
+                .sandbox_capabilities,
+            Some(capabilities)
+        );
+        store
+            .clear_sandbox_id_if_matches(&thread_key, "sbx-trace-expiry")
+            .await
+            .expect("clean up legacy trace fixture");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idempotent_trace_grant_is_one_transaction_and_replays_exact_result() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let workspace_id = format!("T{}", Uuid::new_v4().simple().to_string().to_uppercase());
+        let user_id = format!("U{}", Uuid::new_v4().simple().to_string().to_uppercase());
+        let expires_at = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let key = "trace-grant-concurrent";
+        let request_hash = "put:fixed-hash";
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, second) = tokio::join!(
+            first_store.grant_metadata_trace_consent_idempotent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                expires_at,
+                key,
+                request_hash,
+            ),
+            second_store.grant_metadata_trace_consent_idempotent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                expires_at,
+                key,
+                request_hash,
+            ),
+        );
+        let first = first.expect("first concurrent grant");
+        let second = second.expect("replayed concurrent grant");
+        assert_eq!(first, second);
+        assert_eq!(first.revision, 1);
+
+        let conflict = store
+            .grant_metadata_trace_consent_idempotent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                expires_at + TimeDuration::minutes(1),
+                key,
+                "put:different-hash",
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(SessionStoreError::MetadataTraceIdempotencyConflict)
+        ));
+        assert_eq!(
+            store
+                .metadata_trace_consent("slack", &workspace_id, &user_id)
+                .await
+                .expect("read consent"),
+            first
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn old_idempotent_revoke_replay_never_targets_a_regrant() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _trace_config_lock = TRACE_CONFIG_TEST_LOCK.lock().await;
+        let workspace_id = format!("T-revoke-{}", Uuid::new_v4());
+        let user_id = format!("U-revoke-{}", Uuid::new_v4());
+        let thread_key =
+            ThreadKey::parse(format!("test:revoke-replay-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let identity = MetadataTraceConfigIdentity {
+            generation: next_trace_generation(&store).await,
+            fingerprint: format!("trace-revoke-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .unwrap();
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let first_grant = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        let first_capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("subject-old".to_owned()),
+            metadata_trace_consent_revision: Some(first_grant.revision),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SandboxCapabilities::default_enabled()
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-old",
+                    &first_capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-old",
+                )
+                .await
+                .unwrap()
+        );
+        let (revoked, targets) = store
+            .revoke_metadata_trace_consent_idempotent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                "subject-old",
+                "revoke-once",
+                "delete:once",
+            )
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        let old = &targets[0];
+        assert!(
+            store
+                .clear_metadata_trace_assignment_if_matches(old, "slack", &workspace_id, &user_id)
+                .await
+                .unwrap()
+        );
+        store
+            .complete_metadata_trace_drain_if_empty("slack", &workspace_id, &user_id)
+            .await
+            .unwrap();
+        let regrant = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        let regranted_capabilities = SandboxCapabilities {
+            metadata_trace_consent_revision: Some(regrant.revision),
+            metadata_trace_subject_hash: Some("subject-new".to_owned()),
+            ..first_capabilities
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-new",
+                    &regranted_capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-new",
+                )
+                .await
+                .unwrap()
+        );
+        let (replayed, replay_targets) = store
+            .revoke_metadata_trace_consent_idempotent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                "subject-old",
+                "revoke-once",
+                "delete:once",
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed, revoked);
+        assert!(replay_targets.is_empty());
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-new")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_input_claim_fences_actor_revoke_revision_and_expiry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _trace_config_lock = TRACE_CONFIG_TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:trace-steering-{}", Uuid::new_v4())).unwrap();
+        let workspace_id = format!("T-test-{}", Uuid::new_v4());
+        let user_id = format!("U-test-{}", Uuid::new_v4());
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let generation = next_trace_generation(&store).await;
+        let identity = MetadataTraceConfigIdentity {
+            generation,
+            fingerprint: format!("trace-input-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .expect("activate trace config");
+        let capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(1)),
+            metadata_trace_subject_hash: Some("u1".to_owned()),
+            metadata_trace_consent_revision: Some(1),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SandboxCapabilities::default_enabled()
+        };
+        store
+            .grant_metadata_trace_consent(
+                "slack",
+                &workspace_id,
+                &user_id,
+                capabilities.metadata_trace_expires_at.unwrap(),
+            )
+            .await
+            .expect("grant assignment test consent");
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-trace-claim",
+                    &capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-trace-claim",
+                )
+                .await
+                .expect("persist matching trace assignment")
+        );
+        let metadata = json!({
+            "metadata_trace_enabled": capabilities.metadata_trace_enabled,
+            "metadata_trace_subject_hash": capabilities.metadata_trace_subject_hash,
+            "metadata_trace_consent_revision": capabilities.metadata_trace_consent_revision,
+            "metadata_trace_expires_at": capabilities.metadata_trace_expires_at.map(|value| value.to_string()),
+            "metadata_trace_config_fingerprint": capabilities.metadata_trace_config_fingerprint,
+            "metadata_trace_config_generation": capabilities.metadata_trace_config_generation,
+        });
+        let execution = store
+            .create_execution(&thread_key, None, metadata.clone())
+            .await
+            .expect("create execution");
+        store
+            .mark_execution_running(&execution.execution.execution_id)
+            .await
+            .expect("mark running");
+
+        assert!(
+            store
+                .claim_active_trace_input(&execution.execution.execution_id, &capabilities)
+                .await
+                .expect("matching trace boundary claim")
+        );
+        let mut other_actor = capabilities.clone();
+        other_actor.metadata_trace_subject_hash = Some("u2".to_owned());
+        assert!(
+            !store
+                .claim_active_trace_input(&execution.execution.execution_id, &other_actor)
+                .await
+                .expect("different actor is fenced")
+        );
+
+        let mut revoked = metadata.clone();
+        revoked["metadata_trace_enabled"] = json!(false);
+        sqlx::query("update session_executions set metadata = $2 where execution_id = $1")
+            .bind(&execution.execution.execution_id)
+            .bind(revoked)
+            .execute(store.pool())
+            .await
+            .expect("record revoke before input claim");
+        assert!(
+            !store
+                .claim_active_trace_input(&execution.execution.execution_id, &capabilities)
+                .await
+                .expect("revoked actor is fenced")
+        );
+
+        let mut revised = metadata.clone();
+        revised["metadata_trace_consent_revision"] = json!(8);
+        sqlx::query("update session_executions set metadata = $2 where execution_id = $1")
+            .bind(&execution.execution.execution_id)
+            .bind(revised)
+            .execute(store.pool())
+            .await
+            .expect("record revision before input claim");
+        assert!(
+            !store
+                .claim_active_trace_input(&execution.execution.execution_id, &capabilities)
+                .await
+                .expect("revised actor is fenced")
+        );
+
+        let mut expired = capabilities.clone();
+        expired.metadata_trace_expires_at =
+            Some(OffsetDateTime::now_utc() - TimeDuration::seconds(1));
+        let mut expired_metadata = metadata;
+        expired_metadata["metadata_trace_expires_at"] = json!(
+            expired
+                .metadata_trace_expires_at
+                .map(|value| value.to_string())
+        );
+        sqlx::query("update session_executions set metadata = $2 where execution_id = $1")
+            .bind(&execution.execution.execution_id)
+            .bind(expired_metadata)
+            .execute(store.pool())
+            .await
+            .expect("record expiry before input claim");
+        assert!(
+            !store
+                .claim_active_trace_input(&execution.execution.execution_id, &expired)
+                .await
+                .expect("expired actor is fenced")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_trace_input_guard_blocks_revoke_and_config_rollover() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _trace_config_lock = TRACE_CONFIG_TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:trace-guard-{}", Uuid::new_v4())).unwrap();
+        let workspace_id = format!("T1-{}", Uuid::new_v4());
+        let user_id = format!("U1-{}", Uuid::new_v4());
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let identity = MetadataTraceConfigIdentity {
+            generation: next_trace_generation(&store).await,
+            fingerprint: format!("trace-guard-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .unwrap();
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let consent = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        let capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("guard-u1".to_owned()),
+            metadata_trace_consent_revision: Some(consent.revision),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SandboxCapabilities::default_enabled()
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-guard",
+                    &capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-guard",
+                )
+                .await
+                .unwrap()
+        );
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .unwrap();
+        store
+            .mark_execution_running(&execution.execution.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .metadata_trace_assignment_actor(&thread_key, "sbx-guard")
+                .await
+                .unwrap()
+                .expect("persisted assignment actor"),
+            MetadataTraceAssignmentActor {
+                source: "slack".to_owned(),
+                workspace_id: workspace_id.clone(),
+                user_id: user_id.clone(),
+            }
+        );
+        let guard = store
+            .lock_metadata_trace_input(
+                &capabilities,
+                &thread_key,
+                &execution.execution.execution_id,
+                "sbx-guard",
+            )
+            .await
+            .unwrap()
+            .expect("guard");
+
+        let revoke_store = store.clone();
+        let revoke_workspace_id = workspace_id.clone();
+        let revoke_user_id = user_id.clone();
+        let mut revoke = tokio::spawn(async move {
+            revoke_store
+                .revoke_metadata_trace_consent(
+                    "slack",
+                    &revoke_workspace_id,
+                    &revoke_user_id,
+                    "guard-u1",
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut revoke)
+                .await
+                .is_err(),
+            "revoke must wait for shared guard"
+        );
+        let rollover_store = store.clone();
+        let next_identity = MetadataTraceConfigIdentity {
+            generation: identity.generation + 1,
+            fingerprint: format!("trace-rollover-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        let mut rollover = tokio::spawn(async move {
+            rollover_store
+                .activate_metadata_trace_config(&next_identity)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut rollover)
+                .await
+                .is_err(),
+            "config rollover must wait for shared guard"
+        );
+        guard.commit().await.unwrap();
+        revoke.await.unwrap().unwrap();
+        rollover.await.unwrap().unwrap();
+
+        // A fresh guard cannot cross the committed revoke fence.
+        assert!(
+            store
+                .lock_metadata_trace_input(
+                    &capabilities,
+                    &thread_key,
+                    &execution.execution.execution_id,
+                    "sbx-guard"
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_trace_grant_rejects_pending_drain_and_duplicate_revoke_preserves_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let workspace_id = format!("T-pending-{}", Uuid::new_v4());
+        let user_id = format!("U-pending-{}", Uuid::new_v4());
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        sqlx::query("update metadata_trace_consents set drain_pending = true where source = 'slack' and workspace_id = $1 and user_id = $2")
+            .bind(&workspace_id)
+            .bind(&user_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let (first, _) = store
+            .revoke_metadata_trace_consent("slack", &workspace_id, &user_id, "no-assignment")
+            .await
+            .unwrap();
+        assert!(first.drain_pending);
+        let (duplicate, _) = store
+            .revoke_metadata_trace_consent("slack", &workspace_id, &user_id, "no-assignment")
+            .await
+            .unwrap();
+        assert!(duplicate.drain_pending);
+        assert!(matches!(
+            store
+                .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+                .await,
+            Err(SessionStoreError::MetadataTraceDrainPending)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_trace_generation_fences_activation_leases_and_stale_assignment_clears() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _trace_config_lock = TRACE_CONFIG_TEST_LOCK.lock().await;
+        let workspace_id = format!("T-test-{}", Uuid::new_v4());
+        let user_id = format!("U-test-{}", Uuid::new_v4());
+        // A process-wide singleton is intentionally shared by every test DB.
+        // This generation is wall-clock ordered so a later invocation can
+        // always advance the singleton without deleting its durable history.
+        let generation = next_trace_generation(&store).await;
+        let a = MetadataTraceConfigIdentity {
+            generation,
+            fingerprint: format!("trace-a-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        let b = MetadataTraceConfigIdentity {
+            generation: generation + 1,
+            fingerprint: format!("trace-b-{}", Uuid::new_v4()),
+            enabled: true,
+        };
+        let (activate_a, activate_b) = tokio::join!(
+            store.activate_metadata_trace_config(&a),
+            store.activate_metadata_trace_config(&b),
+        );
+        assert!(
+            activate_b.is_ok(),
+            "newer B activation must win: {activate_b:?}"
+        );
+        assert!(
+            activate_a.is_ok()
+                || matches!(
+                    activate_a,
+                    Err(SessionStoreError::StaleMetadataTraceGeneration { .. })
+                ),
+            "A may commit before B, but must otherwise be rejected as stale: {activate_a:?}"
+        );
+        store
+            .activate_metadata_trace_config(&b)
+            .await
+            .expect("B remains the active identity");
+        assert!(matches!(
+            store.activate_metadata_trace_config(&a).await,
+            Err(SessionStoreError::StaleMetadataTraceGeneration { .. })
+        ));
+        assert!(matches!(
+            store
+                .activate_metadata_trace_config(&MetadataTraceConfigIdentity {
+                    generation: b.generation,
+                    fingerprint: "split-brain".to_owned(),
+                    enabled: true,
+                })
+                .await,
+            Err(SessionStoreError::MetadataTraceConfigConflict { .. })
+        ));
+
+        let lease_a = store
+            .acquire_metadata_trace_reconciler_lease(&b, "reconciler-a", TimeDuration::ZERO)
+            .await
+            .expect("acquire A lease")
+            .expect("A owns expired lease briefly");
+        let lease_b = store
+            .acquire_metadata_trace_reconciler_lease(&b, "reconciler-b", TimeDuration::seconds(1))
+            .await
+            .expect("take over lease")
+            .expect("B owns lease");
+        assert!(lease_b.fence > lease_a.fence);
+        assert!(
+            !store
+                .metadata_trace_reconciler_lease_is_active(&b, &lease_a)
+                .await
+                .expect("A fence is stale")
+        );
+
+        let thread_key = ThreadKey::parse(format!("test:trace-fence-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let consent = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .expect("grant canonical actor consent");
+        let capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("subject-hash".to_owned()),
+            metadata_trace_consent_revision: Some(consent.revision),
+            metadata_trace_config_fingerprint: Some(b.fingerprint.clone()),
+            metadata_trace_config_generation: Some(b.generation),
+            ..SandboxCapabilities::default_enabled()
+        };
+        assert!(
+            !store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-stale-a",
+                    &capabilities,
+                    &a,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-stale-a",
+                )
+                .await
+                .expect("stale A assignment is rejected")
+        );
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-active-b",
+                    &capabilities,
+                    &b,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-active-b",
+                )
+                .await
+                .expect("B assignment")
+        );
+        assert!(
+            !store
+                .clear_sandbox_id_if_matches(&thread_key, "sbx-stale-a")
+                .await
+                .expect("stale request cannot clear B")
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read B assignment")
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-active-b")
+        );
+        let (_, targets) = store
+            .revoke_metadata_trace_consent("slack", &workspace_id, &user_id, "subject-hash")
+            .await
+            .expect("fence active assignment for revoke");
+        let target = targets.into_iter().next().expect("exact drain target");
+        assert_eq!(target.resource_uid, "uid-active-b");
+        sqlx::query(
+            "update sessions set sandbox_metadata_trace_resource_uid = 'uid-replacement' where thread_key = $1",
+        )
+        .bind(thread_key.as_str())
+        .execute(store.pool())
+        .await
+        .expect("simulate same-name replacement UID");
+        let replacement_uid = sqlx::query_scalar::<_, String>(
+            "select sandbox_metadata_trace_resource_uid from sessions where thread_key = $1",
+        )
+        .bind(thread_key.as_str())
+        .fetch_one(store.pool())
+        .await
+        .expect("read replacement UID");
+        assert_eq!(replacement_uid, "uid-replacement");
+        assert!(
+            !store
+                .clear_metadata_trace_assignment_if_matches(
+                    &target,
+                    "slack",
+                    &workspace_id,
+                    &user_id,
+                )
+                .await
+                .expect("old UID must not clear a replacement")
+        );
+        assert!(
+            !store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-late-writer",
+                    &capabilities,
+                    &b,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-late-writer",
+                )
+                .await
+                .expect("a stale create CAS is rejected")
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read fenced assignment")
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-active-b")
         );
     }
 

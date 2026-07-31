@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use centaur_iron_control::SessionRegistrar;
+use centaur_iron_control::{SessionRegistrar, SlackTraceSubject};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
     SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
@@ -27,6 +27,7 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
+    MetadataTraceConfigIdentity, MetadataTraceConsent, MetadataTraceReconcilerLease,
     OwnedTerminalEvent, PgSessionStore, SandboxCapacityCandidate, SessionEventListener,
     SessionStoreError, default_metadata,
 };
@@ -41,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
     io,
     sync::Mutex,
@@ -86,6 +88,12 @@ const STDOUT_OWNER_RENEWER_STOP_TIMEOUT: Duration = Duration::from_millis(250);
 /// young row it observes in that window.
 const PRE_SANDBOX_ORPHAN_GRACE: Duration = Duration::from_secs(120);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
+#[cfg_attr(test, allow(dead_code))]
+const METADATA_TRACE_INPUT_WRITE_MAX: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+static METADATA_TRACE_INPUT_TEST_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(30_000);
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const PUBLIC_REPO_CACHE_SUBPATH: &str = "public";
 const CENTAUR_SKILL_DIRS_ENV: &str = "CENTAUR_SKILL_DIRS";
@@ -93,6 +101,8 @@ const CENTAUR_PUBLIC_SKILL_DIRS_ENV: &str = "CENTAUR_PUBLIC_SKILL_DIRS";
 const SANDBOX_REPO_CACHE_LABEL: &str = "centaur.sandbox_repo_cache";
 const OBSERVABILITY_TOOL_BLOCKLIST: &str =
     "vlogs,vmetrics,grafana,centaur_investigator,centaur-investigator";
+const MAX_METADATA_TRACE_CONSENT: TimeDuration = TimeDuration::hours(24);
+const METADATA_TRACE_RECONCILER_LEASE: TimeDuration = TimeDuration::seconds(20);
 
 type SandboxSpecFactory = Arc<
     dyn Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec + Send + Sync,
@@ -171,6 +181,8 @@ pub struct SessionRuntime {
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
+    metadata_trace_config: Option<MetadataTraceConfigIdentity>,
+    metadata_trace_reconciler_owner_id: String,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -868,6 +880,7 @@ struct EnsureSessionSandboxRequest<'a> {
     iron_control_principal: Option<&'a str>,
     proxy_labels: &'a BTreeMap<String, String>,
     desired_capabilities: &'a SessionSandboxCapabilities,
+    execution_metadata: Option<&'a Value>,
     execution_id: &'a str,
 }
 
@@ -907,6 +920,8 @@ impl SessionRuntime {
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
+            metadata_trace_config: None,
+            metadata_trace_reconciler_owner_id: Uuid::new_v4().to_string(),
             warm_pool: None,
             personas: None,
             session_title_generator: None,
@@ -1414,6 +1429,156 @@ impl SessionRuntime {
         self
     }
 
+    pub async fn slack_trace_consent(
+        &self,
+        workspace_id: &str,
+        user_id: &str,
+    ) -> Result<MetadataTraceConsent, SessionRuntimeError> {
+        Ok(self
+            .store
+            .metadata_trace_consent("slack", workspace_id, user_id)
+            .await?)
+    }
+
+    pub async fn set_slack_trace_consent(
+        &self,
+        workspace_id: &str,
+        user_id: &str,
+        expires_at: OffsetDateTime,
+        idempotency: Option<(&str, String)>,
+    ) -> Result<MetadataTraceConsent, SessionRuntimeError> {
+        if let Some((key, request_hash)) = idempotency {
+            return Ok(self
+                .store
+                .grant_metadata_trace_consent_idempotent(
+                    "slack",
+                    workspace_id,
+                    user_id,
+                    expires_at,
+                    key,
+                    &request_hash,
+                )
+                .await?);
+        }
+        Ok(self
+            .store
+            .grant_metadata_trace_consent("slack", workspace_id, user_id, expires_at)
+            .await?)
+    }
+
+    pub async fn revoke_slack_trace_consent(
+        &self,
+        workspace_id: &str,
+        user_id: &str,
+        idempotency: Option<(&str, String)>,
+    ) -> Result<MetadataTraceConsent, SessionRuntimeError> {
+        let subject = SlackTraceSubject::from_parts(workspace_id, user_id);
+        let subject_hash = trace_subject_hash(&subject);
+        let (consent, targets) = match idempotency {
+            Some((key, request_hash)) => {
+                self.store
+                    .revoke_metadata_trace_consent_idempotent(
+                        "slack",
+                        workspace_id,
+                        user_id,
+                        &subject_hash,
+                        key,
+                        &request_hash,
+                    )
+                    .await?
+            }
+            None => {
+                self.store
+                    .revoke_metadata_trace_consent("slack", workspace_id, user_id, &subject_hash)
+                    .await?
+            }
+        };
+        for target in targets {
+            let sandbox_id = SandboxId::new(&target.sandbox_id);
+            let exact_target_present = matches!(
+                self.sandbox_runtime.manager.observe(&sandbox_id).await,
+                Ok(observation) if observation.resource_uid.as_deref() == Some(target.resource_uid.as_str())
+            );
+            if !exact_target_present {
+                // The expected UID is already absent or the name was reused;
+                // never delete a replacement that only shares the sandbox ID.
+                self.sandbox_pipes.remove(&target.sandbox_id);
+                self.store
+                    .clear_metadata_trace_assignment_if_matches(
+                        &target,
+                        "slack",
+                        workspace_id,
+                        user_id,
+                    )
+                    .await?;
+                continue;
+            }
+            let drained = match timeout(
+                Duration::from_secs(10),
+                self.sandbox_runtime
+                    .manager
+                    .stop_exact(&sandbox_id, Some(&target.resource_uid)),
+            )
+            .await
+            {
+                Ok(Ok(())) => match self.sandbox_runtime.manager.observe(&sandbox_id).await {
+                    Ok(observation) => {
+                        observation.status == SandboxStatus::Gone
+                            || observation.resource_uid.as_deref()
+                                != Some(target.resource_uid.as_str())
+                    }
+                    Err(SandboxError::NotFound(_)) => true,
+                    Err(_) => false,
+                },
+                Ok(Err(SandboxError::NotFound(_))) => true,
+                Ok(Err(error)) => {
+                    warn!(sandbox_id = %target.sandbox_id, %error, "metadata trace sandbox drain stop failed");
+                    false
+                }
+                Err(_) => {
+                    warn!(sandbox_id = %target.sandbox_id, "metadata trace sandbox drain stop timed out");
+                    false
+                }
+            };
+            if drained {
+                self.sandbox_pipes.remove(&target.sandbox_id);
+                self.store
+                    .clear_metadata_trace_assignment_if_matches(
+                        &target,
+                        "slack",
+                        workspace_id,
+                        user_id,
+                    )
+                    .await?;
+            } else {
+                // The already-persisted disabled + drain_pending result is the
+                // only safe acknowledgement. The reconciler retries this
+                // exact epoch instead of claiming the sidecar is gone.
+                warn!(sandbox_id = %target.sandbox_id, "metadata trace sandbox drain remains pending");
+            }
+        }
+        if consent.drain_pending {
+            // The request's durable result deliberately remains pending: a
+            // replay must return the exact accepted result while it resumes
+            // drain work, rather than exposing a later mutation of that
+            // result. The consent row is still cleared once exact targets are
+            // gone, so future grants are not blocked.
+            let _ = self
+                .store
+                .complete_metadata_trace_drain_if_empty("slack", workspace_id, user_id)
+                .await?;
+        }
+        Ok(consent)
+    }
+
+    pub fn with_metadata_trace_config(
+        mut self,
+        config: Option<MetadataTraceConfigIdentity>,
+    ) -> Self {
+        self.metadata_trace_config = config;
+        self
+    }
+
     /// Register the shared unauthenticated MCP tool-host principal when
     /// iron-control is enabled, so proxy-backed tool calls can resolve an
     /// effective config without minting per-user credentials in this layer.
@@ -1527,6 +1692,342 @@ impl SessionRuntime {
         }
         cleanup::SessionSandboxCleanupWorker::new(self.context(), config).spawn();
         self
+    }
+
+    /// Reconcile already-running principal sandboxes independently of a new
+    /// execution. Revocation and changed deployment trace config therefore
+    /// stop the old capability boundary promptly.
+    pub fn with_sandbox_capability_reconciler(self) -> Self {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(error) = runtime.reconcile_active_sandbox_capabilities().await {
+                    warn!(%error, "active sandbox capability reconciliation failed");
+                }
+            }
+        });
+        self
+    }
+
+    pub async fn reconcile_active_sandbox_capabilities(
+        &self,
+    ) -> Result<usize, SessionRuntimeError> {
+        let mut stopped = 0;
+        for pending in self.store.pending_metadata_trace_drains().await? {
+            if pending.source == "slack" {
+                self.revoke_slack_trace_consent(&pending.workspace_id, &pending.user_id, None)
+                    .await?;
+                stopped += 1;
+            }
+        }
+        let Some(identity) = self.metadata_trace_config.as_ref() else {
+            // A no-trace deployment must still retire a sandbox carrying an
+            // old traced assignment. There is no trace generation lease to
+            // acquire in this legacy/no-generation mode; conditional clears
+            // remain the durable ownership fence.
+            return self
+                .reconcile_active_sandbox_capabilities_without_trace_config()
+                .await
+                .map(|count| count + stopped);
+        };
+        let Some(lease) = self
+            .store
+            .acquire_metadata_trace_reconciler_lease(
+                identity,
+                &self.metadata_trace_reconciler_owner_id,
+                METADATA_TRACE_RECONCILER_LEASE,
+            )
+            .await?
+        else {
+            return Ok(stopped);
+        };
+        self.reconcile_active_sandbox_capabilities_with_lease(identity, &lease)
+            .await
+            .map(|count| count + stopped)
+    }
+
+    async fn reconcile_active_sandbox_capabilities_without_trace_config(
+        &self,
+    ) -> Result<usize, SessionRuntimeError> {
+        let sessions = self.store.list_principal_sandbox_sessions().await?;
+        let mut stopped = 0;
+        for session in sessions {
+            // Without a configured trace identity, this pass owns only the
+            // stale trace boundary. Principal capability reconciliation needs
+            // an active registrar/configuration source.
+            if session.sandbox_id.is_none()
+                || !session
+                    .sandbox_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.metadata_trace_enabled)
+            {
+                continue;
+            }
+            let outcome = match self
+                .resolve_sandbox_capabilities(
+                    &session.thread_key,
+                    session.iron_control_principal.as_deref(),
+                    self.metadata_trace_assignment_metadata(&session)
+                        .await?
+                        .as_ref(),
+                )
+                .await
+            {
+                Ok(desired)
+                    if sandbox_capabilities_match(
+                        session.sandbox_capabilities.as_ref(),
+                        &desired,
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Ok(desired) => {
+                    self.reconcile_session_sandbox_capabilities(&session, desired)
+                        .await
+                }
+                Err(SessionRuntimeError::IronControl(error))
+                    if is_deleted_principal_error(&error)
+                        || session_has_expired_metadata_trace_consent(
+                            &session,
+                            OffsetDateTime::now_utc(),
+                        ) =>
+                {
+                    self.reconcile_session_sandbox_capabilities(
+                        &session,
+                        SessionSandboxCapabilities::default_enabled(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(true) => stopped += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    thread_key = %session.thread_key,
+                    sandbox_id = session.sandbox_id.as_deref().unwrap_or(""),
+                    %error,
+                    "active sandbox capability reconciliation failed for session"
+                ),
+            }
+        }
+        Ok(stopped)
+    }
+
+    async fn reconcile_active_sandbox_capabilities_with_lease(
+        &self,
+        identity: &MetadataTraceConfigIdentity,
+        lease: &MetadataTraceReconcilerLease,
+    ) -> Result<usize, SessionRuntimeError> {
+        let sessions = self.store.list_principal_sandbox_sessions().await?;
+        let mut stopped = 0;
+        for session in sessions {
+            if !self
+                .store
+                .metadata_trace_reconciler_lease_is_active(identity, lease)
+                .await?
+            {
+                return Ok(stopped);
+            }
+            if session.sandbox_id.is_none() {
+                continue;
+            }
+            let outcome = match self
+                .resolve_sandbox_capabilities(
+                    &session.thread_key,
+                    session.iron_control_principal.as_deref(),
+                    self.metadata_trace_assignment_metadata(&session)
+                        .await?
+                        .as_ref(),
+                )
+                .await
+            {
+                Ok(desired)
+                    if sandbox_capabilities_match(
+                        session.sandbox_capabilities.as_ref(),
+                        &desired,
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Ok(desired) => {
+                    self.reconcile_session_sandbox_capabilities(&session, desired)
+                        .await
+                }
+                Err(SessionRuntimeError::IronControl(error))
+                    if is_deleted_principal_error(&error)
+                        || session_has_expired_metadata_trace_consent(
+                            &session,
+                            OffsetDateTime::now_utc(),
+                        ) =>
+                {
+                    // A missing principal revokes immediately. For transient
+                    // control-plane failures, the persisted expiry remains the
+                    // hard stop: an outage must never extend a trace lease.
+                    self.reconcile_session_sandbox_capabilities(
+                        &session,
+                        SessionSandboxCapabilities::default_enabled(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+
+            if !self
+                .store
+                .metadata_trace_reconciler_lease_is_active(identity, lease)
+                .await?
+            {
+                return Ok(stopped);
+            }
+            match outcome {
+                Ok(true) => stopped += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    thread_key = %session.thread_key,
+                    sandbox_id = session.sandbox_id.as_deref().unwrap_or(""),
+                    %error,
+                    "active sandbox capability reconciliation failed for session"
+                ),
+            }
+        }
+        Ok(stopped)
+    }
+
+    async fn reconcile_session_sandbox_capabilities(
+        &self,
+        session: &Session,
+        desired: SessionSandboxCapabilities,
+    ) -> Result<bool, SessionRuntimeError> {
+        let Some(sandbox_id) = session.sandbox_id.as_deref() else {
+            return Ok(false);
+        };
+
+        // Lock the current assignment before touching the backend. This makes
+        // a replacement linearizable with the stop: a stale sweep observes the
+        // replacement and does nothing, or a replacement waits until the old
+        // sandbox has been retired and cleared.
+        let Some(assignment_lock) = self
+            .store
+            .lock_sandbox_assignment_for_reconciliation(&session.thread_key, sandbox_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let id = SandboxId::new(sandbox_id);
+        let trace_resource_uid = assignment_lock.metadata_trace_enabled().then(|| {
+            assignment_lock
+                .metadata_trace_resource_uid()
+                .map(str::to_owned)
+        });
+        let gone = match trace_resource_uid {
+            Some(Some(resource_uid)) => {
+                match self
+                    .sandbox_runtime
+                    .manager
+                    .stop_exact(&id, Some(&resource_uid))
+                    .await
+                {
+                    Ok(()) => match self.sandbox_runtime.manager.observe(&id).await {
+                        Ok(observation) => {
+                            observation.status == SandboxStatus::Gone
+                                || observation.resource_uid.as_deref()
+                                    != Some(resource_uid.as_str())
+                        }
+                        Err(SandboxError::NotFound(_)) => true,
+                        Err(error) => {
+                            assignment_lock.rollback().await?;
+                            return Err(SessionRuntimeError::Sandbox(error));
+                        }
+                    },
+                    Err(SandboxError::NotFound(_)) => true,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                }
+            }
+            Some(None) => {
+                // Backfill the missing durable UID from the current backend
+                // observation before deletion. Kubernetes rejects the delete
+                // if the name is reused between this observation and stop.
+                let observed_uid = match self.sandbox_runtime.manager.observe(&id).await {
+                    Ok(observation) if observation.status == SandboxStatus::Gone => None,
+                    Ok(observation) => observation.resource_uid,
+                    Err(SandboxError::NotFound(_)) => None,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                };
+                match self
+                    .sandbox_runtime
+                    .manager
+                    .stop_exact(&id, observed_uid.as_deref())
+                    .await
+                {
+                    Ok(()) => match self.sandbox_runtime.manager.observe(&id).await {
+                        Ok(observation) => {
+                            observation.status == SandboxStatus::Gone
+                                || observed_uid.is_some_and(|uid| {
+                                    observation.resource_uid.as_deref() != Some(uid.as_str())
+                                })
+                        }
+                        Err(SandboxError::NotFound(_)) => true,
+                        Err(error) => {
+                            assignment_lock.rollback().await?;
+                            return Err(SessionRuntimeError::Sandbox(error));
+                        }
+                    },
+                    Err(SandboxError::NotFound(_)) => true,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                }
+            }
+            None => match self.sandbox_runtime.manager.stop(&id).await {
+                Ok(()) => matches!(
+                    self.sandbox_runtime.manager.status(&id).await,
+                    Ok(SandboxStatus::Gone)
+                ),
+                Err(SandboxError::NotFound(_)) => true,
+                Err(error) => {
+                    assignment_lock.rollback().await?;
+                    return Err(SessionRuntimeError::Sandbox(error));
+                }
+            },
+        };
+        if !gone {
+            // A successful delete request is not proof that the exact
+            // backend resource is gone. Keep the durable assignment until a
+            // later reconciler observes name/UID disappearance.
+            assignment_lock.rollback().await?;
+            return Ok(false);
+        }
+        self.sandbox_pipes.remove(sandbox_id);
+
+        // Keep the durable assignment until the stop has succeeded. A failed
+        // backend delete rolls back the lock and remains visible to the next
+        // reconciliation sweep, rather than orphaning a credentialed trace
+        // pod.
+        let cleared = assignment_lock.clear_and_commit().await?;
+        self.store
+            .append_event(
+                &session.thread_key,
+                None,
+                "session.sandbox_capabilities_reconciled",
+                json!({
+                    "sandbox_id": sandbox_id,
+                    "previous_capabilities": session.sandbox_capabilities,
+                    "desired_capabilities": desired,
+                }),
+            )
+            .await?;
+        Ok(cleared)
     }
 
     pub async fn create_or_get_session(
@@ -2153,7 +2654,7 @@ impl SessionRuntime {
                 .create_execution(
                     thread_key,
                     idempotency_key.as_deref(),
-                    execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
+                    execution_metadata(metadata.clone(), idle_timeout_ms, max_duration_ms),
                 )
                 .await?;
             span.record(
@@ -2235,7 +2736,17 @@ impl SessionRuntime {
                 )
                 .await?;
             let desired_capabilities = self
-                .resolve_sandbox_capabilities(session.iron_control_principal.as_deref())
+                .resolve_sandbox_capabilities(
+                    thread_key,
+                    session.iron_control_principal.as_deref(),
+                    metadata.as_ref(),
+                )
+                .await?;
+            self.store
+                .merge_execution_metadata(
+                    &execution.execution_id,
+                    metadata_trace_execution_boundary(&desired_capabilities),
+                )
                 .await?;
 
             let sandbox_id = match self
@@ -2248,6 +2759,7 @@ impl SessionRuntime {
                     iron_control_principal: session.iron_control_principal.as_deref(),
                     proxy_labels: &session.proxy_labels,
                     desired_capabilities: &desired_capabilities,
+                    execution_metadata: metadata.as_ref(),
                     execution_id: &execution.execution_id,
                 })
                 .instrument(execution_trace_span.clone())
@@ -2281,16 +2793,33 @@ impl SessionRuntime {
 
             let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span));
             let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
-            if let Err(error) = write_input_lines(
-                &pipe,
-                &input_lines,
-                thread_key,
-                &execution.execution_id,
-                Some(&sandbox_id),
-            )
-            .instrument(execution_trace_span.clone())
-            .await
-            {
+            let write_result = if desired_capabilities.metadata_trace_enabled {
+                self.write_traced_input_lines(
+                    &pipe,
+                    thread_key,
+                    &execution.execution_id,
+                    &sandbox_id,
+                    &desired_capabilities,
+                    &input_lines,
+                )
+                .instrument(execution_trace_span.clone())
+                .await
+            } else {
+                write_input_lines(
+                    &pipe,
+                    &input_lines,
+                    thread_key,
+                    &execution.execution_id,
+                    Some(&sandbox_id),
+                )
+                .instrument(execution_trace_span.clone())
+                .await
+            };
+            if let Err(error) = write_result {
+                if matches!(error, SessionRuntimeError::MetadataTraceBoundaryChanged) {
+                    self.discard_sandbox_before_input(thread_key, &sandbox_id)
+                        .await?;
+                }
                 self.record_execution_failure(thread_key, &execution.execution_id, &error)
                     .await;
                 return Err(error);
@@ -2394,6 +2923,10 @@ impl SessionRuntime {
         }) else {
             return;
         };
+        if !messages_match_active_trace_subject(thread_key, Some(&execution), messages) {
+            warn!(thread_key = %thread_key, execution_id = %execution.execution_id, "refusing steering across an actor-scoped trace boundary");
+            return;
+        }
 
         // Steering joins the active execution's trace so harness spans for the
         // steered turn stay in the same tree.
@@ -2418,15 +2951,75 @@ impl SessionRuntime {
             }
         };
 
-        if let Err(error) = write_input_lines(
-            &pipe,
-            &input_lines,
-            thread_key,
-            &execution.execution_id,
-            None,
-        )
-        .await
+        let session = match self.store.get_session(thread_key).await {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(thread_key = %thread_key, execution_id = %execution.execution_id, %error, "could not re-read steering trace boundary");
+                return;
+            }
+        };
+        let actor_metadata = messages
+            .iter()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .map(|message| &message.metadata);
+        let current_capabilities = match self
+            .resolve_sandbox_capabilities(
+                thread_key,
+                session.iron_control_principal.as_deref(),
+                actor_metadata,
+            )
+            .await
         {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                warn!(thread_key = %thread_key, execution_id = %execution.execution_id, %error, "could not re-read steering consent");
+                return;
+            }
+        };
+        if !sandbox_capabilities_match(session.sandbox_capabilities.as_ref(), &current_capabilities)
+        {
+            if let Some(sandbox_id) = session.sandbox_id.as_deref()
+                && let Err(error) = self
+                    .discard_sandbox_before_input(thread_key, sandbox_id)
+                    .await
+            {
+                warn!(thread_key = %thread_key, execution_id = %execution.execution_id, %error, "could not retire stale traced sandbox before steering");
+            }
+            warn!(thread_key = %thread_key, execution_id = %execution.execution_id, "steering consent changed before input write");
+            return;
+        }
+        let write_result = if current_capabilities.metadata_trace_enabled {
+            let Some(sandbox_id) = session.sandbox_id.as_deref() else {
+                return;
+            };
+            self.write_traced_input_lines(
+                &pipe,
+                thread_key,
+                &execution.execution_id,
+                sandbox_id,
+                &current_capabilities,
+                &input_lines,
+            )
+            .await
+        } else {
+            write_input_lines(
+                &pipe,
+                &input_lines,
+                thread_key,
+                &execution.execution_id,
+                None,
+            )
+            .await
+        };
+        if let Err(error) = write_result {
+            if matches!(error, SessionRuntimeError::MetadataTraceBoundaryChanged)
+                && let Some(sandbox_id) = session.sandbox_id.as_deref()
+                && let Err(retire_error) = self
+                    .discard_sandbox_before_input(thread_key, sandbox_id)
+                    .await
+            {
+                warn!(thread_key = %thread_key, execution_id = %execution.execution_id, %retire_error, "could not retire traced sandbox after steering boundary change");
+            }
             self.record_steering_failure(thread_key, &execution.execution_id, error.to_string())
                 .await;
             return;
@@ -2455,6 +3048,7 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
         reason: &str,
+        execution_metadata: Option<&Value>,
     ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
         let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
             return Ok(InterruptExecutionOutcome {
@@ -2463,6 +3057,40 @@ impl SessionRuntime {
             });
         };
 
+        let session = self.store.get_session(thread_key).await?;
+        if let Some(capabilities) = session
+            .sandbox_capabilities
+            .as_ref()
+            .filter(|capabilities| capabilities.metadata_trace_enabled)
+        {
+            let sandbox_id = session
+                .sandbox_id
+                .as_deref()
+                .ok_or(SessionRuntimeError::MetadataTraceBoundaryChanged)?;
+            let requested =
+                SlackTraceSubject::from_execution_metadata(thread_key.as_str(), execution_metadata);
+            let assigned = self
+                .store
+                .metadata_trace_assignment_actor(thread_key, sandbox_id)
+                .await?;
+            let matches_assignment =
+                requested
+                    .zip(assigned)
+                    .is_some_and(|(requested, assigned)| {
+                        assigned.source == "slack"
+                            && assigned.workspace_id == requested.workspace_id()
+                            && assigned.user_id == requested.user_id()
+                    });
+            if !matches_assignment {
+                self.discard_sandbox_before_input(thread_key, sandbox_id)
+                    .await?;
+                return Err(SessionRuntimeError::MetadataTraceBoundaryChanged);
+            }
+            // Keep this binding in scope through the later trace write so the
+            // compiler documents that a trace interrupt was actor-checked.
+            let _ = capabilities;
+        }
+
         let execution_span = self
             .execution_spans
             .lock()
@@ -2470,24 +3098,51 @@ impl SessionRuntime {
             .get(&execution.execution_id)
             .cloned();
         let trace = SessionTraceContext::new(thread_key, execution_span.as_ref());
+        let pipe = self
+            .wait_for_active_steering_pipe(thread_key, &execution.execution_id)
+            .await
+            .map_err(SessionRuntimeError::BadRequest)?;
         let input_lines = input_lines_with_session_context(
             thread_key,
             &trace,
             &[interrupt_input_line(thread_key, reason)],
         );
-
-        let pipe = self
-            .wait_for_active_steering_pipe(thread_key, &execution.execution_id)
-            .await
-            .map_err(SessionRuntimeError::BadRequest)?;
-        write_input_lines(
-            &pipe,
-            &input_lines,
-            thread_key,
-            &execution.execution_id,
-            None,
-        )
-        .await?;
+        if let Some(capabilities) = session
+            .sandbox_capabilities
+            .as_ref()
+            .filter(|capabilities| capabilities.metadata_trace_enabled)
+        {
+            let sandbox_id = session
+                .sandbox_id
+                .as_deref()
+                .ok_or(SessionRuntimeError::MetadataTraceBoundaryChanged)?;
+            let write_result = self
+                .write_traced_input_lines(
+                    &pipe,
+                    thread_key,
+                    &execution.execution_id,
+                    sandbox_id,
+                    capabilities,
+                    &input_lines,
+                )
+                .await;
+            if let Err(error) = write_result {
+                if matches!(error, SessionRuntimeError::MetadataTraceBoundaryChanged) {
+                    self.discard_sandbox_before_input(thread_key, sandbox_id)
+                        .await?;
+                }
+                return Err(error);
+            }
+        } else {
+            write_input_lines(
+                &pipe,
+                &input_lines,
+                thread_key,
+                &execution.execution_id,
+                None,
+            )
+            .await?;
+        }
 
         self.store
             .append_event(
@@ -2639,6 +3294,7 @@ impl SessionRuntime {
             iron_control_principal,
             proxy_labels,
             desired_capabilities,
+            execution_metadata,
             execution_id,
         } = request;
         let boot_mode = sandbox_boot_mode_for_thread(thread_key, iron_control_principal);
@@ -2663,6 +3319,8 @@ impl SessionRuntime {
         );
         let ensure_started = Instant::now();
         let result = async {
+            self.ensure_metadata_trace_config_active(desired_capabilities)
+                .await?;
             let persona_context =
                 self.resolve_stored_persona(persona_id, harness_type, desired_capabilities)?;
             if let Some(sandbox_id) = existing_sandbox_id {
@@ -2674,7 +3332,13 @@ impl SessionRuntime {
                         Ok(()) | Err(SandboxError::NotFound(_)) => {}
                         Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
                     }
-                    self.store.update_sandbox_id(thread_key, None).await?;
+                    if !self
+                        .store
+                        .clear_sandbox_id_if_matches(thread_key, sandbox_id)
+                        .await?
+                    {
+                        return Err(SessionRuntimeError::SandboxAssignmentChanged);
+                    }
                     self.store
                         .append_event(
                             thread_key,
@@ -2950,6 +3614,10 @@ impl SessionRuntime {
                 }
             }
 
+            // Fence the eventual assignment against a concurrent replacement;
+            // creating a sidecar is not permission to overwrite a newer
+            // actor's sandbox row.
+            let expected_assignment = self.store.get_session(thread_key).await?.sandbox_id;
             let mut spec = (self.sandbox_runtime.spec_factory)(
                 thread_key,
                 execution_id,
@@ -2962,6 +3630,8 @@ impl SessionRuntime {
             }
             apply_sandbox_boot_mode(&mut spec, &boot_mode);
             apply_sandbox_capabilities(&mut spec, desired_capabilities);
+            self.ensure_metadata_trace_config_active(desired_capabilities)
+                .await?;
             let create_started = Instant::now();
             let handle = self
                 .run_with_running_capacity(thread_key, execution_id, "cold_create", || async {
@@ -2976,9 +3646,19 @@ impl SessionRuntime {
             let ready_duration = ensure_started.elapsed();
             span.record("centaur.sandbox_id", handle.id.as_str());
             span.record("sandbox_id", handle.id.as_str());
-            self.store
-                .update_sandbox_assignment(thread_key, handle.id.as_str(), desired_capabilities)
-                .await?;
+            if let Err(error) = self
+                .persist_sandbox_assignment(
+                    thread_key,
+                    handle.id.as_str(),
+                    desired_capabilities,
+                    expected_assignment.as_deref(),
+                    execution_metadata,
+                )
+                .await
+            {
+                let _ = self.sandbox_runtime.manager.stop(&handle.id).await;
+                return Err(error);
+            }
             self.record_sandbox_ready(SandboxReadyObservation {
                 thread_key,
                 execution_id,
@@ -3022,18 +3702,290 @@ impl SessionRuntime {
 
     async fn resolve_sandbox_capabilities(
         &self,
+        thread_key: &ThreadKey,
         iron_control_principal: Option<&str>,
+        execution_metadata: Option<&Value>,
     ) -> Result<SessionSandboxCapabilities, SessionRuntimeError> {
-        let Some(principal_id) = iron_control_principal else {
-            return Ok(SessionSandboxCapabilities::default_enabled());
+        let capabilities = match (iron_control_principal, &self.iron_control) {
+            (Some(principal_id), Some(registrar)) => {
+                sandbox_capabilities_from_principal(&registrar.get_principal(principal_id).await?)
+            }
+            (Some(_), None) => {
+                return Err(SessionRuntimeError::BadRequest(
+                    "session has an Iron Control principal, but Iron Control is disabled"
+                        .to_owned(),
+                ));
+            }
+            _ => SessionSandboxCapabilities::default_enabled(),
         };
-        let Some(registrar) = &self.iron_control else {
-            return Err(SessionRuntimeError::BadRequest(
-                "session has an Iron Control principal, but Iron Control is disabled".to_owned(),
-            ));
+        let Some(subject) =
+            SlackTraceSubject::from_execution_metadata(thread_key.as_str(), execution_metadata)
+        else {
+            return Ok(capabilities);
         };
-        let principal = registrar.get_principal(principal_id).await?;
-        Ok(sandbox_capabilities_from_principal(&principal))
+        let consent = self
+            .store
+            .metadata_trace_consent("slack", subject.workspace_id(), subject.user_id())
+            .await?;
+        let mut desired = sandbox_capabilities_with_trace_subject(
+            capabilities,
+            &subject,
+            &consent,
+            self.metadata_trace_config.as_ref(),
+        );
+        if desired.metadata_trace_enabled && !self.metadata_trace_config_is_active().await {
+            disable_metadata_trace(&mut desired);
+        }
+        Ok(desired)
+    }
+
+    /// Reconciliation never reuses an execution's actor metadata. It derives
+    /// the consent subject from the exact FK captured with this sandbox
+    /// assignment; old/null-FK assignments fail closed and are retired.
+    async fn metadata_trace_assignment_metadata(
+        &self,
+        session: &Session,
+    ) -> Result<Option<Value>, SessionRuntimeError> {
+        let Some(sandbox_id) = session.sandbox_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(actor) = self
+            .store
+            .metadata_trace_assignment_actor(&session.thread_key, sandbox_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if actor.source != "slack" {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "slack_actor_team_id": actor.workspace_id,
+            "slack_actor_user_id": actor.user_id,
+        })))
+    }
+
+    async fn ensure_metadata_trace_config_active(
+        &self,
+        capabilities: &SessionSandboxCapabilities,
+    ) -> Result<(), SessionRuntimeError> {
+        if !capabilities.metadata_trace_enabled {
+            return Ok(());
+        }
+        let Some(identity) = self.metadata_trace_config.as_ref() else {
+            return Err(SessionRuntimeError::InactiveMetadataTraceConfig);
+        };
+        if capabilities.metadata_trace_config_generation != Some(identity.generation)
+            || capabilities.metadata_trace_config_fingerprint.as_deref()
+                != Some(identity.fingerprint.as_str())
+            || !self.store.metadata_trace_config_is_active(identity).await?
+        {
+            return Err(SessionRuntimeError::InactiveMetadataTraceConfig);
+        }
+        Ok(())
+    }
+
+    async fn write_traced_input_lines(
+        &self,
+        pipe: &SessionPipe,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        sandbox_id: &str,
+        expected: &SessionSandboxCapabilities,
+        input_lines: &[String],
+    ) -> Result<(), SessionRuntimeError> {
+        // Lock the pipe first, then hold the DB shared lock through send+flush.
+        // Revoke takes FOR UPDATE on this consent row and therefore linearizes
+        // strictly before or after a traced stdin delivery.
+        let mut stdin = pipe.stdin.lock().await;
+        let Some(guard) = self
+            .store
+            .lock_metadata_trace_input(expected, thread_key, execution_id, sandbox_id)
+            .await?
+        else {
+            return Err(SessionRuntimeError::MetadataTraceBoundaryChanged);
+        };
+        let Some(remaining) = guard.remaining() else {
+            return Err(SessionRuntimeError::MetadataTraceBoundaryChanged);
+        };
+        // A valid consent may last hours, but it must never pin its shared
+        // DB boundary lock behind an unresponsive stdin pipe for that long.
+        let write_timeout = metadata_trace_write_timeout(remaining);
+        let write = async {
+            for line in input_lines {
+                stdin.send(line).await.map_err(codec_error_to_runtime)?;
+            }
+            io::AsyncWriteExt::flush(stdin.get_mut())
+                .await
+                .map_err(|error| {
+                    SessionRuntimeError::Sandbox(SandboxError::io_source("flush stdin", error))
+                })
+        };
+        timeout(write_timeout, write)
+            .await
+            .map_err(|_| SessionRuntimeError::MetadataTraceBoundaryChanged)??;
+        guard.commit().await?;
+        Ok(())
+    }
+
+    async fn discard_sandbox_before_input(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+    ) -> Result<(), SessionRuntimeError> {
+        let Some(assignment_lock) = self
+            .store
+            .lock_sandbox_assignment_for_reconciliation(thread_key, sandbox_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let id = SandboxId::new(sandbox_id);
+        let trace_resource_uid = assignment_lock.metadata_trace_enabled().then(|| {
+            assignment_lock
+                .metadata_trace_resource_uid()
+                .map(str::to_owned)
+        });
+        let gone = match trace_resource_uid {
+            Some(Some(resource_uid)) => {
+                match self
+                    .sandbox_runtime
+                    .manager
+                    .stop_exact(&id, Some(&resource_uid))
+                    .await
+                {
+                    Ok(()) => match self.sandbox_runtime.manager.observe(&id).await {
+                        Ok(observation) => {
+                            observation.status == SandboxStatus::Gone
+                                || observation.resource_uid.as_deref()
+                                    != Some(resource_uid.as_str())
+                        }
+                        Err(SandboxError::NotFound(_)) => true,
+                        Err(error) => {
+                            assignment_lock.rollback().await?;
+                            return Err(SessionRuntimeError::Sandbox(error));
+                        }
+                    },
+                    Err(SandboxError::NotFound(_)) => true,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                }
+            }
+            Some(None) => {
+                let observed_uid = match self.sandbox_runtime.manager.observe(&id).await {
+                    Ok(observation) if observation.status == SandboxStatus::Gone => None,
+                    Ok(observation) => observation.resource_uid,
+                    Err(SandboxError::NotFound(_)) => None,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                };
+                match self
+                    .sandbox_runtime
+                    .manager
+                    .stop_exact(&id, observed_uid.as_deref())
+                    .await
+                {
+                    Ok(()) => match self.sandbox_runtime.manager.observe(&id).await {
+                        Ok(observation) => {
+                            observation.status == SandboxStatus::Gone
+                                || observed_uid.is_some_and(|uid| {
+                                    observation.resource_uid.as_deref() != Some(uid.as_str())
+                                })
+                        }
+                        Err(SandboxError::NotFound(_)) => true,
+                        Err(error) => {
+                            assignment_lock.rollback().await?;
+                            return Err(SessionRuntimeError::Sandbox(error));
+                        }
+                    },
+                    Err(SandboxError::NotFound(_)) => true,
+                    Err(error) => {
+                        assignment_lock.rollback().await?;
+                        return Err(SessionRuntimeError::Sandbox(error));
+                    }
+                }
+            }
+            None => match self.sandbox_runtime.manager.stop(&id).await {
+                Ok(()) => matches!(
+                    self.sandbox_runtime.manager.status(&id).await,
+                    Ok(SandboxStatus::Gone)
+                ),
+                Err(SandboxError::NotFound(_)) => true,
+                Err(error) => {
+                    assignment_lock.rollback().await?;
+                    return Err(SessionRuntimeError::Sandbox(error));
+                }
+            },
+        };
+        if !gone {
+            assignment_lock.rollback().await?;
+            return Err(SessionRuntimeError::MetadataTraceBoundaryChanged);
+        }
+        assignment_lock.clear_and_commit().await?;
+        self.sandbox_pipes.remove(sandbox_id);
+        Ok(())
+    }
+
+    async fn metadata_trace_config_is_active(&self) -> bool {
+        let Some(identity) = self.metadata_trace_config.as_ref() else {
+            return false;
+        };
+        self.store
+            .metadata_trace_config_is_active(identity)
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn persist_sandbox_assignment(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+        capabilities: &SessionSandboxCapabilities,
+        expected_sandbox_id: Option<&str>,
+        execution_metadata: Option<&Value>,
+    ) -> Result<(), SessionRuntimeError> {
+        if !capabilities.metadata_trace_enabled {
+            self.store
+                .update_sandbox_assignment(thread_key, sandbox_id, capabilities)
+                .await?;
+            return Ok(());
+        }
+        let Some(identity) = self.metadata_trace_config.as_ref() else {
+            return Err(SessionRuntimeError::InactiveMetadataTraceConfig);
+        };
+        let Some(subject) =
+            SlackTraceSubject::from_execution_metadata(thread_key.as_str(), execution_metadata)
+        else {
+            return Err(SessionRuntimeError::MetadataTraceBoundaryChanged);
+        };
+        let resource_uid = self
+            .sandbox_runtime
+            .manager
+            .observe(&SandboxId::new(sandbox_id))
+            .await?
+            .resource_uid
+            .ok_or(SessionRuntimeError::MetadataTraceBoundaryChanged)?;
+        if !self
+            .store
+            .update_sandbox_assignment_if_metadata_trace_config_active(
+                thread_key,
+                sandbox_id,
+                capabilities,
+                identity,
+                expected_sandbox_id,
+                subject.workspace_id(),
+                subject.user_id(),
+                &resource_uid,
+            )
+            .await?
+        {
+            return Err(SessionRuntimeError::InactiveMetadataTraceConfig);
+        }
+        Ok(())
     }
 
     async fn record_sandbox_ready(&self, observation: SandboxReadyObservation<'_>) {
@@ -6579,6 +7531,25 @@ fn sandbox_capabilities_match(
     )
 }
 
+fn is_deleted_principal_error(error: &centaur_iron_control::IronControlError) -> bool {
+    matches!(
+        error,
+        centaur_iron_control::IronControlError::Status { status: 404, .. }
+    )
+}
+
+fn session_has_expired_metadata_trace_consent(session: &Session, now: OffsetDateTime) -> bool {
+    session
+        .sandbox_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| {
+            capabilities.metadata_trace_enabled
+                && capabilities
+                    .metadata_trace_expires_at
+                    .is_none_or(|expires_at| expires_at <= now)
+        })
+}
+
 fn sandbox_repo_cache_access_from_principal(
     principal: &centaur_iron_control::Principal,
 ) -> SessionRepoCacheAccess {
@@ -6601,7 +7572,104 @@ fn sandbox_capabilities_from_principal(
         repo_cache: sandbox_repo_cache_access_from_principal(principal),
         observability_enabled: principal.sandbox_observability_enabled,
         api_server_enabled: principal.sandbox_api_server_enabled,
+        metadata_trace_enabled: false,
+        metadata_trace_expires_at: None,
+        metadata_trace_subject_hash: None,
+        metadata_trace_consent_revision: None,
+        metadata_trace_config_fingerprint: None,
+        metadata_trace_config_generation: None,
     }
+}
+
+fn sandbox_capabilities_with_trace_subject(
+    mut capabilities: SessionSandboxCapabilities,
+    subject: &SlackTraceSubject,
+    consent: &MetadataTraceConsent,
+    metadata_trace_config: Option<&MetadataTraceConfigIdentity>,
+) -> SessionSandboxCapabilities {
+    let now = OffsetDateTime::now_utc();
+    let metadata_trace_expires_at = consent
+        .expires_at
+        .filter(|expires_at| *expires_at > now && *expires_at <= now + MAX_METADATA_TRACE_CONSENT);
+    let metadata_trace_enabled = metadata_trace_expires_at.is_some()
+        && metadata_trace_config.is_some_and(|config| config.enabled);
+    capabilities.metadata_trace_enabled =
+        metadata_trace_enabled && consent.enabled && consent.revision > 0;
+    capabilities.metadata_trace_expires_at = capabilities
+        .metadata_trace_enabled
+        .then_some(metadata_trace_expires_at)
+        .flatten();
+    capabilities.metadata_trace_subject_hash = capabilities
+        .metadata_trace_enabled
+        .then(|| trace_subject_hash(subject));
+    capabilities.metadata_trace_consent_revision = capabilities
+        .metadata_trace_enabled
+        .then_some(consent.revision);
+    capabilities.metadata_trace_config_fingerprint =
+        capabilities.metadata_trace_enabled.then(|| {
+            metadata_trace_config
+                .expect("checked above")
+                .fingerprint
+                .clone()
+        });
+    capabilities.metadata_trace_config_generation = capabilities
+        .metadata_trace_enabled
+        .then(|| metadata_trace_config.expect("checked above").generation);
+    capabilities
+}
+
+fn disable_metadata_trace(capabilities: &mut SessionSandboxCapabilities) {
+    capabilities.metadata_trace_enabled = false;
+    capabilities.metadata_trace_expires_at = None;
+    capabilities.metadata_trace_subject_hash = None;
+    capabilities.metadata_trace_consent_revision = None;
+    capabilities.metadata_trace_config_fingerprint = None;
+    capabilities.metadata_trace_config_generation = None;
+}
+
+fn metadata_trace_execution_boundary(capabilities: &SessionSandboxCapabilities) -> Value {
+    json!({
+        "metadata_trace_subject_hash": capabilities.metadata_trace_subject_hash,
+        "metadata_trace_consent_revision": capabilities.metadata_trace_consent_revision,
+        "metadata_trace_expires_at": capabilities.metadata_trace_expires_at.map(|value| value.to_string()),
+        "metadata_trace_enabled": capabilities.metadata_trace_enabled,
+        "metadata_trace_config_fingerprint": capabilities.metadata_trace_config_fingerprint,
+        "metadata_trace_config_generation": capabilities.metadata_trace_config_generation,
+    })
+}
+
+fn messages_match_active_trace_subject(
+    thread_key: &ThreadKey,
+    active: Option<&SessionExecution>,
+    messages: &[SessionMessageInput],
+) -> bool {
+    let Some(expected) = active
+        .and_then(|execution| execution.metadata.get("metadata_trace_subject_hash"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    messages
+        .iter()
+        .filter(|message| matches!(message.role, MessageRole::User))
+        .all(|message| {
+            SlackTraceSubject::from_execution_metadata(thread_key.as_str(), Some(&message.metadata))
+                .is_some_and(|subject| trace_subject_hash(&subject) == expected)
+        })
+}
+
+fn trace_subject_hash(subject: &SlackTraceSubject) -> String {
+    let digest = Sha256::digest(subject.stable_key().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn metadata_trace_write_timeout(remaining: Duration) -> Duration {
+    #[cfg(test)]
+    let max = Duration::from_millis(METADATA_TRACE_INPUT_TEST_TIMEOUT_MS.load(Ordering::Relaxed));
+    #[cfg(not(test))]
+    let max = METADATA_TRACE_INPUT_WRITE_MAX;
+    remaining.min(max)
 }
 
 fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSandboxCapabilities) {
@@ -6613,6 +7681,7 @@ fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSand
         },
         observability_enabled: capabilities.observability_enabled,
         api_server_enabled: capabilities.api_server_enabled,
+        metadata_trace_enabled: capabilities.metadata_trace_enabled,
     };
     upsert_spec_env(
         spec,
@@ -6633,6 +7702,11 @@ fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSand
         spec,
         "CENTAUR_SANDBOX_API_SERVER_ENABLED",
         capabilities.api_server_enabled.to_string(),
+    );
+    upsert_spec_env(
+        spec,
+        "CENTAUR_SANDBOX_METADATA_TRACE_ENABLED",
+        capabilities.metadata_trace_enabled.to_string(),
     );
     match capabilities.repo_cache {
         SessionRepoCacheAccess::None => {
@@ -6781,6 +7855,9 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
 fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     match error {
         SessionRuntimeError::BadRequest(_) => "bad_request",
+        SessionRuntimeError::MetadataTraceBoundaryChanged => "metadata_trace_boundary_changed",
+        SessionRuntimeError::InactiveMetadataTraceConfig => "metadata_trace_config_inactive",
+        SessionRuntimeError::SandboxAssignmentChanged => "sandbox_assignment_changed",
         SessionRuntimeError::ShuttingDown => "shutting_down",
         SessionRuntimeError::StdoutOwnerRenewerStopTimeout { .. } => "stdout_owner",
         SessionRuntimeError::Store(_) => "store",
@@ -7930,6 +9007,12 @@ pub enum SessionRuntimeError {
     ShuttingDown,
     #[error("timed out stopping stdout owner renewal for execution {execution_id}")]
     StdoutOwnerRenewerStopTimeout { execution_id: String },
+    #[error("metadata trace configuration is no longer the active deployment generation")]
+    InactiveMetadataTraceConfig,
+    #[error("metadata trace consent changed before sandbox input")]
+    MetadataTraceBoundaryChanged,
+    #[error("sandbox assignment changed while replacing the previous sandbox")]
+    SandboxAssignmentChanged,
     #[error(transparent)]
     Store(#[from] SessionStoreError),
     #[error(transparent)]
@@ -8007,6 +9090,12 @@ mod tests {
             repo_cache: SessionRepoCacheAccess::Public,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
         };
 
         apply_sandbox_capabilities(&mut spec, &capabilities);
@@ -8035,6 +9124,12 @@ mod tests {
             repo_cache: SessionRepoCacheAccess::Public,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
         };
 
         apply_sandbox_capabilities(&mut spec, &capabilities);
@@ -8062,6 +9157,12 @@ mod tests {
             repo_cache: SessionRepoCacheAccess::Public,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
         };
 
         apply_sandbox_capabilities(&mut spec, &capabilities);
@@ -8095,6 +9196,12 @@ mod tests {
             repo_cache: SessionRepoCacheAccess::None,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
         };
 
         apply_sandbox_capabilities(&mut spec, &capabilities);
@@ -8118,6 +9225,109 @@ mod tests {
             sandbox_observability_enabled: true,
             sandbox_api_server_enabled: true,
         }
+    }
+
+    #[test]
+    fn actor_trace_revoke_and_config_change_replace_the_sandbox() {
+        let principal = test_principal(BTreeMap::new());
+        let config_a = MetadataTraceConfigIdentity {
+            generation: 1,
+            fingerprint: "config-a".to_owned(),
+            enabled: true,
+        };
+        let config_b = MetadataTraceConfigIdentity {
+            generation: 2,
+            fingerprint: "config-b".to_owned(),
+            enabled: true,
+        };
+        let mut consent = MetadataTraceConsent {
+            source: "slack".to_owned(),
+            workspace_id: "T1".to_owned(),
+            user_id: "U1".to_owned(),
+            enabled: true,
+            expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(1)),
+            revision: 1,
+            drain_pending: false,
+        };
+        let subject = SlackTraceSubject::from_execution_metadata(
+            "slack:T1:C1:1.2",
+            Some(&json!({ "slack_actor_team_id": "T1", "slack_actor_user_id": "U1" })),
+        )
+        .unwrap();
+        let active = sandbox_capabilities_with_trace_subject(
+            sandbox_capabilities_from_principal(&principal),
+            &subject,
+            &consent,
+            Some(&config_a),
+        );
+        assert!(active.metadata_trace_enabled);
+        assert_eq!(
+            active.metadata_trace_config_fingerprint.as_deref(),
+            Some("config-a")
+        );
+
+        let revoked = sandbox_capabilities_from_principal(&test_principal(BTreeMap::new()));
+        assert!(!sandbox_capabilities_match(Some(&active), &revoked));
+
+        let changed = sandbox_capabilities_with_trace_subject(
+            sandbox_capabilities_from_principal(&principal),
+            &subject,
+            &consent,
+            Some(&config_b),
+        );
+        assert!(!sandbox_capabilities_match(Some(&active), &changed));
+
+        let other_subject = SlackTraceSubject::from_execution_metadata(
+            "slack:T1:C1:1.2",
+            Some(&json!({ "slack_actor_team_id": "T1", "slack_actor_user_id": "U2" })),
+        )
+        .unwrap();
+        let other_actor = sandbox_capabilities_with_trace_subject(
+            sandbox_capabilities_from_principal(&principal),
+            &other_subject,
+            &consent,
+            Some(&config_a),
+        );
+        assert!(!sandbox_capabilities_match(Some(&active), &other_actor));
+
+        let disabled = MetadataTraceConfigIdentity {
+            generation: 3,
+            fingerprint: "disabled".to_owned(),
+            enabled: false,
+        };
+        let disabled_capabilities = sandbox_capabilities_with_trace_subject(
+            sandbox_capabilities_from_principal(&principal),
+            &subject,
+            &consent,
+            Some(&disabled),
+        );
+        assert!(!disabled_capabilities.metadata_trace_enabled);
+        assert!(!sandbox_capabilities_match(
+            Some(&active),
+            &disabled_capabilities
+        ));
+
+        consent.expires_at = Some(OffsetDateTime::now_utc() - TimeDuration::seconds(1));
+        assert!(
+            !sandbox_capabilities_with_trace_subject(
+                sandbox_capabilities_from_principal(&principal),
+                &subject,
+                &consent,
+                Some(&config_a)
+            )
+            .metadata_trace_enabled
+        );
+
+        consent.expires_at = Some(OffsetDateTime::now_utc() + TimeDuration::hours(25));
+        assert!(
+            !sandbox_capabilities_with_trace_subject(
+                sandbox_capabilities_from_principal(&principal),
+                &subject,
+                &consent,
+                Some(&config_a)
+            )
+            .metadata_trace_enabled
+        );
     }
 
     #[test]
@@ -9808,6 +11018,18 @@ mod tests {
     }
 
     #[test]
+    fn traced_input_timeout_is_capped_below_long_consent_deadlines() {
+        assert_eq!(
+            metadata_trace_write_timeout(Duration::from_secs(24 * 60 * 60)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            metadata_trace_write_timeout(Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
     fn proxy_labels_from_session_metadata_use_centaur_slack_keys() {
         let thread_key = ThreadKey::parse("slack:T123:C123:1700000000.000000").unwrap();
         let labels = proxy_labels_from_session_metadata(
@@ -9922,7 +11144,7 @@ mod adoption_tests {
     };
 
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
 
@@ -9949,6 +11171,7 @@ mod adoption_tests {
         create_id: String,
         created_specs: std::sync::Mutex<Vec<SandboxSpec>>,
         resume_fails: AtomicBool,
+        stop_fails: AtomicBool,
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
@@ -9972,6 +11195,7 @@ mod adoption_tests {
                 create_id: "mock-sbx".to_owned(),
                 created_specs: std::sync::Mutex::new(Vec::new()),
                 resume_fails: AtomicBool::new(false),
+                stop_fails: AtomicBool::new(false),
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
@@ -10039,6 +11263,14 @@ mod adoption_tests {
 
         fn fail_resume(&self) {
             self.resume_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_stop(&self) {
+            self.stop_fails.store(true, Ordering::SeqCst);
+        }
+
+        fn allow_stop(&self) {
+            self.stop_fails.store(false, Ordering::SeqCst);
         }
 
         fn mark_stop_missing(&self, sandbox_id: &str) {
@@ -10126,11 +11358,14 @@ mod adoption_tests {
         }
 
         async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            if self.stop_fails.load(Ordering::SeqCst) {
+                return Err(SandboxError::backend("mock stop failure"));
+            }
             if self.missing_on_stop.lock().unwrap().contains(id.as_str()) {
                 return Err(SandboxError::NotFound(id.as_str().to_owned()));
             }
             self.stopped.lock().unwrap().push(id.as_str().to_owned());
-            self.set_observed_status(id.as_str(), SandboxStatus::Stopped);
+            self.set_observed_status(id.as_str(), SandboxStatus::Gone);
             Ok(())
         }
 
@@ -10618,6 +11853,24 @@ mod adoption_tests {
             repo_cache: SessionRepoCacheAccess::None,
             observability_enabled: false,
             api_server_enabled: false,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
+        }
+    }
+
+    fn traced_capabilities() -> SessionSandboxCapabilities {
+        SessionSandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(1)),
+            metadata_trace_subject_hash: Some("test-trace-subject".to_owned()),
+            metadata_trace_consent_revision: Some(1),
+            metadata_trace_config_fingerprint: Some("test-trace-config".to_owned()),
+            metadata_trace_config_generation: Some(1),
+            ..restricted_capabilities()
         }
     }
 
@@ -10704,6 +11957,7 @@ mod adoption_tests {
                 iron_control_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &restricted_capabilities(),
+                execution_metadata: None,
                 execution_id: &execution_id,
             })
             .await
@@ -10743,6 +11997,390 @@ mod adoption_tests {
         assert!(
             all.iter()
                 .any(|event| event.event_type == "session.sandbox_capabilities_replaced")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_principal_sandbox_reconciliation_stops_revoked_capabilities() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:cap-reconcile-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-revoked", &traced_capabilities())
+            .await
+            .expect("assign traced sandbox");
+        store
+            .set_iron_control_principal(&thread_key, Some("prn-revoked"))
+            .await
+            .expect("bind principal");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert_eq!(
+            runtime
+                .reconcile_active_sandbox_capabilities()
+                .await
+                .expect("reconcile"),
+            1
+        );
+        assert_eq!(backend.stopped(), vec!["sbx-revoked".to_owned()]);
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn differently_authenticated_actor_cannot_interrupt_a_traced_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:trace-interrupt-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let identity = MetadataTraceConfigIdentity {
+            generation: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64,
+            fingerprint: format!("trace-interrupt-{}", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .unwrap();
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let consent = store
+            .grant_metadata_trace_consent("slack", "T-interrupt", "U1", expiry)
+            .await
+            .unwrap();
+        let capabilities = SessionSandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("u1".to_owned()),
+            metadata_trace_consent_revision: Some(consent.revision),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SessionSandboxCapabilities::default_enabled()
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-u1",
+                    &capabilities,
+                    &identity,
+                    None,
+                    "T-interrupt",
+                    "U1",
+                    "uid-u1",
+                )
+                .await
+                .unwrap()
+        );
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .unwrap();
+        store
+            .mark_execution_running(&execution.execution.execution_id)
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, mut stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with(&store, backend.clone()).with_metadata_trace_config(Some(identity));
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-u1")
+            .await
+            .unwrap();
+
+        let result = runtime
+            .interrupt_active_execution(
+                &thread_key,
+                "U2 identifying reason must not be written",
+                Some(&json!({ "slack_actor_team_id": "T-interrupt", "slack_actor_user_id": "U2" })),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionRuntimeError::MetadataTraceBoundaryChanged)
+        ));
+        assert_eq!(backend.stopped(), vec!["sbx-u1".to_owned()]);
+        let mut bytes = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stdin.read(&mut bytes))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_traced_send_releases_the_revoke_boundary_at_the_test_cap() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:trace-stall-{}", uuid::Uuid::new_v4())).unwrap();
+        let workspace_id = format!("T-stall-{}", uuid::Uuid::new_v4());
+        let user_id = format!("U-stall-{}", uuid::Uuid::new_v4());
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let identity = MetadataTraceConfigIdentity {
+            generation: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64,
+            fingerprint: format!("trace-stall-{}", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        store
+            .activate_metadata_trace_config(&identity)
+            .await
+            .unwrap();
+        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let consent = store
+            .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
+            .await
+            .unwrap();
+        let capabilities = SessionSandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(expiry),
+            metadata_trace_subject_hash: Some("u1".to_owned()),
+            metadata_trace_consent_revision: Some(consent.revision),
+            metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
+            metadata_trace_config_generation: Some(identity.generation),
+            ..SessionSandboxCapabilities::default_enabled()
+        };
+        assert!(
+            store
+                .update_sandbox_assignment_if_metadata_trace_config_active(
+                    &thread_key,
+                    "sbx-stall",
+                    &capabilities,
+                    &identity,
+                    None,
+                    &workspace_id,
+                    &user_id,
+                    "uid-stall"
+                )
+                .await
+                .unwrap()
+        );
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .unwrap();
+        store
+            .mark_execution_running(&execution.execution.execution_id)
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend).with_metadata_trace_config(Some(identity));
+        let pipe = runtime
+            .ensure_session_pipe(&thread_key, "sbx-stall")
+            .await
+            .unwrap();
+        METADATA_TRACE_INPUT_TEST_TIMEOUT_MS.store(20, Ordering::Relaxed);
+        let write_runtime = runtime.clone();
+        let write_capabilities = capabilities.clone();
+        let write_thread_key = thread_key.clone();
+        let write_execution_id = execution.execution.execution_id.clone();
+        let writer = tokio::spawn(async move {
+            write_runtime
+                .write_traced_input_lines(
+                    &pipe,
+                    &write_thread_key,
+                    &write_execution_id,
+                    "sbx-stall",
+                    &write_capabilities,
+                    &["x".repeat(128 * 1024)],
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let revoke_store = store.clone();
+        let revoke = tokio::time::timeout(Duration::from_secs(1), async move {
+            revoke_store
+                .revoke_metadata_trace_consent("slack", &workspace_id, &user_id, "u1")
+                .await
+        })
+        .await;
+        METADATA_TRACE_INPUT_TEST_TIMEOUT_MS.store(30_000, Ordering::Relaxed);
+        assert!(
+            revoke.is_ok(),
+            "revoke must not wait for the consent lifetime"
+        );
+        assert!(matches!(
+            writer.await.unwrap(),
+            Err(SessionRuntimeError::MetadataTraceBoundaryChanged)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_principal_reconciliation_preserves_a_concurrent_replacement() {
+        // Unlike the opportunistic adoption coverage, this regression must run
+        // against Postgres in CI: its assertion is the conditional database
+        // update that fences a replacement committed after the sweep snapshot.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "test:cap-reconcile-replacement-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-observed", &restricted_capabilities())
+            .await
+            .expect("assign observed sandbox");
+        store
+            .set_iron_control_principal(&thread_key, Some("prn-revoked"))
+            .await
+            .expect("bind principal");
+        let observed = store
+            .get_session(&thread_key)
+            .await
+            .expect("read sweep snapshot");
+
+        // A resumed execution may replace the sandbox after the reconciler
+        // listed this session but before its stop operation. The old snapshot
+        // must never clear the new canonical assignment.
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-replacement", &default_capabilities())
+            .await
+            .expect("replace sandbox concurrently");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            !runtime
+                .reconcile_session_sandbox_capabilities(&observed, default_capabilities())
+                .await
+                .expect("reconcile stale snapshot")
+        );
+        assert!(backend.stopped().is_empty());
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read replacement")
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-replacement")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_capability_stop_keeps_assignment_for_retry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:cap-stop-retry-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-stop-retry", &restricted_capabilities())
+            .await
+            .expect("assign sandbox");
+        let observed = store.get_session(&thread_key).await.expect("read session");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.fail_stop();
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            runtime
+                .reconcile_session_sandbox_capabilities(&observed, default_capabilities())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read retryable assignment")
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-stop-retry")
+        );
+
+        backend.allow_stop();
+        assert!(
+            runtime
+                .reconcile_session_sandbox_capabilities(&observed, default_capabilities())
+                .await
+                .expect("retry stop")
+        );
+        assert!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("read cleared assignment")
+                .sandbox_id
+                .is_none()
         );
     }
 
@@ -10795,6 +12433,7 @@ mod adoption_tests {
                 iron_control_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &restricted_capabilities(),
+                execution_metadata: None,
                 execution_id: &execution_id,
             })
             .await
@@ -10858,6 +12497,7 @@ mod adoption_tests {
                 iron_control_principal: Some("principal-existing"),
                 proxy_labels: &proxy_labels,
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                execution_metadata: None,
                 execution_id: &execution_id,
             })
             .await
@@ -11240,6 +12880,7 @@ mod adoption_tests {
                 iron_control_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                execution_metadata: None,
                 execution_id: &execution_id,
             })
             .await

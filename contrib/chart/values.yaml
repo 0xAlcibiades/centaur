@@ -273,6 +273,25 @@ sandbox:
   # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
   # with the policy the sandbox actually runs.
   extraEnv: {}
+  # Consent-gated metadata-only Codex tracing. Enabling this only makes the
+  # sidecar available; each principal remains opt-in. Supply an immutable
+  # image digest, an HTTPS gateway, and a per-consumer Secret containing the
+  # two named keys. Neither credential is placed in an environment variable.
+  # Set credentialSecretVersion to an opaque Secret generation or versioned
+  # name, and change it with every rotation. It changes the sandbox fingerprint
+  # so existing sandboxes are recreated without hashing secret content.
+  metadataTrace:
+    enabled: false
+    # Required in both enabled and disabled states. Increment for every trace
+    # configuration change, including disabling a prior rollout; this durable
+    # fence is separate from the sidecar fingerprint.
+    configGeneration: 1
+    gatewayUrl: ""
+    gatewayPort: 443
+    credentialSecretName: ""
+    credentialSecretVersion: ""
+    bearerSecretKey: bearer
+    pseudonymKeySecretKey: pseudonym_key
   stateVolume:
     enabled: false
     size: 10Gi
@@ -734,6 +753,13 @@ networkPolicy:
     #     ports:
     #       - port: 8428
     #         protocol: TCP
+  # Kubernetes NetworkPolicy is pod-wide: an egress rule selected for a
+  # metadata-trace-enabled sandbox applies to both the trace sidecar and Codex
+  # container. Keep these gateway CIDRs narrow (/32 IPv4 or /64+ IPv6) because
+  # NetworkPolicy cannot restrict a rule to one container or hostname.
+  metadataTraceEgress:
+    enabled: false
+    gatewayCidrs: []
 
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch

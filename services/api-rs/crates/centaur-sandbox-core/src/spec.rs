@@ -29,6 +29,10 @@ pub struct SandboxCapabilities {
     pub repo_cache: RepoCacheAccess,
     pub observability_enabled: bool,
     pub api_server_enabled: bool,
+    /// Consent-gated metadata-only Codex trace export. Kept on the neutral
+    /// spec so backend-specific sidecar construction cannot invent consent.
+    #[serde(default)]
+    pub metadata_trace_enabled: bool,
 }
 
 impl SandboxCapabilities {
@@ -37,11 +41,15 @@ impl SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
         }
     }
 
     pub fn is_default_enabled(&self) -> bool {
-        self.repo_cache.enabled() && self.observability_enabled && self.api_server_enabled
+        self.repo_cache.enabled()
+            && self.observability_enabled
+            && self.api_server_enabled
+            && !self.metadata_trace_enabled
     }
 }
 

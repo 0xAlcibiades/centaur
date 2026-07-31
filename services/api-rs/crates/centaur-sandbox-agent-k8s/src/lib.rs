@@ -16,11 +16,14 @@ use centaur_sandbox_core::{
     SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
+    Preconditions,
 };
 use kube::{Api, Client, Error};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
@@ -40,6 +43,14 @@ const COMPONENT_LABEL: &str = "centaur.ai/component";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const API_SERVER_ENABLED_LABEL: &str = "centaur.ai/api-server-enabled";
+const METADATA_TRACE_ENABLED_LABEL: &str = "centaur.ai/metadata-trace-enabled";
+const METADATA_TRACE_CAPABILITY_SIZE_LIMIT: &str = "1Mi";
+const METADATA_TRACE_RUNTIME_SIZE_LIMIT: &str = "4Mi";
+const METADATA_TRACE_SPOOL_SIZE_LIMIT: &str = "64Mi";
+/// Reviewed upstream artifact for the consented metadata-only sidecar. This
+/// digest, not a deployment-provided source claim or mutable tag, is the
+/// executable trust boundary.
+pub const AUTOROTATE_TRACE_AGENT_IMAGE: &str = "us-west1-docker.pkg.dev/snappy-storm-496900-m0/autorotate/autorotate@sha256:d314bb1a420ec6bc2948a4314ee70dd597b6af645a25ff32e6793f044c5f0427";
 const MANAGED_BY_VALUE: &str = "api-rs";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
@@ -48,6 +59,12 @@ const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-princip
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
+/// Immutable token tying every same-name auxiliary object to one Sandbox
+/// assignment. It is created before the CR because egress policy objects must
+/// exist before the controller creates the pod, then retained on the CR for
+/// later exact cleanup.
+pub(crate) const AUXILIARY_GENERATION_ANNOTATION: &str = "centaur.ai/auxiliary-generation";
+pub(crate) const AUXILIARY_GENERATION_LABEL: &str = "centaur.ai/auxiliary-generation";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -71,6 +88,9 @@ pub struct AgentSandboxConfig {
     /// sandboxes. Sandbox pod egress is granted by chart-level label policy;
     /// the per-sandbox proxy uses this target for its own explicit egress.
     pub otlp_egress: Option<OtlpEgressTarget>,
+    /// Opt-in, metadata-only trace sidecar. This never uses the generic OTLP
+    /// passthrough path because the sidecar owns its own credentials.
+    pub metadata_trace_sidecar: Option<MetadataTraceSidecarConfig>,
     pub ready_timeout: Duration,
 }
 
@@ -112,6 +132,7 @@ impl AgentSandboxConfig {
             iron_control: None,
             tools: None,
             otlp_egress: None,
+            metadata_trace_sidecar: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -134,6 +155,105 @@ impl AgentSandboxConfig {
     pub fn tools(mut self, tools: ToolsConfig) -> Self {
         self.tools = Some(tools);
         self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataTraceSidecarConfig {
+    pub image: String,
+    pub gateway_url: String,
+    pub gateway_port: u16,
+    pub credential_secret_name: String,
+    /// Deployment-controlled Secret generation. Operators update this opaque
+    /// value with the referenced Secret; it deliberately never derives from
+    /// credential data.
+    pub credential_secret_version: String,
+    pub bearer_secret_key: String,
+    pub pseudonym_key_secret_key: String,
+}
+
+impl MetadataTraceSidecarConfig {
+    pub fn pinned(
+        gateway_url: String,
+        gateway_port: u16,
+        credential_secret_name: String,
+        credential_secret_version: String,
+        bearer_secret_key: String,
+        pseudonym_key_secret_key: String,
+    ) -> Self {
+        Self {
+            image: AUTOROTATE_TRACE_AGENT_IMAGE.to_owned(),
+            gateway_url,
+            gateway_port,
+            credential_secret_name,
+            credential_secret_version,
+            bearer_secret_key,
+            pseudonym_key_secret_key,
+        }
+    }
+
+    pub fn fingerprint(&self) -> String {
+        // This contains only deployment selectors, never secret contents.
+        let material = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.image,
+            self.gateway_url,
+            self.gateway_port,
+            self.credential_secret_name,
+            self.credential_secret_version,
+            self.bearer_secret_key,
+            self.pseudonym_key_secret_key,
+        );
+        hex::encode(Sha256::digest(material))
+    }
+    pub fn validate(&self) -> SandboxResult<()> {
+        if self.image != AUTOROTATE_TRACE_AGENT_IMAGE {
+            return Err(SandboxError::InvalidSpec(
+                "metadata trace sidecar image must use the reviewed immutable digest".to_owned(),
+            ));
+        }
+        let pinned_digest = self
+            .image
+            .rsplit_once("@sha256:")
+            .map(|(_, digest)| digest)
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        if pinned_digest.is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "metadata trace sidecar image must be pinned by digest".to_owned(),
+            ));
+        }
+        let gateway = reqwest::Url::parse(&self.gateway_url).ok();
+        if !gateway.is_some_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && (url.path().is_empty() || url.path() == "/")
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.port_or_known_default() == Some(self.gateway_port)
+        }) {
+            return Err(SandboxError::InvalidSpec(
+                "metadata trace gateway must be an HTTPS origin with the configured port"
+                    .to_owned(),
+            ));
+        }
+        if [
+            &self.credential_secret_name,
+            &self.credential_secret_version,
+            &self.bearer_secret_key,
+            &self.pseudonym_key_secret_key,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(SandboxError::InvalidSpec(
+                "metadata trace credential Secret name, version, and keys are required".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -163,9 +283,126 @@ impl StateVolumeConfig {
 pub struct AgentSandboxBackend {
     client: Client,
     config: AgentSandboxConfig,
-    // sandbox id -> iron-control proxy OID, so the proxy can be deregistered on
-    // stop. Only populated for sync-mode sandboxes.
-    proxy_ids: Arc<Mutex<HashMap<String, String>>>,
+    // sandbox id -> current generation's iron-control proxy OID. This is a
+    // recoverable cache, but generation-CAS removal prevents old cleanup from
+    // deleting a replacement assignment's mapping.
+    proxy_ids: Arc<Mutex<HashMap<String, ProxyMapping>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProxyMapping {
+    generation: String,
+    proxy_id: String,
+}
+
+fn remove_proxy_mapping_if_generation(
+    mappings: &mut HashMap<String, ProxyMapping>,
+    sandbox_id: &str,
+    generation: &str,
+) -> Option<ProxyMapping> {
+    mappings
+        .get(sandbox_id)
+        .is_some_and(|mapping| mapping.generation == generation)
+        .then(|| mappings.remove(sandbox_id))
+        .flatten()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactStopAction {
+    DeleteSandbox,
+    DeleteProxy,
+    DeleteStatePvc,
+}
+
+fn exact_stop_actions(
+    expected_resource_uid: Option<&str>,
+    observed_resource_uid: Option<&str>,
+) -> SandboxResult<[ExactStopAction; 3]> {
+    if let Some(expected_resource_uid) = expected_resource_uid
+        && observed_resource_uid != Some(expected_resource_uid)
+    {
+        return Err(SandboxError::backend(
+            "sandbox resource UID changed before exact delete",
+        ));
+    }
+    Ok([
+        ExactStopAction::DeleteSandbox,
+        ExactStopAction::DeleteProxy,
+        ExactStopAction::DeleteStatePvc,
+    ])
+}
+
+fn new_auxiliary_generation() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub(crate) fn auxiliary_generation_from_sandbox(sandbox: &crd::Sandbox) -> SandboxResult<String> {
+    if let Some(generation) = sandbox
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+        .filter(|generation| !generation.trim().is_empty())
+        .cloned()
+    {
+        return Ok(generation);
+    }
+    let uid = sandbox.metadata.uid.as_deref().ok_or_else(|| {
+        SandboxError::backend("legacy sandbox is missing UID required for auxiliary adoption")
+    })?;
+    Ok(format!("legacy-{uid}"))
+}
+
+fn sandbox_has_auxiliary_generation(sandbox: &crd::Sandbox) -> bool {
+    sandbox
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+        .is_some_and(|generation| !generation.trim().is_empty())
+}
+
+pub(crate) fn object_is_owned_by_sandbox(metadata: &ObjectMeta, sandbox: &crd::Sandbox) -> bool {
+    let Some(sandbox_uid) = sandbox.metadata.uid.as_deref() else {
+        return false;
+    };
+    metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| owners.iter().any(|owner| owner.uid == sandbox_uid))
+}
+
+/// Return delete preconditions only for the exact auxiliary generation. Both
+/// Kubernetes identity tokens are required: a replacement object's update or
+/// recreation turns the delete into a conflict instead of deleting by name.
+pub(crate) fn auxiliary_delete_params(
+    metadata: &ObjectMeta,
+    generation: &str,
+) -> SandboxResult<Option<DeleteParams>> {
+    if metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+        .map(String::as_str)
+        != Some(generation)
+    {
+        return Ok(None);
+    }
+    let uid = metadata.uid.clone().ok_or_else(|| {
+        SandboxError::backend("auxiliary resource is missing UID required for exact delete")
+    })?;
+    let resource_version = metadata.resource_version.clone().ok_or_else(|| {
+        SandboxError::backend(
+            "auxiliary resource is missing resourceVersion required for exact delete",
+        )
+    })?;
+    Ok(Some(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid),
+            resource_version: Some(resource_version),
+        }),
+        ..DeleteParams::default()
+    }))
 }
 
 impl AgentSandboxBackend {
@@ -222,6 +459,7 @@ impl AgentSandboxBackend {
         let status = sandbox_status_from_pod(replicas, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_component(sandbox_component(sandbox))
+            .with_resource_uid(sandbox.metadata.uid.clone())
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox)))
     }
@@ -235,17 +473,187 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("patch sandbox", err))
     }
 
-    async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
+    /// Upgrade a pre-generation Sandbox while it still exists. Only resources
+    /// already owned by this exact CR UID are stamped, so an old controller
+    /// cannot adopt or retire same-name resources precreated for a replacement.
+    async fn ensure_auxiliary_generation(
+        &self,
+        id: &SandboxId,
+        sandbox: crd::Sandbox,
+    ) -> SandboxResult<(crd::Sandbox, String)> {
+        let generation = auxiliary_generation_from_sandbox(&sandbox)?;
+        let sandbox = if sandbox_has_auxiliary_generation(&sandbox) {
+            sandbox
+        } else {
+            let resource_version =
+                sandbox
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .ok_or_else(|| {
+                        SandboxError::backend(
+                            "legacy sandbox is missing resourceVersion required for adoption",
+                        )
+                    })?;
+            let uid = sandbox.metadata.uid.as_deref().ok_or_else(|| {
+                SandboxError::backend("legacy sandbox is missing UID required for adoption")
+            })?;
+            let patch = Patch::Merge(json!({
+                "metadata": {
+                    "uid": uid,
+                    "resourceVersion": resource_version,
+                    "annotations": { AUXILIARY_GENERATION_ANNOTATION: generation },
+                    "labels": { AUXILIARY_GENERATION_LABEL: generation },
+                },
+                "spec": {
+                    "podTemplate": {
+                        "metadata": {
+                            "labels": { AUXILIARY_GENERATION_LABEL: generation },
+                        },
+                    },
+                },
+            }));
+            self.sandboxes()
+                .patch(id.as_str(), &PatchParams::default(), &patch)
+                .await
+                .map_err(|err| map_kube_error("adopt legacy sandbox auxiliary generation", err))?
+        };
+        // Re-run this reconciliation even after the CR was stamped: a prior
+        // CAS conflict may have left one old auxiliary unconverted. Every
+        // pass is ownership- and identity-fenced, so retrying cannot adopt a
+        // replacement resource.
+        let sandbox_pod_isolation_ready = self
+            .adopt_legacy_sandbox_pod(id, &sandbox, &generation)
+            .await?;
+        self.adopt_legacy_iron_proxy_resources(
+            id,
+            &sandbox,
+            &generation,
+            sandbox_pod_isolation_ready,
+        )
+        .await?;
+        self.adopt_legacy_state_pvc(id, &sandbox, &generation)
+            .await?;
+        Ok((sandbox, generation))
+    }
+
+    async fn adopt_legacy_sandbox_pod(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+        generation: &str,
+    ) -> SandboxResult<bool> {
+        let api = self.pods();
+        let pod = match api.get(id.as_str()).await {
+            Ok(pod) => pod,
+            Err(err) if is_not_found(&err) => return Ok(true),
+            Err(err) => return Err(map_kube_error("get legacy sandbox pod", err)),
+        };
+        if pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(AUXILIARY_GENERATION_LABEL))
+            .map(String::as_str)
+            == Some(generation)
+        {
+            return Ok(true);
+        }
+        if !object_is_owned_by_sandbox(&pod.metadata, sandbox) {
+            return Ok(false);
+        }
+        let uid = pod.metadata.uid.as_deref().ok_or_else(|| {
+            SandboxError::backend("legacy sandbox pod is missing UID required for adoption")
+        })?;
+        let resource_version = pod.metadata.resource_version.as_deref().ok_or_else(|| {
+            SandboxError::backend(
+                "legacy sandbox pod is missing resourceVersion required for adoption",
+            )
+        })?;
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "uid": uid,
+                "resourceVersion": resource_version,
+                "labels": { AUXILIARY_GENERATION_LABEL: generation },
+            },
+        }));
+        match api
+            .patch(id.as_str(), &PatchParams::default(), &patch)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(false),
+            Err(err) => Err(map_kube_error("adopt legacy sandbox pod", err)),
+        }
+    }
+
+    async fn adopt_legacy_state_pvc(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+        generation: &str,
+    ) -> SandboxResult<()> {
         if self.config.state_volume.is_none() {
             return Ok(());
         }
-        match self
-            .persistent_volume_claims()
-            .delete(&state_pvc_name(id), &DeleteParams::default())
-            .await
+        let api = self.persistent_volume_claims();
+        let name = state_pvc_name(id);
+        let pvc = match api.get(&name).await {
+            Ok(pvc) => pvc,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get legacy sandbox state pvc", err)),
+        };
+        if !object_is_owned_by_sandbox(&pvc.metadata, sandbox)
+            || pvc
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| {
+                    annotations.contains_key(AUXILIARY_GENERATION_ANNOTATION)
+                })
         {
+            return Ok(());
+        }
+        let resource_version = pvc.metadata.resource_version.as_deref().ok_or_else(|| {
+            SandboxError::backend("legacy sandbox state pvc is missing resourceVersion")
+        })?;
+        let uid = pvc
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| SandboxError::backend("legacy sandbox state pvc is missing UID"))?;
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "uid": uid,
+                "resourceVersion": resource_version,
+                "annotations": { AUXILIARY_GENERATION_ANNOTATION: generation },
+                "labels": { AUXILIARY_GENERATION_LABEL: generation },
+            },
+        }));
+        match api.patch(&name, &PatchParams::default(), &patch).await {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
+            Err(err) => Err(map_kube_error("adopt legacy sandbox state pvc", err)),
+        }
+    }
+
+    async fn delete_state_pvc(&self, id: &SandboxId, generation: &str) -> SandboxResult<()> {
+        if self.config.state_volume.is_none() {
+            return Ok(());
+        }
+        let pvc_api = self.persistent_volume_claims();
+        let name = state_pvc_name(id);
+        let pvc = match pvc_api.get(&name).await {
+            Ok(pvc) => pvc,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get sandbox state pvc for delete", err)),
+        };
+        let Some(params) = auxiliary_delete_params(&pvc.metadata, generation)? else {
+            return Ok(());
+        };
+        match pvc_api.delete(&name, &params).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) || is_conflict(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox state pvc", err)),
         }
     }
@@ -315,19 +723,27 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let id = SandboxId::new(next_sandbox_name());
+        let auxiliary_generation = new_auxiliary_generation();
         let mut spec = spec;
         let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
         }
         if let Err(err) = self
-            .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
+            .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref(), &auxiliary_generation)
             .await
         {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            let _ = self
+                .delete_iron_proxy_resources(&id, &auxiliary_generation)
+                .await;
             return Err(err);
         }
-        let sandbox = build_agent_sandbox(&id, &spec, &self.config)?;
+        let sandbox = build_agent_sandbox_with_generation(
+            &id,
+            &spec,
+            &self.config,
+            Some(&auxiliary_generation),
+        )?;
         let created = match self
             .sandboxes()
             .create(&PostParams::default(), &sandbox)
@@ -335,14 +751,19 @@ impl SandboxBackend for AgentSandboxBackend {
         {
             Ok(created) => created,
             Err(err) => {
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                let _ = self
+                    .delete_iron_proxy_resources(&id, &auxiliary_generation)
+                    .await;
                 return Err(map_kube_error("create sandbox", err));
             }
         };
         // The proxy resources are created before the Sandbox CR (the egress
         // policies must exist before the pod starts), so bind them to it here
         // for cascade deletion. Failure leaves them cleanable by stop() only.
-        if let Err(error) = self.adopt_iron_proxy_resources(&id, &created).await {
+        if let Err(error) = self
+            .adopt_iron_proxy_resources(&id, &created, &auxiliary_generation)
+            .await
+        {
             tracing::warn!(
                 sandbox_id = id.as_str(),
                 %error,
@@ -426,22 +847,55 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
-        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let Some(sandbox) = self.get_sandbox(id).await? else {
+            return Ok(());
+        };
+        let (_, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
         match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
             .await
         {
             Ok(_) => {
-                proxy_result?;
-                self.delete_state_pvc(id).await
+                self.delete_iron_proxy_resources(id, &generation).await?;
+                self.delete_state_pvc(id, &generation).await
             }
             Err(err) if is_not_found(&err) => {
-                proxy_result?;
-                self.delete_state_pvc(id).await
+                self.delete_iron_proxy_resources(id, &generation).await?;
+                self.delete_state_pvc(id, &generation).await
             }
             Err(err) => Err(map_kube_error("delete sandbox", err)),
         }
+    }
+
+    async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if let Some(expected_resource_uid) = expected_resource_uid {
+            let Some(current) = self.get_sandbox(id).await? else {
+                return Ok(());
+            };
+            exact_stop_actions(Some(expected_resource_uid), current.metadata.uid.as_deref())?;
+            let (_, generation) = self.ensure_auxiliary_generation(id, current).await?;
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(expected_resource_uid.to_owned()),
+                    ..Preconditions::default()
+                }),
+                ..DeleteParams::default()
+            };
+            return match self.sandboxes().delete(id.as_str(), &params).await {
+                Ok(_) => {
+                    self.delete_iron_proxy_resources(id, &generation).await?;
+                    self.delete_state_pvc(id, &generation).await
+                }
+                Err(err) if is_not_found(&err) => Ok(()),
+                Err(err) => Err(map_kube_error("delete exact sandbox", err)),
+            };
+        }
+        self.stop(id).await
     }
 
     async fn assign_iron_control_proxy_principal(
@@ -472,17 +926,23 @@ impl SandboxBackend for AgentSandboxBackend {
         // Resume only has the sandbox id, not the spec, so rebind the proxy to
         // the principal recorded at create rather than re-resolving from spec.
         let resolved_iron_proxy = self.resolve_iron_proxy_for_resume(id).await?;
+        let sandbox = self
+            .get_sandbox(id)
+            .await?
+            .ok_or_else(|| SandboxError::backend("sandbox disappeared before proxy resume"))?;
+        let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
         if let Err(err) = self
-            .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
+            .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref(), &generation)
             .await
         {
-            let _ = self.delete_iron_proxy_resources(id).await;
+            let _ = self.delete_iron_proxy_resources(id, &generation).await;
             return Err(err);
         }
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
-        if let Some(sandbox) = self.get_sandbox(id).await?
-            && let Err(error) = self.adopt_iron_proxy_resources(id, &sandbox).await
+        if let Err(error) = self
+            .adopt_iron_proxy_resources(id, &sandbox, &generation)
+            .await
         {
             tracing::warn!(
                 sandbox_id = id.as_str(),
@@ -541,8 +1001,9 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
     if replicas == 0 {
         return SandboxStatus::Suspended;
     }
-    // The backing Pod Ready condition is the attach boundary; phase alone can be Running while
-    // the sandbox is still not ready for I/O.
+    // Readiness is the Codex container's attach boundary. Optional telemetry
+    // must not turn an image pull or credential-projection failure into a
+    // session outage.
     let Some(pod) = pod else {
         return SandboxStatus::Created;
     };
@@ -557,7 +1018,7 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
         .unwrap_or("unknown")
         .to_ascii_lowercase();
     match phase.as_str() {
-        "running" if pod_ready(pod) => SandboxStatus::Running,
+        "running" | "pending" if pod_ready(pod) => SandboxStatus::Running,
         "running" | "pending" => SandboxStatus::Created,
         "succeeded" | "failed" => SandboxStatus::Stopped,
         "unknown" => SandboxStatus::Unknown("unknown".to_owned()),
@@ -568,18 +1029,28 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
 fn pod_ready(pod: &Pod) -> bool {
     pod.status
         .as_ref()
-        .and_then(|status| status.conditions.as_ref())
-        .is_some_and(|conditions| {
-            conditions
+        .and_then(|status| status.container_statuses.as_ref())
+        .is_some_and(|statuses| {
+            statuses
                 .iter()
-                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+                .any(|container| container.name == DEFAULT_CONTAINER_NAME && container.ready)
         })
 }
 
+#[cfg(test)]
 fn build_agent_sandbox(
     id: &SandboxId,
     spec: &SandboxSpec,
     config: &AgentSandboxConfig,
+) -> SandboxResult<crd::Sandbox> {
+    build_agent_sandbox_with_generation(id, spec, config, None)
+}
+
+fn build_agent_sandbox_with_generation(
+    id: &SandboxId,
+    spec: &SandboxSpec,
+    config: &AgentSandboxConfig,
+    auxiliary_generation: Option<&str>,
 ) -> SandboxResult<crd::Sandbox> {
     let mut labels = config.labels.clone();
     labels.extend(spec.labels.clone());
@@ -590,6 +1061,18 @@ fn build_agent_sandbox(
     }
     if spec.capabilities.api_server_enabled {
         labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
+    }
+    let metadata_trace = spec.capabilities.metadata_trace_enabled
+        && spec
+            .labels
+            .get("centaur.ai/harness")
+            .is_some_and(|harness| harness == "codex")
+        && config.metadata_trace_sidecar.is_some();
+    if metadata_trace {
+        labels.insert(METADATA_TRACE_ENABLED_LABEL.to_owned(), "true".to_owned());
+    }
+    if let Some(generation) = auxiliary_generation {
+        labels.insert(AUXILIARY_GENERATION_LABEL.to_owned(), generation.to_owned());
     }
 
     let mut pod_labels = labels.clone();
@@ -642,6 +1125,22 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
+    if metadata_trace {
+        // The consented sidecar is the only trace path for this container.
+        // In particular, do not let generic api-rs OTEL headers overwrite the
+        // loopback-only config the trusted launcher composes at runtime.
+        agent_env.retain(|(name, _)| !name.starts_with("OTEL_"));
+        upsert_env(
+            &mut agent_env,
+            "CENTAUR_CODEX_METADATA_TRACE_ADDRESS_FILE",
+            "/var/run/autorotate-trace/capability/agent/otlp-endpoint".to_owned(),
+        );
+        upsert_env(
+            &mut agent_env,
+            "CENTAUR_CODEX_METADATA_TRACE_WAIT_SECONDS",
+            "5".to_owned(),
+        );
+    }
     insert_optional(
         &mut container,
         "env",
@@ -657,6 +1156,7 @@ fn build_agent_sandbox(
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
     let mut init_containers = Vec::new();
+    let mut sidecars = Vec::new();
     if let Some(state_volume) = &config.state_volume {
         volume_mounts.push(json!({
             "name": "state",
@@ -673,6 +1173,14 @@ fn build_agent_sandbox(
     if repo_cache_tools.is_some() {
         volume_mounts.extend(tools::agent_volume_mounts_json(repo_cache_tools));
         volumes.extend(tools::volumes_json(repo_cache_tools));
+    }
+    if metadata_trace {
+        volume_mounts.push(json!({
+            "name": "metadata-trace-capability",
+            "mountPath": "/var/run/autorotate-trace/capability",
+            "readOnly": true,
+        }));
+        volumes.push(metadata_trace_capability_volume_json());
     }
     insert_optional(
         &mut container,
@@ -701,6 +1209,20 @@ fn build_agent_sandbox(
             clone_proxy.as_ref(),
         ));
     }
+    if metadata_trace {
+        let trace = config
+            .metadata_trace_sidecar
+            .as_ref()
+            .expect("metadata trace sidecar checked above");
+        trace.validate()?;
+        // This is deliberately an ordinary container, not a restartable init
+        // container. A bad trace image or unavailable trace Secret must never
+        // keep the Codex container from starting.
+        sidecars.push(metadata_trace_sidecar_json(trace));
+        volumes.push(metadata_trace_credentials_volume_json(trace));
+        volumes.push(metadata_trace_runtime_volume_json());
+        volumes.push(metadata_trace_spool_volume_json());
+    }
 
     let mut pod_spec = json!({
         "containers": [container],
@@ -708,7 +1230,13 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if repo_cache_tools.is_some() {
+    if !sidecars.is_empty() {
+        let containers = pod_spec["containers"]
+            .as_array_mut()
+            .expect("sandbox containers are an array");
+        containers.append(&mut sidecars);
+    }
+    if repo_cache_tools.is_some() || metadata_trace {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -748,7 +1276,10 @@ fn build_agent_sandbox(
     insert_optional(
         &mut agent_spec,
         "volumeClaimTemplates",
-        config.state_volume.as_ref().map(state_volume_claim_json),
+        config
+            .state_volume
+            .as_ref()
+            .map(|state_volume| state_volume_claim_json(state_volume, auxiliary_generation)),
     );
 
     let mut annotations = config.annotations.clone();
@@ -756,6 +1287,12 @@ fn build_agent_sandbox(
         annotations.insert(
             IRON_CONTROL_PRINCIPAL_ANNOTATION.to_owned(),
             principal.clone(),
+        );
+    }
+    if let Some(generation) = auxiliary_generation {
+        annotations.insert(
+            AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+            generation.to_owned(),
         );
     }
 
@@ -817,7 +1354,97 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!limits.is_empty()).then(|| json!({ "limits": limits }))
 }
 
-fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
+fn metadata_trace_capability_volume_json() -> Value {
+    json!({
+        "name": "metadata-trace-capability",
+        "emptyDir": { "sizeLimit": METADATA_TRACE_CAPABILITY_SIZE_LIMIT },
+    })
+}
+
+fn metadata_trace_runtime_volume_json() -> Value {
+    json!({
+        "name": "metadata-trace-runtime",
+        "emptyDir": { "sizeLimit": METADATA_TRACE_RUNTIME_SIZE_LIMIT },
+    })
+}
+
+fn metadata_trace_spool_volume_json() -> Value {
+    json!({
+        "name": "metadata-trace-spool",
+        "emptyDir": { "sizeLimit": METADATA_TRACE_SPOOL_SIZE_LIMIT },
+    })
+}
+
+fn metadata_trace_credentials_volume_json(config: &MetadataTraceSidecarConfig) -> Value {
+    json!({
+        "name": "metadata-trace-credentials",
+        "projected": {
+            "defaultMode": 384,
+            "sources": [{
+                "secret": {
+                    "name": config.credential_secret_name,
+                    "optional": true,
+                    "items": [
+                        { "key": config.bearer_secret_key, "path": "bearer", "mode": 384 },
+                        { "key": config.pseudonym_key_secret_key, "path": "pseudonym-key", "mode": 384 },
+                    ],
+                },
+            }],
+        },
+    })
+}
+
+fn metadata_trace_sidecar_json(config: &MetadataTraceSidecarConfig) -> Value {
+    json!({
+        "name": "metadata-trace",
+        "image": config.image,
+        "command": ["/bin/sh", "-ec"],
+        "args": [
+            "umask 077\nendpoint=/var/run/autorotate-trace/capability/agent/otlp-endpoint\ncleanup() { rm -f \"$endpoint\"; }\ntrap cleanup EXIT INT TERM\nwhile :; do\n  cleanup\n  if install -d -m 0700 /var/run/autorotate-trace/capability/agent /var/run/autorotate-trace/runtime/agent/credentials /var/run/autorotate-trace/spool && [ -r /var/run/autorotate-trace/source/bearer ] && [ -r /var/run/autorotate-trace/source/pseudonym-key ] && install -m 0600 /var/run/autorotate-trace/source/bearer /var/run/autorotate-trace/runtime/agent/credentials/bearer && install -m 0600 /var/run/autorotate-trace/source/pseudonym-key /var/run/autorotate-trace/runtime/agent/credentials/pseudonym-key; then\n    /usr/local/bin/autorotate-trace-agent || true\n  fi\n  cleanup\n  sleep 5\ndone"
+        ],
+        "env": [
+            { "name": "AUTOROTATE_TRACE_LISTEN", "value": "127.0.0.1:0" },
+            { "name": "AUTOROTATE_TRACE_GATEWAY_URL", "value": config.gateway_url },
+            { "name": "AUTOROTATE_TRACE_SOURCE", "value": "bojack" },
+            { "name": "AUTOROTATE_TRACE_LISTEN_ADDRESS_FILE", "value": "/var/run/autorotate-trace/capability/agent/otlp-endpoint" },
+            { "name": "AUTOROTATE_TRACE_BEARER_TOKEN_FILE", "value": "/var/run/autorotate-trace/runtime/agent/credentials/bearer" },
+            { "name": "AUTOROTATE_TRACE_PSEUDONYM_KEY_FILE", "value": "/var/run/autorotate-trace/runtime/agent/credentials/pseudonym-key" },
+            { "name": "AUTOROTATE_TRACE_SPOOL_DIR", "value": "/var/run/autorotate-trace/spool" },
+        ],
+        "volumeMounts": [
+            { "name": "metadata-trace-capability", "mountPath": "/var/run/autorotate-trace/capability" },
+            { "name": "metadata-trace-runtime", "mountPath": "/var/run/autorotate-trace/runtime" },
+            { "name": "metadata-trace-spool", "mountPath": "/var/run/autorotate-trace/spool" },
+            { "name": "metadata-trace-credentials", "mountPath": "/var/run/autorotate-trace/source", "readOnly": true },
+        ],
+        "securityContext": {
+            "runAsNonRoot": true,
+            "runAsUser": 1001,
+            "runAsGroup": 1001,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": { "drop": ["ALL"] },
+            "seccompProfile": { "type": "RuntimeDefault" },
+        },
+        "resources": {
+            "limits": {
+                "cpu": "100m",
+                "memory": "128Mi",
+                "ephemeral-storage": "128Mi",
+            },
+            "requests": {
+                "cpu": "25m",
+                "memory": "64Mi",
+                "ephemeral-storage": "64Mi",
+            },
+        },
+    })
+}
+
+fn state_volume_claim_json(
+    state_volume: &StateVolumeConfig,
+    auxiliary_generation: Option<&str>,
+) -> Vec<Value> {
     let mut pvc_spec = json!({
         "accessModes": ["ReadWriteOnce"],
         "resources": {
@@ -831,10 +1458,17 @@ fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
         "storageClassName",
         state_volume.storage_class_name.clone(),
     );
+    let mut metadata = json!({"name": "state"});
+    if let Some(generation) = auxiliary_generation {
+        metadata["annotations"] = json!({
+            AUXILIARY_GENERATION_ANNOTATION: generation,
+        });
+        metadata["labels"] = json!({
+            AUXILIARY_GENERATION_LABEL: generation,
+        });
+    }
     vec![json!({
-        "metadata": {
-            "name": "state",
-        },
+        "metadata": metadata,
         "spec": pvc_spec,
     })]
 }
@@ -875,6 +1509,10 @@ fn is_not_found(err: &Error) -> bool {
     matches!(err, Error::Api(api_error) if api_error.code == 404)
 }
 
+pub(crate) fn is_conflict(err: &Error) -> bool {
+    matches!(err, Error::Api(api_error) if api_error.code == 409)
+}
+
 fn map_kube_error(operation: &str, err: Error) -> SandboxError {
     if is_not_found(&err) {
         SandboxError::NotFound(operation.to_owned())
@@ -886,7 +1524,9 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use centaur_sandbox_core::{RepoCacheAccess, ResourceLimits, SandboxCapabilities, SandboxSpec};
-    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateWaiting, ContainerStatus, PodStatus,
+    };
 
     use super::*;
 
@@ -937,6 +1577,7 @@ mod tests {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
         });
         let config = AgentSandboxConfig::new("centaur");
 
@@ -1003,6 +1644,7 @@ mod tests {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: false,
             api_server_enabled: false,
+            metadata_trace_enabled: false,
         });
         let config = AgentSandboxConfig::new("centaur");
 
@@ -1098,6 +1740,7 @@ mod tests {
             repo_cache: RepoCacheAccess::None,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
         });
         let mut tools = ToolsConfig::new("paradigmxyz/centaur", "api:test");
         tools.repo_cache_path = Some("/var/lib/centaur/repos".to_owned());
@@ -1151,6 +1794,210 @@ mod tests {
         );
     }
 
+    fn metadata_trace_config() -> MetadataTraceSidecarConfig {
+        MetadataTraceSidecarConfig::pinned(
+            "https://traces.example:8443".to_owned(),
+            8443,
+            "consumer-trace-credentials".to_owned(),
+            "generation-1".to_owned(),
+            "bearer".to_owned(),
+            "pseudonym_key".to_owned(),
+        )
+    }
+
+    #[test]
+    fn metadata_trace_sidecar_rejects_any_image_other_than_the_reviewed_digest() {
+        let mut config = metadata_trace_config();
+        config.image = "registry.example/trace@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn metadata_trace_secret_generation_changes_the_sandbox_fingerprint() {
+        let config = metadata_trace_config();
+        let fingerprint = config.fingerprint();
+        let mut rotated = config.clone();
+        rotated.credential_secret_version = "generation-2".to_owned();
+
+        assert_ne!(fingerprint, rotated.fingerprint());
+    }
+
+    #[test]
+    fn metadata_trace_sidecar_is_consent_gated_and_credential_is_file_only() {
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .label("centaur.ai/harness", "codex")
+            .env(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "authorization=Bearer not-a-token",
+            )
+            .capabilities(SandboxCapabilities {
+                repo_cache: RepoCacheAccess::All,
+                observability_enabled: true,
+                api_server_enabled: true,
+                metadata_trace_enabled: true,
+            });
+        let mut config = AgentSandboxConfig::new("centaur");
+        config.metadata_trace_sidecar = Some(metadata_trace_config());
+
+        let pod = serde_json::to_value(
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap(),
+        )
+        .unwrap();
+        let rendered = pod.to_string();
+        let sidecar = &pod["spec"]["podTemplate"]["spec"]["containers"][1];
+
+        assert_eq!(sidecar["command"], json!(["/bin/sh", "-ec"]));
+        let launcher = sidecar["args"][0].as_str().unwrap();
+        assert!(launcher.contains("install -d -m 0700"));
+        assert!(launcher.contains("install -m 0600"));
+        assert!(launcher.contains("while :; do"));
+        assert!(launcher.contains("cleanup() { rm -f"));
+        assert!(launcher.contains("/usr/local/bin/autorotate-trace-agent || true"));
+        assert!(sidecar.get("restartPolicy").is_none());
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(sidecar["securityContext"]["readOnlyRootFilesystem"], true);
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"]["drop"],
+            json!(["ALL"])
+        );
+        assert_eq!(sidecar["resources"]["limits"]["cpu"], "100m");
+        assert_eq!(sidecar["resources"]["limits"]["memory"], "128Mi");
+        assert_eq!(sidecar["resources"]["limits"]["ephemeral-storage"], "128Mi");
+        assert_eq!(
+            pod["spec"]["podTemplate"]["spec"]["automountServiceAccountToken"],
+            false
+        );
+        assert_eq!(
+            pod["spec"]["podTemplate"]["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|volume| volume["name"] == "metadata-trace-credentials")
+                .unwrap()["projected"]["sources"][0]["secret"]["items"],
+            json!([
+                { "key": "bearer", "path": "bearer", "mode": 384 },
+                { "key": "pseudonym_key", "path": "pseudonym-key", "mode": 384 },
+            ])
+        );
+        assert_eq!(
+            pod["spec"]["podTemplate"]["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|volume| volume["name"] == "metadata-trace-credentials")
+                .unwrap()["projected"]["sources"][0]["secret"]["optional"],
+            true
+        );
+        for (name, size_limit) in [
+            ("metadata-trace-capability", "1Mi"),
+            ("metadata-trace-runtime", "4Mi"),
+            ("metadata-trace-spool", "64Mi"),
+        ] {
+            assert_eq!(
+                pod["spec"]["podTemplate"]["spec"]["volumes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|volume| volume["name"] == name)
+                    .unwrap()["emptyDir"]["sizeLimit"],
+                size_limit
+            );
+        }
+        for name in [
+            "AUTOROTATE_TRACE_LISTEN_ADDRESS_FILE",
+            "AUTOROTATE_TRACE_BEARER_TOKEN_FILE",
+            "AUTOROTATE_TRACE_PSEUDONYM_KEY_FILE",
+            "AUTOROTATE_TRACE_SPOOL_DIR",
+        ] {
+            assert!(
+                sidecar["env"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|env| env["name"] == name)
+            );
+        }
+        assert!(rendered.contains("\"defaultMode\":384"));
+        assert!(!rendered.contains("not-a-token"));
+        assert!(!rendered.contains("OTEL_EXPORTER_OTLP_HEADERS"));
+        let agent_env = &pod["spec"]["podTemplate"]["spec"]["containers"][0]["env"];
+        assert!(
+            agent_env
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|env| env["name"] == "CENTAUR_CODEX_METADATA_TRACE_ADDRESS_FILE")
+        );
+        assert!(agent_env.as_array().unwrap().iter().all(|env| {
+            !env["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("OTEL_")
+        }));
+        assert!(
+            sidecar["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == "metadata-trace-credentials"),
+            "only the trace sidecar receives the projected credential volume"
+        );
+        assert!(
+            pod["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .is_none_or(|mounts| mounts
+                    .iter()
+                    .all(|mount| mount["name"] != "metadata-trace-credentials")),
+            "the agent container must never receive trace credentials"
+        );
+    }
+
+    #[test]
+    fn metadata_trace_sidecar_never_attaches_to_non_codex_or_revoked_sandboxes() {
+        let mut config = AgentSandboxConfig::new("centaur");
+        config.metadata_trace_sidecar = Some(metadata_trace_config());
+        for (harness, enabled) in [("claude-code", true), ("codex", false)] {
+            let spec = SandboxSpec::new("centaur-agent:latest")
+                .label("centaur.ai/harness", harness)
+                .capabilities(SandboxCapabilities {
+                    repo_cache: RepoCacheAccess::All,
+                    observability_enabled: true,
+                    api_server_enabled: true,
+                    metadata_trace_enabled: enabled,
+                });
+            let sandbox =
+                build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+            let pod = serde_json::to_value(sandbox).unwrap();
+            assert!(
+                pod["spec"]["podTemplate"]["spec"]["initContainers"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
+            );
+            assert!(
+                pod["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                    .as_array()
+                    .is_none_or(|env| env.iter().all(|entry| {
+                        entry["name"] != "CENTAUR_CODEX_METADATA_TRACE_ADDRESS_FILE"
+                    }))
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_trace_gateway_is_an_https_origin_with_the_rendered_port() {
+        let mut config = metadata_trace_config();
+        assert!(config.validate().is_ok());
+        config.gateway_url = "https://traces.example:8443/v1".to_owned();
+        assert!(config.validate().is_err());
+        config.gateway_url = "https://traces.example:443".to_owned();
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn maps_agent_sandbox_replicas_and_pod_readiness_to_status() {
         let ready_pod = pod_with_phase_and_ready("Running", true);
@@ -1170,6 +2017,40 @@ mod tests {
         );
         assert_eq!(sandbox_status_from_pod(1, None), SandboxStatus::Created);
 
+        let trace_unavailable_pod = Pod {
+            status: Some(PodStatus {
+                // Kubernetes keeps Pod phase Pending while a second regular
+                // container is in ImagePullBackOff, even after the Codex
+                // container has started and is attachable.
+                phase: Some("Pending".to_owned()),
+                container_statuses: Some(vec![
+                    ContainerStatus {
+                        name: DEFAULT_CONTAINER_NAME.to_owned(),
+                        ready: true,
+                        ..ContainerStatus::default()
+                    },
+                    ContainerStatus {
+                        name: "metadata-trace".to_owned(),
+                        ready: false,
+                        state: Some(ContainerState {
+                            waiting: Some(ContainerStateWaiting {
+                                reason: Some("ImagePullBackOff".to_owned()),
+                                ..ContainerStateWaiting::default()
+                            }),
+                            ..ContainerState::default()
+                        }),
+                        ..ContainerStatus::default()
+                    },
+                ]),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        };
+        assert_eq!(
+            sandbox_status_from_pod(1, Some(&trace_unavailable_pod)),
+            SandboxStatus::Running
+        );
+
         let failed_pod = pod_with_phase_and_ready("Failed", false);
         assert_eq!(
             sandbox_status_from_pod(1, Some(&failed_pod)),
@@ -1185,14 +2066,200 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_and_state_claim_share_the_auxiliary_generation() {
+        let config = AgentSandboxConfig::new("test")
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "1Gi"));
+        let sandbox = build_agent_sandbox_with_generation(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test"),
+            &config,
+            Some("generation-test"),
+        )
+        .unwrap();
+        assert_eq!(
+            sandbox
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+                .map(String::as_str),
+            Some("generation-test")
+        );
+        let value = serde_json::to_value(sandbox).unwrap();
+        assert_eq!(
+            value["spec"]["volumeClaimTemplates"][0]["metadata"]["annotations"]
+                [AUXILIARY_GENERATION_ANNOTATION],
+            "generation-test"
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["metadata"]["labels"][AUXILIARY_GENERATION_LABEL],
+            "generation-test"
+        );
+        assert_eq!(
+            value["spec"]["volumeClaimTemplates"][0]["metadata"]["labels"]
+                [AUXILIARY_GENERATION_LABEL],
+            "generation-test"
+        );
+    }
+
+    #[test]
+    fn legacy_sandbox_generation_is_uid_derived_and_requires_exact_ownership() {
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test"),
+            &AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+        sandbox.metadata.uid = Some("sandbox-legacy-uid".to_owned());
+        sandbox.metadata.annotations = None;
+        assert_eq!(
+            auxiliary_generation_from_sandbox(&sandbox).unwrap(),
+            "legacy-sandbox-legacy-uid"
+        );
+        let owned = ObjectMeta {
+            owner_references: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "agents.x-k8s.io/v1alpha1".to_owned(),
+                    kind: "Sandbox".to_owned(),
+                    name: "asbx-test".to_owned(),
+                    uid: "sandbox-legacy-uid".to_owned(),
+                    ..Default::default()
+                },
+            ]),
+            ..ObjectMeta::default()
+        };
+        assert!(object_is_owned_by_sandbox(&owned, &sandbox));
+        let mut replacement = sandbox.clone();
+        replacement.metadata.uid = Some("sandbox-replacement-uid".to_owned());
+        assert!(!object_is_owned_by_sandbox(&owned, &replacement));
+    }
+
+    #[test]
+    fn exact_stop_uid_aba_fences_proxy_and_pvc_cleanup_order() {
+        let mut calls = vec!["observe"];
+        let conflict = exact_stop_actions(Some("uid-old"), Some("uid-replacement"));
+        assert!(conflict.is_err());
+        assert_eq!(
+            calls,
+            vec!["observe"],
+            "UID conflict touches no auxiliaries"
+        );
+
+        calls.extend(
+            exact_stop_actions(Some("uid-old"), Some("uid-old"))
+                .unwrap()
+                .iter()
+                .map(|action| match action {
+                    ExactStopAction::DeleteSandbox => "delete-sandbox",
+                    ExactStopAction::DeleteProxy => "delete-proxy",
+                    ExactStopAction::DeleteStatePvc => "delete-pvc",
+                }),
+        );
+        assert_eq!(
+            calls,
+            vec!["observe", "delete-sandbox", "delete-proxy", "delete-pvc"]
+        );
+    }
+
+    fn auxiliary_metadata(generation: &str, uid: &str, resource_version: &str) -> ObjectMeta {
+        ObjectMeta {
+            annotations: Some(BTreeMap::from([(
+                AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                generation.to_owned(),
+            )])),
+            uid: Some(uid.to_owned()),
+            resource_version: Some(resource_version.to_owned()),
+            ..ObjectMeta::default()
+        }
+    }
+
+    #[test]
+    fn accepted_exact_delete_cannot_clean_replacement_auxiliaries_or_mapping() {
+        let old_generation = "generation-old";
+        let replacement_generation = "generation-replacement";
+        let accepted = exact_stop_actions(Some("sandbox-old"), Some("sandbox-old")).unwrap();
+        assert_eq!(accepted[0], ExactStopAction::DeleteSandbox);
+        let old = [
+            auxiliary_metadata(old_generation, "proxy-old", "1"),
+            auxiliary_metadata(old_generation, "service-old", "2"),
+            auxiliary_metadata(old_generation, "policy-old", "3"),
+            auxiliary_metadata(old_generation, "pvc-old", "4"),
+        ];
+        let replacement = [
+            auxiliary_metadata(replacement_generation, "proxy-new", "11"),
+            auxiliary_metadata(replacement_generation, "service-new", "12"),
+            auxiliary_metadata(replacement_generation, "policy-new", "13"),
+            auxiliary_metadata(replacement_generation, "pvc-new", "14"),
+        ];
+        let mut mappings = HashMap::from([(
+            "asbx-test".to_owned(),
+            ProxyMapping {
+                generation: replacement_generation.to_owned(),
+                proxy_id: "proxy-replacement".to_owned(),
+            },
+        )]);
+
+        // The old CR's UID-preconditioned delete has already been accepted.
+        // Before cleanup runs, the next assignment precreates same-name
+        // auxiliaries and replaces the recoverable iron-control mapping.
+        assert!(old.iter().all(|metadata| {
+            auxiliary_delete_params(metadata, old_generation)
+                .unwrap()
+                .is_some()
+        }));
+        assert!(replacement.iter().all(|metadata| {
+            auxiliary_delete_params(metadata, old_generation)
+                .unwrap()
+                .is_none()
+        }));
+        assert!(
+            remove_proxy_mapping_if_generation(&mut mappings, "asbx-test", old_generation,)
+                .is_none()
+        );
+        assert_eq!(
+            mappings.get("asbx-test").unwrap().proxy_id,
+            "proxy-replacement"
+        );
+
+        let mut calls = Vec::new();
+        for (name, metadata) in [
+            ("proxy", &old[0]),
+            ("service", &old[1]),
+            ("network-policy", &old[2]),
+            ("pvc", &old[3]),
+        ] {
+            let params = auxiliary_delete_params(metadata, old_generation)
+                .unwrap()
+                .unwrap();
+            let preconditions = params.preconditions.unwrap();
+            assert_eq!(preconditions.uid, metadata.uid);
+            assert_eq!(preconditions.resource_version, metadata.resource_version);
+            calls.push(name);
+        }
+        let mut old_mapping = HashMap::from([(
+            "asbx-test".to_owned(),
+            ProxyMapping {
+                generation: old_generation.to_owned(),
+                proxy_id: "proxy-old".to_owned(),
+            },
+        )]);
+        assert!(
+            remove_proxy_mapping_if_generation(&mut old_mapping, "asbx-test", old_generation)
+                .is_some()
+        );
+        assert!(old_mapping.is_empty());
+        assert_eq!(calls, ["proxy", "service", "network-policy", "pvc"]);
+    }
+
     fn pod_with_phase_and_ready(phase: &str, ready: bool) -> Pod {
         Pod {
             status: Some(PodStatus {
                 phase: Some(phase.to_owned()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_owned(),
-                    status: if ready { "True" } else { "False" }.to_owned(),
-                    ..PodCondition::default()
+                container_statuses: Some(vec![ContainerStatus {
+                    name: DEFAULT_CONTAINER_NAME.to_owned(),
+                    ready,
+                    ..ContainerStatus::default()
                 }]),
                 ..PodStatus::default()
             }),

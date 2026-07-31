@@ -1,3 +1,6 @@
+{{- if and .Values.sandbox.metadataTrace.enabled (not .Values.networkPolicy.enabled) }}
+{{- fail "networkPolicy.enabled must be true when sandbox.metadataTrace.enabled" }}
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 {{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
@@ -295,6 +298,44 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.networkPolicy.otlpEgress.port }}
+---
+{{- end }}
+{{- if .Values.sandbox.metadataTrace.enabled }}
+{{- if not .Values.networkPolicy.metadataTraceEgress.enabled }}
+{{- fail "networkPolicy.metadataTraceEgress.enabled must be true when sandbox.metadataTrace.enabled" }}
+{{- end }}
+{{- if not .Values.networkPolicy.metadataTraceEgress.gatewayCidrs }}
+{{- fail "networkPolicy.metadataTraceEgress.gatewayCidrs must contain the trace gateway IPBlock when sandbox.metadataTrace.enabled" }}
+{{- end }}
+{{- range $cidr := .Values.networkPolicy.metadataTraceEgress.gatewayCidrs }}
+{{- if or (regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[01])$" $cidr) (regexMatch "^[0-9A-Fa-f:]+/([0-9]|[1-5][0-9]|6[0-3])$" $cidr) }}
+{{- fail (printf "networkPolicy.metadataTraceEgress.gatewayCidrs entry %q is too broad; use an IPv4 /32 or IPv6 /64+ gateway CIDR because NetworkPolicy applies pod-wide" $cidr) }}
+{{- end }}
+{{- end }}
+# The trace sidecar is selected only for consented Codex sandboxes. NetworkPolicy
+# cannot express a hostname allowlist, so this is intentionally an explicit,
+# deployment-supplied HTTPS IPBlock rather than a broad port-443 allowance.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-metadata-trace-egress
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/metadata-trace-enabled: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+{{- range $cidr := .Values.networkPolicy.metadataTraceEgress.gatewayCidrs }}
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ required "sandbox.metadataTrace.gatewayPort is required when sandbox.metadataTrace.enabled" .Values.sandbox.metadataTrace.gatewayPort }}
 ---
 {{- end }}
 apiVersion: networking.k8s.io/v1

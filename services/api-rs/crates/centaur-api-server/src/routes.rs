@@ -18,7 +18,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -30,9 +30,9 @@ use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::{ChatDestination, HarnessType, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
-    thread_trace_id, thread_trace_parent_span_id,
+    SessionRuntimeError, thread_trace_id, thread_trace_parent_span_id,
 };
-use centaur_session_sqlx::PgSessionStore;
+use centaur_session_sqlx::{MetadataTraceConsent, PgSessionStore, SessionStoreError};
 use centaur_telemetry::{
     PrometheusHandle, http_status_class, prometheus_handle, record_http_request_finished,
     record_http_request_started, set_span_parent_trace,
@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -72,6 +73,7 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     codex_nanocodex_rollout_percent: u8,
+    slack_trace_consent_bearer_secret: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -87,12 +89,22 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             codex_nanocodex_rollout_percent: 0,
+            slack_trace_consent_bearer_secret: None,
         }
     }
 
     pub fn with_codex_nanocodex_rollout_percent(mut self, percent: u8) -> Self {
         self.codex_nanocodex_rollout_percent = percent;
         self
+    }
+
+    pub fn with_slack_trace_consent_bearer_secret(mut self, secret: Option<String>) -> Self {
+        self.slack_trace_consent_bearer_secret = secret.map(Arc::<str>::from);
+        self
+    }
+
+    fn slack_trace_consent_bearer_secret(&self) -> Option<Arc<str>> {
+        self.slack_trace_consent_bearer_secret.clone()
     }
 
     pub fn ready(runtime: SessionRuntime, workflows: Option<WorkflowRuntime>) -> Self {
@@ -171,6 +183,7 @@ impl AppState {
 }
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
+const MAX_SLACK_TRACE_CONSENT_DURATION: TimeDuration = TimeDuration::hours(24);
 const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -209,6 +222,12 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/personas", get(list_personas))
+        .route(
+            "/api/v1/slack_trace_consents/{workspace_id}/{user_id}",
+            get(get_slack_trace_consent)
+                .put(put_slack_trace_consent)
+                .delete(delete_slack_trace_consent),
+        )
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route(
             "/.well-known/oauth-protected-resource",
@@ -353,6 +372,195 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[derive(Deserialize)]
+struct SlackTraceConsentRequest {
+    data: SlackTraceConsentInput,
+}
+
+#[derive(Deserialize)]
+struct SlackTraceConsentInput {
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct SlackTraceConsentEnvelope {
+    data: MetadataTraceConsent,
+}
+
+async fn get_slack_trace_consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, user_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    authorize_slack_trace_consent(&headers, &state)?;
+    validate_slack_trace_subject(&workspace_id, &user_id)?;
+    let consent = state
+        .runtime()?
+        .slack_trace_consent(&workspace_id, &user_id)
+        .await?;
+    Ok(slack_trace_consent_response(consent))
+}
+
+async fn put_slack_trace_consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, user_id)): Path<(String, String)>,
+    Json(request): Json<SlackTraceConsentRequest>,
+) -> Result<Response, ApiError> {
+    authorize_slack_trace_consent(&headers, &state)?;
+    validate_slack_trace_subject(&workspace_id, &user_id)?;
+    let now = OffsetDateTime::now_utc();
+    if request.data.expires_at <= now
+        || request.data.expires_at > now + MAX_SLACK_TRACE_CONSENT_DURATION
+    {
+        return Err(ApiError::BadRequest(
+            "expires_at must be in the future and within 24 hours".to_owned(),
+        ));
+    }
+    let consent = state
+        .runtime()?
+        .set_slack_trace_consent(
+            &workspace_id,
+            &user_id,
+            request.data.expires_at,
+            trace_consent_idempotency(&headers, format!("PUT:{}", request.data.expires_at))?,
+        )
+        .await
+        .map_err(trace_consent_runtime_error)?;
+    Ok(slack_trace_consent_response(consent))
+}
+
+async fn delete_slack_trace_consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, user_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    authorize_slack_trace_consent(&headers, &state)?;
+    validate_slack_trace_subject(&workspace_id, &user_id)?;
+    let consent = state
+        .runtime()?
+        .revoke_slack_trace_consent(
+            &workspace_id,
+            &user_id,
+            trace_consent_idempotency(&headers, "DELETE".to_owned())?,
+        )
+        .await
+        .map_err(trace_consent_runtime_error)?;
+    Ok(slack_trace_consent_response(consent))
+}
+
+fn authorize_slack_trace_consent(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    if slackbot_bearer_is_exact(headers, state) {
+        return Ok(());
+    }
+    if state.slack_trace_consent_bearer_secret().is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "Slack trace consent is not configured".to_owned(),
+        ));
+    }
+    Err(ApiError::Unauthorized("invalid bearer token".to_owned()))
+}
+
+/// Trace actors are only meaningful when Slackbot already verified the Slack
+/// event and authenticated this server-to-server request. Other callers keep
+/// their ordinary channel/session metadata but cannot select trace consent.
+fn trace_actor_metadata_for_request(
+    metadata: Option<Value>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<Value> {
+    if slackbot_bearer_is_exact(headers, state) {
+        return metadata;
+    }
+    let mut metadata = metadata?;
+    if let Value::Object(values) = &mut metadata {
+        values.remove("slack_actor_team_id");
+        values.remove("slack_actor_user_id");
+    }
+    Some(metadata)
+}
+
+fn slackbot_bearer_is_exact(headers: &HeaderMap, state: &AppState) -> bool {
+    let Some(secret) = state.slack_trace_consent_bearer_secret() else {
+        return false;
+    };
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    authorization.is_some_and(|token| bool::from(token.as_bytes().ct_eq(secret.as_bytes())))
+}
+
+fn trace_consent_idempotency(
+    headers: &HeaderMap,
+    request: String,
+) -> Result<Option<(&str, String)>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("Idempotency-Key must be valid ASCII".to_owned()))?
+        .trim();
+    if key.is_empty() || key.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "Idempotency-Key must be between 1 and 128 bytes".to_owned(),
+        ));
+    }
+    let digest = Sha256::digest(request.as_bytes());
+    Ok(Some((
+        key,
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    )))
+}
+
+fn validate_slack_trace_subject(workspace_id: &str, user_id: &str) -> Result<(), ApiError> {
+    if slack_id_matches(workspace_id, b'T')
+        && (slack_id_matches(user_id, b'U') || slack_id_matches(user_id, b'W'))
+    {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(
+        "workspace_id must be a Slack team ID and user_id must be a Slack member ID".to_owned(),
+    ))
+}
+
+fn slack_id_matches(value: &str, prefix: u8) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() > 1
+        && bytes[0] == prefix
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn slack_trace_consent_response(consent: MetadataTraceConsent) -> Response {
+    let mut response = Json(SlackTraceConsentEnvelope { data: consent }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn trace_consent_runtime_error(error: SessionRuntimeError) -> ApiError {
+    match error {
+        SessionRuntimeError::Store(SessionStoreError::MetadataTraceIdempotencyConflict) => {
+            ApiError::Conflict(
+                "Idempotency-Key was already used for a different trace consent request".to_owned(),
+            )
+        }
+        SessionRuntimeError::Store(SessionStoreError::MetadataTraceDrainPending) => {
+            ApiError::Locked(
+                "trace consent is disabled while the prior sandbox drain is pending; retry later"
+                    .to_owned(),
+            )
+        }
+        error => ApiError::Runtime(error),
+    }
+}
+
 async fn healthz(headers: HeaderMap) -> Json<Value> {
     let mut body = json!({"ok": true});
     if let Some(token) = bearer_jwt_from_headers(&headers) {
@@ -440,6 +648,7 @@ fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
 
 async fn create_or_get_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
@@ -492,7 +701,10 @@ async fn create_or_get_session(
             &thread_key,
             &harness_type,
             request.persona_id.as_deref(),
-            session_metadata_with_harness_assignment(request.metadata, harness_assignment.as_ref()),
+            session_metadata_with_harness_assignment(
+                trace_actor_metadata_for_request(request.metadata, &headers, &state),
+                harness_assignment.as_ref(),
+            ),
             on_harness_conflict,
         )
         .await?;
@@ -649,6 +861,40 @@ mod harness_rollout_tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn trace_actor_metadata_requires_the_exact_slackbot_bearer() {
+        let metadata = || {
+            Some(json!({
+                "slack_team_id": "T_CHANNEL",
+                "slack_user_id": "U_CHANNEL",
+                "slack_actor_team_id": "T_ACTOR",
+                "slack_actor_user_id": "U_ACTOR"
+            }))
+        };
+        let state = AppState::unready()
+            .with_slack_trace_consent_bearer_secret(Some("exact-slackbot-key".to_owned()));
+
+        for headers in [HeaderMap::new(), {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, "Bearer wrong-key".parse().unwrap());
+            headers
+        }] {
+            let sanitized = trace_actor_metadata_for_request(metadata(), &headers, &state).unwrap();
+            assert_eq!(sanitized.get("slack_team_id"), Some(&json!("T_CHANNEL")));
+            assert!(sanitized.get("slack_actor_team_id").is_none());
+            assert!(sanitized.get("slack_actor_user_id").is_none());
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer exact-slackbot-key".parse().unwrap(),
+        );
+        let trusted = trace_actor_metadata_for_request(metadata(), &headers, &state).unwrap();
+        assert_eq!(trusted.get("slack_actor_team_id"), Some(&json!("T_ACTOR")));
+        assert_eq!(trusted.get("slack_actor_user_id"), Some(&json!("U_ACTOR")));
+    }
 }
 
 async fn get_session_context(
@@ -754,13 +1000,24 @@ async fn list_personas(
 
 async fn append_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let messages = request
+        .messages
+        .into_iter()
+        .map(|mut message| {
+            message.metadata =
+                trace_actor_metadata_for_request(Some(message.metadata), &headers, &state)
+                    .unwrap_or_else(|| json!({}));
+            message
+        })
+        .collect::<Vec<_>>();
     let message_ids = state
         .runtime()?
-        .append_messages(&thread_key, &request.messages)
+        .append_messages(&thread_key, &messages)
         .await?;
     Ok(Json(AppendMessagesResponse {
         ok: true,
@@ -770,6 +1027,7 @@ async fn append_messages(
 
 async fn execute_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
@@ -780,7 +1038,7 @@ async fn execute_session(
             &thread_key,
             ExecuteSessionInput {
                 idempotency_key: request.idempotency_key,
-                metadata: request.metadata,
+                metadata: trace_actor_metadata_for_request(request.metadata, &headers, &state),
                 input_lines: request.input_lines,
                 idle_timeout_ms: request.idle_timeout_ms,
                 max_duration_ms: request.max_duration_ms,
@@ -797,6 +1055,7 @@ async fn execute_session(
 
 async fn interrupt_session_execution(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<InterruptSessionExecutionRequest>,
 ) -> Result<Json<InterruptSessionExecutionResponse>, ApiError> {
@@ -809,7 +1068,11 @@ async fn interrupt_session_execution(
         .unwrap_or("Interrupted from Slack");
     let outcome = state
         .runtime()?
-        .interrupt_active_execution(&thread_key, reason)
+        .interrupt_active_execution(
+            &thread_key,
+            reason,
+            trace_actor_metadata_for_request(request.metadata, &headers, &state).as_ref(),
+        )
         .await?;
     Ok(Json(InterruptSessionExecutionResponse {
         ok: true,
@@ -4170,5 +4433,23 @@ mod webhook_tests {
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn trace_consent_idempotency_conflict_is_stable_409() {
+        let response = trace_consent_runtime_error(SessionRuntimeError::Store(
+            SessionStoreError::MetadataTraceIdempotencyConflict,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn trace_consent_drain_pending_is_retryable_423() {
+        let response = trace_consent_runtime_error(SessionRuntimeError::Store(
+            SessionStoreError::MetadataTraceDrainPending,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::LOCKED);
     }
 }

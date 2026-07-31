@@ -5112,6 +5112,40 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
   })
+
+  it('interrupts a Slack Connect execution with the external actor identity', async () => {
+    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'] })
+    const externalStop = await postUserMessage(`<@${BOT_USER_ID}> stop`)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-external-stop',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          user_team: 'TEXTERNAL',
+          ts: externalStop.ts,
+          text: `<@${BOT_USER_ID}> stop`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.interrupts).toEqual([
+      {
+        body: {
+          metadata: { slack_actor_team_id: 'TEXTERNAL', slack_actor_user_id: USER_ID },
+          reason: `Interrupted from Slack by ${USER_ID}`
+        },
+        threadKey: threadKey(externalStop.ts)
+      }
+    ])
+  })
 })
 
 function createTestBot(
@@ -5496,6 +5530,14 @@ type MockSessionEventRequest = {
   threadKey: string
 }
 
+type MockSessionInterruptRequest = {
+  body: {
+    metadata?: Record<string, unknown>
+    reason: string
+  }
+  threadKey: string
+}
+
 type MockSessionEvent = {
   data: string
   event: string
@@ -5530,6 +5572,7 @@ type MockSessionApi = {
     cohort: string
     rollout_percent: number
   }
+  interrupts: MockSessionInterruptRequest[]
   resolvedHarnessType?: string
   reset(): void
   streamCount: number
@@ -5543,6 +5586,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
+  const interrupts: MockSessionInterruptRequest[] = []
   const idempotentExecutions = new Map<string, string>()
   const streams = new Set<ServerResponse>()
   const workflowEvents: MockWorkflowEventRequest[] = []
@@ -5567,6 +5611,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       events,
       eventRequests,
       executes,
+      interrupts,
       get autoRespond() {
         return autoRespond
       },
@@ -5617,12 +5662,14 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     creates,
     eventRequests,
     executes,
+    interrupts,
     reset() {
       appends.length = 0
       creates.length = 0
       eventRequests.length = 0
       events.length = 0
       executes.length = 0
+      interrupts.length = 0
       idempotentExecutions.clear()
       executeHoldRelease?.()
       executeHold = null
@@ -5735,6 +5782,7 @@ async function handleMockCodexRequest(
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
     executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
+    interrupts: MockSessionInterruptRequest[]
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
@@ -5757,7 +5805,7 @@ async function handleMockCodexRequest(
     await sendWebResponse(res, Response.json({ ok: true }))
     return
   }
-  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
+  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events|interrupt))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))
     return
@@ -5823,6 +5871,16 @@ async function handleMockCodexRequest(
     const body = (await request.json()) as SlackbotV2AppendMessagesRequest
     input.appends.push({ threadKey, body })
     await sendWebResponse(res, Response.json({ ok: true, message_ids: body.messages.map((_, index) => `msg-${index + 1}`) }))
+    return
+  }
+
+  if (endpoint === 'interrupt') {
+    const body = (await request.json()) as MockSessionInterruptRequest['body']
+    input.interrupts.push({ threadKey, body })
+    await sendWebResponse(
+      res,
+      Response.json({ execution_id: 'exe-interrupted', interrupted: true, thread_key: threadKey })
+    )
     return
   }
 

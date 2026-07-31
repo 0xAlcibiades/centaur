@@ -90,6 +90,45 @@ Optional required-by-mode variables:
 | `SLACK_BOT_TOKEN` | Explicit `secretKeyRef` from `secretManager.existingSecretName`. | Slack Web API access for api-rs Slack proxy and workflow Slack helpers. |
 | `OPENAI_API_KEY` | Secret mounted into api-rs, or `apiRs.extraEnv` for local/dev overrides. | OpenAI credential for activity summaries; the feature stays disabled when no key is present. |
 | `SESSION_ACTIVITY_SUMMARY_MODEL` | `apiRs.activitySummary.model`, default `gpt-5.4-nano`. | Model used for the short live activity sentence. |
+| `sandbox.metadataTrace.*` | Helm values, default disabled. | Makes the reviewed Autorotate digest-pinned metadata-only trace sidecar available to principals explicitly granted `sandbox_metadata_trace_enabled`. `configGeneration` is required and must increase monotonically for each deployment trace configuration change, including disabling a previous rollout; a disabled generation retires stale traced replicas independently of the derived fingerprint. The image digest is fixed in the API-RS binary, so a deployment cannot substitute a mutable tag or an operator-supplied source claim. The gateway must be an HTTPS origin and `gatewayPort` is rendered into the matching NetworkPolicy rule. Credentials are copied as mode-0600 files into a sidecar-only volume, and `networkPolicy.metadataTraceEgress.gatewayCidrs` must contain the gateway IP ranges. This path does not forward control-plane OTEL headers or alter sandbox authentication. |
+
+### Consented Codex metadata tracing
+
+This optional path is metadata-only: the sidecar reduces the pinned Codex OTLP
+contract to a closed schema before its retry spool or gateway. Prompts,
+assistant output, tool or connector names, arguments, results, raw IDs,
+provider URLs, request IDs, headers, and error text are discarded. It is not a
+generic OTLP route and must not be enabled by supplying `OTEL_*` values.
+
+1. Configure `sandbox.metadataTrace.enabled`, its HTTPS gateway origin and
+   credential Secret, then enable `networkPolicy.metadataTraceEgress` with the
+   gateway's complete current IP CIDRs. The policy selects every consented
+   sandbox pod, so its CIDRs are pod-wide egress authority rather than a
+   per-request hostname rule. Include every address the gateway may use before
+   enabling the feature; Kubernetes `NetworkPolicy` cannot enforce DNS names.
+2. Grant the principal capability
+   `sandbox_metadata_trace_enabled`. This only permits a Codex sandbox to
+   receive the sidecar; Claude and other harnesses do not receive it.
+3. Grant that sidecar credential an active, `metadata`-scoped gateway consent
+   with an explicit expiry. Both the principal capability and current gateway
+   consent are required. A denied, revoked, expired, malformed, or unreachable
+   consent response leaves intake disabled and removes the loopback capability.
+4. Revoke either gate to stop future intake: remove the principal capability
+   for new sandboxes, and revoke the gateway consent to fence a running
+   sidecar. Confirm the gateway reports no new batches before deleting any
+   incident evidence.
+
+Rotate the trace bearer and pseudonymization-key Secret as one credential
+generation. Update the gateway's corresponding credential/consent first, then
+roll the affected sandboxes so the sidecar receives fresh mode-0600 files; do
+not place either value in `sandbox.extraEnv` or an `auth.json` file. Keep the
+old gateway credential only for the planned overlap, then revoke it. The
+sidecar's local spool is bounded (8 MiB and 24 hours by default), private, and
+contains normalized metadata only. Temporary gateway failures retain bounded
+entries for retry. `401`/`403`, consent revocation/expiry, corrupt spool state,
+or an unavailable sidecar fail closed for tracing and fail open for Codex work:
+Codex authentication and normal execution continue, with no fallback upload to
+generic OTLP.
 
 Sandbox lifecycle:
 

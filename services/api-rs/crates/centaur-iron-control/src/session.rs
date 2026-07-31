@@ -17,6 +17,69 @@ use crate::principal::{
     derive_principal_with_slack_team, is_direct_message, slack_conversation_id,
 };
 
+/// Authenticated Slack actor used exclusively for trace consent. It is kept
+/// separate from the channel principal, which continues to own tool and proxy
+/// permissions for the session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlackTraceSubject {
+    workspace_id: String,
+    user_id: String,
+}
+
+impl SlackTraceSubject {
+    pub fn from_parts(workspace_id: &str, user_id: &str) -> Self {
+        Self {
+            workspace_id: workspace_id.to_owned(),
+            user_id: user_id.to_owned(),
+        }
+    }
+    /// Only Slack executions carrying both stable workspace and actor ids can
+    /// opt into tracing. Missing/blank metadata is an opt-out, never a fallback
+    /// to a channel or previous actor.
+    pub fn from_execution_metadata(thread_key: &str, metadata: Option<&Value>) -> Option<Self> {
+        if !thread_key.starts_with("slack:") {
+            return None;
+        }
+        let metadata = metadata?;
+        let workspace_id = metadata
+            .get("slack_actor_team_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let user_id = metadata
+            .get("slack_actor_user_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        Some(Self {
+            workspace_id: workspace_id.to_owned(),
+            user_id: user_id.to_owned(),
+        })
+    }
+
+    pub fn principal_foreign_id(&self) -> String {
+        derive_principal_with_slack_team(
+            &format!("slack:{}:D0:trace", self.workspace_id),
+            Some(&self.user_id),
+            Some(&self.workspace_id),
+            None,
+        )
+        .foreign_id
+    }
+
+    pub fn stable_key(&self) -> String {
+        format!("{}:{}", self.workspace_id, self.user_id)
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SessionPrincipalMetadata<'a> {
     actor_user_id: Option<&'a str>,
@@ -256,6 +319,47 @@ mod tests {
             })))
             .slack_user_email,
             Some("ada@example.com")
+        );
+    }
+
+    #[test]
+    fn slack_trace_subject_requires_actor_team_and_user() {
+        let subject = SlackTraceSubject::from_execution_metadata(
+            "slack:T123:C456:123.4",
+            Some(&json!({
+                "slack_actor_team_id": " T123 ",
+                "slack_actor_user_id": " U1 "
+            })),
+        )
+        .expect("subject");
+        assert_eq!(subject.stable_key(), "T123:U1");
+        assert_eq!(subject.principal_foreign_id(), "slack-user-t123-u1");
+        assert!(
+            SlackTraceSubject::from_execution_metadata(
+                "slack:T123:C456:123.4",
+                Some(&json!({ "slack_actor_team_id": "T123" })),
+            )
+            .is_none()
+        );
+        assert!(
+            SlackTraceSubject::from_execution_metadata(
+                "web:123",
+                Some(&json!({
+                    "slack_actor_team_id": "T123",
+                    "slack_actor_user_id": "U1"
+                })),
+            )
+            .is_none()
+        );
+        assert!(
+            SlackTraceSubject::from_execution_metadata(
+                "slack:T123:C456:123.4",
+                Some(&json!({
+                    "slack_team_id": "T123",
+                    "slack_user_id": "U1"
+                })),
+            )
+            .is_none()
         );
     }
 

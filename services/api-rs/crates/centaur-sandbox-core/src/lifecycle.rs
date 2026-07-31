@@ -96,6 +96,9 @@ pub struct ObservedSandbox {
     pub id: SandboxId,
     /// Name of the backend that produced the observation.
     pub backend: String,
+    /// Backend resource UID observed for this sandbox, when the backend has a
+    /// stable object identity distinct from its human-readable name.
+    pub resource_uid: Option<String>,
     /// Current portable lifecycle status.
     pub status: SandboxStatus,
     /// Backend-owned diagnostic reason for the observed status.
@@ -118,6 +121,7 @@ impl ObservedSandbox {
         Self {
             id: id.into(),
             backend: backend.into(),
+            resource_uid: None,
             status,
             reason: None,
             component: None,
@@ -133,6 +137,11 @@ impl ObservedSandbox {
 
     pub fn with_component(mut self, component: Option<String>) -> Self {
         self.component = component;
+        self
+    }
+
+    pub fn with_resource_uid(mut self, resource_uid: Option<String>) -> Self {
+        self.resource_uid = resource_uid;
         self
     }
 

@@ -26,7 +26,8 @@ async fn main() -> Result<(), ServerError> {
     );
 
     let app_state = AppState::unready()
-        .with_codex_nanocodex_rollout_percent(args.codex_nanocodex_rollout_percent());
+        .with_codex_nanocodex_rollout_percent(args.codex_nanocodex_rollout_percent())
+        .with_slack_trace_consent_bearer_secret(args.slack_trace_consent_bearer_secret());
     let app = build_router_with_app_state(app_state.clone());
     let shutdown_state = app_state.clone();
     let drain_timeout = args.shutdown_execution_drain_timeout();
@@ -75,9 +76,19 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         tokio::spawn(worker.run());
     }
     let pool = store.pool().clone();
+    let metadata_trace_config = args.metadata_trace_config_identity()?;
+    let should_run_metadata_trace_reconciler =
+        metadata_trace_reconciler_runs(metadata_trace_config.as_ref());
+    if let Some(identity) = metadata_trace_config.as_ref() {
+        // Fail before readiness if this replica is stale or split-brain. A
+        // config fingerprint is not an ordering mechanism; the deployment
+        // generation is the only activation fence.
+        store.activate_metadata_trace_config(identity).await?;
+    }
     let sandbox_runtime = args.sandbox_runtime().await?;
     let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime)
-        .with_openai_session_title_generator_from_env();
+        .with_openai_session_title_generator_from_env()
+        .with_metadata_trace_config(metadata_trace_config);
     let mut warm_pool_bootstrap_principal = None;
     let mut workflow_host_principal = None;
     let mut workflow_principal_registrar = None;
@@ -87,6 +98,12 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         workflow_host_principal = Some(iron_control.workflow_host_principal);
         workflow_principal_registrar = Some(iron_control.workflow_principal_registrar);
         runtime = runtime.with_iron_control(iron_control.registrar);
+    }
+    // Trace revocation, expiry, and disabled-generation retirement are
+    // durable session concerns. They must keep running in deployments that do
+    // not configure the optional credential-control plane.
+    if should_run_metadata_trace_reconciler {
+        runtime = runtime.with_sandbox_capability_reconciler();
     }
     runtime = runtime.with_personas(args.persona_registry()?);
     let sandbox_capacity_config = args.sandbox_capacity_config();
@@ -135,6 +152,14 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
 
 fn init_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+fn metadata_trace_reconciler_runs(
+    config: Option<&centaur_session_sqlx::MetadataTraceConfigIdentity>,
+) -> bool {
+    // A disabled config still fences a prior enabled generation, so this must
+    // depend on identity presence rather than the enabled bit or Iron Control.
+    config.is_some()
 }
 
 /// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal Kubernetes
@@ -205,4 +230,22 @@ pub(crate) enum ServerError {
     IronProxySourceAuthSecretCollision,
     #[error("{0}")]
     UnsupportedConfig(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use centaur_session_sqlx::MetadataTraceConfigIdentity;
+
+    use super::metadata_trace_reconciler_runs;
+
+    #[test]
+    fn trace_reconciler_starts_without_iron_control_for_disabled_identity() {
+        let disabled = MetadataTraceConfigIdentity {
+            generation: 7,
+            fingerprint: "disabled-generation".to_owned(),
+            enabled: false,
+        };
+        assert!(metadata_trace_reconciler_runs(Some(&disabled)));
+        assert!(!metadata_trace_reconciler_runs(None));
+    }
 }

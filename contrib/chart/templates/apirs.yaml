@@ -419,6 +419,27 @@ spec:
               value: {{ .Values.sandbox.codexAuthMode | quote }}
             - name: CLAUDE_CODE_AUTH_MODE
               value: {{ .Values.sandbox.claudeCodeAuthMode | quote }}
+            # This durable fence is required in both enabled and disabled
+            # states. A disabled generation retires traced sandboxes created
+            # by an older rollout before any replica can accept new work.
+            - name: SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION
+              value: {{ required "sandbox.metadataTrace.configGeneration is required even when metadata tracing is disabled; increase it to retire a prior trace configuration" .Values.sandbox.metadataTrace.configGeneration | quote }}
+{{- if .Values.sandbox.metadataTrace.enabled }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_ENABLED
+              value: "true"
+            - name: SESSION_SANDBOX_METADATA_TRACE_GATEWAY_URL
+              value: {{ required "sandbox.metadataTrace.gatewayUrl is required when metadata tracing is enabled" .Values.sandbox.metadataTrace.gatewayUrl | quote }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_GATEWAY_PORT
+              value: {{ .Values.sandbox.metadataTrace.gatewayPort | quote }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_NAME
+              value: {{ required "sandbox.metadataTrace.credentialSecretName is required when metadata tracing is enabled" .Values.sandbox.metadataTrace.credentialSecretName | quote }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_VERSION
+              value: {{ required "sandbox.metadataTrace.credentialSecretVersion is required when metadata tracing is enabled; change it whenever the referenced Secret is rotated" .Values.sandbox.metadataTrace.credentialSecretVersion | quote }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_BEARER_SECRET_KEY
+              value: {{ .Values.sandbox.metadataTrace.bearerSecretKey | quote }}
+            - name: SESSION_SANDBOX_METADATA_TRACE_PSEUDONYM_KEY_SECRET_KEY
+              value: {{ .Values.sandbox.metadataTrace.pseudonymKeySecretKey | quote }}
+{{- end }}
             # Which harness's auth fragment iron-proxy registers (and therefore
             # which placeholder credential lands in the sandbox env). Must agree
             # with the harness the sandbox image CMD actually runs.
@@ -455,6 +476,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
+            # This is intentionally the same narrowly scoped ingress secret
+            # Slackbot uses to call api-rs; it is never forwarded to console.
+            - name: SLACKBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
 {{- end }}
 {{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
 {{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}

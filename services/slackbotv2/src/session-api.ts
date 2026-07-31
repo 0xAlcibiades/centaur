@@ -621,11 +621,12 @@ export async function openSessionEventStream(
 export async function interruptSessionExecution(
   options: SlackbotV2Options,
   threadId: string,
-  reason: string
+  reason: string,
+  metadata: JsonObject = {}
 ): Promise<SlackbotV2InterruptSessionResponse> {
   return recordSessionApiOperation(
     'interrupt_session',
-    () => postInterruptSessionExecution(options, threadId, reason),
+    () => postInterruptSessionExecution(options, threadId, reason, metadata),
     sessionApiTimeoutMs(options),
     'interrupt session'
   )
@@ -1374,7 +1375,8 @@ async function executeSession(
 async function postInterruptSessionExecution(
   options: SlackbotV2Options,
   threadId: string,
-  reason: string
+  reason: string,
+  metadata: JsonObject
 ): Promise<SlackbotV2InterruptSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const response = await fetchWithTimeout(
@@ -1383,7 +1385,7 @@ async function postInterruptSessionExecution(
     {
       method: 'POST',
       headers: apiHeaders(options),
-      body: JSON.stringify({ reason })
+      body: JSON.stringify({ reason, metadata })
     },
     sessionApiTimeoutMs(options),
     'interrupt session'

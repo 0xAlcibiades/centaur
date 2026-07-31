@@ -239,6 +239,16 @@ where
         .await
     }
 
+    pub async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        self.backend.stop_exact(id, expected_resource_uid).await?;
+        self.store.set(id.clone(), DesiredSandboxState::Stopped);
+        Ok(())
+    }
+
     pub async fn assign_iron_control_proxy_principal(
         &self,
         id: &SandboxId,
