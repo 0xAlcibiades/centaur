@@ -3130,7 +3130,7 @@ impl PgSessionStore {
             where session.thread_key = $1
               and execution.thread_key = session.thread_key
               and execution.stdout_owner_lease_expires_at > clock_timestamp()
-            returning session.thread_key, session.title, session.sandbox_id, session.sandbox_repo_cache_enabled, session.sandbox_repo_cache_access, session.sandbox_observability_enabled, session.sandbox_api_server_enabled, session.harness_type, session.harness_thread_id, session.persona_id, session.status, session.iron_control_principal, session.proxy_labels, session.sandbox_last_active_at, session.created_at, session.updated_at
+            returning session.thread_key, session.title, session.sandbox_id, session.sandbox_repo_cache_enabled, session.sandbox_repo_cache_access, session.sandbox_observability_enabled, session.sandbox_api_server_enabled, session.sandbox_metadata_trace_enabled, session.sandbox_metadata_trace_expires_at, session.sandbox_metadata_trace_subject_hash, session.sandbox_metadata_trace_consent_revision, session.sandbox_metadata_trace_config_fingerprint, session.sandbox_metadata_trace_config_generation, session.harness_type, session.harness_thread_id, session.persona_id, session.status, session.iron_control_principal, session.proxy_labels, session.sandbox_last_active_at, session.created_at, session.updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -5705,6 +5705,19 @@ mod tests {
         let new_owner_id = format!("owner-new-{}", Uuid::new_v4().simple());
         let (thread_key, execution_id) =
             running_execution_with_stdout_owner(&store, "harness-thread", &old_owner_id).await;
+        let trace_capabilities = SandboxCapabilities {
+            metadata_trace_enabled: true,
+            metadata_trace_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(1)),
+            metadata_trace_subject_hash: Some("stdout-owner-subject".to_owned()),
+            metadata_trace_consent_revision: Some(1),
+            metadata_trace_config_fingerprint: Some("stdout-owner-config".to_owned()),
+            metadata_trace_config_generation: Some(1),
+            ..SandboxCapabilities::default_enabled()
+        };
+        store
+            .update_sandbox_assignment(&thread_key, "sbx-stdout-owner", &trace_capabilities)
+            .await
+            .expect("persist trace assignment");
 
         let root_a = store
             .update_harness_thread_id_if_stdout_owner(
@@ -5717,6 +5730,7 @@ mod tests {
             .expect("active owner persists root")
             .expect("active owner owns the root write");
         assert_eq!(root_a.harness_thread_id.as_deref(), Some("root-a"));
+        assert_eq!(root_a.sandbox_capabilities, Some(trace_capabilities));
 
         expire_stdout_owner(&store, &execution_id).await;
         assert!(
