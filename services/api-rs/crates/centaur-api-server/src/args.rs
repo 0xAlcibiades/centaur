@@ -2564,12 +2564,17 @@ mod tests {
 
     #[test]
     fn absent_metadata_trace_configuration_does_not_require_a_generation() {
-        let args = Args::try_parse_from([
+        let mut args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
         ])
         .unwrap();
+        // The test runner may provide the production deployment environment.
+        // Exercise the absent-input state directly instead of depending on
+        // process-global environment inherited by this test binary.
+        args.sandbox.metadata_trace_enabled = false;
+        args.sandbox.metadata_trace_config_generation = None;
         assert!(args.metadata_trace_config_identity().unwrap().is_none());
     }
 
