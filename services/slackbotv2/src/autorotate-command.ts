@@ -40,13 +40,17 @@ const ACCOUNT_FIELDS = [
   'limits_observed_at',
   'primary',
   'secondary',
+  'reset_credits',
   'next_available_at'
 ] as const
+const REQUIRED_ACCOUNT_FIELDS = ACCOUNT_FIELDS.filter(field => field !== 'reset_credits')
 const RATE_LIMIT_FIELDS = [
   'used_percent',
   'resets_at',
   'window_minutes'
 ] as const
+const RESET_CREDITS_FIELDS = ['available_count', 'credits'] as const
+const RESET_CREDIT_FIELDS = ['expires_at'] as const
 const ENROLLMENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/
 const SLACK_MEMBER_ID_PATTERN = /^[UW][A-Z0-9]+$/i
 const SLACK_TEAM_ID_PATTERN = /^T[A-Z0-9]+$/i
@@ -90,6 +94,7 @@ type AutorotateAccount = {
   next_available_at: string | null
   primary: RateLimitWindow | null
   reconciliation_required: boolean
+  reset_credits: ResetCredits | null
   secondary: RateLimitWindow | null
   unusable_reason: AccountUnusableReason | null
 }
@@ -107,6 +112,15 @@ type RateLimitWindow = {
   resets_at: string | null
   used_percent: number
   window_minutes: number | null
+}
+
+type ResetCredit = {
+  expires_at: string | null
+}
+
+type ResetCredits = {
+  available_count: number
+  credits: ResetCredit[]
 }
 
 type ActiveEnrollmentState = 'starting' | 'monitoring' | 'cancel_requested' | 'cancelling'
@@ -856,6 +870,7 @@ function formatStatus(accounts: readonly AutorotateAccount[]): string {
       `  state: ${state}`,
       `  reason: ${accountReason(account)}`,
       ...rateLimitRows(account),
+      ...resetCreditRows(account.reset_credits),
       `  observed: ${limitsObservedAt(account)}`,
       `  next available: ${nextAvailable(account)}`
     ].join('\n')
@@ -986,8 +1001,25 @@ function formatPercent(value: number): string {
   return `${Object.is(value, -0) ? '0' : String(value)}%`
 }
 
+function resetCreditRows(resetCredits: ResetCredits | null): string[] {
+  if (!resetCredits) return ['  reset credits: unknown']
+  const missingExpiryCount = resetCredits.available_count - resetCredits.credits.length
+  return [
+    `  reset credits: ${resetCredits.available_count} available`,
+    ...resetCredits.credits.map((credit, index) => {
+      const expiry = credit.expires_at
+        ? `expires ${formatUtcTimestamp(credit.expires_at)}`
+        : 'does not expire'
+      return `    reset ${index + 1}: ${expiry}`
+    }),
+    ...(missingExpiryCount > 0
+      ? [`    expiry unavailable for ${missingExpiryCount} ${missingExpiryCount === 1 ? 'credit' : 'credits'}`]
+      : [])
+  ]
+}
+
 function limitsObservedAt(account: AutorotateAccount): string {
-  if (!account.primary && !account.secondary) return 'unknown'
+  if (!account.primary && !account.secondary && !account.reset_credits) return 'unknown'
   return account.limits_observed_at
     ? formatUtcTimestamp(account.limits_observed_at)
     : 'unknown'
@@ -1185,10 +1217,11 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
   const unusableReason = payload.unusable_reason
   const limitsObservedAt = payload.limits_observed_at
   const primary = validateRateLimitWindow(payload.primary)
+  const resetCredits = validateResetCredits(payload.reset_credits)
   const secondary = validateRateLimitWindow(payload.secondary)
   const nextAvailableAt = payload.next_available_at
   if (
-    !ACCOUNT_FIELDS.every(field => Object.hasOwn(payload, field))
+    !REQUIRED_ACCOUNT_FIELDS.every(field => Object.hasOwn(payload, field))
     || !safeAccountLabel(label)
     || (email !== null && !safeEmail(email))
     || !isAccountStatus(status)
@@ -1221,6 +1254,7 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
     next_available_at: nextAvailableAt,
     primary,
     reconciliation_required: reconciliationRequired,
+    reset_credits: resetCredits,
     secondary,
     unusable_reason: unusableReason
   }
@@ -1231,7 +1265,10 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
 }
 
 function validAccountState(account: AutorotateAccount): boolean {
-  if ((account.primary || account.secondary) && !account.limits_observed_at) return false
+  if (
+    (account.primary || account.secondary || account.reset_credits)
+    && !account.limits_observed_at
+  ) return false
   switch (account.availability) {
     case 'available':
       return account.status === 'enabled'
@@ -1305,6 +1342,46 @@ function validateRateLimitWindow(value: unknown): RateLimitWindow | null {
     resets_at: resetsAt,
     used_percent: usedPercent,
     window_minutes: windowMinutes as number | null
+  }
+}
+
+function validateResetCredits(value: unknown): ResetCredits | null {
+  if (value === undefined || value === null) return null
+  if (!isJsonObject(value)) {
+    throw new AutorotateError('Autorotate returned invalid reset credits')
+  }
+  const payload = selectFields(value, RESET_CREDITS_FIELDS)
+  const availableCount = payload.available_count
+  const credits = payload.credits
+  if (
+    typeof availableCount !== 'number'
+    || !Number.isSafeInteger(availableCount)
+    || availableCount < 0
+    || !Array.isArray(credits)
+    || credits.length > availableCount
+  ) {
+    throw new AutorotateError('Autorotate returned invalid reset credits')
+  }
+  return {
+    available_count: availableCount,
+    credits: credits.map(validateResetCredit)
+  }
+}
+
+function validateResetCredit(value: unknown): ResetCredit {
+  if (!isJsonObject(value)) {
+    throw new AutorotateError('Autorotate returned invalid reset credit')
+  }
+  const payload = selectFields(value, RESET_CREDIT_FIELDS)
+  const expiresAt = payload.expires_at
+  if (
+    !Object.hasOwn(payload, 'expires_at')
+    || (expiresAt !== null && !safeTimestamp(expiresAt))
+  ) {
+    throw new AutorotateError('Autorotate returned invalid reset credit')
+  }
+  return {
+    expires_at: expiresAt as string | null
   }
 }
 

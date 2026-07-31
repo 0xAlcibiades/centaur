@@ -569,6 +569,106 @@ describe('Autorotate Slack command', () => {
     expect(slackText).not.toContain('refresh_token')
   })
 
+  it('renders reset-credit counts and every provider expiry detail', async () => {
+    const responses: string[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/accounts')) {
+        return Response.json({
+          accounts: [
+            operatorAccount({
+              label: 'complete-credits',
+              email: 'complete@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              reset_credits: {
+                available_count: 2,
+                credits: [
+                  { expires_at: '2026-08-03T05:45:00Z' },
+                  { expires_at: null }
+                ]
+              }
+            }),
+            operatorAccount({
+              label: 'partial-credits',
+              email: 'partial@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              reset_credits: {
+                available_count: 3,
+                credits: [{ expires_at: '2026-08-04T05:45:00Z' }]
+              }
+            }),
+            operatorAccount({
+              label: 'zero-credits',
+              email: 'zero@example.test',
+              limits_observed_at: '2026-07-30T00:00:00Z',
+              reset_credits: {
+                available_count: 0,
+                credits: []
+              }
+            }),
+            operatorAccount({
+              label: 'unknown-credits',
+              email: 'unknown@example.test'
+            }),
+            operatorAccount({
+              label: 'null-credits',
+              email: 'null@example.test',
+              reset_credits: null
+            })
+          ]
+        })
+      }
+      if (url === RESPONSE_URL && init?.body) {
+        responses.push((JSON.parse(String(init.body)) as { text: string }).text)
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('status'))
+
+    const slackText = responses.at(-1) ?? ''
+    expect(slackText).toContain('reset credits: 2 available')
+    expect(slackText).toContain('reset 1: expires 2026-08-03 05:45 UTC')
+    expect(slackText).toContain('reset 2: does not expire')
+    expect(slackText).toContain('reset credits: 3 available')
+    expect(slackText).toContain('expiry unavailable for 2 credits')
+    expect(slackText).toContain('reset credits: 0 available')
+    expect(slackText.match(/reset credits: unknown/g)).toHaveLength(2)
+  })
+
+  it('rejects malformed reset-credit counts and expiry details', async () => {
+    const invalidResetCredits = [
+      { available_count: -1, credits: [] },
+      { available_count: 0.5, credits: [] },
+      { available_count: 0, credits: [{ expires_at: null }] },
+      { available_count: 1, credits: [{ expires_at: 'not-a-time' }] }
+    ]
+
+    for (const resetCredits of invalidResetCredits) {
+      let slackText = ''
+      const handler = testHandler(async (input, init) => {
+        const url = String(input)
+        if (url.endsWith('/v1/operator/accounts')) {
+          return Response.json({
+            accounts: [
+              operatorAccount({
+                limits_observed_at: '2026-07-30T00:00:00Z',
+                reset_credits: resetCredits
+              })
+            ]
+          })
+        }
+        if (url === RESPONSE_URL && init?.body) {
+          slackText = (JSON.parse(String(init.body)) as { text: string }).text
+        }
+        return new Response('', { status: 200 })
+      })
+
+      await handleAndWait(handler, commandRequest('status'))
+      expect(slackText).toBe('Codex account status is temporarily unavailable.')
+    }
+  })
+
   it('keeps 5h and weekly quota rows distinct when only one window is known', async () => {
     const responses: string[] = []
     const handler = testHandler(async (input, init) => {
