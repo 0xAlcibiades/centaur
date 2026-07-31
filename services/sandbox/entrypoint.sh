@@ -362,7 +362,6 @@ PYEOF
         echo "metadata trace sidecar unavailable; continuing without trace export" >&2
         return 0
     fi
-
     CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" CODEX_TRACE_ENDPOINT="$endpoint" python3 - <<'PYEOF'
 import os
 from pathlib import Path
@@ -399,7 +398,12 @@ except ModuleNotFoundError:
             return "\n".join(lines) + ("\n" if lines else "")
 
 path = Path(os.environ["CODEX_CONFIG_PATH"])
-endpoint = os.environ["CODEX_TRACE_ENDPOINT"]
+# Codex 0.146 configures OTLP/HTTP at the signal endpoint, whereas the
+# capability is deliberately published as its base URL. Normalize both current
+# and already signal-scoped capabilities without a duplicate path.
+endpoint = os.environ["CODEX_TRACE_ENDPOINT"].rstrip("/")
+if not endpoint.endswith("/v1/traces"):
+    endpoint = f"{endpoint}/v1/traces"
 config = tomllib.loads(path.read_text())
 config.pop("otel", None)
 config["otel"] = {

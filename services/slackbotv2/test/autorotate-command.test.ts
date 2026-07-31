@@ -603,7 +603,16 @@ describe('Autorotate Slack command', () => {
     expect(body.text).toContain('/autorotate login')
     expect(body.text).toContain('/autorotate trace status')
     expect(body.text).toContain('/autorotate trace on [duration]')
+    expect(body.text).toContain('/autorotate trace confirm [duration]')
     expect(body.text).toContain('/autorotate trace off')
+    expect(body.text).toContain('default: 1h; max: 24h')
+    expect(body.text).toContain('source, Codex version, pseudonymous execution/thread/account IDs')
+    expect(body.text).toContain('transport kind/outcome/status class')
+    expect(body.text).not.toContain('model')
+    expect(body.text).toContain('never prompts, responses, tool arguments, or tool output')
+    expect(body.text).toContain('Only SSH-key holders can read traces')
+    expect(body.text).toContain('Producer spool: 24h; archive: 30d; snapshots can survive up to 45d')
+    expect(body.text).toContain('Revoking or expiry fences future intake; it does not delete retained data')
     expect(body.text).not.toContain('/autorotate accounts')
     expect(body.text).not.toContain('/autorotate add')
     expect(body.text).not.toContain('/autorotate relogin')
@@ -633,7 +642,7 @@ describe('Autorotate Slack command', () => {
     expect(response.headers.get('cache-control')).toBe('no-store')
     expect(await response.json()).toEqual({
       response_type: 'ephemeral',
-      text: 'Slack trace collection is off. When enabled, it collects only metadata, never message content.'
+      text: 'Trace consent is durably off: its input fence rejects new trace data and no exact sandbox drain is pending.'
     })
     expect(calls.some(call => call.url === RESPONSE_URL)).toBe(false)
     expect(calls).toContainEqual({
@@ -642,7 +651,23 @@ describe('Autorotate Slack command', () => {
     })
   })
 
-  it('enables trace metadata collection for at most 24 hours and reports expiry ephemerally', async () => {
+  it('reviews trace consent before activation without calling the API', async () => {
+    const handler = testHandler(async () => {
+      throw new Error('trace review must not call the API')
+    })
+
+    const response = await handleAndWait(handler, commandRequest('trace on 90m'))
+    const body = await response.json() as { response_type: string; text: string }
+
+    expect(body.response_type).toBe('ephemeral')
+    expect(body.text).toContain('Trace consent is still off')
+    expect(body.text).toContain('for 90m')
+    expect(body.text).toContain('Codex version')
+    expect(body.text).toContain('transport kind/outcome/status class')
+    expect(body.text).toContain('`/autorotate trace confirm 90m`')
+  })
+
+  it('enables confirmed trace metadata collection for at most 24 hours and reports expiry ephemerally', async () => {
     const calls: FetchCall[] = []
     const handler = testHandler(async (input, init) => {
       const url = String(input)
@@ -663,12 +688,19 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    const response = await handleAndWait(handler, commandRequest('trace on 90m'))
+    const response = await handleAndWait(handler, commandRequest('trace confirm 90m'))
 
-    expect(await response.json()).toEqual({
-      response_type: 'ephemeral',
-      text: expect.stringContaining('Slack trace collection is on until')
-    })
+    const body = await response.json() as { response_type: string; text: string }
+    expect(body.response_type).toBe('ephemeral')
+    expect(body.text).toContain('Slack trace collection is on until')
+    expect(body.text).toContain('it expires automatically')
+    expect(body.text).toContain('source, Codex version, pseudonymous execution/thread/account IDs')
+    expect(body.text).toContain('transport kind/outcome/status class')
+    expect(body.text).not.toContain('model')
+    expect(body.text).toContain('Never prompts, responses, tool arguments, or tool output')
+    expect(body.text).toContain('Only SSH-key holders can read traces')
+    expect(body.text).toContain('Producer spool: 24h; archive: 30d; snapshots can survive up to 45d')
+    expect(body.text).toContain('Revoking or expiry fences future intake; it does not delete retained data')
     const upstream = calls.find(call => call.url.includes('/api/v1/slack_trace_consents/'))
     expect(upstream?.method).toBe('PUT')
   })
@@ -689,7 +721,7 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    await handleAndWait(handler, commandRequest('trace on'))
+    await handleAndWait(handler, commandRequest('trace confirm'))
   })
 
   it('rejects invalid trace duration and target selectors before calling the API', async () => {
@@ -699,7 +731,7 @@ describe('Autorotate Slack command', () => {
       return new Response('', { status: 200 })
     })
 
-    for (const command of ['trace on 25h', `trace off ${OTHER_USER_ID}`]) {
+    for (const command of ['trace on 25h', 'trace confirm 25h', `trace off ${OTHER_USER_ID}`]) {
       const response = await handleAndWait(handler, commandRequest(command))
       expect(await response.json()).toMatchObject({ text: expect.stringContaining('Autorotate commands') })
     }
@@ -742,7 +774,7 @@ describe('Autorotate Slack command', () => {
     const response = await responsePromise
     expect(await response?.json()).toEqual({
       response_type: 'ephemeral',
-      text: 'Slack trace collection is off. When enabled, it collects only metadata, never message content.'
+      text: 'Trace consent is durably off: its input fence rejects new trace data and no exact sandbox drain is pending.'
     })
   })
 
@@ -758,7 +790,7 @@ describe('Autorotate Slack command', () => {
     const response = await handleAndWait(handler, commandRequest('trace off'))
 
     expect(await response.json()).toMatchObject({
-      text: 'Slack trace collection was revoked, but the Kubernetes drain is pending. Check `/autorotate trace status`.'
+      text: 'Trace consent is durably off: its input fence rejects new trace data. An exact sandbox drain is pending, so its sidecar is not yet confirmed gone. Check `/autorotate trace status`.'
     })
   })
 
@@ -773,7 +805,7 @@ describe('Autorotate Slack command', () => {
     const response = await handleAndWait(handler, commandRequest('trace status'))
 
     expect(await response.json()).toMatchObject({
-      text: 'Slack trace collection was revoked, but the Kubernetes drain is pending. Check `/autorotate trace status`.'
+      text: 'Trace consent is durably off: its input fence rejects new trace data. An exact sandbox drain is pending, so its sidecar is not yet confirmed gone. Check `/autorotate trace status`.'
     })
   })
 
@@ -887,7 +919,7 @@ describe('Autorotate Slack command', () => {
 
     expect(await response.json()).toEqual({
       response_type: 'ephemeral',
-      text: 'Slack trace collection is off. When enabled, it collects only metadata, never message content.'
+      text: 'Trace consent is durably off: its input fence rejects new trace data and no exact sandbox drain is pending.'
     })
     expect(calls).toHaveLength(1)
     expect(calls[0]).toMatchObject({ method: 'DELETE' })
@@ -905,8 +937,8 @@ describe('Autorotate Slack command', () => {
     })
     const timestamp = Math.floor(Date.now() / 1000) - 10
 
-    await handleAndWait(handler, commandRequest('trace on 90m', { timestamp }))
-    await handleAndWait(handler, commandRequest('trace on 90m', { timestamp }))
+    await handleAndWait(handler, commandRequest('trace confirm 90m', { timestamp }))
+    await handleAndWait(handler, commandRequest('trace confirm 90m', { timestamp }))
 
     expect(expiries).toHaveLength(2)
     expect(expiries[0]).toBe(new Date(timestamp * 1000 + 90 * 60_000).toISOString())
@@ -922,7 +954,7 @@ describe('Autorotate Slack command', () => {
     })
 
     const response = await handleAndWait(handler, commandRequest('trace status'))
-    expect(await response.json()).toMatchObject({ text: expect.stringContaining('Slack trace collection is off') })
+    expect(await response.json()).toMatchObject({ text: expect.stringContaining('Trace consent is durably off') })
   })
 
   it('returns account status through the operator token', async () => {

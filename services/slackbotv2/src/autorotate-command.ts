@@ -675,6 +675,9 @@ export function createAutorotateSlackCommandHandler(
       const owner = `slack:${teamId}:${userId}`
       if (command.kind === 'help') return ephemeralResponse(helpText())
       if (isTraceCommand(command)) {
+        if (command.kind === 'trace_on_preview') {
+          return ephemeralResponse(traceConsentPreview(command.durationMs))
+        }
         if (command.kind === 'trace_off') {
           try {
             return ephemeralResponse(formatTraceConsent(await traceClient.disable(
@@ -937,7 +940,7 @@ async function traceConsentResponse(input: {
           new Date(input.requestTimestampSeconds * 1000 + input.command.durationMs).toISOString()
         )
       : unreachableTraceCommand(input.command)
-  return formatTraceConsent(consent)
+  return formatTraceConsent(consent, input.command.kind === 'trace_on')
 }
 
 function unreachableTraceCommand(command: never): never {
@@ -1323,13 +1326,15 @@ type ParsedCommand =
   | { kind: 'maintenance_drain' }
   | { kind: 'maintenance_resume' }
   | { kind: 'trace_off' }
+  | { kind: 'trace_on_preview', durationMs: number }
   | { kind: 'trace_on', durationMs: number }
   | { kind: 'trace_status' }
 
-type TraceCommand = Extract<ParsedCommand, { kind: 'trace_off' | 'trace_on' | 'trace_status' }>
+type TraceCommand = Extract<ParsedCommand, { kind: 'trace_off' | 'trace_on_preview' | 'trace_on' | 'trace_status' }>
 
 function isTraceCommand(command: ParsedCommand): command is TraceCommand {
   return command.kind === 'trace_off'
+    || command.kind === 'trace_on_preview'
     || command.kind === 'trace_on'
     || command.kind === 'trace_status'
 }
@@ -1360,11 +1365,15 @@ function parseCommand(text: string): ParsedCommand {
     const action = parts[1]?.toLowerCase()
     if (parts.length === 2 && action === 'status') return { kind: 'trace_status' }
     if (parts.length === 2 && action === 'off') return { kind: 'trace_off' }
-    if (action === 'on' && (parts.length === 2 || parts.length === 3)) {
+    if ((action === 'on' || action === 'confirm') && (parts.length === 2 || parts.length === 3)) {
       const durationMs = parts.length === 2
         ? DEFAULT_TRACE_CONSENT_LIFETIME_MS
         : parseTraceConsentDuration(parts[2] ?? '')
-      if (durationMs !== null) return { kind: 'trace_on', durationMs }
+      if (durationMs !== null) {
+        return action === 'on'
+          ? { kind: 'trace_on_preview', durationMs }
+          : { kind: 'trace_on', durationMs }
+      }
     }
     return { kind: 'help' }
   }
@@ -1390,8 +1399,11 @@ function helpText(): string {
     '`/autorotate maintenance drain` — operators only; stop new broker work',
     '`/autorotate maintenance resume` — operators only; resume the current drain',
     '`/autorotate trace status` — show your trace setting',
-    '`/autorotate trace on [duration]` — collect metadata for up to 24h (default: 1h)',
-    '`/autorotate trace off` — stop trace collection'
+    '`/autorotate trace on [duration]` — review a proposed reliability/performance trace grant (default: 1h; max: 24h)',
+    '`/autorotate trace confirm [duration]` — activate the disclosed grant',
+    'Trace fields: source, Codex version, pseudonymous execution/thread/account IDs, observed time, event kind, outcome/duration/exit code, token counts, coarse tool category, transport kind/outcome/status class, rate-limit data, and error class; never prompts, responses, tool arguments, or tool output.',
+    'Only SSH-key holders can read traces. Producer spool: 24h; archive: 30d; snapshots can survive up to 45d. Revoking or expiry fences future intake; it does not delete retained data.',
+    '`/autorotate trace off` — durably fence new trace input; status reports any pending exact sandbox drain'
   ].join('\n')
 }
 
@@ -1413,23 +1425,49 @@ function traceConsentFailure(kind: TraceCommand['kind']): string {
       return 'Your Slack trace setting is temporarily unavailable. Check `/autorotate trace status`.'
     case 'trace_on':
       return 'Your Slack trace setting could not be confirmed. Check `/autorotate trace status`.'
+    case 'trace_on_preview':
+      return 'Trace consent review could not be confirmed. Check `/autorotate trace status`.'
     case 'trace_off':
       return 'Trace collection revoke could not be confirmed. Check `/autorotate trace status`.'
   }
 }
 
-function formatTraceConsent(consent: SlackTraceConsent): string {
+function formatTraceConsent(consent: SlackTraceConsent, includeDisclosure = false): string {
   if (consent.drain_pending) {
-    return 'Slack trace collection was revoked, but the Kubernetes drain is pending. Check `/autorotate trace status`.'
+    return 'Trace consent is durably off: its input fence rejects new trace data. An exact sandbox drain is pending, so its sidecar is not yet confirmed gone. Check `/autorotate trace status`.'
   }
   if (!consent.enabled) {
-    return 'Slack trace collection is off. When enabled, it collects only metadata, never message content.'
+    return 'Trace consent is durably off: its input fence rejects new trace data and no exact sandbox drain is pending.'
   }
   const expiresAt = consent.expires_at
   if (!expiresAt) throw new AutorotateError('Centaur API returned an invalid trace consent')
+  const status = `Slack trace collection is on until ${formatUtcTimestamp(expiresAt)}; it expires automatically.`
+  if (!includeDisclosure) return status
+  return [status, traceMetadataDisclosure()].join(' ')
+}
+
+function traceConsentPreview(durationMs: number): string {
+  const duration = traceConsentDurationLabel(durationMs)
   return [
-    `Slack trace collection is on until ${formatUtcTimestamp(expiresAt)}.`,
-    'Only metadata is collected, never message content. It expires automatically.'
+    `Trace consent is still off. This would grant metadata collection for ${duration}.`,
+    traceMetadataDisclosure(),
+    `To activate this exact ${duration} grant, run \`/autorotate trace confirm ${duration}\`.`
+  ].join(' ')
+}
+
+function traceConsentDurationLabel(durationMs: number): string {
+  const minutes = durationMs / 60_000
+  return minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`
+}
+
+function traceMetadataDisclosure(): string {
+  return [
+    'Purpose: diagnose Codex reliability and performance.',
+    'Fields: source, Codex version, pseudonymous execution/thread/account IDs, observed time, event kind, outcome/duration/exit code, token counts, coarse tool category, transport kind/outcome/status class, rate-limit data, and error class.',
+    'Never prompts, responses, tool arguments, or tool output.',
+    'Only SSH-key holders can read traces.',
+    'Producer spool: 24h; archive: 30d; snapshots can survive up to 45d.',
+    'Revoking or expiry fences future intake; it does not delete retained data.'
   ].join(' ')
 }
 

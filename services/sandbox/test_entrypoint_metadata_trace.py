@@ -67,17 +67,41 @@ class MetadataTraceEntrypointTests(unittest.TestCase):
                 config_path.read_text().strip(),
             )
 
-            endpoint = "http://127.0.0.1:4318/v1/traces"
-            subprocess.run(
-                [sys.executable, "-c", consented_config],
-                check=True,
-                env=env | {"CODEX_TRACE_ENDPOINT": endpoint},
-            )
-            config = config_path.read_text()
-            self.assertIn('exporter = "none"', config)
-            self.assertIn('log_user_prompt = false', config)
-            self.assertIn('metrics_exporter = "none"', config)
-            self.assertIn(f'endpoint = "{endpoint}"', config)
+            for endpoint in (
+                "http://127.0.0.1:4318/v1/traces",
+                "http://127.0.0.1:4318/v1/traces/",
+                "http://127.0.0.1:4318",
+            ):
+                with self.subTest(endpoint=endpoint):
+                    config_path.write_text('[otel]\nexporter = "otlp"\n')
+                    subprocess.run(
+                        [sys.executable, "-c", consented_config],
+                        check=True,
+                        env=env | {"CODEX_TRACE_ENDPOINT": endpoint},
+                    )
+                    # Parse the generated config instead of matching its TOML
+                    # spelling: this is the exact Codex 0.146 contract.
+                    config = tomllib.loads(config_path.read_text())
+                    self.assertEqual(
+                        {
+                            "exporter": "none",
+                            "log_user_prompt": False,
+                            "metrics_exporter": "none",
+                            "trace_exporter": {
+                                "otlp-http": {
+                                    "endpoint": "http://127.0.0.1:4318/v1/traces",
+                                    "protocol": "binary",
+                                }
+                            },
+                        },
+                        config["otel"],
+                    )
+
+    def test_trace_capability_gets_one_signal_path(self) -> None:
+        _, consented_config = self.trace_python_heredocs()
+        self.assertIn('endpoint = os.environ["CODEX_TRACE_ENDPOINT"].rstrip("/")', consented_config)
+        self.assertIn('if not endpoint.endswith("/v1/traces"):', consented_config)
+        self.assertIn('endpoint = f"{endpoint}/v1/traces"', consented_config)
 
     def test_trace_config_rewrite_removes_inline_and_commented_otel_forms(self) -> None:
         default_config, _ = self.trace_python_heredocs()

@@ -380,12 +380,22 @@ and Slack member. It never accepts a workspace or user selector, creates no
 session or dashboard, and uses the same `SLACKBOT_API_KEY` bearer credential as
 the normal Slackbot session API.
 
-Use `/autorotate trace status` to see your setting, `/autorotate trace on
-[duration]` to enable it, and `/autorotate trace off` to disable it. The default
-duration is `1h`; whole-minute (`30m`) and whole-hour (`2h`) durations are
-accepted up to `24h`. When enabled, Centaur collects only trace metadata, never
-message content, and reports the automatic expiry. Command acknowledgements and
-follow-ups are ephemeral with `Cache-Control: no-store`.
+Use `/autorotate trace status` to see your setting. `/autorotate trace on
+[duration]` presents an ephemeral disclosure; only `/autorotate trace confirm
+[duration]` activates the matching grant. `/autorotate trace off` durably
+fences new intake and reports whether an exact sandbox drain remains pending.
+The default duration is `1h`; whole-minute (`30m`) and whole-hour (`2h`)
+durations are accepted up to `24h`.
+
+The pinned sidecar records only source, Codex version, pseudonymous
+execution/thread/account IDs, observed time, event kind,
+outcome/duration/exit code, token counts, coarse tool category, transport
+kind/outcome/status class, rate-limit data, and error class. It never records
+prompts, responses, tool arguments, or tool output. Only SSH-key holders can
+read traces. The producer spool survives up to 24 hours, the archive 30 days,
+and snapshots up to 45 days. Revocation and expiry fence future intake but do
+not delete retained data. Command acknowledgements and follow-ups are ephemeral
+with `Cache-Control: no-store`.
 
 ### Slack fleet and maintenance
 
