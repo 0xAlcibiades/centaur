@@ -41,6 +41,8 @@ const options: SlackbotV2Options = {
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
   autoJoinCreatedChannels: booleanEnv('SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS', false),
   autorotateUrl: optionalEnv('SLACKBOTV2_AUTOROTATE_URL'),
+  autorotateControlToken: optionalEnv('AUTOROTATE_CONTROL_TOKEN'),
+  autorotateMaintenanceSlackUserIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS'),
   autorotateOperatorToken: optionalEnv('AUTOROTATE_OPERATOR_TOKEN'),
   autorotateSlackTeamIds: listEnv('SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS'),
   botToken,

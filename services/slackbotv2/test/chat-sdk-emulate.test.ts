@@ -4926,6 +4926,11 @@ describe('slackbotv2', () => {
     await Promise.all(allowedExternalWaits)
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]!.body.metadata).toMatchObject({
+      slack_actor_team_id: 'TEXTERNAL',
+      slack_actor_user_id: USER_ID,
+      slack_team_id: TEAM_ID
+    })
 
     bot = createTestBot()
     codexApi.reset()

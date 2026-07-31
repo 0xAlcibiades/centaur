@@ -49,6 +49,7 @@ import {
   serializeMessageLinks,
   serializeMessage,
   sessionStreamError,
+  slackWorkspaceContextForMessage,
   slackApiTimeoutMs,
   withSlackApiTimeout
 } from './session-api'
@@ -80,6 +81,7 @@ import type {
   SlackbotV2Options,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
+  SlackbotV2SlackWorkspaceContext,
   SlackbotV2ThreadState,
   SlackbotV2Trace
 } from './types'
@@ -132,6 +134,7 @@ type SlackFallbackAdapter = Adapter & {
 const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
+  slackWorkspace?: SlackbotV2SlackWorkspaceContext
   waitUntil(promise: Promise<unknown>): void
 }
 
@@ -266,10 +269,14 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
   const state = options.state ?? createDefaultState(options, logger)
   const autorotateCommands = createAutorotateSlackCommandHandler({
+    apiKey: options.apiKey,
+    apiUrl: options.apiUrl,
     brokerUrl: options.autorotateUrl,
     fetch: options.fetch,
     logger,
+    controlToken: options.autorotateControlToken,
     operatorSlackTeamIds: options.autorotateSlackTeamIds,
+    operatorSlackUserIds: options.autorotateMaintenanceSlackUserIds,
     operatorToken: options.autorotateOperatorToken,
     pollIntervalMs: options.autorotatePollIntervalMs,
     responseUrlHosts: options.autorotateSlackResponseUrlHosts,
@@ -418,6 +425,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       const webhookFields = slackWebhookLogFields(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = {
+        slackWorkspace: slackWebhookWorkspaceContext(rawBody),
         waitUntil: promise => waitUntil(c, promise)
       }
       const response = await requestContext.run(context, () => {
@@ -660,6 +668,14 @@ function slackWebhookEventType(rawBody: string): string {
   const event = payload.event
   if (isJsonObject(event)) return stringValue(event.type) ?? 'unknown'
   return stringValue(payload.type) ?? 'unknown'
+}
+
+function slackWebhookWorkspaceContext(rawBody: string): SlackbotV2SlackWorkspaceContext | undefined {
+  const payload = parseSlackWebhookPayload(rawBody)
+  const event = payload && isJsonObject(payload.event) ? payload.event : undefined
+  const hostTeamId =
+    stringValue(payload?.team_id) ?? stringValue(event?.team_id) ?? stringValue(event?.team)
+  return hostTeamId ? { hostTeamId } : undefined
 }
 
 function slackChannelCreatedJoinInput(rawBody: string): {
@@ -1065,7 +1081,8 @@ async function syncThreadMessageToSession(
   }
 
   const serializeStartedAtMs = nowMs()
-  const serializedMessage = await serializeMessage(message, input.options)
+  const slackWorkspace = requestContext.getStore()?.slackWorkspace
+  const serializedMessage = await serializeMessage(message, input.options, slackWorkspace)
   // Inspect the original text before the strategy strips recognized flags.
   // This is the authority for whether a sticky thread selection may change.
   const explicitOverrides = extractMessageOverrides(serializedMessage.text)
@@ -1167,10 +1184,10 @@ async function syncThreadMessageToSession(
     try {
       context = shouldRefreshThreadContext
         ? await withSlackApiTimeout(input.options, 'collect Slack thread context', () =>
-            collectSlackThreadContext(input.options, message)
+            collectSlackThreadContext(input.options, message, slackWorkspace)
           )
         : await withSlackApiTimeout(input.options, 'collect initial thread context', () =>
-            collectInitialContext(thread, message, input.options)
+            collectInitialContext(thread, message, input.options, slackWorkspace)
           )
     } catch (error) {
       contextDegraded = true
@@ -1234,7 +1251,7 @@ async function syncThreadMessageToSession(
         history = await withSlackApiTimeout(
           input.options,
           'collect restart thread context',
-          () => collectInitialContext(thread, message, input.options)
+          () => collectInitialContext(thread, message, input.options, slackWorkspace)
         )
       } catch (error) {
         restartContextDegraded = true
@@ -3226,13 +3243,16 @@ function slackMessageHasPullRequest(message: ChatMessage): boolean {
 
 async function collectSlackThreadContext(
   options: SlackbotV2Options,
-  currentMessage: ChatMessage
+  currentMessage: ChatMessage,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
 ): Promise<SlackbotV2ApiMessage[]> {
   const raw = slackRawRecord(currentMessage)
   const channel = stringField(raw.channel)
   const threadTs = stringField(raw.thread_ts)
   const currentTs = stringField(raw.ts) || currentMessage.id
-  if (!channel || !threadTs) return [await serializeMessage(currentMessage, options)]
+  if (!channel || !threadTs) {
+    return [await serializeMessage(currentMessage, options, workspaceContext)]
+  }
 
   const messages: SlackbotV2ApiMessage[] = []
   let cursor: string | undefined
@@ -3253,13 +3273,13 @@ async function collectSlackThreadContext(
       const messageTs = stringField(message.ts)
       if (!messageTs || compareSlackTs(messageTs, currentTs) > 0) continue
       if (isSelfSlackBotMessage(options, message)) continue
-      messages.push(await slackApiMessageFromSlack(options, message, currentMessage))
+      messages.push(await slackApiMessageFromSlack(options, message, currentMessage, workspaceContext))
     }
     cursor = response.nextCursor
   } while (cursor)
 
   const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
-  const serializedCurrent = await serializeMessage(currentMessage, options)
+  const serializedCurrent = await serializeMessage(currentMessage, options, workspaceContext)
   if (currentIndex >= 0) {
     messages[currentIndex] = serializedCurrent
   } else {
@@ -3271,9 +3291,12 @@ async function collectSlackThreadContext(
 async function slackApiMessageFromSlack(
   options: SlackbotV2Options,
   message: Record<string, unknown>,
-  currentMessage: ChatMessage
+  currentMessage: ChatMessage,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
 ): Promise<SlackbotV2ApiMessage> {
   const rawCurrent = slackRawRecord(currentMessage)
+  const currentWorkspace = slackWorkspaceContextForMessage(rawCurrent, workspaceContext)
+  const actorWorkspace = slackWorkspaceContextForMessage(message, currentWorkspace)
   const id = stringField(message.ts) || randomUUID()
   const actorId = slackActorId(message)
   const isBot = Boolean(message.bot_id || message.bot_profile)
@@ -3288,6 +3311,7 @@ async function slackApiMessageFromSlack(
       userId: actorId,
       userName: actorId
     },
+    actorTeamId: actorWorkspace.actorTeamId,
     displayText: displayText.text,
     displayTextSource: displayText.source,
     id,
@@ -3296,11 +3320,8 @@ async function slackApiMessageFromSlack(
     raw: message,
     rawSlackAttachmentCount: displayText.rawAttachmentCount,
     rawSlackBlockCount: displayText.rawBlockCount,
-    teamId:
-      stringField(message.team)
-      || stringField(message.team_id)
-      || stringField(rawCurrent.team)
-      || stringField(rawCurrent.team_id),
+    hostTeamId: actorWorkspace.hostTeamId,
+    teamId: actorWorkspace.hostTeamId as string,
     text,
     threadId: currentMessage.threadId,
     timestamp: slackTimestampToIso(id)

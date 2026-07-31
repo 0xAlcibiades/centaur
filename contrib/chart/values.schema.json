@@ -375,13 +375,15 @@
             "credentialsSecretName": { "type": "string" },
             "observerTokenKey": { "type": "string" },
             "operatorTokenKey": { "type": "string" },
+            "controlTokenKey": { "type": "string" },
             "operatorSlackTeamIds": {
               "type": "array",
               "items": { "type": "string" }
             },
             "operatorSlackUserIds": {
+              "description": "Workspace-qualified Slack TEAM_ID:USER_ID principals allowed to drain or resume Autorotate maintenance. Fleet and status reads remain workspace-wide.",
               "type": "array",
-              "items": { "type": "string" }
+              "items": { "type": "string", "pattern": "^T[A-Za-z0-9]+:[UW][A-Za-z0-9]+$" }
             }
           }
         },

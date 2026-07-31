@@ -486,9 +486,11 @@ slackbotv2:
   # Requires the Slack app to grant channels:read and channels:join.
   autoJoinCreatedChannels: false
   # Signed, pre-session `/autorotate` Slack command. Every subcommand can be
-  # invoked from any Slack conversation, but responses remain ephemeral and are
-  # available to every member of an allowed workspace. Observer and
-  # operator tokens come from a dedicated Secret so no broker administration
+  # invoked from any Slack conversation by every member of an allowed workspace;
+  # responses remain ephemeral. Trace consent is always for the signed invoking
+  # workspace/member, so it has no target selector. Read-only fleet and
+  # maintenance status are workspace-wide; drain/resume use the member list.
+  # Observer, operator, and dedicated control tokens come from a dedicated Secret so no broker administration
   # credential enters Slack, a sandbox, or the shared infra Secret.
   autorotate:
     enabled: false
@@ -496,9 +498,11 @@ slackbotv2:
     credentialsSecretName: ""
     observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
     operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
+    controlTokenKey: AUTOROTATE_CONTROL_TOKEN
     operatorSlackTeamIds: []
-    # Old runtimes require this during a chart-first rolling upgrade. Current
-    # runtimes ignore it and authorize every valid member of the workspace.
+    # Required `TEAM_ID:USER_ID` principals for `/autorotate maintenance
+    # drain|resume`. Slack Connect users are authorized in their signed actor
+    # workspace, so an unqualified user ID never grants access elsewhere.
     operatorSlackUserIds: []
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.

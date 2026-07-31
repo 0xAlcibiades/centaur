@@ -114,6 +114,8 @@ spec:
             - name: SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS
               value: {{ required "slackbotv2.autorotate.operatorSlackTeamIds must not be empty when Autorotate commands are enabled" (join "," .Values.slackbotv2.autorotate.operatorSlackTeamIds) | quote }}
 {{- if .Values.slackbotv2.autorotate.operatorSlackUserIds }}
+            # Only drain/resume require these TEAM_ID:USER_ID principals. Fleet
+            # and status remain workspace-wide reads for a signed workspace.
             - name: SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS
               value: {{ join "," .Values.slackbotv2.autorotate.operatorSlackUserIds | quote }}
 {{- end }}
@@ -127,6 +129,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
                   key: {{ .Values.slackbotv2.autorotate.operatorTokenKey | quote }}
+            - name: AUTOROTATE_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ .Values.slackbotv2.autorotate.controlTokenKey | quote }}
 {{- end }}
 {{- if .Values.slackbotv2.channelDefaults }}
             # Per-channel default harness / model / provider / reasoning, keyed

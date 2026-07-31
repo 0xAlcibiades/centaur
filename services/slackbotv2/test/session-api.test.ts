@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import type { Message } from 'chat'
 import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
@@ -115,6 +116,17 @@ function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   return (execute?.body ?? {}) as Record<string, unknown>
 }
 
+function metadataForRequest(request: RecordedRequest): Record<string, unknown> {
+  if (request.url.endsWith('/messages')) {
+    const body = request.body as { messages?: Array<{ metadata?: Record<string, unknown> }> }
+    return body.messages?.[0]?.metadata ?? {}
+  }
+  return ((request.body as { metadata?: Record<string, unknown> }).metadata ?? {}) as Record<
+    string,
+    unknown
+  >
+}
+
 function executeLine(requests: RecordedRequest[]): JsonObject {
   const inputLines = (executeBody(requests) as { input_lines: string[] }).input_lines
   return JSON.parse(inputLines[0]!) as JsonObject
@@ -145,6 +157,104 @@ function textPartIncludes(part: JsonObject, text: string): boolean {
 function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
+
+function slackMessage(raw: Record<string, unknown>): Message {
+  return {
+    attachments: [],
+    author: {
+      fullName: 'Test User',
+      isBot: false,
+      isMe: false,
+      userId: 'U1',
+      userName: 'test'
+    },
+    id: '1700000000.000100',
+    isMention: true,
+    links: [],
+    metadata: { dateSent: new Date('2026-06-10T00:00:00.000Z') },
+    raw,
+    text: 'test',
+    threadId: 'slack:C1:1700000000.000100'
+  } as unknown as Message
+}
+
+describe('Slack actor workspace metadata', () => {
+  test('keeps a Slack Connect actor workspace separate from the signed host workspace', async () => {
+    const message = await serializeMessage(
+      slackMessage({ source_team: 'TSOURCE', team: 'TEVENT', user_team: 'TACTOR' }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'TACTOR', hostTeamId: 'THOST', teamId: 'THOST' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    for (const request of requests) {
+      expect(metadataForRequest(request)).toMatchObject({
+        slack_actor_team_id: 'TACTOR',
+        slack_actor_user_id: 'U1',
+        slack_team_id: 'THOST',
+        slack_user_id: 'U1'
+      })
+    }
+  })
+
+  test('uses the home workspace for an ordinary Slack message', async () => {
+    const message = await serializeMessage(slackMessage({ team: 'THOME' }))
+
+    expect(message).toMatchObject({ actorTeamId: 'THOME', hostTeamId: 'THOME', teamId: 'THOME' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    for (const request of requests) {
+      expect(metadataForRequest(request)).toMatchObject({
+        slack_actor_team_id: 'THOME',
+        slack_actor_user_id: 'U1',
+        slack_team_id: 'THOME',
+        slack_user_id: 'U1'
+      })
+    }
+  })
+
+  test('uses source_team when Slack does not provide user_team', async () => {
+    const message = await serializeMessage(
+      slackMessage({ source_team: 'TACTOR', team: 'TEVENT' }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'TACTOR', hostTeamId: 'THOST', teamId: 'THOST' })
+  })
+
+  test('ignores missing or forged generic workspace metadata', async () => {
+    const message = await serializeMessage(
+      slackMessage({
+        actor_team_id: 'TFORGED',
+        actor_user_id: 'UFORGED',
+        slack_actor_team_id: 'TFORGED',
+        slack_actor_user_id: 'UFORGED',
+        slack_team_id: 'TFORGED',
+        team: 'TEVENT'
+      }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'THOST', hostTeamId: 'THOST', teamId: 'THOST' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    expect(executeBody(requests).metadata).toMatchObject({
+      slack_actor_team_id: 'THOST',
+      slack_actor_user_id: 'U1',
+      slack_team_id: 'THOST'
+    })
+  })
+})
 
 describe('session event streaming', () => {
   test('passes activity summary events through to the renderer source stream', async () => {
