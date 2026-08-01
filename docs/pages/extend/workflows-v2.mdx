@@ -137,11 +137,14 @@ The API derives the `workflow-nightly-report` principal in the Centaur Console.
 Automatic agent turns use this principal even without `WORKFLOW_PRINCIPAL`.
 Setting `WORKFLOW_PRINCIPAL = True` also runs the workflow's host sandbox under
 it, so direct `ctx.call_tool(...)` calls share the same grants. Grant only the
-roles or secrets that the workflow needs:
+roles or secrets that the workflow needs. Centaur does not assign channel-style
+default roles to workflow principals, so agent turns also need an explicit
+model or harness credential role such as `infra`:
 
 ```bash
 cargo run -p centaur-perms -- \
   principals grant workflow-nightly-report \
+  --role infra \
   --tool slack
 ```
 

@@ -1423,9 +1423,7 @@ impl SessionRuntime {
             let (registered_principal, desired_capabilities) =
                 if let Some(registrar) = &self.iron_control {
                     let principal = if let Some(workflow_name) = workflow_name {
-                        registrar
-                            .ensure_workflow_agent_principal(workflow_name)
-                            .await?
+                        registrar.ensure_workflow_principal(workflow_name).await?
                     } else {
                         registrar
                             .register_session(thread_key.as_str(), Some(&session_metadata))
