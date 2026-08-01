@@ -174,7 +174,21 @@
       "properties": {
         "runtimeClassName": { "type": "string" },
         "reposPath": { "type": "string" },
-        "resources": { "type": "object" }
+        "resources": { "type": "object" },
+        "metadataTrace": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configGeneration": { "type": "integer", "minimum": 1 },
+            "gatewayUrl": { "type": "string", "format": "uri" },
+            "gatewayPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "credentialSecretName": { "type": "string" },
+            "credentialSecretVersion": { "type": "string" },
+            "bearerSecretKey": { "type": "string" },
+            "pseudonymKeySecretKey": { "type": "string" }
+          },
+          "required": ["configGeneration"]
+        }
       }
     },
     "repoCache": {
@@ -375,13 +389,15 @@
             "credentialsSecretName": { "type": "string" },
             "observerTokenKey": { "type": "string" },
             "operatorTokenKey": { "type": "string" },
+            "controlTokenKey": { "type": "string" },
             "operatorSlackTeamIds": {
               "type": "array",
               "items": { "type": "string" }
             },
             "operatorSlackUserIds": {
+              "description": "Workspace-qualified Slack TEAM_ID:USER_ID principals allowed to drain or resume Autorotate maintenance. Fleet and status reads remain workspace-wide.",
               "type": "array",
-              "items": { "type": "string" }
+              "items": { "type": "string", "pattern": "^T[A-Za-z0-9]+:[UW][A-Za-z0-9]+$" }
             }
           }
         },
@@ -481,6 +497,16 @@
                 },
                 "required": ["ports"]
               }
+            }
+          }
+        },
+        "metadataTraceEgress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "gatewayCidrs": {
+              "type": "array",
+              "items": { "type": "string", "format": "cidr" }
             }
           }
         }

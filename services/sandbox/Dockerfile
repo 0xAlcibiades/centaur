@@ -74,7 +74,10 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.154
-ARG CODEX_VERSION=0.144.0
+ARG CODEX_VERSION=0.146.0
+# npm's SRI for @openai/codex 0.146.0. Keep the package acquisition pinned to
+# reviewed bytes instead of trusting a mutable registry response at build time.
+ARG CODEX_NPM_SHA512=c86dec3d635d6bfd980084080eaf4caeb8e8093210eebc5833921ab2b1b754172e8422d39207a0fc9cea989ab557df11138309e630b10d75d094e8eb762b4547
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
@@ -119,9 +122,12 @@ RUN set -eux; \
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm install -g --prefer-online --force \
+    codex_package="$(npm pack --silent "@openai/codex@${CODEX_VERSION}")" \
+    && echo "${CODEX_NPM_SHA512}  ${codex_package}" | sha512sum -c - \
+    && npm install -g --prefer-online --force "${codex_package}" \
+    && rm -f "${codex_package}" \
+    && npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-      "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \

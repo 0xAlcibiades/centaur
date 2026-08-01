@@ -116,6 +116,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_trace_consent_requires_the_exact_configured_bearer() {
+        for authorization in [None, Some("Bearer wrong"), Some("bearer trace-secret")] {
+            let app = build_router_with_app_state(
+                AppState::unready()
+                    .with_slack_trace_consent_bearer_secret(Some("trace-secret".to_owned())),
+            );
+            let mut request = Request::builder()
+                .uri("/api/v1/slack_trace_consents/T123/U456")
+                .body(Body::empty())
+                .unwrap();
+            if let Some(authorization) = authorization {
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, authorization.parse().unwrap());
+            }
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn slack_trace_consent_validates_slack_subjects_before_runtime_access() {
+        let app = build_router_with_app_state(
+            AppState::unready()
+                .with_slack_trace_consent_bearer_secret(Some("trace-secret".to_owned())),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/slack_trace_consents/not-a-team/not-a-user")
+                    .header(header::AUTHORIZATION, "Bearer trace-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn slack_trace_consent_rejects_expiry_outside_the_bounded_window() {
+        let app = build_router_with_app_state(
+            AppState::unready()
+                .with_slack_trace_consent_bearer_secret(Some("trace-secret".to_owned())),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/slack_trace_consents/T123/U456")
+                    .header(header::AUTHORIZATION, "Bearer trace-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{\"data\":{\"expires_at\":\"2099-01-01T00:00:00Z\"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn healthz_decodes_slack_client_bearer_jwt_when_present() {
         let app = build_router_with_app_state(AppState::unready());
         let token = encode(

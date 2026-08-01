@@ -24,7 +24,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    IronProxySecretEnv, OtlpEgressTarget, ToolSource, ToolsConfig,
+    IronProxySecretEnv, MetadataTraceSidecarConfig, OtlpEgressTarget, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -33,6 +33,7 @@ use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
     PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
 };
+use centaur_session_sqlx::MetadataTraceConfigIdentity;
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{info, warn};
@@ -42,17 +43,6 @@ use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
-
-/// OTLP env always forwarded from the api-rs process into codex sandboxes,
-/// mirroring the Python control plane's `_SANDBOX_PASSTHROUGH_ENV_KEYS`. The
-/// wrapper inside the sandbox reads these to configure codex's trace export
-/// (endpoint, Laminar ingest auth header, resource attributes).
-const SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS: [&str; 4] = [
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-    "OTEL_RESOURCE_ATTRIBUTES",
-];
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the Centaur API Rust session control plane")]
@@ -66,6 +56,35 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    pub(crate) fn metadata_trace_config_identity(
+        &self,
+    ) -> Result<Option<MetadataTraceConfigIdentity>, ServerError> {
+        let config = self.sandbox.metadata_trace_sidecar_config()?;
+        let Some(generation) = self.sandbox.metadata_trace_config_generation else {
+            // Plain binary/local deployments that have never enabled tracing
+            // must not acquire a retirement generation just to start.
+            if config.is_none() {
+                return Ok(None);
+            }
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required when metadata tracing is enabled"
+                    .to_owned(),
+            ));
+        };
+        if generation <= 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION must be positive".to_owned(),
+            ));
+        }
+        Ok(Some(MetadataTraceConfigIdentity {
+            generation,
+            fingerprint: config
+                .as_ref()
+                .map_or_else(|| "disabled".to_owned(), |config| config.fingerprint()),
+            enabled: config.is_some(),
+        }))
+    }
+
     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
         self.sandbox.runtime().await
     }
@@ -115,6 +134,24 @@ impl Args {
 
     pub(crate) fn codex_nanocodex_rollout_percent(&self) -> u8 {
         self.server.codex_nanocodex_rollout_percent
+    }
+
+    pub(crate) fn slack_trace_consent_bearer_secret(&self) -> Option<String> {
+        self.server
+            .slack_trace_consent_bearer_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn slack_session_bearer_secret(&self) -> Option<String> {
+        self.server
+            .slack_session_bearer_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
     }
 
     pub(crate) fn execution_adoption_interval(&self) -> Option<Duration> {
@@ -465,6 +502,22 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// Ordinary Slackbot-to-api-rs service credential. It authenticates Slack
+    /// actor metadata on session endpoints, but cannot mutate trace consent.
+    #[arg(
+        long = "slack-session-bearer-secret",
+        env = "SLACKBOT_API_KEY",
+        hide_env_values = true
+    )]
+    slack_session_bearer_secret: Option<String>,
+    /// Dedicated credential used exclusively by the verified Slack ingress when
+    /// it relays a member's trace-consent request to api-rs.
+    #[arg(
+        long = "slack-trace-consent-bearer-secret",
+        env = "SLACK_TRACE_CONSENT_API_KEY",
+        hide_env_values = true
+    )]
+    slack_trace_consent_bearer_secret: Option<String>,
     /// Percentage of sessions requesting Codex that are assigned to
     /// Nanocodex. The assignment is deterministic by thread key and the
     /// resolved harness is persisted on the session.
@@ -651,6 +704,57 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    /// Enable the consent-gated metadata-only Codex trace sidecar. It is
+    /// inactive until a principal explicitly has the matching capability.
+    #[arg(
+        long = "session-sandbox-metadata-trace-enabled",
+        env = "SESSION_SANDBOX_METADATA_TRACE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    metadata_trace_enabled: bool,
+    /// Deployment-owned monotonic trace configuration generation. This is
+    /// deliberately independent of the derived configuration fingerprint.
+    #[arg(
+        long = "session-sandbox-metadata-trace-config-generation",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION"
+    )]
+    metadata_trace_config_generation: Option<i64>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-gateway-url",
+        env = "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_URL"
+    )]
+    metadata_trace_gateway_url: Option<String>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-gateway-port",
+        env = "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_PORT",
+        default_value_t = 443
+    )]
+    metadata_trace_gateway_port: u16,
+    #[arg(
+        long = "session-sandbox-metadata-trace-credential-secret-name",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_NAME"
+    )]
+    metadata_trace_credential_secret_name: Option<String>,
+    /// Opaque generation for the projected trace Secret. Bump this when the
+    /// Secret is rotated so the durable sandbox fingerprint recreates it.
+    #[arg(
+        long = "session-sandbox-metadata-trace-credential-secret-version",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_VERSION"
+    )]
+    metadata_trace_credential_secret_version: Option<String>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-bearer-secret-key",
+        env = "SESSION_SANDBOX_METADATA_TRACE_BEARER_SECRET_KEY",
+        default_value = "bearer"
+    )]
+    metadata_trace_bearer_secret_key: String,
+    #[arg(
+        long = "session-sandbox-metadata-trace-pseudonym-key-secret-key",
+        env = "SESSION_SANDBOX_METADATA_TRACE_PSEUDONYM_KEY_SECRET_KEY",
+        default_value = "pseudonym_key"
+    )]
+    metadata_trace_pseudonym_key_secret_key: String,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -1015,21 +1119,6 @@ impl SandboxArgs {
             }
         }
 
-        // OTLP trace wiring rides from this process into every sandbox (the
-        // same hardcoded set the Python control plane forwarded). The harness
-        // wrapper needs the endpoint + auth header to configure codex's OTLP
-        // export — codex's `session_task.turn` spans carry the token usage
-        // Laminar prices into cost. The headers value is a secret (Laminar
-        // ingest key, ideally ingest-only): it reaches the api-rs process via
-        // the chart's secret envFrom, never via values.
-        for name in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref())
-                && !envs.iter().any(|(existing, _)| existing == name)
-            {
-                envs.push((name.to_owned(), value));
-            }
-        }
-
         for name in self.passthrough_env_names() {
             if let Ok(value) = env::var(name) {
                 if let Some((_, existing_value)) = envs
@@ -1142,6 +1231,42 @@ impl SandboxArgs {
                 Ok(None)
             }
         }
+    }
+
+    pub(crate) fn metadata_trace_sidecar_config(
+        &self,
+    ) -> Result<Option<MetadataTraceSidecarConfig>, ServerError> {
+        if !self.metadata_trace_enabled {
+            return Ok(None);
+        }
+        let required = |value: Option<&str>, name: &str| {
+            clean_optional_value(value).ok_or_else(|| {
+                ServerError::UnsupportedConfig(format!(
+                    "{name} is required when SESSION_SANDBOX_METADATA_TRACE_ENABLED=true"
+                ))
+            })
+        };
+        let config = MetadataTraceSidecarConfig::pinned(
+            required(
+                self.metadata_trace_gateway_url.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_URL",
+            )?,
+            self.metadata_trace_gateway_port,
+            required(
+                self.metadata_trace_credential_secret_name.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_NAME",
+            )?,
+            required(
+                self.metadata_trace_credential_secret_version.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_VERSION",
+            )?,
+            self.metadata_trace_bearer_secret_key.clone(),
+            self.metadata_trace_pseudonym_key_secret_key.clone(),
+        );
+        config
+            .validate()
+            .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))?;
+        Ok(Some(config))
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
@@ -1393,6 +1518,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // The chart label policy handles sandbox OTLP egress; keep the
         // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
+        config.metadata_trace_sidecar = args.metadata_trace_sidecar_config()?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -2366,6 +2492,93 @@ mod tests {
     }
 
     #[test]
+    fn metadata_trace_sidecar_requires_pinned_https_configuration() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-enabled",
+            "true",
+            "--session-sandbox-metadata-trace-config-generation",
+            "1",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+        assert!(AgentSandboxConfig::try_from(&args.sandbox).is_err());
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-enabled",
+            "true",
+            "--session-sandbox-metadata-trace-gateway-url",
+            "https://traces.example:8443",
+            "--session-sandbox-metadata-trace-config-generation",
+            "1",
+            "--session-sandbox-metadata-trace-gateway-port",
+            "8443",
+            "--session-sandbox-metadata-trace-credential-secret-name",
+            "consumer-trace-credentials",
+            "--session-sandbox-metadata-trace-credential-secret-version",
+            "generation-1",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let trace = config.metadata_trace_sidecar.unwrap();
+        assert_eq!(trace.gateway_url, "https://traces.example:8443");
+        assert_eq!(trace.credential_secret_version, "generation-1");
+        assert_eq!(
+            args.metadata_trace_config_identity()
+                .unwrap()
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(
+            args.metadata_trace_config_identity()
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn disabled_metadata_trace_with_a_generation_activates_a_retirement_fence() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-config-generation",
+            "2",
+        ])
+        .unwrap();
+        let identity = args.metadata_trace_config_identity().unwrap().unwrap();
+        assert_eq!(identity.generation, 2);
+        assert_eq!(identity.fingerprint, "disabled");
+        assert!(!identity.enabled);
+    }
+
+    #[test]
+    fn absent_metadata_trace_configuration_does_not_require_a_generation() {
+        let mut args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        // The test runner may provide the production deployment environment.
+        // Exercise the absent-input state directly instead of depending on
+        // process-global environment inherited by this test binary.
+        args.sandbox.metadata_trace_enabled = false;
+        args.sandbox.metadata_trace_config_generation = None;
+        assert!(args.metadata_trace_config_identity().unwrap().is_none());
+    }
+
+    #[test]
     fn tools_config_read_from_flags() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2768,67 +2981,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(mock.sandbox.sandbox_otlp_egress_target().unwrap(), None);
-    }
-
-    /// The only test that mutates the process-level OTLP env keys: keeps all
-    /// assertions that depend on their presence or absence sequential so
-    /// parallel tests never race on them.
-    #[test]
-    fn codex_app_server_env_template_forwards_process_otlp_env() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
-        ])
-        .unwrap();
-
-        unsafe {
-            for key in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-                env::remove_var(key);
-            }
-        }
-        let envs = args.sandbox.codex_app_server_env_template().unwrap();
-        assert!(!envs.iter().any(|(name, _)| name.starts_with("OTEL_")));
-        assert_eq!(args.sandbox.sandbox_otlp_egress_target().unwrap(), None);
-
-        unsafe {
-            env::set_var(
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                "http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces",
-            );
-            env::set_var("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer test");
-        }
-        let envs = args.sandbox.codex_app_server_env_template().unwrap();
-        let value = |key: &str| {
-            envs.iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.as_str())
-        };
-        // The harness wrapper reads these to configure codex's OTLP export
-        // (endpoint + Laminar ingest auth header).
-        assert_eq!(
-            value("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
-            Some("http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces")
-        );
-        assert_eq!(
-            value("OTEL_EXPORTER_OTLP_HEADERS"),
-            Some("authorization=Bearer test")
-        );
-        // The egress target derives from the same forwarded endpoint.
-        assert_eq!(
-            args.sandbox.sandbox_otlp_egress_target().unwrap(),
-            Some(OtlpEgressTarget {
-                namespace: "laminar".to_owned(),
-                port: 8000,
-            })
-        );
-        unsafe {
-            for key in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-                env::remove_var(key);
-            }
-        }
     }
 
     #[test]

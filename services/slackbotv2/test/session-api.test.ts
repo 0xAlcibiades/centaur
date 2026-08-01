@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import type { Message } from 'chat'
 import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
@@ -21,6 +22,7 @@ import type {
 
 type RecordedRequest = {
   body: unknown
+  headers: Headers
   url: string
 }
 
@@ -75,7 +77,7 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
   const fetchFn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input)
     const body = init?.body ? JSON.parse(String(init.body)) : undefined
-    requests.push({ body, url })
+    requests.push({ body, headers: new Headers(init?.headers), url })
     if (url.endsWith('/execute')) {
       return Response.json({
         execution_id: 'exec-1',
@@ -103,6 +105,7 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
 
 function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   return {
+    apiKey: 'ordinary-session-api-secret',
     apiUrl: 'http://api.test',
     botToken: 'xoxb-test',
     fetch: fetchFn,
@@ -113,6 +116,17 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
 function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
   return (execute?.body ?? {}) as Record<string, unknown>
+}
+
+function metadataForRequest(request: RecordedRequest): Record<string, unknown> {
+  if (request.url.endsWith('/messages')) {
+    const body = request.body as { messages?: Array<{ metadata?: Record<string, unknown> }> }
+    return body.messages?.[0]?.metadata ?? {}
+  }
+  return ((request.body as { metadata?: Record<string, unknown> }).metadata ?? {}) as Record<
+    string,
+    unknown
+  >
 }
 
 function executeLine(requests: RecordedRequest[]): JsonObject {
@@ -145,6 +159,134 @@ function textPartIncludes(part: JsonObject, text: string): boolean {
 function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
+
+function slackMessage(raw: Record<string, unknown>): Message {
+  return {
+    attachments: [],
+    author: {
+      fullName: 'Test User',
+      isBot: false,
+      isMe: false,
+      userId: 'U1',
+      userName: 'test'
+    },
+    id: '1700000000.000100',
+    isMention: true,
+    links: [],
+    metadata: { dateSent: new Date('2026-06-10T00:00:00.000Z') },
+    raw,
+    text: 'test',
+    threadId: 'slack:C1:1700000000.000100'
+  } as unknown as Message
+}
+
+describe('Slack actor workspace metadata', () => {
+  test('uses the ordinary Slack API key for session endpoints', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hello')))
+    expect(requests).not.toHaveLength(0)
+    for (const request of requests) {
+      expect(request.headers.get('authorization')).toBe('Bearer ordinary-session-api-secret')
+    }
+  })
+
+  test('keeps each actor boundary in a mixed append batch', async () => {
+    const u1 = await serializeMessage(slackMessage({ team: 'T1' }))
+    const second = slackMessage({ team: 'T2' })
+    second.author.userId = 'U2'
+    const u2 = await serializeMessage(second)
+    const { fetchFn, requests } = fakeApi()
+
+    await forwardToSessionApi(options(fetchFn), forwardInput(u1, {
+      executeMessage: undefined,
+      messages: [u1, u2]
+    }))
+
+    const append = requests.find(request => request.url.endsWith('/messages'))
+    const messages = (append?.body as { messages?: Array<{ metadata?: Record<string, unknown> }> })
+      .messages ?? []
+    expect(messages.map(message => message.metadata)).toEqual([
+      expect.objectContaining({ slack_actor_team_id: 'T1', slack_actor_user_id: 'U1' }),
+      expect.objectContaining({ slack_actor_team_id: 'T2', slack_actor_user_id: 'U2' })
+    ])
+  })
+
+  test('keeps a Slack Connect actor workspace separate from the signed host workspace', async () => {
+    const message = await serializeMessage(
+      slackMessage({ source_team: 'TSOURCE', team: 'TEVENT', user_team: 'TACTOR' }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'TACTOR', hostTeamId: 'THOST', teamId: 'THOST' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    for (const request of requests) {
+      expect(metadataForRequest(request)).toMatchObject({
+        slack_actor_team_id: 'TACTOR',
+        slack_actor_user_id: 'U1',
+        slack_team_id: 'THOST',
+        slack_user_id: 'U1'
+      })
+    }
+  })
+
+  test('uses the home workspace for an ordinary Slack message', async () => {
+    const message = await serializeMessage(slackMessage({ team: 'THOME' }))
+
+    expect(message).toMatchObject({ actorTeamId: 'THOME', hostTeamId: 'THOME', teamId: 'THOME' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    for (const request of requests) {
+      expect(metadataForRequest(request)).toMatchObject({
+        slack_actor_team_id: 'THOME',
+        slack_actor_user_id: 'U1',
+        slack_team_id: 'THOME',
+        slack_user_id: 'U1'
+      })
+    }
+  })
+
+  test('uses source_team when Slack does not provide user_team', async () => {
+    const message = await serializeMessage(
+      slackMessage({ source_team: 'TACTOR', team: 'TEVENT' }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'TACTOR', hostTeamId: 'THOST', teamId: 'THOST' })
+  })
+
+  test('ignores missing or forged generic workspace metadata', async () => {
+    const message = await serializeMessage(
+      slackMessage({
+        actor_team_id: 'TFORGED',
+        actor_user_id: 'UFORGED',
+        slack_actor_team_id: 'TFORGED',
+        slack_actor_user_id: 'UFORGED',
+        slack_team_id: 'TFORGED',
+        team: 'TEVENT'
+      }),
+      undefined,
+      { hostTeamId: 'THOST' }
+    )
+
+    expect(message).toMatchObject({ actorTeamId: 'THOST', hostTeamId: 'THOST', teamId: 'THOST' })
+
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    expect(executeBody(requests).metadata).toMatchObject({
+      slack_actor_team_id: 'THOST',
+      slack_actor_user_id: 'U1',
+      slack_team_id: 'THOST'
+    })
+  })
+})
 
 describe('session event streaming', () => {
   test('passes activity summary events through to the renderer source stream', async () => {
@@ -238,13 +380,14 @@ describe('session event streaming', () => {
 })
 
 describe('session interruption', () => {
-  test('posts interruption reason to the thread interrupt endpoint', async () => {
+  test('posts the external Slack Connect actor with the interruption reason', async () => {
     const { fetchFn, requests } = fakeApi()
 
     const response = await interruptSessionExecution(
       options(fetchFn),
       'slack:C1:1700000000.000100',
-      'Interrupted from Slack by U1'
+      'Interrupted from Slack by U1',
+      { slack_actor_team_id: 'TACTOR', slack_actor_user_id: 'U1' }
     )
 
     expect(response.interrupted).toBe(true)
@@ -252,7 +395,10 @@ describe('session interruption', () => {
     expect(interrupt?.url).toBe(
       'http://api.test/api/session/slack%3AC1%3A1700000000.000100/interrupt'
     )
-    expect(interrupt?.body).toEqual({ reason: 'Interrupted from Slack by U1' })
+    expect(interrupt?.body).toEqual({
+      metadata: { slack_actor_team_id: 'TACTOR', slack_actor_user_id: 'U1' },
+      reason: 'Interrupted from Slack by U1'
+    })
   })
 })
 
@@ -857,8 +1003,10 @@ describe('session principal display name', () => {
 	      slack_channel_id?: string
 	      slack_conversation_name?: string
 	      slack_team_id?: string
+	      slack_actor_team_id?: string
 	      slack_user_email?: string
       slack_user_id?: string
+	      slack_actor_user_id?: string
     }
 	  } {
 	    return (requests.find(request => request.url.endsWith('.000100'))?.body ?? {}) as {
@@ -866,8 +1014,10 @@ describe('session principal display name', () => {
 	        slack_channel_id?: string
 	        slack_conversation_name?: string
 	        slack_team_id?: string
+	        slack_actor_team_id?: string
 	        slack_user_email?: string
         slack_user_id?: string
+	        slack_actor_user_id?: string
       }
     }
   }
@@ -1029,8 +1179,10 @@ describe('session principal display name', () => {
 	    expect(createBody(requests).metadata?.slack_conversation_name).toBe('Ada Lovelace')
 	    expect(createBody(requests).metadata?.slack_channel_id).toBe('D9')
 	    expect(createBody(requests).metadata?.slack_team_id).toBe('T1')
+	    expect(createBody(requests).metadata?.slack_actor_team_id).toBe('T1')
     expect(createBody(requests).metadata?.slack_user_email).toBe('ada@example.com')
     expect(createBody(requests).metadata?.slack_user_id).toBe('U1')
+    expect(createBody(requests).metadata?.slack_actor_user_id).toBe('U1')
   })
 
   test('falls back to no name when the channel lookup fails', async () => {

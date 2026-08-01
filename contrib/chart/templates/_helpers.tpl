@@ -43,6 +43,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- required "secretManager.existingSecretName is required" .Values.secretManager.existingSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.traceConsentSecretName" -}}
+{{- required "slackbotv2.traceConsent.apiKeySecretName is required" .Values.slackbotv2.traceConsent.apiKeySecretName | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "centaur.trustedCaSecretName" -}}
 {{- required "firewall.existingCaSecretName is required" .Values.firewall.existingCaSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -153,6 +157,10 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- $caKeyName := include "centaur.trustedCaKeySecretName" . -}}
 {{- $payload := dict "env" (include "centaur.secretResourceVersion" (dict "root" . "name" $envName)) "ca" (include "centaur.secretResourceVersion" (dict "root" . "name" $caName)) "caKey" (include "centaur.secretResourceVersion" (dict "root" . "name" $caKeyName)) -}}
 {{- toJson $payload | sha256sum -}}
+{{- end -}}
+
+{{- define "centaur.traceConsentSecretChecksum" -}}
+{{- include "centaur.secretResourceVersion" (dict "root" . "name" (include "centaur.traceConsentSecretName" .)) | sha256sum -}}
 {{- end -}}
 
 {{- /*

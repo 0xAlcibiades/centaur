@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
-    DesiredSandboxState, ObservedSandbox, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    DesiredSandboxState, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId,
+    SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_telemetry::{record_sandbox_operation, record_sandbox_startup_duration};
 use tokio::time::Instant;
@@ -190,6 +190,21 @@ where
         Ok(())
     }
 
+    pub async fn pause_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        self.backend.pause_exact(id, expected_resource_uid).await?;
+        if let Some(DesiredSandboxState::Running(spec) | DesiredSandboxState::Suspended(spec)) =
+            self.store.get(id)
+        {
+            self.store
+                .set(id.clone(), DesiredSandboxState::Suspended(spec));
+        }
+        Ok(())
+    }
+
     pub async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         let backend = self.backend.name();
         match self.backend.resume(id).await {
@@ -199,6 +214,39 @@ where
                 return Err(error);
             }
         }
+        if let Some(DesiredSandboxState::Running(spec) | DesiredSandboxState::Suspended(spec)) =
+            self.store.get(id)
+        {
+            self.store
+                .set(id.clone(), DesiredSandboxState::Running(spec));
+        }
+        Ok(())
+    }
+
+    pub async fn resume_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        self.backend.resume_exact(id, expected_resource_uid).await?;
+        if let Some(DesiredSandboxState::Running(spec) | DesiredSandboxState::Suspended(spec)) =
+            self.store.get(id)
+        {
+            self.store
+                .set(id.clone(), DesiredSandboxState::Running(spec));
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_running_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: &str,
+        fence_nonce: &str,
+    ) -> SandboxResult<()> {
+        self.backend
+            .ensure_running_exact(id, expected_resource_uid, fence_nonce)
+            .await?;
         if let Some(DesiredSandboxState::Running(spec) | DesiredSandboxState::Suspended(spec)) =
             self.store.get(id)
         {
@@ -239,6 +287,16 @@ where
         .await
     }
 
+    pub async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        self.backend.stop_exact(id, expected_resource_uid).await?;
+        self.store.set(id.clone(), DesiredSandboxState::Stopped);
+        Ok(())
+    }
+
     pub async fn assign_iron_control_proxy_principal(
         &self,
         id: &SandboxId,
@@ -267,19 +325,25 @@ where
         };
         let observed = self.backend.observe(id).await?;
         let plan = ReconcilePlan::for_state(&desired, &observed);
-        self.apply_plan(id, plan).await
+        self.apply_plan(id, &observed, plan).await
     }
 
     async fn apply_plan(
         &self,
         id: &SandboxId,
+        observed: &ObservedSandbox,
         plan: ReconcilePlan,
     ) -> SandboxResult<ReconcileOutcome> {
         let backend = self.backend.name();
         match plan.action {
             ReconcileAction::None => Ok(ReconcileOutcome::Noop),
             ReconcileAction::Pause => {
-                match self.backend.pause(id).await {
+                let Some(resource_uid) = observed.resource_uid.as_deref() else {
+                    return Err(SandboxError::backend(
+                        "reconciliation pause requires a stable resource UID",
+                    ));
+                };
+                match self.backend.pause_exact(id, Some(resource_uid)).await {
                     Ok(()) => record_sandbox_operation(backend, "pause", "success"),
                     Err(error) => {
                         record_sandbox_operation(backend, "pause", "error");
@@ -289,7 +353,12 @@ where
                 Ok(ReconcileOutcome::Paused)
             }
             ReconcileAction::Resume => {
-                match self.backend.resume(id).await {
+                let Some(resource_uid) = observed.resource_uid.as_deref() else {
+                    return Err(SandboxError::backend(
+                        "reconciliation resume requires a stable resource UID",
+                    ));
+                };
+                match self.backend.resume_exact(id, Some(resource_uid)).await {
                     Ok(()) => record_sandbox_operation(backend, "resume", "success"),
                     Err(error) => {
                         record_sandbox_operation(backend, "resume", "error");
@@ -299,7 +368,12 @@ where
                 Ok(ReconcileOutcome::Resumed)
             }
             ReconcileAction::Stop => {
-                match self.backend.stop(id).await {
+                let Some(resource_uid) = observed.resource_uid.as_deref() else {
+                    return Err(SandboxError::backend(
+                        "reconciliation stop requires a stable resource UID",
+                    ));
+                };
+                match self.backend.stop_exact(id, Some(resource_uid)).await {
                     Ok(()) => record_sandbox_operation(backend, "stop", "success"),
                     Err(error) => {
                         record_sandbox_operation(backend, "stop", "error");
@@ -317,7 +391,7 @@ where
         for (id, desired) in self.store.list() {
             let observed = self.backend.observe(&id).await?;
             let plan = ReconcilePlan::for_state(&desired, &observed);
-            let outcome = self.apply_plan(&id, plan).await?;
+            let outcome = self.apply_plan(&id, &observed, plan).await?;
             reconciled.push(ManagedSandbox {
                 id,
                 desired,

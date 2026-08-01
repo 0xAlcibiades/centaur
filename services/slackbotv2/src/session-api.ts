@@ -18,7 +18,8 @@ import type {
   SlackbotV2InterruptSessionResponse,
   SlackbotV2Options,
   SlackbotV2RendererSource,
-  SlackbotV2SessionMessage
+  SlackbotV2SessionMessage,
+  SlackbotV2SlackWorkspaceContext
 } from './types'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import { rawSlackUserId } from './slack-user'
@@ -181,7 +182,8 @@ type ForwardSessionApiCallbacks = {
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message,
-  options?: SlackbotV2Options
+  options?: SlackbotV2Options,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
 ): Promise<SlackbotV2ApiMessage[]> {
   const messages: Message[] = []
   try {
@@ -190,7 +192,7 @@ export async function collectInitialContext(
     }
   } catch (error) {
     if (!isSlackThreadNotFoundError(error)) throw error
-    return [await serializeMessage(currentMessage, options)]
+    return [await serializeMessage(currentMessage, options, workspaceContext)]
   }
 
   const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
@@ -202,7 +204,7 @@ export async function collectInitialContext(
 
   const serialized: SlackbotV2ApiMessage[] = []
   for (const message of messages) {
-    serialized.push(await serializeMessage(message, options))
+    serialized.push(await serializeMessage(message, options, workspaceContext))
   }
   return serialized
 }
@@ -221,7 +223,8 @@ function isSlackThreadNotFoundError(error: unknown): boolean {
 
 export async function serializeMessage(
   message: Message,
-  options?: SlackbotV2Options
+  options?: SlackbotV2Options,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
 ): Promise<SlackbotV2ApiMessage> {
   const attachments: SlackbotV2ApiAttachment[] = []
   for (const attachment of message.attachments) {
@@ -233,6 +236,7 @@ export async function serializeMessage(
     }
   }
   const displayText = renderSlackDisplayText({ raw: message.raw, text: message.text })
+  const slackWorkspace = slackWorkspaceContextForMessage(message.raw, workspaceContext)
 
   return {
     attachments,
@@ -243,6 +247,7 @@ export async function serializeMessage(
       userId: message.author.userId,
       userName: message.author.userName
     },
+    actorTeamId: slackWorkspace.actorTeamId,
     displayText: displayText.text,
     displayTextSource: displayText.source,
     id: message.id,
@@ -251,10 +256,29 @@ export async function serializeMessage(
     raw: message.raw,
     rawSlackAttachmentCount: displayText.rawAttachmentCount,
     rawSlackBlockCount: displayText.rawBlockCount,
-    teamId: slackTeamId(message.raw) as string,
+    hostTeamId: slackWorkspace.hostTeamId,
+    teamId: slackWorkspace.hostTeamId as string,
     text: message.text,
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString()
+  }
+}
+
+/**
+ * Select the actor workspace only from Slack-owned event fields. Do not accept
+ * generic metadata keys here: callers use this value for trace attribution.
+ */
+export function slackWorkspaceContextForMessage(
+  raw: unknown,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
+): SlackbotV2SlackWorkspaceContext {
+  const event = isJsonObject(raw) ? raw : undefined
+  const hostTeamId = workspaceContext?.hostTeamId ?? slackTeamId(event)
+  const actorTeamId =
+    stringValue(event?.user_team) ?? stringValue(event?.source_team) ?? hostTeamId
+  return {
+    ...(actorTeamId ? { actorTeamId } : {}),
+    ...(hostTeamId ? { hostTeamId } : {})
   }
 }
 
@@ -456,10 +480,6 @@ function slackTeamId(raw: unknown): string | undefined {
   if (typeof raw.team_id === 'string' && raw.team_id) return raw.team_id
   if (typeof team === 'string' && team) return team
   if (isJsonObject(team) && typeof team.id === 'string' && team.id) return team.id
-  const user = raw.user
-  if (isJsonObject(user) && typeof user.team_id === 'string' && user.team_id) {
-    return user.team_id
-  }
   return undefined
 }
 
@@ -601,11 +621,12 @@ export async function openSessionEventStream(
 export async function interruptSessionExecution(
   options: SlackbotV2Options,
   threadId: string,
-  reason: string
+  reason: string,
+  metadata: JsonObject = {}
 ): Promise<SlackbotV2InterruptSessionResponse> {
   return recordSessionApiOperation(
     'interrupt_session',
-    () => postInterruptSessionExecution(options, threadId, reason),
+    () => postInterruptSessionExecution(options, threadId, reason, metadata),
     sessionApiTimeoutMs(options),
     'interrupt session'
   )
@@ -909,12 +930,15 @@ function sessionRequesterMetadata(
 ): JsonObject {
   const slackUserId = identity?.slackUserId ?? messageRequesterUserId(message)
   const slackTeamId = identity?.slackTeamId ?? messageSlackTeamId(message)
+  const slackActorTeamId = messageActorTeamId(message)
   const slackChannelId = message ? slackConversationId(message) : undefined
   const slackUserName = identity?.slackUserName ?? message?.author.userName
   const slackDisplayName = identity?.slackDisplayName ?? message?.author.fullName
   const slackEmail = identity?.slackEmail
   return {
     ...(slackUserId ? { slack_user_id: slackUserId } : {}),
+    ...(slackUserId ? { slack_actor_user_id: slackUserId } : {}),
+    ...(slackActorTeamId ? { slack_actor_team_id: slackActorTeamId } : {}),
     ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
     ...(slackChannelId ? { slack_channel_id: slackChannelId } : {}),
     ...(slackUserName ? { slack_user_name: slackUserName } : {}),
@@ -926,7 +950,15 @@ function sessionRequesterMetadata(
 
 function messageSlackTeamId(message: SlackbotV2ApiMessage | undefined): string | undefined {
   if (!message) return undefined
-  return message.teamId || slackTeamId(message.raw) || rawSlackString(message.raw, 'team_id')
+  return message.hostTeamId ?? message.teamId ?? slackTeamId(message.raw)
+}
+
+function messageActorTeamId(message: SlackbotV2ApiMessage | undefined): string | undefined {
+  if (!message) return undefined
+  return (
+    message.actorTeamId ??
+    slackWorkspaceContextForMessage(message.raw, { hostTeamId: messageSlackTeamId(message) }).actorTeamId
+  )
 }
 
 function messageRequesterUserId(message: SlackbotV2ApiMessage | undefined): string | undefined {
@@ -1343,7 +1375,8 @@ async function executeSession(
 async function postInterruptSessionExecution(
   options: SlackbotV2Options,
   threadId: string,
-  reason: string
+  reason: string,
+  metadata: JsonObject
 ): Promise<SlackbotV2InterruptSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const response = await fetchWithTimeout(
@@ -1352,7 +1385,7 @@ async function postInterruptSessionExecution(
     {
       method: 'POST',
       headers: apiHeaders(options),
-      body: JSON.stringify({ reason })
+      body: JSON.stringify({ reason, metadata })
     },
     sessionApiTimeoutMs(options),
     'interrupt session'

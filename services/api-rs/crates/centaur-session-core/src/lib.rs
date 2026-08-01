@@ -416,6 +416,33 @@ pub struct SandboxCapabilities {
     pub repo_cache: SandboxRepoCacheAccess,
     pub observability_enabled: bool,
     pub api_server_enabled: bool,
+    /// Consent-gated metadata-only Codex trace export. This is intentionally
+    /// separate from generic sandbox observability, which has broader access.
+    #[serde(default)]
+    pub metadata_trace_enabled: bool,
+    /// The last control-plane expiry authorizing the trace capability. It is
+    /// persisted with the sandbox assignment so control-plane outages cannot
+    /// extend tracing beyond the last known consent boundary.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub metadata_trace_expires_at: Option<OffsetDateTime>,
+    /// Stable hash of the Slack actor that authorized this sidecar. Raw Slack
+    /// identifiers never become a sandbox capability or durable session field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_trace_subject_hash: Option<String>,
+    /// Monotonic user-consent revision observed when this sidecar was assigned.
+    /// A later grant or revoke must replace this sandbox before accepting input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_trace_consent_revision: Option<i64>,
+    /// Hash of the effective, non-secret trace sidecar configuration. It is
+    /// persisted with the assignment so a changed image or gateway replaces a
+    /// previously traced sandbox instead of silently reusing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_trace_config_fingerprint: Option<String>,
+    /// Deployment-supplied monotonic generation of the active metadata trace
+    /// configuration. This fences stale control-plane replicas even when a
+    /// configuration fingerprint happens to be reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_trace_config_generation: Option<i64>,
 }
 
 impl SandboxCapabilities {
@@ -424,6 +451,12 @@ impl SandboxCapabilities {
             repo_cache: SandboxRepoCacheAccess::All,
             observability_enabled: true,
             api_server_enabled: true,
+            metadata_trace_enabled: false,
+            metadata_trace_expires_at: None,
+            metadata_trace_subject_hash: None,
+            metadata_trace_consent_revision: None,
+            metadata_trace_config_fingerprint: None,
+            metadata_trace_config_generation: None,
         }
     }
 
@@ -431,6 +464,12 @@ impl SandboxCapabilities {
         matches!(self.repo_cache, SandboxRepoCacheAccess::All)
             && self.observability_enabled
             && self.api_server_enabled
+            && !self.metadata_trace_enabled
+            && self.metadata_trace_expires_at.is_none()
+            && self.metadata_trace_subject_hash.is_none()
+            && self.metadata_trace_consent_revision.is_none()
+            && self.metadata_trace_config_fingerprint.is_none()
+            && self.metadata_trace_config_generation.is_none()
     }
 
     pub const fn repo_cache_enabled(&self) -> bool {

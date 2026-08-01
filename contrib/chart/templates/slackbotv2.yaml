@@ -21,6 +21,7 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+        checksum/trace-consent-secret: {{ include "centaur.traceConsentSecretChecksum" . }}
 {{- with $slackbotV2MetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -62,6 +63,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: SLACK_TRACE_CONSENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.traceConsentSecretName" . }}
+                  key: {{ required "slackbotv2.traceConsent.apiKeySecretKey is required" .Values.slackbotv2.traceConsent.apiKeySecretKey }}
             - name: SLACKBOTV2_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -114,6 +120,8 @@ spec:
             - name: SLACKBOTV2_AUTOROTATE_SLACK_TEAM_IDS
               value: {{ required "slackbotv2.autorotate.operatorSlackTeamIds must not be empty when Autorotate commands are enabled" (join "," .Values.slackbotv2.autorotate.operatorSlackTeamIds) | quote }}
 {{- if .Values.slackbotv2.autorotate.operatorSlackUserIds }}
+            # Only drain/resume require these TEAM_ID:USER_ID principals. Fleet
+            # and status remain workspace-wide reads for a signed workspace.
             - name: SLACKBOTV2_AUTOROTATE_SLACK_USER_IDS
               value: {{ join "," .Values.slackbotv2.autorotate.operatorSlackUserIds | quote }}
 {{- end }}
@@ -127,6 +135,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
                   key: {{ .Values.slackbotv2.autorotate.operatorTokenKey | quote }}
+            - name: AUTOROTATE_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ .Values.slackbotv2.autorotate.controlTokenKey | quote }}
 {{- end }}
 {{- if .Values.slackbotv2.channelDefaults }}
             # Per-channel default harness / model / provider / reasoning, keyed

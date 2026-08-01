@@ -277,6 +277,145 @@ else
     exit 1
 fi
 
+# A consented metadata-trace sidecar writes its loopback-only OTLP capability
+# here. The agent mount is read-only and this bounded wait deliberately keeps
+# Codex available when the sidecar is absent or unhealthy.
+configure_codex_metadata_trace() {
+    local address_file="${CENTAUR_CODEX_METADATA_TRACE_ADDRESS_FILE:-}"
+    [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "codex" ] || return 0
+
+    # The image may be reused after an earlier deployment injected OTEL state.
+    # Disable every inherited exporter before considering the narrow loopback
+    # capability, so an unavailable trace agent cannot fall back to a broad
+    # collector or export prompts through stale configuration.
+    while IFS='=' read -r name _; do
+        case "$name" in OTEL_*) unset "$name" ;; esac
+    done < <(env)
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
+from pathlib import Path
+import os
+import tomllib
+
+try:
+    import tomli_w
+except ModuleNotFoundError:
+    # The production image installs tomli-w. Keep local/minimal images usable
+    # with the TOML parser as the authority and a conservative writer fallback.
+    import json
+
+    class tomli_w:
+        @staticmethod
+        def dumps(value):
+            def scalar(item):
+                if isinstance(item, bool):
+                    return str(item).lower()
+                if isinstance(item, str):
+                    return json.dumps(item)
+                if isinstance(item, list):
+                    return "[" + ", ".join(scalar(entry) for entry in item) + "]"
+                return str(item)
+
+            lines = []
+            def write_table(table, path=()):
+                for key, item in table.items():
+                    if not isinstance(item, dict):
+                        lines.append(f"{key} = {scalar(item)}")
+                for key, item in table.items():
+                    if isinstance(item, dict):
+                        heading = ".".join((*path, key))
+                        lines.append(f"[{heading}]")
+                        write_table(item, (*path, key))
+            write_table(value)
+            return "\n".join(lines) + ("\n" if lines else "")
+
+path = Path(os.environ["CODEX_CONFIG_PATH"])
+config = tomllib.loads(path.read_text())
+config.pop("otel", None)
+config["otel"] = {
+    "exporter": "none",
+    "log_user_prompt": False,
+    "metrics_exporter": "none",
+    "trace_exporter": "none",
+}
+path.write_text(tomli_w.dumps(config))
+PYEOF
+    # Metadata-trace mode is the only supported Codex tracing path. This must
+    # remain disabled even when this execution has no consent, otherwise a
+    # baked or inherited exporter can observe prompts during a config rollout.
+    [ "${CENTAUR_SANDBOX_METADATA_TRACE_ENABLED:-false}" = "true" ] || return 0
+    [ -n "$address_file" ] || return 0
+
+    local wait_seconds="${CENTAUR_CODEX_METADATA_TRACE_WAIT_SECONDS:-5}"
+    local deadline=$(( $(date +%s) + wait_seconds ))
+    local endpoint=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -r "$address_file" ]; then
+            endpoint="$(tr -d '\r\n' < "$address_file")"
+            case "$endpoint" in
+                http://127.0.0.1:*|http://[::1]:*) break ;;
+                *) endpoint="" ;;
+            esac
+        fi
+        sleep 0.2
+    done
+    if [ -z "$endpoint" ]; then
+        echo "metadata trace sidecar unavailable; continuing without trace export" >&2
+        return 0
+    fi
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" CODEX_TRACE_ENDPOINT="$endpoint" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+import tomllib
+
+try:
+    import tomli_w
+except ModuleNotFoundError:
+    import json
+
+    class tomli_w:
+        @staticmethod
+        def dumps(value):
+            def scalar(item):
+                if isinstance(item, bool):
+                    return str(item).lower()
+                if isinstance(item, str):
+                    return json.dumps(item)
+                if isinstance(item, list):
+                    return "[" + ", ".join(scalar(entry) for entry in item) + "]"
+                return str(item)
+
+            lines = []
+            def write_table(table, path=()):
+                for key, item in table.items():
+                    if not isinstance(item, dict):
+                        lines.append(f"{key} = {scalar(item)}")
+                for key, item in table.items():
+                    if isinstance(item, dict):
+                        heading = ".".join((*path, key))
+                        lines.append(f"[{heading}]")
+                        write_table(item, (*path, key))
+            write_table(value)
+            return "\n".join(lines) + ("\n" if lines else "")
+
+path = Path(os.environ["CODEX_CONFIG_PATH"])
+# Codex 0.146 configures OTLP/HTTP at the signal endpoint, whereas the
+# capability is deliberately published as its base URL. Normalize both current
+# and already signal-scoped capabilities without a duplicate path.
+endpoint = os.environ["CODEX_TRACE_ENDPOINT"].rstrip("/")
+if not endpoint.endswith("/v1/traces"):
+    endpoint = f"{endpoint}/v1/traces"
+config = tomllib.loads(path.read_text())
+config.pop("otel", None)
+config["otel"] = {
+    "exporter": "none",
+    "log_user_prompt": False,
+    "metrics_exporter": "none",
+    "trace_exporter": {"otlp-http": {"endpoint": endpoint, "protocol": "binary"}},
+}
+path.write_text(tomli_w.dumps(config))
+PYEOF
+}
+
 # ── Claude Code settings ────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.claude"
 if [ -f "$HARNESS_CONFIG_DIR/claude/settings.json" ]; then
@@ -435,6 +574,8 @@ fi
 
 # Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
 cd "$WORKSPACE_DIR"
+
+configure_codex_metadata_trace "$@"
 
 if [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "amp" ] && [ -f "$TARGET_PROMPT" ]; then
     rm -f "$WORKSPACE_DIR/AGENT.md"

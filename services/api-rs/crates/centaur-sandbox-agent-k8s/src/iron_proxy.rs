@@ -15,14 +15,16 @@ use k8s_openapi::api::networking::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Resource};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    API_SERVER_ENABLED_LABEL, AgentSandboxBackend, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    OBSERVABILITY_ENABLED_LABEL, OtlpEgressTarget, SANDBOX_ID_LABEL, is_not_found, map_kube_error,
+    API_SERVER_ENABLED_LABEL, AUXILIARY_GENERATION_ANNOTATION, AUXILIARY_GENERATION_LABEL,
+    AgentSandboxBackend, MANAGED_BY_LABEL, MANAGED_BY_VALUE, OBSERVABILITY_ENABLED_LABEL,
+    OtlpEgressTarget, SANDBOX_ID_LABEL, auxiliary_delete_params, auxiliary_generation_from_sandbox,
+    is_conflict, is_not_found, map_kube_error, object_is_owned_by_sandbox,
 };
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
@@ -369,16 +371,17 @@ impl AgentSandboxBackend {
         &self,
         id: &SandboxId,
         resolved: Option<&ResolvedIronProxy>,
+        generation: &str,
     ) -> SandboxResult<()> {
         let (Some(resolved), Some(iron_proxy)) = (resolved, self.config.iron_proxy.as_ref()) else {
             return Ok(());
         };
-        self.delete_iron_proxy_resources(id).await?;
-        let sync = self.register_sync_proxy(id, resolved).await?;
+        self.delete_iron_proxy_resources(id, generation).await?;
+        let sync = self.register_sync_proxy(id, resolved, generation).await?;
         self.services()
             .create(
                 &PostParams::default(),
-                &build_iron_proxy_service(id, resolved),
+                &build_iron_proxy_service_with_generation(id, resolved, generation),
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy service", err))?;
@@ -387,9 +390,10 @@ impl AgentSandboxBackend {
             &self.config.namespace,
             iron_proxy.control_plane_pod_labels.clone(),
         );
-        for policy in build_iron_proxy_network_policies(
+        for policy in build_iron_proxy_network_policies_with_generation(
             id,
             resolved,
+            generation,
             iron_proxy,
             &control_target,
             self.config.otlp_egress.as_ref(),
@@ -403,13 +407,14 @@ impl AgentSandboxBackend {
         self.pods()
             .create(
                 &PostParams::default(),
-                &build_iron_proxy_pod(id, iron_proxy, resolved, &sync),
+                &build_iron_proxy_pod_with_generation(id, iron_proxy, resolved, &sync, generation),
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
         self.wait_until_proxy_running(resolved).await?;
         self.wait_for_cold_proxy_principal_applied(
             id,
+            generation,
             &resolved.principal_id,
             sync.config_hash.as_deref(),
         )
@@ -424,6 +429,7 @@ impl AgentSandboxBackend {
         &self,
         id: &SandboxId,
         resolved: &ResolvedIronProxy,
+        generation: &str,
     ) -> SandboxResult<ProxySyncEnv> {
         let iron_control = self.config.iron_control.as_ref().ok_or_else(|| {
             SandboxError::backend("iron-proxy requires iron-control to be configured")
@@ -436,10 +442,13 @@ impl AgentSandboxBackend {
         let token = proxy
             .token
             .ok_or_else(|| SandboxError::backend("iron-control create proxy returned no token"))?;
-        self.proxy_ids
-            .lock()
-            .await
-            .insert(id.as_str().to_owned(), proxy.id.clone());
+        self.proxy_ids.lock().await.insert(
+            id.as_str().to_owned(),
+            crate::ProxyMapping {
+                generation: generation.to_owned(),
+                proxy_id: proxy.id.clone(),
+            },
+        );
         Ok(ProxySyncEnv {
             proxy_id: proxy.id,
             control_url: iron_control.control_url.clone(),
@@ -458,14 +467,89 @@ impl AgentSandboxBackend {
         &self,
         id: &SandboxId,
         sandbox: &crate::crd::Sandbox,
+        generation: &str,
     ) -> SandboxResult<()> {
         let Some(owner_reference) = sandbox_owner_reference(sandbox) else {
             return Ok(());
         };
         let params = PatchParams::default();
-        let patch = Patch::Merge(json!({
-            "metadata": { "ownerReferences": [owner_reference] },
-        }));
+        let pods = self
+            .pods()
+            .list(&ListParams::default().labels(&format!(
+                "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+                id.as_str(),
+            )))
+            .await
+            .map_err(|err| map_kube_error("list iron-proxy pods for adoption", err))?;
+        for pod in pods.items {
+            let Some(name) = pod.metadata.name.as_ref() else {
+                continue;
+            };
+            if auxiliary_delete_params(&pod.metadata, generation)?.is_none() {
+                continue;
+            }
+            let patch = owner_reference_patch(&pod.metadata, &owner_reference, None)?;
+            match self.pods().patch(name, &params, &patch).await {
+                Ok(_) => {}
+                Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                Err(err) => return Err(map_kube_error("adopt iron-proxy pod", err)),
+            }
+        }
+        let service_name = iron_proxy_service_name(id);
+        let service_matches = match self.services().get(&service_name).await {
+            Ok(service) => Some(auxiliary_delete_params(&service.metadata, generation)?),
+            Err(err) if is_not_found(&err) => None,
+            Err(err) => return Err(map_kube_error("get iron-proxy service for adoption", err)),
+        };
+        if let Some(Some(delete_params)) = service_matches {
+            let patch =
+                owner_reference_patch_from_delete_params(delete_params, &owner_reference, None);
+            match self.services().patch(&service_name, &params, &patch).await {
+                Ok(_) => {}
+                Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                Err(err) => return Err(map_kube_error("adopt iron-proxy service", err)),
+            }
+        }
+        for name in [
+            iron_proxy_sandbox_egress_policy_name(id),
+            iron_proxy_policy_name(id),
+        ] {
+            let policy_matches = match self.network_policies().get(&name).await {
+                Ok(policy) => Some(auxiliary_delete_params(&policy.metadata, generation)?),
+                Err(err) if is_not_found(&err) => None,
+                Err(err) => {
+                    return Err(map_kube_error(
+                        "get iron-proxy network policy for adoption",
+                        err,
+                    ));
+                }
+            };
+            if let Some(Some(delete_params)) = policy_matches {
+                let patch =
+                    owner_reference_patch_from_delete_params(delete_params, &owner_reference, None);
+                match self.network_policies().patch(&name, &params, &patch).await {
+                    Ok(_) => {}
+                    Err(err) if is_not_found(&err) || is_conflict(&err) => {}
+                    Err(err) => {
+                        return Err(map_kube_error("adopt iron-proxy network policy", err));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn adopt_legacy_iron_proxy_resources(
+        &self,
+        id: &SandboxId,
+        sandbox: &crate::crd::Sandbox,
+        generation: &str,
+        sandbox_pod_isolation_ready: bool,
+    ) -> SandboxResult<()> {
+        let Some(owner_reference) = sandbox_owner_reference(sandbox) else {
+            return Ok(());
+        };
+        let params = PatchParams::default();
         let pods = self
             .pods()
             .list(&ListParams::default().labels(&format!(
@@ -473,64 +557,127 @@ impl AgentSandboxBackend {
                 id.as_str()
             )))
             .await
-            .map_err(|err| map_kube_error("list iron-proxy pods for adoption", err))?;
+            .map_err(|err| map_kube_error("list legacy iron-proxy pods", err))?;
         for pod in pods.items {
-            let Some(name) = pod.metadata.name else {
+            let Some(name) = pod.metadata.name.as_ref() else {
                 continue;
             };
-            match self.pods().patch(&name, &params, &patch).await {
+            if !legacy_auxiliary_is_adoptable(&pod.metadata, sandbox) {
+                continue;
+            }
+            let patch = owner_reference_patch(&pod.metadata, &owner_reference, Some(generation))?;
+            match self.pods().patch(name, &params, &patch).await {
                 Ok(_) => {}
                 Err(err) if is_not_found(&err) => {}
-                Err(err) => return Err(map_kube_error("adopt iron-proxy pod", err)),
+                Err(err) => return Err(map_kube_error("adopt legacy iron-proxy pod", err)),
             }
         }
-        match self
-            .services()
-            .patch(&iron_proxy_service_name(id), &params, &patch)
-            .await
-        {
-            Ok(_) => {}
-            Err(err) if is_not_found(&err) => {}
-            Err(err) => return Err(map_kube_error("adopt iron-proxy service", err)),
-        }
+        self.adopt_legacy_iron_proxy_service(id, sandbox, &owner_reference, generation)
+            .await?;
         for name in [
             iron_proxy_sandbox_egress_policy_name(id),
             iron_proxy_policy_name(id),
         ] {
-            match self.network_policies().patch(&name, &params, &patch).await {
-                Ok(_) => {}
-                Err(err) if is_not_found(&err) => {}
-                Err(err) => return Err(map_kube_error("adopt iron-proxy network policy", err)),
+            if name == iron_proxy_sandbox_egress_policy_name(id) && !sandbox_pod_isolation_ready {
+                continue;
             }
+            self.adopt_legacy_iron_proxy_network_policy(
+                &name,
+                sandbox,
+                &owner_reference,
+                generation,
+            )
+            .await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn delete_iron_proxy_resources(&self, id: &SandboxId) -> SandboxResult<()> {
+    async fn adopt_legacy_iron_proxy_service(
+        &self,
+        id: &SandboxId,
+        sandbox: &crate::crd::Sandbox,
+        owner_reference: &Value,
+        generation: &str,
+    ) -> SandboxResult<()> {
+        let api = self.services();
+        let name = iron_proxy_service_name(id);
+        let service = match api.get(&name).await {
+            Ok(service) => service,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get legacy iron-proxy service", err)),
+        };
+        if !legacy_auxiliary_is_adoptable(&service.metadata, sandbox) {
+            return Ok(());
+        }
+        let patch = service_generation_patch(&service, owner_reference, generation)?;
+        match api.patch(&name, &PatchParams::default(), &patch).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error("adopt legacy iron-proxy service", err)),
+        }
+    }
+
+    async fn adopt_legacy_iron_proxy_network_policy(
+        &self,
+        name: &str,
+        sandbox: &crate::crd::Sandbox,
+        owner_reference: &Value,
+        generation: &str,
+    ) -> SandboxResult<()> {
+        let api = self.network_policies();
+        let policy = match api.get(name).await {
+            Ok(policy) => policy,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get legacy iron-proxy network policy", err)),
+        };
+        if !legacy_auxiliary_is_adoptable(&policy.metadata, sandbox) {
+            return Ok(());
+        }
+        let patch = network_policy_generation_patch(&policy, owner_reference, generation)?;
+        match api.patch(name, &PatchParams::default(), &patch).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error(
+                "adopt legacy iron-proxy network policy",
+                err,
+            )),
+        }
+    }
+
+    pub(crate) async fn delete_iron_proxy_resources(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> SandboxResult<()> {
         // Deliberately not gated on iron_proxy being configured: the resources
         // may exist from a previous configuration, and deleting absent ones is
         // a no-op.
         //
         // Deregister the iron-control proxy first (best-effort): once the pod is
         // gone the token is useless, and a stale proxy row just fails to sync.
-        if let Some(iron_control) = self.config.iron_control.as_ref()
-            && let Some(proxy_id) = self.proxy_ids.lock().await.remove(id.as_str())
-        {
-            let _ = iron_control.client.delete_proxy(&proxy_id).await;
+        let mapping = self
+            .proxy_ids
+            .lock()
+            .await
+            .get(id.as_str())
+            .filter(|mapping| mapping.generation == generation)
+            .cloned();
+        if let Some(mapping) = mapping {
+            if let Some(iron_control) = self.config.iron_control.as_ref() {
+                let _ = iron_control.client.delete_proxy(&mapping.proxy_id).await;
+            }
+            let mut proxy_ids = self.proxy_ids.lock().await;
+            crate::remove_proxy_mapping_if_generation(&mut proxy_ids, id.as_str(), generation);
         }
-        let _ = self.delete_iron_proxy_pods_for_sandbox(id).await;
-        let _ = self
-            .services()
-            .delete(&iron_proxy_service_name(id), &DeleteParams::default())
-            .await;
+        self.delete_iron_proxy_pods_for_sandbox(id, generation)
+            .await?;
+        self.delete_iron_proxy_service(id, generation).await?;
         for name in [
             iron_proxy_sandbox_egress_policy_name(id),
             iron_proxy_policy_name(id),
         ] {
-            let _ = self
-                .network_policies()
-                .delete(&name, &DeleteParams::default())
-                .await;
+            self.delete_iron_proxy_network_policy(&name, generation)
+                .await?;
         }
         Ok(())
     }
@@ -549,8 +696,18 @@ impl AgentSandboxBackend {
                 backend: crate::BACKEND_NAME,
                 operation: "assign_iron_control_proxy_principal",
             })?;
-        let mut proxy_id = self.proxy_id_for_sandbox(id).await?;
-        if proxy_id.is_none() || !self.has_usable_iron_proxy_resources(id).await? {
+        let sandbox = self
+            .sandboxes()
+            .get(id.as_str())
+            .await
+            .map_err(|err| map_kube_error("get sandbox for proxy assignment", err))?;
+        let (_, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let mut proxy_id = self.proxy_id_for_sandbox(id, &generation).await?;
+        if proxy_id.is_none()
+            || !self
+                .has_usable_iron_proxy_resources(id, &generation)
+                .await?
+        {
             tracing::warn!(
                 sandbox_id = id.as_str(),
                 principal_id,
@@ -572,14 +729,22 @@ impl AgentSandboxBackend {
             .assign_proxy_principal(&proxy_id, principal_id, labels)
             .await
             .map_err(|err| SandboxError::backend_source("iron-control assign proxy", err))?;
-        self.proxy_ids
-            .lock()
-            .await
-            .insert(id.as_str().to_owned(), proxy.id);
-        self.patch_iron_control_principal_annotation(id, principal_id)
+        self.proxy_ids.lock().await.insert(
+            id.as_str().to_owned(),
+            crate::ProxyMapping {
+                generation: generation.clone(),
+                proxy_id: proxy.id,
+            },
+        );
+        self.patch_iron_control_principal_annotation(id, &generation, principal_id)
             .await?;
-        self.wait_for_proxy_principal_applied(id, principal_id, proxy.config_hash.as_deref())
-            .await;
+        self.wait_for_proxy_principal_applied(
+            id,
+            &generation,
+            principal_id,
+            proxy.config_hash.as_deref(),
+        )
+        .await;
         Ok(())
     }
 
@@ -598,15 +763,18 @@ impl AgentSandboxBackend {
                 operation: "ensure_iron_control_proxy_resources",
             });
         }
-        let proxy_id = self.proxy_id_for_sandbox(id).await?;
+        let sandbox = self
+            .sandboxes()
+            .get(id.as_str())
+            .await
+            .map_err(|err| map_kube_error("get sandbox for proxy principal check", err))?;
+        let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let proxy_id = self.proxy_id_for_sandbox(id, &generation).await?;
         if let Some(proxy_id) = proxy_id
-            && self.has_usable_iron_proxy_resources(id).await?
+            && self
+                .has_usable_iron_proxy_resources(id, &generation)
+                .await?
         {
-            let sandbox = self
-                .sandboxes()
-                .get(id.as_str())
-                .await
-                .map_err(|err| map_kube_error("get sandbox for proxy principal check", err))?;
             let assigned_principal = sandbox
                 .metadata
                 .annotations
@@ -624,8 +792,13 @@ impl AgentSandboxBackend {
                 .assign_proxy_principal(&proxy_id, principal_id, labels)
                 .await
                 .map_err(|err| SandboxError::backend_source("iron-control assign proxy", err))?;
-            self.wait_for_proxy_principal_applied(id, principal_id, proxy.config_hash.as_deref())
-                .await;
+            self.wait_for_proxy_principal_applied(
+                id,
+                &generation,
+                principal_id,
+                proxy.config_hash.as_deref(),
+            )
+            .await;
             return Ok(());
         }
 
@@ -636,7 +809,7 @@ impl AgentSandboxBackend {
         );
         self.recreate_iron_proxy_resources_for_principal(id, principal_id, labels)
             .await?;
-        self.patch_iron_control_principal_annotation(id, principal_id)
+        self.patch_iron_control_principal_annotation(id, &generation, principal_id)
             .await?;
         Ok(())
     }
@@ -653,17 +826,16 @@ impl AgentSandboxBackend {
                 operation: "assign_iron_control_proxy_principal",
             });
         }
-        let sandbox = match self.sandboxes().get(id.as_str()).await {
-            Ok(sandbox) => Some(sandbox),
-            Err(err) if is_not_found(&err) => None,
-            Err(err) => return Err(map_kube_error("get sandbox for iron-proxy repair", err)),
-        };
-        let pg = self.resolved_pg_for_recreation(sandbox.as_ref());
+        let sandbox = self
+            .sandboxes()
+            .get(id.as_str())
+            .await
+            .map_err(|err| map_kube_error("get sandbox for iron-proxy repair", err))?;
+        let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let pg = self.resolved_pg_for_recreation(Some(&sandbox));
         let principal_id = principal_id.to_owned();
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
-        let observability_enabled = sandbox
-            .as_ref()
-            .and_then(|sandbox| sandbox_observability_enabled(sandbox, &self.config.container_name))
+        let observability_enabled = sandbox_observability_enabled(&sandbox, &self.config.container_name)
             .unwrap_or_else(|| {
                 tracing::warn!(
                     sandbox_id = id.as_str(),
@@ -672,9 +844,7 @@ impl AgentSandboxBackend {
                 );
                 true
             });
-        let api_server_enabled = sandbox
-            .as_ref()
-            .and_then(|sandbox| sandbox_api_server_enabled(sandbox, &self.config.container_name))
+        let api_server_enabled = sandbox_api_server_enabled(&sandbox, &self.config.container_name)
             .unwrap_or_else(|| {
                 tracing::warn!(
                     sandbox_id = id.as_str(),
@@ -694,10 +864,11 @@ impl AgentSandboxBackend {
                 api_server_enabled,
             },
         );
-        self.create_iron_proxy_resources(id, Some(&resolved))
+        self.create_iron_proxy_resources(id, Some(&resolved), &generation)
             .await?;
-        if let Some(sandbox) = sandbox
-            && let Err(error) = self.adopt_iron_proxy_resources(id, &sandbox).await
+        if let Err(error) = self
+            .adopt_iron_proxy_resources(id, &sandbox, &generation)
+            .await
         {
             tracing::warn!(
                 sandbox_id = id.as_str(),
@@ -709,7 +880,8 @@ impl AgentSandboxBackend {
             .lock()
             .await
             .get(id.as_str())
-            .cloned()
+            .filter(|mapping| mapping.generation == generation)
+            .map(|mapping| mapping.proxy_id.clone())
             .ok_or_else(|| {
                 SandboxError::backend(format!(
                     "iron-control proxy id for sandbox {} was not recorded after repair",
@@ -749,12 +921,13 @@ impl AgentSandboxBackend {
     async fn wait_for_proxy_principal_applied(
         &self,
         id: &SandboxId,
+        generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
     ) {
         let started = Instant::now();
         match self
-            .proxy_principal_ack(id, principal_id, config_hash, "claim barrier")
+            .proxy_principal_ack(id, generation, principal_id, config_hash, "claim barrier")
             .await
         {
             Ok(ProxyAck::Applied) => {
@@ -805,12 +978,19 @@ impl AgentSandboxBackend {
     async fn wait_for_cold_proxy_principal_applied(
         &self,
         id: &SandboxId,
+        generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
     ) {
         let started = Instant::now();
         match self
-            .proxy_principal_ack(id, principal_id, config_hash, "cold create barrier")
+            .proxy_principal_ack(
+                id,
+                generation,
+                principal_id,
+                config_hash,
+                "cold create barrier",
+            )
             .await
         {
             Ok(ProxyAck::Applied) => {
@@ -856,11 +1036,12 @@ impl AgentSandboxBackend {
     async fn proxy_principal_ack(
         &self,
         id: &SandboxId,
+        generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
         barrier: &'static str,
     ) -> SandboxResult<ProxyAck> {
-        let endpoint = match self.proxy_management_endpoint(id).await {
+        let endpoint = match self.proxy_management_endpoint(id, generation).await {
             Ok(Some(endpoint)) => endpoint,
             Ok(None) => {
                 return Err(SandboxError::NotReady(format!(
@@ -900,10 +1081,11 @@ impl AgentSandboxBackend {
     async fn proxy_management_endpoint(
         &self,
         id: &SandboxId,
+        generation: &str,
     ) -> SandboxResult<Option<ProxyManagementEndpoint>> {
         let params = ListParams::default().labels(&format!(
-            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
-            id.as_str()
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+            id.as_str(),
         ));
         let pods = self
             .pods()
@@ -916,13 +1098,24 @@ impl AgentSandboxBackend {
             .find_map(proxy_management_endpoint_from_pod))
     }
 
-    async fn proxy_id_for_sandbox(&self, id: &SandboxId) -> SandboxResult<Option<String>> {
-        if let Some(proxy_id) = self.proxy_ids.lock().await.get(id.as_str()).cloned() {
+    async fn proxy_id_for_sandbox(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> SandboxResult<Option<String>> {
+        if let Some(proxy_id) = self
+            .proxy_ids
+            .lock()
+            .await
+            .get(id.as_str())
+            .filter(|mapping| mapping.generation == generation)
+            .map(|mapping| mapping.proxy_id.clone())
+        {
             return Ok(Some(proxy_id));
         }
         let params = ListParams::default().labels(&format!(
-            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
-            id.as_str()
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+            id.as_str(),
         ));
         let pods = self
             .pods()
@@ -938,31 +1131,71 @@ impl AgentSandboxBackend {
                 .filter(|value| !value.trim().is_empty())
             {
                 let proxy_id = proxy_id.to_owned();
-                self.proxy_ids
-                    .lock()
-                    .await
-                    .insert(id.as_str().to_owned(), proxy_id.clone());
+                if auxiliary_delete_params(&pod.metadata, generation)?.is_none() {
+                    continue;
+                }
+                self.proxy_ids.lock().await.insert(
+                    id.as_str().to_owned(),
+                    crate::ProxyMapping {
+                        generation: generation.to_owned(),
+                        proxy_id: proxy_id.clone(),
+                    },
+                );
                 return Ok(Some(proxy_id));
             }
         }
         Ok(None)
     }
 
-    async fn has_usable_iron_proxy_resources(&self, id: &SandboxId) -> SandboxResult<bool> {
+    async fn has_usable_iron_proxy_resources(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> SandboxResult<bool> {
         let params = ListParams::default().labels(&format!(
-            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
-            id.as_str()
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+            id.as_str(),
         ));
         let pods = self
             .pods()
             .list(&params)
             .await
             .map_err(|err| map_kube_error("list iron-proxy pods", err))?;
-        if !pods.items.iter().any(pod_running) {
+        if !pods.items.iter().any(|pod| {
+            auxiliary_delete_params(&pod.metadata, generation)
+                .ok()
+                .flatten()
+                .is_some()
+                && pod_running(pod)
+        }) {
             return Ok(false);
         }
         match self.services().get(&iron_proxy_service_name(id)).await {
-            Ok(_) => Ok(true),
+            Ok(service) => {
+                if auxiliary_delete_params(&service.metadata, generation)?.is_none()
+                    || !service_is_generation_scoped(&service, generation)
+                {
+                    return Ok(false);
+                }
+                for name in [
+                    iron_proxy_sandbox_egress_policy_name(id),
+                    iron_proxy_policy_name(id),
+                ] {
+                    let policy = match self.network_policies().get(&name).await {
+                        Ok(policy) => policy,
+                        Err(err) if is_not_found(&err) => return Ok(false),
+                        Err(err) => {
+                            return Err(map_kube_error("get iron-proxy network policy", err));
+                        }
+                    };
+                    if auxiliary_delete_params(&policy.metadata, generation)?.is_none()
+                        || !network_policy_is_generation_scoped(&policy, generation)
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             Err(err) if is_not_found(&err) => Ok(false),
             Err(err) => Err(map_kube_error("get iron-proxy service", err)),
         }
@@ -971,10 +1204,34 @@ impl AgentSandboxBackend {
     async fn patch_iron_control_principal_annotation(
         &self,
         id: &SandboxId,
+        generation: &str,
         principal_id: &str,
     ) -> SandboxResult<()> {
+        let sandbox =
+            self.sandboxes().get(id.as_str()).await.map_err(|err| {
+                map_kube_error("get sandbox for iron-control principal patch", err)
+            })?;
+        if auxiliary_generation_from_sandbox(&sandbox)?.as_str() != generation {
+            return Ok(());
+        }
+        let uid = sandbox.metadata.uid.as_deref().ok_or_else(|| {
+            SandboxError::backend(
+                "sandbox is missing UID required for iron-control principal patch",
+            )
+        })?;
+        let resource_version = sandbox
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or_else(|| {
+                SandboxError::backend(
+                    "sandbox is missing resourceVersion required for iron-control principal patch",
+                )
+            })?;
         let patch = Patch::Merge(json!({
             "metadata": {
+                "uid": uid,
+                "resourceVersion": resource_version,
                 "annotations": {
                     crate::IRON_CONTROL_PRINCIPAL_ANNOTATION: principal_id,
                 },
@@ -995,10 +1252,14 @@ impl AgentSandboxBackend {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    async fn delete_iron_proxy_pods_for_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
+    async fn delete_iron_proxy_pods_for_sandbox(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> SandboxResult<()> {
         let params = ListParams::default().labels(&format!(
-            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
-            id.as_str()
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+            id.as_str(),
         ));
         let pods = self
             .pods()
@@ -1006,11 +1267,66 @@ impl AgentSandboxBackend {
             .await
             .map_err(|err| map_kube_error("list iron-proxy pods", err))?;
         for pod in pods.items {
-            if let Some(name) = pod.metadata.name {
-                let _ = self.pods().delete(&name, &DeleteParams::default()).await;
+            if let Some(name) = pod.metadata.name.as_ref() {
+                let Some(params) = auxiliary_delete_params(&pod.metadata, generation)? else {
+                    continue;
+                };
+                match self.pods().delete(name, &params).await {
+                    Ok(_) => {}
+                    Err(err) if is_not_found(&err) => {}
+                    Err(err) => return Err(map_kube_error("delete iron-proxy pod", err)),
+                }
             }
         }
         Ok(())
+    }
+
+    async fn delete_iron_proxy_service(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+    ) -> SandboxResult<()> {
+        let api = self.services();
+        let name = iron_proxy_service_name(id);
+        let service = match api.get(&name).await {
+            Ok(service) => service,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(map_kube_error("get iron-proxy service for delete", err)),
+        };
+        let Some(params) = auxiliary_delete_params(&service.metadata, generation)? else {
+            return Ok(());
+        };
+        match api.delete(&name, &params).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error("delete iron-proxy service", err)),
+        }
+    }
+
+    async fn delete_iron_proxy_network_policy(
+        &self,
+        name: &str,
+        generation: &str,
+    ) -> SandboxResult<()> {
+        let api = self.network_policies();
+        let policy = match api.get(name).await {
+            Ok(policy) => policy,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => {
+                return Err(map_kube_error(
+                    "get iron-proxy network policy for delete",
+                    err,
+                ));
+            }
+        };
+        let Some(params) = auxiliary_delete_params(&policy.metadata, generation)? else {
+            return Ok(());
+        };
+        match api.delete(name, &params).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
+            Err(err) => Err(map_kube_error("delete iron-proxy network policy", err)),
+        }
     }
 
     async fn wait_until_proxy_running(&self, resolved: &ResolvedIronProxy) -> SandboxResult<()> {
@@ -1233,11 +1549,22 @@ pub(crate) fn sandbox_ca_volume_json(iron_proxy: &IronProxyConfig) -> Value {
     })
 }
 
+#[cfg(test)]
 fn build_iron_proxy_pod(
     id: &SandboxId,
     iron_proxy: &IronProxyConfig,
     resolved: &ResolvedIronProxy,
     sync: &ProxySyncEnv,
+) -> Pod {
+    build_iron_proxy_pod_with_generation(id, iron_proxy, resolved, sync, "test-generation")
+}
+
+fn build_iron_proxy_pod_with_generation(
+    id: &SandboxId,
+    iron_proxy: &IronProxyConfig,
+    resolved: &ResolvedIronProxy,
+    sync: &ProxySyncEnv,
+    generation: &str,
 ) -> Pod {
     let annotations = BTreeMap::from([
         (
@@ -1248,6 +1575,10 @@ fn build_iron_proxy_pod(
             crate::IRON_CONTROL_PRINCIPAL_ANNOTATION.to_owned(),
             resolved.principal_id.clone(),
         ),
+        (
+            AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+            generation.to_owned(),
+        ),
     ]);
     Pod {
         metadata: object_meta_with_annotations(
@@ -1256,6 +1587,7 @@ fn build_iron_proxy_pod(
                 id,
                 resolved.observability_enabled,
                 resolved.api_server_enabled,
+                generation,
             ),
             annotations,
         ),
@@ -1437,25 +1769,40 @@ fn iron_proxy_volumes(iron_proxy: &IronProxyConfig) -> Vec<Volume> {
     ]
 }
 
+#[cfg(test)]
 fn build_iron_proxy_service(id: &SandboxId, resolved: &ResolvedIronProxy) -> Service {
+    build_iron_proxy_service_with_generation(id, resolved, "test-generation")
+}
+
+fn build_iron_proxy_service_with_generation(
+    id: &SandboxId,
+    resolved: &ResolvedIronProxy,
+    generation: &str,
+) -> Service {
     let mut ports = vec![service_port("proxy", resolved.proxy_port)];
     if let Some(pg) = &resolved.pg {
         ports.push(service_port("pg", pg.port));
     }
     Service {
-        metadata: object_meta(
+        metadata: object_meta_with_annotations(
             iron_proxy_service_name(id),
             iron_proxy_labels(
                 id,
                 resolved.observability_enabled,
                 resolved.api_server_enabled,
+                generation,
             ),
+            BTreeMap::from([(
+                AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                generation.to_owned(),
+            )]),
         ),
         spec: Some(ServiceSpec {
             selector: Some(iron_proxy_labels(
                 id,
                 resolved.observability_enabled,
                 resolved.api_server_enabled,
+                generation,
             )),
             ports: Some(ports),
             ..Default::default()
@@ -1464,9 +1811,30 @@ fn build_iron_proxy_service(id: &SandboxId, resolved: &ResolvedIronProxy) -> Ser
     }
 }
 
+#[cfg(test)]
 fn build_iron_proxy_network_policies(
     id: &SandboxId,
     resolved: &ResolvedIronProxy,
+    iron_proxy: &IronProxyConfig,
+    control_target: &ControlPlaneEgressTarget,
+    otlp_egress: Option<&OtlpEgressTarget>,
+    observability_enabled: bool,
+) -> Vec<NetworkPolicy> {
+    build_iron_proxy_network_policies_with_generation(
+        id,
+        resolved,
+        "test-generation",
+        iron_proxy,
+        control_target,
+        otlp_egress,
+        observability_enabled,
+    )
+}
+
+fn build_iron_proxy_network_policies_with_generation(
+    id: &SandboxId,
+    resolved: &ResolvedIronProxy,
+    generation: &str,
     iron_proxy: &IronProxyConfig,
     control_target: &ControlPlaneEgressTarget,
     otlp_egress: Option<&OtlpEgressTarget>,
@@ -1479,6 +1847,7 @@ fn build_iron_proxy_network_policies(
                 id,
                 observability_enabled,
                 resolved.api_server_enabled,
+                generation,
             ))],
             sandbox_to_proxy_ports.clone(),
         ),
@@ -1486,32 +1855,46 @@ fn build_iron_proxy_network_policies(
     ];
     vec![
         NetworkPolicy {
-            metadata: object_meta(
+            metadata: object_meta_with_annotations(
                 iron_proxy_sandbox_egress_policy_name(id),
-                sandbox_labels(id),
+                sandbox_labels(id, generation),
+                BTreeMap::from([(
+                    AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                    generation.to_owned(),
+                )]),
             ),
             spec: Some(NetworkPolicySpec {
-                pod_selector: Some(label_selector(sandbox_labels(id))),
+                pod_selector: Some(label_selector(sandbox_labels(id, generation))),
                 policy_types: Some(vec!["Egress".to_owned()]),
                 egress: Some(sandbox_egress),
                 ..Default::default()
             }),
         },
         NetworkPolicy {
-            metadata: object_meta(
+            metadata: object_meta_with_annotations(
                 iron_proxy_policy_name(id),
-                iron_proxy_labels(id, observability_enabled, resolved.api_server_enabled),
+                iron_proxy_labels(
+                    id,
+                    observability_enabled,
+                    resolved.api_server_enabled,
+                    generation,
+                ),
+                BTreeMap::from([(
+                    AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                    generation.to_owned(),
+                )]),
             ),
             spec: Some(NetworkPolicySpec {
                 pod_selector: Some(label_selector(iron_proxy_labels(
                     id,
                     observability_enabled,
                     resolved.api_server_enabled,
+                    generation,
                 ))),
                 policy_types: Some(vec!["Ingress".to_owned(), "Egress".to_owned()]),
                 ingress: Some(vec![
                     NetworkPolicyIngressRule {
-                        from: Some(vec![pod_peer(sandbox_labels(id))]),
+                        from: Some(vec![pod_peer(sandbox_labels(id, generation))]),
                         ports: Some(sandbox_to_proxy_ports),
                     },
                     // api-rs -> proxy management API, for the claim-time
@@ -1900,8 +2283,184 @@ fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
     }))
 }
 
-fn object_meta(name: impl Into<String>, labels: BTreeMap<String, String>) -> ObjectMeta {
-    object_meta_with_annotations(name, labels, BTreeMap::new())
+fn legacy_auxiliary_is_adoptable(metadata: &ObjectMeta, sandbox: &crate::crd::Sandbox) -> bool {
+    object_is_owned_by_sandbox(metadata, sandbox)
+        && metadata
+            .annotations
+            .as_ref()
+            .is_none_or(|annotations| !annotations.contains_key(AUXILIARY_GENERATION_ANNOTATION))
+}
+
+fn owner_reference_patch(
+    metadata: &ObjectMeta,
+    owner_reference: &Value,
+    generation: Option<&str>,
+) -> SandboxResult<Patch<Value>> {
+    let uid = metadata.uid.as_deref().ok_or_else(|| {
+        SandboxError::backend("auxiliary resource is missing UID required for adoption")
+    })?;
+    let resource_version = metadata.resource_version.as_deref().ok_or_else(|| {
+        SandboxError::backend("auxiliary resource is missing resourceVersion required for adoption")
+    })?;
+    Ok(owner_reference_patch_from_identity(
+        uid,
+        resource_version,
+        owner_reference,
+        generation,
+    ))
+}
+
+fn owner_reference_patch_from_delete_params(
+    params: kube::api::DeleteParams,
+    owner_reference: &Value,
+    generation: Option<&str>,
+) -> Patch<Value> {
+    let preconditions = params
+        .preconditions
+        .expect("generation-checked auxiliary delete always carries preconditions");
+    owner_reference_patch_from_identity(
+        preconditions
+            .uid
+            .as_deref()
+            .expect("generation-checked auxiliary delete always carries UID"),
+        preconditions
+            .resource_version
+            .as_deref()
+            .expect("generation-checked auxiliary delete always carries resourceVersion"),
+        owner_reference,
+        generation,
+    )
+}
+
+fn owner_reference_patch_from_identity(
+    uid: &str,
+    resource_version: &str,
+    owner_reference: &Value,
+    generation: Option<&str>,
+) -> Patch<Value> {
+    let mut metadata = json!({
+        "uid": uid,
+        "resourceVersion": resource_version,
+        "ownerReferences": [owner_reference],
+    });
+    if let Some(generation) = generation {
+        metadata["annotations"] = json!({ AUXILIARY_GENERATION_ANNOTATION: generation });
+        metadata["labels"] = json!({ AUXILIARY_GENERATION_LABEL: generation });
+    }
+    Patch::Merge(json!({ "metadata": metadata }))
+}
+
+fn service_generation_patch(
+    service: &Service,
+    owner_reference: &Value,
+    generation: &str,
+) -> SandboxResult<Patch<Value>> {
+    let mut patch = patch_value(owner_reference_patch(
+        &service.metadata,
+        owner_reference,
+        Some(generation),
+    )?);
+    if let Some(spec) = &service.spec {
+        let mut spec = serde_json::to_value(spec).map_err(|error| {
+            SandboxError::backend_source("serialize legacy iron-proxy service spec", error)
+        })?;
+        spec["selector"][AUXILIARY_GENERATION_LABEL] = json!(generation);
+        patch["spec"] = spec;
+    }
+    Ok(Patch::Merge(patch))
+}
+
+fn network_policy_generation_patch(
+    policy: &NetworkPolicy,
+    owner_reference: &Value,
+    generation: &str,
+) -> SandboxResult<Patch<Value>> {
+    let mut patch = patch_value(owner_reference_patch(
+        &policy.metadata,
+        owner_reference,
+        Some(generation),
+    )?);
+    if let Some(spec) = &policy.spec {
+        let mut spec = serde_json::to_value(spec).map_err(|error| {
+            SandboxError::backend_source("serialize legacy iron-proxy network policy spec", error)
+        })?;
+        scope_network_policy_selectors(&mut spec, generation);
+        patch["spec"] = spec;
+    }
+    Ok(Patch::Merge(patch))
+}
+
+fn patch_value(patch: Patch<Value>) -> Value {
+    match patch {
+        Patch::Merge(value) => value,
+        _ => unreachable!("auxiliary adoption only uses merge patches"),
+    }
+}
+
+fn scope_network_policy_selectors(value: &mut Value, generation: &str) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(selector)) = object.get_mut("podSelector")
+                && let Some(Value::Object(labels)) = selector.get_mut("matchLabels")
+                && (labels.contains_key(SANDBOX_ID_LABEL) || labels.contains_key(IRON_PROXY_LABEL))
+            {
+                labels.insert(AUXILIARY_GENERATION_LABEL.to_owned(), json!(generation));
+            }
+            for value in object.values_mut() {
+                scope_network_policy_selectors(value, generation);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                scope_network_policy_selectors(value, generation);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn service_is_generation_scoped(service: &Service, generation: &str) -> bool {
+    service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.selector.as_ref())
+        .and_then(|selector| selector.get(AUXILIARY_GENERATION_LABEL))
+        .map(String::as_str)
+        == Some(generation)
+}
+
+fn network_policy_is_generation_scoped(policy: &NetworkPolicy, generation: &str) -> bool {
+    let Some(spec) = policy.spec.as_ref() else {
+        return false;
+    };
+    let Ok(value) = serde_json::to_value(spec) else {
+        return false;
+    };
+    network_policy_selectors_are_generation_scoped(&value, generation)
+}
+
+fn network_policy_selectors_are_generation_scoped(value: &Value, generation: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(selector)) = object.get("podSelector")
+                && let Some(Value::Object(labels)) = selector.get("matchLabels")
+                && (labels.contains_key(SANDBOX_ID_LABEL) || labels.contains_key(IRON_PROXY_LABEL))
+                && labels
+                    .get(AUXILIARY_GENERATION_LABEL)
+                    .and_then(Value::as_str)
+                    != Some(generation)
+            {
+                return false;
+            }
+            object
+                .values()
+                .all(|value| network_policy_selectors_are_generation_scoped(value, generation))
+        }
+        Value::Array(values) => values
+            .iter()
+            .all(|value| network_policy_selectors_are_generation_scoped(value, generation)),
+        _ => true,
+    }
 }
 
 fn object_meta_with_annotations(
@@ -2039,10 +2598,11 @@ fn iron_proxy_policy_name(id: &SandboxId) -> String {
     format!("{}-proxy-net", id.as_str())
 }
 
-fn sandbox_labels(id: &SandboxId) -> BTreeMap<String, String> {
+fn sandbox_labels(id: &SandboxId, generation: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
         (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
+        (AUXILIARY_GENERATION_LABEL.to_owned(), generation.to_owned()),
     ])
 }
 
@@ -2050,11 +2610,13 @@ fn iron_proxy_labels(
     id: &SandboxId,
     observability_enabled: bool,
     api_server_enabled: bool,
+    generation: &str,
 ) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::from([
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
         (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
         (IRON_PROXY_LABEL.to_owned(), "true".to_owned()),
+        (AUXILIARY_GENERATION_LABEL.to_owned(), generation.to_owned()),
     ]);
     if observability_enabled {
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
@@ -2210,18 +2772,18 @@ mod tests {
         let id = SandboxId::new("asbx-test");
 
         assert_eq!(
-            iron_proxy_labels(&id, true, true)
+            iron_proxy_labels(&id, true, true, "test-generation")
                 .get(OBSERVABILITY_ENABLED_LABEL)
                 .map(String::as_str),
             Some("true")
         );
         assert_eq!(
-            iron_proxy_labels(&id, true, true)
+            iron_proxy_labels(&id, true, true, "test-generation")
                 .get(API_SERVER_ENABLED_LABEL)
                 .map(String::as_str),
             Some("true")
         );
-        let restricted_labels = iron_proxy_labels(&id, false, false);
+        let restricted_labels = iron_proxy_labels(&id, false, false, "test-generation");
         assert!(!restricted_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
         assert!(!restricted_labels.contains_key(API_SERVER_ENABLED_LABEL));
     }
@@ -2241,6 +2803,22 @@ mod tests {
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
         assert_eq!(
             pod.metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+                .map(String::as_str),
+            Some("test-generation")
+        );
+        assert_eq!(
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(AUXILIARY_GENERATION_LABEL))
+                .map(String::as_str),
+            Some("test-generation")
+        );
+        assert_eq!(
+            pod.metadata
                 .labels
                 .as_ref()
                 .and_then(|labels| labels.get(OBSERVABILITY_ENABLED_LABEL))
@@ -2257,6 +2835,24 @@ mod tests {
         );
 
         let service = build_iron_proxy_service(&id, &resolved);
+        assert_eq!(
+            service
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+                .map(String::as_str),
+            Some("test-generation")
+        );
+        assert_eq!(
+            service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.selector.as_ref())
+                .and_then(|labels| labels.get(AUXILIARY_GENERATION_LABEL))
+                .map(String::as_str),
+            Some("test-generation")
+        );
         assert_eq!(
             service
                 .metadata
@@ -2303,6 +2899,25 @@ mod tests {
             true,
         );
         let proxy_policy = &policies[1];
+        assert!(policies.iter().all(|policy| {
+            policy
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(AUXILIARY_GENERATION_ANNOTATION))
+                .map(String::as_str)
+                == Some("test-generation")
+        }));
+        assert!(policies.iter().all(|policy| {
+            policy
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.pod_selector.as_ref())
+                .and_then(|selector| selector.match_labels.as_ref())
+                .and_then(|labels| labels.get(AUXILIARY_GENERATION_LABEL))
+                .map(String::as_str)
+                == Some("test-generation")
+        }));
         assert_eq!(
             proxy_policy
                 .metadata
@@ -2403,6 +3018,257 @@ mod tests {
             assert_eq!(key_ref.name, "centaur-iron-proxy-source-auth");
             assert_eq!(key_ref.key, key);
             assert_eq!(key_ref.optional, Some(false));
+        }
+    }
+
+    #[test]
+    fn legacy_adoption_patch_is_uid_and_resource_version_cas() {
+        let mut sandbox = crate::build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test"),
+            &crate::AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+        sandbox.metadata.uid = Some("sandbox-old".to_owned());
+        let metadata = ObjectMeta {
+            uid: Some("proxy-old".to_owned()),
+            resource_version: Some("17".to_owned()),
+            owner_references: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "agents.x-k8s.io/v1alpha1".to_owned(),
+                    kind: "Sandbox".to_owned(),
+                    name: "asbx-test".to_owned(),
+                    uid: "sandbox-old".to_owned(),
+                    ..Default::default()
+                },
+            ]),
+            ..ObjectMeta::default()
+        };
+        let owner = sandbox_owner_reference(&sandbox).unwrap();
+        let patch = owner_reference_patch(&metadata, &owner, Some("legacy-sandbox-old")).unwrap();
+        let value = match patch {
+            Patch::Merge(value) => value,
+            _ => unreachable!("legacy adoption uses a merge patch"),
+        };
+        assert_eq!(value["metadata"]["uid"], "proxy-old");
+        assert_eq!(value["metadata"]["resourceVersion"], "17");
+        assert_eq!(
+            value["metadata"]["annotations"][AUXILIARY_GENERATION_ANNOTATION],
+            "legacy-sandbox-old"
+        );
+        assert_eq!(
+            value["metadata"]["labels"][AUXILIARY_GENERATION_LABEL],
+            "legacy-sandbox-old"
+        );
+        let mut replacement = sandbox.clone();
+        replacement.metadata.uid = Some("sandbox-replacement".to_owned());
+        assert!(!legacy_auxiliary_is_adoptable(&metadata, &replacement));
+    }
+
+    #[test]
+    fn replacement_service_and_policies_exclude_old_generation_pods() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let resolved = resolved();
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+        let old_proxy = build_iron_proxy_pod_with_generation(
+            &id,
+            &iron_proxy,
+            &resolved,
+            &sync,
+            "generation-old",
+        );
+        let replacement_service =
+            build_iron_proxy_service_with_generation(&id, &resolved, "generation-replacement");
+        let replacement_policies = build_iron_proxy_network_policies_with_generation(
+            &id,
+            &resolved,
+            "generation-replacement",
+            &iron_proxy,
+            &control_target(),
+            None,
+            true,
+        );
+        let old_labels = old_proxy.metadata.labels.as_ref().unwrap();
+        let service_selector = replacement_service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.selector.as_ref())
+            .unwrap();
+        assert_ne!(
+            service_selector.get(AUXILIARY_GENERATION_LABEL),
+            old_labels.get(AUXILIARY_GENERATION_LABEL)
+        );
+        let proxy_policy_selector = replacement_policies[1]
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.pod_selector.as_ref())
+            .and_then(|selector| selector.match_labels.as_ref())
+            .unwrap();
+        assert_ne!(
+            proxy_policy_selector.get(AUXILIARY_GENERATION_LABEL),
+            old_labels.get(AUXILIARY_GENERATION_LABEL)
+        );
+        let sandbox_policy_selector = replacement_policies[0]
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.pod_selector.as_ref())
+            .and_then(|selector| selector.match_labels.as_ref())
+            .unwrap();
+        assert_eq!(
+            sandbox_policy_selector.get(AUXILIARY_GENERATION_LABEL),
+            Some(&"generation-replacement".to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_adoption_converts_service_and_policy_selectors() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let resolved = resolved();
+        let mut sandbox = crate::build_agent_sandbox(
+            &id,
+            &SandboxSpec::new("agent:test"),
+            &crate::AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+        sandbox.metadata.uid = Some("sandbox-old".to_owned());
+        let owner = sandbox_owner_reference(&sandbox).unwrap();
+        let owner_reference = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "agents.x-k8s.io/v1alpha1".to_owned(),
+            kind: "Sandbox".to_owned(),
+            name: "asbx-test".to_owned(),
+            uid: "sandbox-old".to_owned(),
+            ..Default::default()
+        };
+        let mut service = build_iron_proxy_service(&id, &resolved);
+        service.metadata.uid = Some("service-old".to_owned());
+        service.metadata.resource_version = Some("10".to_owned());
+        service.metadata.owner_references = Some(vec![owner_reference.clone()]);
+        service.metadata.annotations = None;
+        service
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(AUXILIARY_GENERATION_LABEL);
+        service
+            .spec
+            .as_mut()
+            .unwrap()
+            .selector
+            .as_mut()
+            .unwrap()
+            .remove(AUXILIARY_GENERATION_LABEL);
+        let service_patch =
+            patch_value(service_generation_patch(&service, &owner, "legacy-sandbox-old").unwrap());
+        assert_eq!(
+            service_patch["spec"]["selector"][AUXILIARY_GENERATION_LABEL],
+            "legacy-sandbox-old"
+        );
+
+        let mut policy = build_iron_proxy_network_policies(
+            &id,
+            &resolved,
+            &iron_proxy,
+            &control_target(),
+            None,
+            true,
+        )[1]
+        .clone();
+        policy.metadata.uid = Some("policy-old".to_owned());
+        policy.metadata.resource_version = Some("11".to_owned());
+        policy.metadata.owner_references = Some(vec![owner_reference]);
+        policy.metadata.annotations = None;
+        policy
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(AUXILIARY_GENERATION_LABEL);
+        let mut old_spec = serde_json::to_value(policy.spec.as_ref().unwrap()).unwrap();
+        remove_generation_selectors(&mut old_spec);
+        policy.spec = Some(serde_json::from_value(old_spec).unwrap());
+        assert!(!network_policy_is_generation_scoped(
+            &policy,
+            "legacy-sandbox-old"
+        ));
+        let policy_patch = patch_value(
+            network_policy_generation_patch(&policy, &owner, "legacy-sandbox-old").unwrap(),
+        );
+        let patched_policy = NetworkPolicy {
+            metadata: policy.metadata.clone(),
+            spec: Some(serde_json::from_value(policy_patch["spec"].clone()).unwrap()),
+        };
+        assert!(network_policy_is_generation_scoped(
+            &patched_policy,
+            "legacy-sandbox-old"
+        ));
+    }
+
+    #[test]
+    fn partial_legacy_conflict_stays_retriable_until_resource_is_converted() {
+        let mut sandbox = crate::build_agent_sandbox_with_generation(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent:test"),
+            &crate::AgentSandboxConfig::new("test"),
+            Some("legacy-sandbox-old"),
+        )
+        .unwrap();
+        sandbox.metadata.uid = Some("sandbox-old".to_owned());
+        let metadata = ObjectMeta {
+            owner_references: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "agents.x-k8s.io/v1alpha1".to_owned(),
+                    kind: "Sandbox".to_owned(),
+                    name: "asbx-test".to_owned(),
+                    uid: "sandbox-old".to_owned(),
+                    ..Default::default()
+                },
+            ]),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(
+            crate::auxiliary_generation_from_sandbox(&sandbox).unwrap(),
+            "legacy-sandbox-old"
+        );
+        assert!(legacy_auxiliary_is_adoptable(&metadata, &sandbox));
+        // A 409 leaves the fetched object unchanged. The next reconciliation
+        // must therefore attempt the same ownership-fenced adoption again.
+        assert!(legacy_auxiliary_is_adoptable(&metadata, &sandbox));
+        let converted = ObjectMeta {
+            annotations: Some(BTreeMap::from([(
+                AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                "legacy-sandbox-old".to_owned(),
+            )])),
+            ..metadata
+        };
+        assert!(!legacy_auxiliary_is_adoptable(&converted, &sandbox));
+    }
+
+    fn remove_generation_selectors(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::Object(selector)) = object.get_mut("podSelector")
+                    && let Some(Value::Object(labels)) = selector.get_mut("matchLabels")
+                {
+                    labels.remove(AUXILIARY_GENERATION_LABEL);
+                }
+                for value in object.values_mut() {
+                    remove_generation_selectors(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    remove_generation_selectors(value);
+                }
+            }
+            _ => {}
         }
     }
 

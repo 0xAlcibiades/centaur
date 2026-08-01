@@ -255,11 +255,10 @@ mod tests {
         }
 
         async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
-            Ok(ObservedSandbox::new(
-                id.clone(),
-                self.name(),
-                self.status(id).await?,
-            ))
+            Ok(
+                ObservedSandbox::new(id.clone(), self.name(), self.status(id).await?)
+                    .with_resource_uid(Some(format!("uid-{}", id.as_str()))),
+            )
         }
 
         async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -268,7 +267,10 @@ mod tests {
                 .lock()
                 .expect("status lock poisoned")
                 .iter()
-                .map(|(id, status)| ObservedSandbox::new(id.clone(), self.name(), status.clone()))
+                .map(|(id, status)| {
+                    ObservedSandbox::new(id.clone(), self.name(), status.clone())
+                        .with_resource_uid(Some(format!("uid-{}", id.as_str())))
+                })
                 .collect())
         }
 
@@ -279,6 +281,17 @@ mod tests {
             Ok(())
         }
 
+        async fn stop_exact(
+            &self,
+            id: &SandboxId,
+            expected_resource_uid: Option<&str>,
+        ) -> SandboxResult<()> {
+            if expected_resource_uid != Some(format!("uid-{}", id.as_str()).as_str()) {
+                return Err(SandboxError::backend("fake resource UID did not match"));
+            }
+            self.stop(id).await
+        }
+
         async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
             self.push_operation("pause", id);
             self.maybe_fail("pause")?;
@@ -286,11 +299,33 @@ mod tests {
             Ok(())
         }
 
+        async fn pause_exact(
+            &self,
+            id: &SandboxId,
+            expected_resource_uid: Option<&str>,
+        ) -> SandboxResult<()> {
+            if expected_resource_uid != Some(format!("uid-{}", id.as_str()).as_str()) {
+                return Err(SandboxError::backend("fake resource UID did not match"));
+            }
+            self.pause(id).await
+        }
+
         async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
             self.push_operation("resume", id);
             self.maybe_fail("resume")?;
             self.set_status(id, SandboxStatus::Running);
             Ok(())
+        }
+
+        async fn resume_exact(
+            &self,
+            id: &SandboxId,
+            expected_resource_uid: Option<&str>,
+        ) -> SandboxResult<()> {
+            if expected_resource_uid != Some(format!("uid-{}", id.as_str()).as_str()) {
+                return Err(SandboxError::backend("fake resource UID did not match"));
+            }
+            self.resume(id).await
         }
     }
 }

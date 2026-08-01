@@ -273,6 +273,25 @@ sandbox:
   # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
   # with the policy the sandbox actually runs.
   extraEnv: {}
+  # Consent-gated metadata-only Codex tracing. Enabling this only makes the
+  # sidecar available; each principal remains opt-in. Supply an immutable
+  # image digest, an HTTPS gateway, and a per-consumer Secret containing the
+  # two named keys. Neither credential is placed in an environment variable.
+  # Set credentialSecretVersion to an opaque Secret generation or versioned
+  # name, and change it with every rotation. It changes the sandbox fingerprint
+  # so existing sandboxes are recreated without hashing secret content.
+  metadataTrace:
+    enabled: false
+    # Required in both enabled and disabled states. Increment for every trace
+    # configuration change, including disabling a prior rollout; this durable
+    # fence is separate from the sidecar fingerprint.
+    configGeneration: 1
+    gatewayUrl: ""
+    gatewayPort: 443
+    credentialSecretName: ""
+    credentialSecretVersion: ""
+    bearerSecretKey: bearer
+    pseudonymKeySecretKey: pseudonym_key
   stateVolume:
     enabled: false
     size: 10Gi
@@ -476,6 +495,11 @@ apiRs:
 slackbotv2:
   enabled: true
   replicaCount: 1
+  # This Secret is deliberately separate from the shared infra Secret.  It is
+  # mounted only as the trace-consent bearer and never via envFrom.
+  traceConsent:
+    apiKeySecretName: centaur-trace-consent
+    apiKeySecretKey: SLACK_TRACE_CONSENT_API_KEY
   image:
     repository: centaur-slackbotv2
     tag: latest
@@ -486,9 +510,11 @@ slackbotv2:
   # Requires the Slack app to grant channels:read and channels:join.
   autoJoinCreatedChannels: false
   # Signed, pre-session `/autorotate` Slack command. Every subcommand can be
-  # invoked from any Slack conversation, but responses remain ephemeral and are
-  # available to every member of an allowed workspace. Observer and
-  # operator tokens come from a dedicated Secret so no broker administration
+  # invoked from any Slack conversation by every member of an allowed workspace;
+  # responses remain ephemeral. Trace consent is always for the signed invoking
+  # workspace/member, so it has no target selector. Read-only fleet and
+  # maintenance status are workspace-wide; drain/resume use the member list.
+  # Observer, operator, and dedicated control tokens come from a dedicated Secret so no broker administration
   # credential enters Slack, a sandbox, or the shared infra Secret.
   autorotate:
     enabled: false
@@ -496,9 +522,11 @@ slackbotv2:
     credentialsSecretName: ""
     observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
     operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
+    controlTokenKey: AUTOROTATE_CONTROL_TOKEN
     operatorSlackTeamIds: []
-    # Old runtimes require this during a chart-first rolling upgrade. Current
-    # runtimes ignore it and authorize every valid member of the workspace.
+    # Required `TEAM_ID:USER_ID` principals for `/autorotate maintenance
+    # drain|resume`. Slack Connect users are authorized in their signed actor
+    # workspace, so an unqualified user ID never grants access elsewhere.
     operatorSlackUserIds: []
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
@@ -730,6 +758,13 @@ networkPolicy:
     #     ports:
     #       - port: 8428
     #         protocol: TCP
+  # Kubernetes NetworkPolicy is pod-wide: an egress rule selected for a
+  # metadata-trace-enabled sandbox applies to both the trace sidecar and Codex
+  # container. Keep these gateway CIDRs narrow (/32 IPv4 or /64+ IPv6) because
+  # NetworkPolicy cannot restrict a rule to one container or hostname.
+  metadataTraceEgress:
+    enabled: false
+    gatewayCidrs: []
 
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch

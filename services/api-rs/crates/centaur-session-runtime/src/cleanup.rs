@@ -1,12 +1,9 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 
-use centaur_sandbox_core::{ObservedSandbox, SandboxError, SandboxId, SandboxStatus};
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{RuntimeContext, SessionRuntimeError, record_idle_pause};
-
-const WORKFLOW_RUN_COMPONENT: &str = "workflow-run";
 
 #[derive(Clone, Copy, Debug)]
 pub struct SessionSandboxCleanupConfig {
@@ -25,8 +22,6 @@ impl SessionSandboxCleanupConfig {
 
 #[derive(Debug, Default)]
 pub struct SessionSandboxCleanupReport {
-    pub stopped_orphans: usize,
-    pub failed_orphans: usize,
     pub idle_pause_attempts: usize,
     pub failed_idle_pauses: usize,
 }
@@ -34,16 +29,11 @@ pub struct SessionSandboxCleanupReport {
 pub struct SessionSandboxCleanupWorker {
     ctx: RuntimeContext,
     config: SessionSandboxCleanupConfig,
-    pending_orphans: BTreeSet<String>,
 }
 
 impl SessionSandboxCleanupWorker {
     pub(crate) fn new(ctx: RuntimeContext, config: SessionSandboxCleanupConfig) -> Self {
-        Self {
-            ctx,
-            config,
-            pending_orphans: BTreeSet::new(),
-        }
+        Self { ctx, config }
     }
 
     pub(crate) fn spawn(mut self) {
@@ -66,51 +56,8 @@ impl SessionSandboxCleanupWorker {
         &mut self,
     ) -> Result<SessionSandboxCleanupReport, SessionRuntimeError> {
         let mut report = SessionSandboxCleanupReport::default();
-        self.reap_unreferenced_sandboxes(&mut report).await?;
         self.pause_idle_sandboxes(&mut report).await?;
         Ok(report)
-    }
-
-    async fn reap_unreferenced_sandboxes(
-        &mut self,
-        report: &mut SessionSandboxCleanupReport,
-    ) -> Result<(), SessionRuntimeError> {
-        let referenced = self
-            .ctx
-            .store
-            .list_referenced_sandbox_ids()
-            .await?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let observed = self.ctx.manager.list_observed().await?;
-        let candidates =
-            select_orphan_reap_candidates(&observed, &referenced, &mut self.pending_orphans);
-
-        for sandbox_id in candidates {
-            let id = SandboxId::new(sandbox_id.clone());
-            match self.ctx.manager.stop(&id).await {
-                Ok(()) | Err(SandboxError::NotFound(_)) => {
-                    self.ctx.sandbox_pipes.remove(&sandbox_id);
-                    self.pending_orphans.remove(&sandbox_id);
-                    report.stopped_orphans += 1;
-                    info!(
-                        sandbox_id,
-                        reason = "unreferenced",
-                        "session sandbox cleanup worker stopped orphaned sandbox"
-                    );
-                }
-                Err(error) => {
-                    report.failed_orphans += 1;
-                    warn!(
-                        sandbox_id,
-                        %error,
-                        "session sandbox cleanup worker failed to stop orphaned sandbox"
-                    );
-                }
-            }
-        }
-
-        Ok(())
     }
 
     async fn pause_idle_sandboxes(
@@ -147,172 +94,5 @@ impl SessionSandboxCleanupWorker {
             }
         }
         Ok(())
-    }
-}
-
-fn select_orphan_reap_candidates(
-    observed: &[ObservedSandbox],
-    referenced: &BTreeSet<String>,
-    pending_orphans: &mut BTreeSet<String>,
-) -> Vec<String> {
-    let current_orphans = observed
-        .iter()
-        .filter(|sandbox| orphan_reap_eligible(sandbox, referenced))
-        .map(|sandbox| sandbox.id.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-
-    let candidates = current_orphans
-        .intersection(pending_orphans)
-        .cloned()
-        .collect::<Vec<_>>();
-    *pending_orphans = current_orphans;
-    candidates
-}
-
-fn orphan_reap_eligible(sandbox: &ObservedSandbox, referenced: &BTreeSet<String>) -> bool {
-    if referenced.contains(sandbox.id.as_str()) {
-        return false;
-    }
-    if sandbox.component.as_deref() == Some(WORKFLOW_RUN_COMPONENT) {
-        return false;
-    }
-    !matches!(
-        sandbox.status,
-        SandboxStatus::Created | SandboxStatus::Stopped | SandboxStatus::Gone
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn observed(id: &str, status: SandboxStatus) -> ObservedSandbox {
-        ObservedSandbox::new(SandboxId::new(id), "test", status)
-    }
-
-    fn referenced(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|id| (*id).to_owned()).collect()
-    }
-
-    fn observed_with_component(
-        id: &str,
-        status: SandboxStatus,
-        component: Option<&str>,
-    ) -> ObservedSandbox {
-        observed(id, status).with_component(component.map(str::to_owned))
-    }
-
-    #[test]
-    fn orphan_reap_requires_two_consecutive_passes() {
-        let observed = [observed("asbx-1", SandboxStatus::Running)];
-        let mut pending = BTreeSet::new();
-
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            vec!["asbx-1".to_owned()]
-        );
-    }
-
-    #[test]
-    fn orphan_reap_skips_workflow_runs_but_keeps_other_orphans_eligible() {
-        let observed = [
-            observed_with_component(
-                "asbx-session",
-                SandboxStatus::Running,
-                Some("session-sandbox"),
-            ),
-            observed_with_component("asbx-warm", SandboxStatus::Running, Some("session-sandbox")),
-            observed_with_component(
-                "asbx-unknown",
-                SandboxStatus::Unknown("backend state".to_owned()),
-                None,
-            ),
-            observed_with_component(
-                "asbx-workflow-run",
-                SandboxStatus::Running,
-                Some(WORKFLOW_RUN_COMPONENT),
-            ),
-        ];
-        let expected = BTreeSet::from([
-            "asbx-session".to_owned(),
-            "asbx-unknown".to_owned(),
-            "asbx-warm".to_owned(),
-        ]);
-        let mut pending = BTreeSet::new();
-
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            Vec::<String>::new()
-        );
-        assert_eq!(&pending, &expected);
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            expected.iter().cloned().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            expected.iter().cloned().collect::<Vec<_>>()
-        );
-        assert_eq!(&pending, &expected);
-    }
-
-    #[test]
-    fn referenced_sandbox_rescues_pending_orphan() {
-        let observed = [observed("asbx-1", SandboxStatus::Running)];
-        let mut pending = BTreeSet::new();
-
-        select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending);
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&["asbx-1"]), &mut pending),
-            Vec::<String>::new()
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn created_and_terminal_sandboxes_are_not_reaped() {
-        let observed = [
-            observed("asbx-created", SandboxStatus::Created),
-            observed("asbx-stopped", SandboxStatus::Stopped),
-            observed("asbx-gone", SandboxStatus::Gone),
-        ];
-        let mut pending = BTreeSet::from([
-            "asbx-created".to_owned(),
-            "asbx-stopped".to_owned(),
-            "asbx-gone".to_owned(),
-        ]);
-
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            Vec::<String>::new()
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn failed_stop_stays_pending_for_retry() {
-        let observed = [observed("asbx-1", SandboxStatus::Running)];
-        let mut pending = BTreeSet::from(["asbx-1".to_owned()]);
-
-        assert_eq!(
-            select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            vec!["asbx-1".to_owned()]
-        );
-        assert!(pending.contains("asbx-1"));
-    }
-
-    #[test]
-    fn vanished_pending_orphan_is_dropped() {
-        let mut pending = BTreeSet::from(["asbx-1".to_owned()]);
-
-        assert_eq!(
-            select_orphan_reap_candidates(&[], &referenced(&[]), &mut pending),
-            Vec::<String>::new()
-        );
-        assert!(pending.is_empty());
     }
 }

@@ -128,6 +128,7 @@ pub struct ExecuteSessionResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InterruptSessionExecutionRequest {
     pub reason: Option<String>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -41,6 +41,10 @@ COPY tools/ /app/tools/
 COPY workflows/ /app/workflows/
 ENV PYTHON_WORKFLOW_HOST_PATH=/app/workflow-python/workflow_host.py
 ENV WORKFLOW_DIRS=/app/workflows
+# A non-Helm launch still publishes a disabled trace generation so an upgrade
+# retires a prior traced assignment instead of silently omitting that fence.
+ENV SESSION_SANDBOX_METADATA_TRACE_ENABLED=false
+ENV SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION=1
 # Infra + harness auth secrets are embedded in the binary at compile time
 # (include_str! of the in-crate infra.yaml); tool secrets are discovered from
 # /app/tools plus any mounted overlay tools.

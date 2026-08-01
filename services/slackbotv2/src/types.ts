@@ -41,9 +41,21 @@ export type SlackbotV2ApiMessageLink = {
   url: string
 }
 
+/**
+ * Workspace identity carried from Slack's signed event envelope into a
+ * normalized message. `actorTeamId` identifies the member who sent the
+ * message; `hostTeamId` identifies the workspace hosting the channel.
+ */
+export type SlackbotV2SlackWorkspaceContext = {
+  actorTeamId?: string
+  hostTeamId?: string
+}
+
 export type SlackbotV2ApiMessage = {
   attachments: SlackbotV2ApiAttachment[]
   author: SlackbotV2ApiAuthor
+  /** Canonical workspace of the Slack member who authored this message. */
+  actorTeamId?: string
   displayText?: string
   displayTextSource?: SlackDisplayTextSource
   id: string
@@ -52,6 +64,8 @@ export type SlackbotV2ApiMessage = {
   raw: unknown
   rawSlackAttachmentCount?: number
   rawSlackBlockCount?: number
+  /** Signed workspace that owns the channel, when available. */
+  hostTeamId?: string
   teamId: string
   text: string
   threadId: string
@@ -128,6 +142,8 @@ export type SlackbotV2BlockActionPayload = {
 export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
+  /** Dedicated bearer for the narrow Slack trace-consent API. */
+  traceConsentApiKey?: string
   apiUrl: string
   assistantStatus?: string
   /**
@@ -141,8 +157,12 @@ export type SlackbotV2Options = {
   autorotateUrl?: string
   /** Operator-scoped token used only for account status and device enrollment sessions. */
   autorotateOperatorToken?: string
+  /** Dedicated broker-control token for fleet and maintenance operations. */
+  autorotateControlToken?: string
   /** Slack workspace IDs allowed to use the Autorotate command. */
   autorotateSlackTeamIds?: readonly string[]
+  /** Slack members allowed to start or resume broker maintenance. */
+  autorotateMaintenanceSlackUserIds?: readonly string[]
   /** Test/development override for Slack response URL host validation. */
   autorotateSlackResponseUrlHosts?: readonly string[]
   /** Device-enrollment polling interval. */

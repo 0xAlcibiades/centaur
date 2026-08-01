@@ -71,6 +71,19 @@ Minimum keys:
 the API process requires it before it can start. Generate a high-entropy value,
 store it in the infra Secret, and reuse the same value in Slackbot.
 
+Trace-consent mutations use a different Secret. Create it before installing the
+chart (the default name is `centaur-trace-consent`):
+
+```sh
+kubectl --namespace centaur create secret generic centaur-trace-consent \
+  --from-literal=SLACK_TRACE_CONSENT_API_KEY="$(openssl rand -hex 32)"
+```
+
+Set `slackbotv2.traceConsent.apiKeySecretName` and
+`slackbotv2.traceConsent.apiKeySecretKey` if your secret uses another name or
+key. It must not be the shared `secretManager.existingSecretName`; rotating it
+changes the pod checksum and rolls api-rs and Slackbot.
+
 For either non-environment 1Password source, create a separate
 `ironProxy.sourceAuth.existingSecretName` Secret. It exposes exactly one key to
 each proxy:
@@ -321,7 +334,7 @@ Register the command once in the existing Slack app using Slack's
    - **Command:** `/autorotate`
    - **Request URL:** `https://<your-host>/api/slack/commands`
    - **Short description:** `Manage the Codex account pool`
-   - **Usage hint:** `status | login`
+   - **Usage hint:** `status | login | fleet | maintenance | trace`
 3. Save the command and reinstall the app if Slack prompts you. The app's
    existing `SLACK_SIGNING_SECRET` validates requests; no Autorotate credential
    is configured in Slack.
@@ -332,13 +345,14 @@ API requires a separate app-configuration token and replaces the complete
 manifest, so use the app console when the deployment only has `SLACK_APP_ID`,
 `SLACK_BOT_TOKEN`, and `SLACK_SIGNING_SECRET`.
 
-Create a dedicated Kubernetes Secret containing only the two scoped Autorotate
+Create a dedicated Kubernetes Secret containing only the scoped Autorotate
 tokens:
 
 ```bash
 kubectl --namespace centaur create secret generic centaur-autorotate \
   --from-literal=AUTOROTATE_OBSERVER_TOKEN='<observer token>' \
-  --from-literal=AUTOROTATE_OPERATOR_TOKEN='<enrollment operator token>'
+  --from-literal=AUTOROTATE_OPERATOR_TOKEN='<enrollment operator token>' \
+  --from-literal=AUTOROTATE_CONTROL_TOKEN='<maintenance control token>'
 ```
 
 Then enable the integration in the deployment values:
@@ -351,17 +365,72 @@ slackbotv2:
     credentialsSecretName: centaur-autorotate
     operatorSlackTeamIds:
       - T0123456789
+    operatorSlackUserIds:
+      - T0123456789:U0123456789
 ```
 
 The workspace allowlist must match the signed Slack request. Obtain the workspace
 ID from Slack's `auth.test` response or the workspace administration page.
 `credentialsSecretName` must not name the shared Centaur infrastructure Secret.
 
-Every member of an allowed workspace can run every `/autorotate` subcommand from
-any Slack conversation; a direct message is not required. Slackbot sends the
+Every member of an allowed workspace can run read-only `/autorotate` commands
+from any Slack conversation; a direct message is not required. Slackbot sends the
 immediate acknowledgement and device-login follow-ups through Slack's ephemeral
 response path, so a device link and code are returned in the invoking channel
 without entering a Centaur session, sandbox, tool result, or database.
+
+`operatorSlackUserIds` is the maintenance mutation allowlist. Configure each
+principal as `TEAM_ID:USER_ID` before using `/autorotate maintenance drain` or
+`resume`; an empty list fails those writes closed. Slack Connect authorization
+uses the signed invoking workspace, so the same user ID in another workspace
+does not inherit access. It does not restrict workspace-wide status or fleet
+reads.
+
+### Slack trace consent
+
+Trace consent is Slack-only and always applies to the signed invoking workspace
+and Slack member. It never accepts a workspace or user selector, creates no
+session or dashboard, and uses the dedicated `SLACK_TRACE_CONSENT_API_KEY`
+bearer credential. This value belongs in the separate trace-consent Secret,
+never the shared infra Secret or an `envFrom` mount.
+
+Use `/autorotate trace status` to see your setting. `/autorotate trace on
+[duration]` presents an ephemeral disclosure; only `/autorotate trace confirm
+<token>` activates the matching grant. The duration starts at confirmation,
+not preview. `/autorotate trace off` durably
+fences new intake and reports whether an exact sandbox drain remains pending.
+The default duration is `1h`; whole-minute (`30m`) and whole-hour (`2h`)
+durations are accepted up to `24h`.
+
+The pinned sidecar records only source, Codex version, pseudonymous
+execution/thread/account IDs, observed time, event kind,
+outcome/duration/exit code, token counts, coarse tool category, transport
+kind/outcome/status class, rate-limit data, and error class. It never records
+prompts, responses, tool arguments, or tool output. Only SSH-key holders can
+read traces. The producer spool survives up to 24 hours, the archive 30 days,
+and snapshots up to 45 days. Revocation and expiry fence future intake but do
+not delete retained data. Command acknowledgements and follow-ups are ephemeral
+with `Cache-Control: no-store`.
+
+### Slack fleet and maintenance
+
+`/autorotate fleet` reads the broker's control-token-only `/v1/fleet` snapshot
+and returns an ephemeral, no-store view: redacted consumer fingerprints, client
+versions, account email/label, heartbeat and expiry timestamps, plus terminal
+lease aggregates. It never creates a dashboard or stores the result. The output
+omits broker IDs, leases, fences, generations, provider identity, credentials,
+and request bodies; use the client version to ask a consumer to bump.
+
+`/autorotate maintenance status` is likewise a workspace-wide, read-only
+control-token view. `/autorotate maintenance drain` and `resume` require both a
+signed allowed workspace and `operatorSlackUserIds`. Slackbot uses the dedicated
+`AUTOROTATE_CONTROL_TOKEN`, never the administrator, runner, observer, or
+enrollment token. A mutation reads the current control epoch, sends a
+deterministic UUID request ID with its exact body, retries only brief transport
+or `408`, `429`, `502`, `503`, and `504` failures. It first reads the durable
+result for that request ID; on an ambiguous write or body-hash conflict it keeps
+looking up that same ID until its deadline and never rebuilds a fresh body.
+Resume always carries the current expected drain epoch.
 
 `/autorotate status` is the workspace view. It is plain text, with one multi-line
 block per account. The first line contains its email and label; the following
@@ -385,7 +454,8 @@ recovery includes the enrollment expiry and ephemeral device link/code; after
 import starts it reports non-secret progress, then completes with the canonical
 account label, email, and usability.
 
-This Slack status schema requires Autorotate broker v0.4.7 or newer. Deploy the
+Fleet and maintenance commands require Autorotate broker v0.4.24 or newer; the
+account-status schema requires v0.4.7 or newer. Deploy the
 broker before the corresponding Slackbot image.
 
 Route an all-accounts-unusable pool outage to the production paging channel:
@@ -460,6 +530,30 @@ helm upgrade --install centaur contrib/chart \
   --create-namespace \
   -f values.production.yaml
 ```
+
+### Input-delivery ledger cutover
+
+The input-delivery migration is a coordinated API writer cutover, not a rolling
+schema change. It rejects the migration while any execution is `queued` or
+`running`, because an older API writer cannot reconstruct that execution's
+exact stdin payload into the new ledger. Terminal executions do not block the
+cutover and do not acquire a delivery obligation.
+
+1. Stop or drain every previous API writer and ingress that can call the
+   session execute endpoint. Do not allow an old replica to restart.
+2. Use the approved database administrative path to confirm this query returns
+   `0` before running the migration:
+
+   ```sql
+   select count(*)
+   from session_executions
+   where status in ('queued', 'running');
+   ```
+
+3. Run the migration with the new API image, then deploy the new API writers
+   and ingress together. If the preflight is nonzero, keep draining; do not
+   bypass the migration error or attach a newly generated payload to an old
+   execution.
 
 ## 6. Verify the deployment
 

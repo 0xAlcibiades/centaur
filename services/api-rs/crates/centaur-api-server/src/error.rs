@@ -25,6 +25,10 @@ pub enum ApiError {
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Locked(String),
+    #[error("{0}")]
     ServiceUnavailable(String),
     /// Server-side misconfiguration or invariant failure. The message is
     /// logged but never returned to the client.
@@ -55,9 +59,15 @@ impl IntoResponse for ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Locked(_) => StatusCode::LOCKED,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                | SessionRuntimeError::SandboxAssignmentChanged,
+            ) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND
             }
@@ -109,6 +119,16 @@ impl IntoResponse for ApiError {
             body["existing_harness"] = json!(existing);
             body["requested_harness"] = json!(requested);
         }
+        if matches!(
+            &self,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                    | SessionRuntimeError::SandboxAssignmentChanged
+            )
+        ) {
+            body["code"] = json!("input_delivery_conflict");
+            body["retryable"] = json!(true);
+        }
         (status, Json(body)).into_response()
     }
 }
@@ -145,5 +165,16 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn delivery_fence_races_are_retryable_conflicts() {
+        for error in [
+            SessionRuntimeError::MetadataTraceBoundaryChanged,
+            SessionRuntimeError::SandboxAssignmentChanged,
+        ] {
+            let response = ApiError::Runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
     }
 }
