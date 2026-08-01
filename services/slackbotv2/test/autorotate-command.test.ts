@@ -110,11 +110,13 @@ function commandRequest(
     channelId = 'C123456789',
     signatureValid = true,
     teamId = TEAM_ID,
+    timestamp = String(Math.floor(Date.now() / 1000)),
     userId = USER_ID
   }: {
     channelId?: string
     signatureValid?: boolean
     teamId?: string
+    timestamp?: string
     userId?: string
   } = {}
 ): Request {
@@ -126,7 +128,6 @@ function commandRequest(
     text,
     user_id: userId
   }).toString()
-  const timestamp = String(Math.floor(Date.now() / 1000))
   const signature = createHmac('sha256', SIGNING_SECRET)
     .update(`v0:${timestamp}:${body}`)
     .digest('hex')
@@ -262,7 +263,7 @@ describe('Autorotate Slack command', () => {
     expect(brokerRequests).toBe(1)
   })
 
-  it('advertises only status and login in ephemeral help', async () => {
+  it('advertises status, login, and rate-limit reset in ephemeral help', async () => {
     const handler = testHandler(async () => {
       throw new Error('must not fetch')
     })
@@ -273,6 +274,7 @@ describe('Autorotate Slack command', () => {
     expect(body.response_type).toBe('ephemeral')
     expect(body.text).toContain('/autorotate status')
     expect(body.text).toContain('/autorotate login')
+    expect(body.text).toContain('/autorotate reset <account-email>')
     expect(body.text).not.toContain('/autorotate accounts')
     expect(body.text).not.toContain('/autorotate add')
     expect(body.text).not.toContain('/autorotate relogin')
@@ -301,6 +303,205 @@ describe('Autorotate Slack command', () => {
     expect(slackCall).toBeDefined()
     expect(JSON.stringify(slackCall?.body)).toContain('Codex accounts: 1 usable / 1')
     expect(calls.some(call => call.url.includes('/v1/status'))).toBe(false)
+  })
+
+  it('resets an account through the operator API with a deterministic opaque request key', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined
+      calls.push({ body, method: init?.method ?? 'GET', url })
+      if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer operator-secret')
+        return Response.json({
+          outcome: 'reset',
+          account: operatorAccount({
+            limits_observed_at: '2026-07-31T20:00:00Z',
+            primary: {
+              used_percent: 0,
+              resets_at: '2026-08-01T01:00:00Z',
+              window_minutes: 300
+            },
+            secondary: {
+              used_percent: 15,
+              resets_at: '2026-08-07T01:00:00Z',
+              window_minutes: 10_080
+            },
+            reset_credits: { available_count: 0, credits: [] },
+            owner: `slack:${TEAM_ID}:${USER_ID}`
+          })
+        })
+      }
+      return new Response('', { status: 200 })
+    })
+    const timestamp = String(Math.floor(Date.now() / 1000))
+
+    const first = await handleAndWait(
+      handler,
+      commandRequest('reset person@example.test', { timestamp })
+    )
+    const second = await handleAndWait(
+      handler,
+      commandRequest('reset person@example.test', { timestamp })
+    )
+
+    expect(await first.json()).toEqual({
+      response_type: 'ephemeral',
+      text: 'Resetting rate limits for person@example.test…'
+    })
+    expect(await second.json()).toEqual({
+      response_type: 'ephemeral',
+      text: 'Resetting rate limits for person@example.test…'
+    })
+    const resetCalls = calls.filter(call => call.url.endsWith('/reset'))
+    expect(resetCalls).toHaveLength(2)
+    expect(resetCalls.map(call => call.body)).toEqual([
+      { idempotency_key: expect.stringMatching(/^[0-9a-f]{64}$/) },
+      { idempotency_key: expect.stringMatching(/^[0-9a-f]{64}$/) }
+    ])
+    expect((resetCalls[0]?.body as { idempotency_key: string }).idempotency_key).toBe(
+      (resetCalls[1]?.body as { idempotency_key: string }).idempotency_key
+    )
+    expect(JSON.stringify(resetCalls)).not.toContain(SIGNING_SECRET)
+    const slackResponses = calls.filter(call => call.url === RESPONSE_URL)
+    expect(slackResponses).toHaveLength(2)
+    expect(JSON.stringify(slackResponses.at(-1)?.body)).toContain('Rate-limit reset applied')
+    expect(JSON.stringify(slackResponses.at(-1)?.body)).toContain('5h: 0% used')
+    expect(JSON.stringify(slackResponses.at(-1)?.body)).toContain('weekly: 15% used')
+  })
+
+  it('allows every configured-workspace member to reset rate limits', async () => {
+    const calls: FetchCall[] = []
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      calls.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method ?? 'GET',
+        url
+      })
+      if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+        return Response.json({ outcome: 'nothing_to_reset', account: operatorAccount() })
+      }
+      return new Response('', { status: 200 })
+    })
+
+    const response = await handleAndWait(
+      handler,
+      commandRequest('reset person@example.test', { userId: OTHER_USER_ID })
+    )
+
+    expect(await response.json()).toMatchObject({
+      text: 'Resetting rate limits for person@example.test…'
+    })
+    expect(calls.some(call => call.url.endsWith('/reset'))).toBe(true)
+  })
+
+  it('renders reset outcomes and keeps broker failures generic', async () => {
+    const outcomes = [
+      ['already_redeemed', 'Rate-limit reset was already applied'],
+      ['nothing_to_reset', 'No active rate limit to reset'],
+      ['no_credit', 'No rate-limit reset credit is available']
+    ] as const
+
+    for (const [outcome, text] of outcomes) {
+      let slackText = ''
+      const handler = testHandler(async (input, init) => {
+        const url = String(input)
+        if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+          return Response.json({ outcome, account: operatorAccount() })
+        }
+        if (url === RESPONSE_URL && init?.body) {
+          slackText = (JSON.parse(String(init.body)) as { text: string }).text
+        }
+        return new Response('', { status: 200 })
+      })
+
+      await handleAndWait(handler, commandRequest('reset person@example.test'))
+      expect(slackText).toContain(text)
+    }
+
+    const logs: Array<{ data?: unknown; event: string }> = []
+    let slackText = ''
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+        return Response.json(
+          { error: { code: 'account_busy', message: 'operator-secret provider response' } },
+          { status: 409 }
+        )
+      }
+      if (url === RESPONSE_URL && init?.body) {
+        slackText = (JSON.parse(String(init.body)) as { text: string }).text
+      }
+      return new Response('', { status: 200 })
+    }, logs)
+
+    await handleAndWait(handler, commandRequest('reset person@example.test'))
+    expect(slackText).toBe('That Codex account is busy. Try the rate-limit reset again shortly.')
+    expect(JSON.stringify(logs)).not.toContain('operator-secret')
+    expect(JSON.stringify(logs)).not.toContain('provider response')
+  })
+
+  it('asks for a new reset when an idempotent prior reset did not clear the current limit', async () => {
+    let slackText = ''
+    const handler = testHandler(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+        return Response.json({
+          outcome: 'already_redeemed',
+          account: operatorAccount({
+            availability: 'rate_limited',
+            limited_until: '2026-08-01T02:03:04Z',
+            next_available_at: '2026-08-01T02:03:04Z'
+          })
+        })
+      }
+      if (url === RESPONSE_URL && init?.body) {
+        slackText = (JSON.parse(String(init.body)) as { text: string }).text
+      }
+      return new Response('', { status: 200 })
+    })
+
+    await handleAndWait(handler, commandRequest('reset person@example.test'))
+
+    expect(slackText).toContain('A previous reset attempt was redeemed')
+    expect(slackText).toContain('this account is still rate limited')
+    expect(slackText).toContain(
+      'Run /autorotate reset person@example.test again to reset the current rate-limit incident'
+    )
+  })
+
+  it('renders validated reset retry times and redacts malformed broker context', async () => {
+    const responseText = async (error: Record<string, unknown>): Promise<string> => {
+      let slackText = ''
+      const handler = testHandler(async (input, init) => {
+        const url = String(input)
+        if (url.endsWith('/v1/operator/accounts/person%40example.test/reset')) {
+          return Response.json({ error }, { status: 409 })
+        }
+        if (url === RESPONSE_URL && init?.body) {
+          slackText = (JSON.parse(String(init.body)) as { text: string }).text
+        }
+        return new Response('', { status: 200 })
+      })
+      await handleAndWait(handler, commandRequest('reset person@example.test'))
+      return slackText
+    }
+
+    await expect(responseText({
+      code: 'account_busy',
+      retry_at: '2038-01-19T03:14:07.123Z'
+    })).resolves.toBe(
+      'That Codex account is busy. Try the rate-limit reset again at 2038-01-19 03:14:07.123 UTC.'
+    )
+    await expect(responseText({
+      code: 'account_busy',
+      message: 'operator-secret provider response',
+      retry_at: 'must-not-render'
+    })).resolves.toBe('That Codex account is busy. Try the rate-limit reset again shortly.')
+    await expect(responseText({ code: 'not_found' })).resolves.toBe(
+      'Autorotate could not find that Codex account. Check the email and try again.'
+    )
   })
 
   it('starts login from a channel, sends the code only ephemerally, and replaces it on completion', async () => {
@@ -960,7 +1161,10 @@ describe('Autorotate Slack command', () => {
       'login label person@example.test',
       'login relogin legacy-primary',
       'add label',
-      'relogin legacy-primary'
+      'relogin legacy-primary',
+      'reset',
+      'reset not-an-email',
+      'reset person@example.test extra'
     ]) {
       const handler = testHandler(async () => {
         throw new Error('must not fetch')
