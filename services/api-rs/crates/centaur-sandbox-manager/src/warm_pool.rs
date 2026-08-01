@@ -288,6 +288,7 @@ pub enum WarmPoolError {
 mod tests {
     use std::{
         collections::BTreeMap,
+        str::FromStr,
         sync::{Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -297,6 +298,7 @@ mod tests {
         ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
         SandboxResult, SandboxSpec, SandboxStatus,
     };
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::*;
 
@@ -439,10 +441,39 @@ mod tests {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
             return None;
         };
-        let store = PgSessionStore::connect(&url)
+        let bootstrap_store = PgSessionStore::connect(&url)
             .await
             .expect("connect test db");
-        store.run_migrations().await.expect("run migrations");
+        bootstrap_store
+            .run_migrations()
+            .await
+            .expect("run migrations");
+
+        // The workspace test command shares one database between test binaries.
+        // Capacity tests can reserve any ready warm row, so clone just the table
+        // this module exercises into a private schema before exposing test rows.
+        let schema = format!("warm_pool_test_{}", unique_suffix());
+        sqlx::query(&format!("create schema {schema}"))
+            .execute(bootstrap_store.pool())
+            .await
+            .expect("create isolated warm-pool test schema");
+        sqlx::query(&format!(
+            "create table {schema}.session_warm_sandboxes (like public.session_warm_sandboxes including all)"
+        ))
+        .execute(bootstrap_store.pool())
+        .await
+        .expect("clone isolated warm-pool test table");
+
+        let search_path = format!("{schema},public");
+        let options = PgConnectOptions::from_str(&url)
+            .expect("parse test database URL")
+            .options([("search_path", search_path.as_str())]);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect isolated warm-pool test store");
+        let store = PgSessionStore::new(pool);
         Some(store)
     }
 

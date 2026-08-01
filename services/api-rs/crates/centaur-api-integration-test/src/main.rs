@@ -504,6 +504,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     let sentinel_name = format!("api_integration_sentinel_{unique}");
     let workflow_name = format!("api_integration_workflow_{unique}");
     let workflow_path = workflow_dir.join(format!("{workflow_name}.py"));
+    let handler_started_marker = workflow_dir.join(format!("{workflow_name}.started"));
 
     write_sentinel_workflow(&workflow_dir, &sentinel_name)?;
     write_test_workflow(&workflow_path, &workflow_name)?;
@@ -543,6 +544,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         &workflow_name,
         json!({
             "case": "removed-workflow-run",
+            "handler_started_marker": handler_started_marker,
             "sleep_ms": 60_000,
         }),
     )
@@ -551,6 +553,11 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     wait_for_workflow_run_status(http, base_url, &removed_run_id, &["running"])
         .await
         .context("wait for long-running workflow run to start")?;
+    // A run becomes `running` before the workflow host resolves and invokes its handler.
+    // Wait for the fixture marker so removal exercises cancellation of an active handler.
+    wait_for_file(&handler_started_marker)
+        .await
+        .context("wait for long-running workflow handler to start")?;
 
     fs::remove_file(&workflow_path)
         .with_context(|| format!("remove workflow file {}", workflow_path.display()))?;
@@ -593,6 +600,7 @@ fn write_test_workflow(path: &Path, workflow_name: &str) -> Result<()> {
     let source = format!(
         r#"
 import asyncio
+from pathlib import Path
 
 WORKFLOW_NAME = "{workflow_name}"
 SCHEDULE = {{
@@ -605,6 +613,9 @@ SCHEDULE = {{
 
 
 async def handler(params, ctx):
+    handler_started_marker = params.get("handler_started_marker")
+    if handler_started_marker:
+        Path(handler_started_marker).touch()
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
         await asyncio.sleep(sleep_ms / 1000)
@@ -685,6 +696,22 @@ async fn wait_for_workflow_run_status(
     bail!(
         "workflow run {run_id} did not reach one of {:?} before timeout; last run: {last_run}",
         expected_statuses
+    )
+}
+
+async fn wait_for_file(path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(25);
+
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!(
+        "workflow handler did not create start marker {}",
+        path.display()
     )
 }
 
