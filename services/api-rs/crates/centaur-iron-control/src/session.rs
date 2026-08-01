@@ -14,8 +14,11 @@ use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, SlackChannelPermissionInput};
 use crate::principal::{
-    derive_principal_with_slack_team, is_direct_message, slack_conversation_id,
+    derive_principal_with_slack_team, derive_workflow_principal, is_direct_message,
+    slack_conversation_id,
 };
+
+const WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL: &str = "workflow_agent_default_roles_seeded";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SessionPrincipalMetadata<'a> {
@@ -87,21 +90,7 @@ impl SessionRegistrar {
         );
         let mut input = principal.to_identity_input(&self.namespace);
         apply_slack_dm_email_label(thread_key, metadata.slack_user_email, &mut input.labels);
-        let existing = match self
-            .client
-            .get_principal(&self.namespace, &input.foreign_id)
-            .await
-        {
-            Ok(existing) => Some(existing),
-            Err(error) if is_status(&error, 404) => None,
-            Err(error) => return Err(error),
-        };
-        let exists = existing.is_some();
-        if let Some(existing) = existing {
-            let mut labels = existing.labels;
-            labels.extend(input.labels);
-            input.labels = labels;
-        }
+        let exists = self.merge_existing_labels(&mut input).await?;
         let slack_permission = slack_permission_for_thread(thread_key, &input.labels);
         let should_upsert_slack_permission = !exists
             || slack_permission
@@ -114,6 +103,68 @@ impl SessionRegistrar {
                 .await?;
         }
         Ok(record)
+    }
+
+    /// Ensure the stable principal for ``workflow_name`` exists without
+    /// granting the default roles used by agent sandboxes. Workflow discovery
+    /// uses this for host-only ``WORKFLOW_PRINCIPAL`` opt-ins.
+    pub async fn ensure_workflow_principal(&self, workflow_name: &str) -> Result<Principal> {
+        let mut input = derive_workflow_principal(workflow_name).to_identity_input(&self.namespace);
+        self.merge_existing_labels(&mut input).await?;
+        self.client.upsert_principal(&input).await
+    }
+
+    /// Ensure the stable principal for ``workflow_name`` has received the
+    /// default session roles once. The durable marker keeps later operator
+    /// revocations sticky, matching ordinary session-principal behavior.
+    pub async fn ensure_workflow_agent_principal(&self, workflow_name: &str) -> Result<Principal> {
+        let mut input = derive_workflow_principal(workflow_name).to_identity_input(&self.namespace);
+        self.merge_existing_labels(&mut input).await?;
+        let roles_seeded = input
+            .labels
+            .get(WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL)
+            .is_some_and(|value| value == "true");
+        let record = self.client.upsert_principal(&input).await?;
+        if roles_seeded {
+            return Ok(record);
+        }
+
+        self.assign_default_roles(&record.id).await?;
+        input.labels.insert(
+            WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL.to_owned(),
+            "true".to_owned(),
+        );
+        self.client.upsert_principal(&input).await
+    }
+
+    async fn merge_existing_labels(&self, input: &mut crate::IdentityInput) -> Result<bool> {
+        let existing = match self
+            .client
+            .get_principal(&self.namespace, &input.foreign_id)
+            .await
+        {
+            Ok(existing) => Some(existing),
+            Err(error) if is_status(&error, 404) => None,
+            Err(error) => return Err(error),
+        };
+        let exists = existing.is_some();
+        if let Some(existing) = existing {
+            let mut labels = existing.labels;
+            labels.extend(input.labels.clone());
+            input.labels = labels;
+        }
+        Ok(exists)
+    }
+
+    async fn assign_default_roles(&self, principal_id: &str) -> Result<()> {
+        for role_id in &self.assign_role_ids {
+            match self.client.assign_role(principal_id, role_id).await {
+                Ok(()) => {}
+                Err(error) if is_status(&error, 409) || is_status(&error, 422) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
@@ -174,7 +225,7 @@ fn is_status(err: &IronControlError, code: u16) -> bool {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -395,6 +446,156 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn ensure_workflow_principal_preserves_labels_without_seeding_roles() {
+        let existing_labels = BTreeMap::from([("operator_label".to_owned(), "keep".to_owned())]);
+        let (base_url, requests, server) =
+            spawn_workflow_principal_stub(Some(existing_labels), 200).await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+
+        registrar
+            .ensure_workflow_principal("newsletter_daily_digest")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let put = requests
+            .iter()
+            .find(|request| request.method == "PUT")
+            .expect("workflow principal upsert");
+        assert_eq!(put.body["data"]["labels"]["operator_label"], "keep");
+        assert_eq!(put.body["data"]["labels"]["kind"], "workflow");
+        assert_eq!(
+            put.body["data"]["labels"]["workflow_name"],
+            "newsletter_daily_digest"
+        );
+        assert!(!requests.iter().any(|request| request.method == "POST"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ensure_workflow_agent_principal_seeds_roles_and_marks_the_principal() {
+        let existing_labels = BTreeMap::from([("operator_label".to_owned(), "keep".to_owned())]);
+        let (base_url, requests, server) =
+            spawn_workflow_principal_stub(Some(existing_labels), 200).await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+
+        registrar
+            .ensure_workflow_agent_principal("newsletter_daily_digest")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let puts = requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(puts[1].body["data"]["labels"]["operator_label"], "keep");
+        assert_eq!(
+            puts[1].body["data"]["labels"][WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL],
+            "true"
+        );
+        assert!(requests.iter().any(|request| {
+            request.method == "POST" && request.path == "/api/v1/principals/prn_workflow/roles"
+        }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ensure_workflow_agent_principal_preserves_revoked_roles_after_seeding() {
+        let existing_labels = BTreeMap::from([(
+            WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL.to_owned(),
+            "true".to_owned(),
+        )]);
+        let (base_url, requests, server) =
+            spawn_workflow_principal_stub(Some(existing_labels), 200).await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+
+        registrar
+            .ensure_workflow_agent_principal("newsletter_daily_digest")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
+        assert!(!requests.iter().any(|request| request.method == "POST"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ensure_workflow_agent_principal_marks_only_after_role_assignment_succeeds() {
+        let (base_url, requests, server) = spawn_workflow_principal_stub(None, 500).await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+
+        assert!(
+            registrar
+                .ensure_workflow_agent_principal("newsletter_daily_digest")
+                .await
+                .is_err()
+        );
+
+        let requests = requests.lock().unwrap();
+        let puts = requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 1);
+        assert!(
+            puts[0].body["data"]["labels"]
+                .get(WORKFLOW_AGENT_DEFAULT_ROLES_SEEDED_LABEL)
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ensure_workflow_agent_principal_accepts_concurrent_role_conflicts() {
+        let (base_url, requests, server) = spawn_workflow_principal_stub(None, 409).await;
+        let registrar = SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+            vec!["role_infra".to_owned()],
+        );
+
+        registrar
+            .ensure_workflow_agent_principal("newsletter_daily_digest")
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            2
+        );
+        server.abort();
+    }
+
     #[test]
     fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
         let mut labels = BTreeMap::new();
@@ -481,5 +682,132 @@ mod tests {
 
     fn user_principal_body() -> String {
         r#"{"data":{"id":"prn_user","namespace":"default","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: Value,
+    }
+
+    async fn spawn_workflow_principal_stub(
+        existing_labels: Option<BTreeMap<String, String>>,
+        role_status: u16,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                let (header_end, content_length) = loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break (header_end, content_length);
+                };
+                while request.len() < header_end + content_length {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let first_line = headers.lines().next().unwrap_or_default();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_owned();
+                let path = parts.next().unwrap_or_default().to_owned();
+                let body = serde_json::from_slice(
+                    &request[header_end..request.len().min(header_end + content_length)],
+                )
+                .unwrap_or(Value::Null);
+                seen.lock().unwrap().push(RecordedRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                });
+
+                let workflow_lookup =
+                    "/api/v1/principals/lookup/default/workflow-newsletter-daily-digest";
+                let workflow_upsert = "/api/v1/principals/workflow-newsletter-daily-digest";
+                let (status_line, response_body) = match (method.as_str(), path.as_str()) {
+                    ("GET", path) if path == workflow_lookup => match &existing_labels {
+                        Some(labels) => ("200 OK", workflow_principal_body(labels.clone())),
+                        None => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
+                    },
+                    ("PUT", path) if path == workflow_upsert => {
+                        let labels = body["data"]["labels"]
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|(key, value)| Some((key, value.as_str()?.to_owned())))
+                            .collect();
+                        ("200 OK", workflow_principal_body(labels))
+                    }
+                    ("POST", "/api/v1/principals/prn_workflow/roles") => match role_status {
+                        200 => ("200 OK", r#"{"data":{"ok":true}}"#.to_owned()),
+                        409 => ("409 Conflict", r#"{"error":"duplicate"}"#.to_owned()),
+                        _ => (
+                            "500 Internal Server Error",
+                            r#"{"error":"assignment failed"}"#.to_owned(),
+                        ),
+                    },
+                    _ => (
+                        "500 Internal Server Error",
+                        r#"{"error":"unexpected"}"#.to_owned(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn workflow_principal_body(labels: BTreeMap<String, String>) -> String {
+        json!({
+            "data": {
+                "id": "prn_workflow",
+                "namespace": "default",
+                "foreign_id": "workflow-newsletter-daily-digest",
+                "name": "Workflow newsletter_daily_digest",
+                "labels": labels,
+            }
+        })
+        .to_string()
     }
 }

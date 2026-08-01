@@ -727,11 +727,12 @@ impl SandboxArgs {
                 ]),
             })
             .await?;
+        let registrar = SessionRegistrar::new(client, namespace);
         Ok(Some(IronControlRuntime {
-            registrar: SessionRegistrar::new(client.clone(), namespace.clone()),
+            registrar: registrar.clone(),
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
-            workflow_principal_registrar: WorkflowPrincipalRegistrar::new(client, namespace),
+            workflow_principal_registrar: WorkflowPrincipalRegistrar::new(registrar),
         }))
     }
 

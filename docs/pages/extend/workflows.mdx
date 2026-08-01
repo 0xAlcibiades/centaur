@@ -64,15 +64,17 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     return {"channel": inp.channel, "report": result}
 ```
 
-`WORKFLOW_PRINCIPAL` is optional. Use it when the workflow host calls tools
-directly with `ctx.call_tool(...)` and should have its own credential boundary.
-The API derives and registers the `workflow-nightly-report` principal from
-`WORKFLOW_NAME` and runs that workflow-host sandbox under it. Workflow code
-cannot choose another principal id, display name, or labels. Grant the required
-tool roles or secrets to the derived principal. `WORKFLOW_PRINCIPAL = True`
-requires `apiRs.workflowHostSandbox=true`, which renders
-`WORKFLOW_HOST_SANDBOX=true`; startup fails if workflow-host sandboxing is
-disabled.
+The API derives the stable `workflow-nightly-report` principal from
+`WORKFLOW_NAME`. Automatic `ctx.agent_turn(...)` and `ctx.run_agent(...)`
+sessions use this principal while keeping a separate session for each workflow
+run. Grant the required agent tool roles or secrets to this principal.
+
+`WORKFLOW_PRINCIPAL` is optional. Set it to `True` when the workflow host calls
+tools directly with `ctx.call_tool(...)`; this opts the host sandbox into the
+same workflow principal. Workflow code cannot choose another principal id,
+display name, or labels. `WORKFLOW_PRINCIPAL = True` requires
+`apiRs.workflowHostSandbox=true`, which renders `WORKFLOW_HOST_SANDBOX=true`;
+startup fails if workflow-host sandboxing is disabled.
 
 ## Durable primitives
 

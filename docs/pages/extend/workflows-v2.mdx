@@ -109,7 +109,6 @@ Use `ctx.agent_turn(...)` when the workflow needs an agent sandbox:
 ```python
 result = await ctx.agent_turn(
     "Investigate this alert and return the next action.",
-    thread_key=f"workflow:{ctx.run_id}:agent",
     harness="codex",
     model="gpt-5.2",
     reasoning="high",
@@ -119,7 +118,10 @@ result = await ctx.agent_turn(
 
 The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
-session runtime.
+session runtime. Without an explicit `thread_key`, Centaur creates a
+run-specific session and binds it to the stable `workflow-<name>` principal.
+An explicit `thread_key` instead uses the normal session-derived principal and
+persistent session lifecycle.
 
 #### Declare Workflow-Host Permissions
 
@@ -131,9 +133,11 @@ WORKFLOW_NAME = "nightly_report"
 WORKFLOW_PRINCIPAL = True
 ```
 
-The API derives and registers the `workflow-nightly-report` principal in the
-Centaur Console and runs that workflow's host sandbox under it. Grant only the
-roles or secrets that workflow needs:
+The API derives the `workflow-nightly-report` principal in the Centaur Console.
+Automatic agent turns use this principal even without `WORKFLOW_PRINCIPAL`.
+Setting `WORKFLOW_PRINCIPAL = True` also runs the workflow's host sandbox under
+it, so direct `ctx.call_tool(...)` calls share the same grants. Grant only the
+roles or secrets that the workflow needs:
 
 ```bash
 cargo run -p centaur-perms -- \

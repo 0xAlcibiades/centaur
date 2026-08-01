@@ -1343,6 +1343,55 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_workflow_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+        )
+        .await
+    }
+
+    /// Create or load an automatic workflow agent session and bind it to the
+    /// workflow's stable principal instead of deriving a principal from the
+    /// run-specific thread key.
+    pub async fn create_or_get_workflow_agent_session(
+        &self,
+        thread_key: &ThreadKey,
+        workflow_name: &str,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let workflow_name = workflow_name.trim();
+        if workflow_name.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "workflow_name must not be empty".to_owned(),
+            ));
+        }
+        self.create_or_get_session_with_workflow_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            Some(workflow_name),
+        )
+        .await
+    }
+
+    async fn create_or_get_session_with_workflow_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        workflow_name: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1373,9 +1422,15 @@ impl SessionRuntime {
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
             let (registered_principal, desired_capabilities) =
                 if let Some(registrar) = &self.iron_control {
-                    let principal = registrar
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
-                        .await?;
+                    let principal = if let Some(workflow_name) = workflow_name {
+                        registrar
+                            .ensure_workflow_agent_principal(workflow_name)
+                            .await?
+                    } else {
+                        registrar
+                            .register_session(thread_key.as_str(), Some(&session_metadata))
+                            .await?
+                    };
                     let desired_capabilities = sandbox_capabilities_from_principal(&principal);
                     (Some(principal), desired_capabilities)
                 } else {

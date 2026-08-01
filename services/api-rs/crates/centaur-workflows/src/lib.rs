@@ -11,7 +11,7 @@ use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
     SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
 };
-use centaur_iron_control::{IdentityInput, IronControlClient, IronControlError, slugify};
+use centaur_iron_control::{IronControlError, SessionRegistrar};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -291,16 +291,12 @@ impl WorkflowHostSandboxRuntime {
 
 #[derive(Clone)]
 pub struct WorkflowPrincipalRegistrar {
-    client: IronControlClient,
-    namespace: String,
+    registrar: SessionRegistrar,
 }
 
 impl WorkflowPrincipalRegistrar {
-    pub fn new(client: IronControlClient, namespace: impl Into<String>) -> Self {
-        Self {
-            client,
-            namespace: namespace.into(),
-        }
+    pub fn new(registrar: SessionRegistrar) -> Self {
+        Self { registrar }
     }
 
     async fn register_workflow_principals(
@@ -309,32 +305,14 @@ impl WorkflowPrincipalRegistrar {
     ) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
         let mut registered = BTreeMap::new();
         for workflow_name in principals {
-            let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
             let record = self
-                .client
-                .upsert_principal(&IdentityInput {
-                    namespace: self.namespace.clone(),
-                    foreign_id,
-                    name: format!("Workflow {workflow_name}"),
-                    labels: workflow_principal_labels(workflow_name),
-                })
+                .registrar
+                .ensure_workflow_principal(workflow_name)
                 .await?;
             registered.insert(workflow_name.clone(), record.id);
         }
         Ok(registered)
     }
-}
-
-fn canonical_workflow_principal_foreign_id(workflow_name: &str) -> String {
-    format!("workflow-{}", slugify(workflow_name))
-}
-
-fn workflow_principal_labels(workflow_name: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("kind".to_owned(), "workflow".to_owned()),
-        ("managed-by".to_owned(), "centaur".to_owned()),
-        ("workflow_name".to_owned(), workflow_name.to_owned()),
-    ])
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2679,7 +2657,7 @@ async fn run_centaur_workflow_inner(
                     let session_runtime = session_runtime.clone();
                     let harness_type = input.harness_type.clone();
                     let thread_key =
-                        format!("wf:{}:agent:agent_turn", ctx.task_id().replace('-', ""));
+                        automatic_workflow_agent_thread_key(ctx.task_id(), "agent_turn");
                     let task_id = ctx.task_id().to_owned();
                     let run_id = ctx.run_id().to_owned();
                     async move {
@@ -2705,6 +2683,7 @@ async fn run_centaur_workflow_inner(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
                                 workflow_owned_thread: true,
+                                workflow_principal_name: Some("agent_turn".to_owned()),
                                 idle_timeout_ms,
                                 max_duration_ms,
                                 model: None,
@@ -3553,11 +3532,7 @@ async fn run_python_agent_turn(
         .map(ToOwned::to_owned);
     let workflow_owned_thread = explicit_thread_key.is_none();
     let thread_key = explicit_thread_key.unwrap_or_else(|| {
-        format!(
-            "wf:{}:agent:{}",
-            ctx.task_id().replace('-', ""),
-            input.workflow_name
-        )
+        automatic_workflow_agent_thread_key(ctx.task_id(), &input.workflow_name)
     });
     let harness_type = parse_agent_harness(&args)?.unwrap_or_else(|| input.harness_type.clone());
     let persona_id = args
@@ -3632,6 +3607,10 @@ async fn run_python_agent_turn(
             execution_metadata,
             execution_idempotency_key,
             workflow_owned_thread,
+            workflow_principal_name: workflow_agent_principal_name(
+                workflow_owned_thread,
+                &input.workflow_name,
+            ),
             idle_timeout_ms,
             max_duration_ms,
             model,
@@ -3641,6 +3620,17 @@ async fn run_python_agent_turn(
     )
     .await?;
     serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
+}
+
+fn automatic_workflow_agent_thread_key(task_id: &str, workflow_name: &str) -> String {
+    format!("wf:{}:agent:{workflow_name}", task_id.replace('-', ""))
+}
+
+fn workflow_agent_principal_name(
+    workflow_owned_thread: bool,
+    workflow_name: &str,
+) -> Option<String> {
+    workflow_owned_thread.then(|| workflow_name.to_owned())
 }
 
 /// Returns the first arg key that holds a non-empty (trimmed) string, owned.
@@ -3924,6 +3914,7 @@ struct AgentTurnRequest {
     execution_metadata: Value,
     execution_idempotency_key: String,
     workflow_owned_thread: bool,
+    workflow_principal_name: Option<String>,
     idle_timeout_ms: u64,
     max_duration_ms: u64,
     // Optional per-turn model / provider / reasoning-effort overrides. When set
@@ -3979,6 +3970,7 @@ async fn run_agent_session_turn(
         execution_metadata,
         execution_idempotency_key,
         workflow_owned_thread,
+        workflow_principal_name,
         idle_timeout_ms,
         max_duration_ms,
         model,
@@ -3990,15 +3982,28 @@ async fn run_agent_session_turn(
     if workflow_owned_thread {
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
-    session_runtime
-        .create_or_get_session(
-            &thread_key,
-            &harness_type,
-            persona_id.as_deref(),
-            Some(session_metadata),
-            HarnessConflictPolicy::Reject,
-        )
-        .await?;
+    if let Some(workflow_name) = workflow_principal_name.as_deref() {
+        session_runtime
+            .create_or_get_workflow_agent_session(
+                &thread_key,
+                workflow_name,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+            )
+            .await?;
+    } else {
+        session_runtime
+            .create_or_get_session(
+                &thread_key,
+                &harness_type,
+                persona_id.as_deref(),
+                Some(session_metadata),
+                HarnessConflictPolicy::Reject,
+            )
+            .await?;
+    }
     session_runtime
         .append_messages(
             &thread_key,
@@ -4174,6 +4179,32 @@ mod tests {
         assert_eq!(
             python_workflow_event_name("review", "change:42"),
             "python:[\"review\",\"change:42\"]"
+        );
+    }
+
+    #[test]
+    fn automatic_agent_threads_are_per_task_but_share_the_workflow_identity() {
+        let first = automatic_workflow_agent_thread_key(
+            "019f9511-cfb6-7c4a-bcb9-ea74651c0e30",
+            "newsletter_daily_digest",
+        );
+        let second = automatic_workflow_agent_thread_key(
+            "019f9511-cfb6-7c4a-bcb9-ea74651c0e31",
+            "newsletter_daily_digest",
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(
+            workflow_agent_principal_name(true, "newsletter_daily_digest").as_deref(),
+            Some("newsletter_daily_digest")
+        );
+    }
+
+    #[test]
+    fn explicit_agent_threads_keep_session_derived_principals() {
+        assert_eq!(
+            workflow_agent_principal_name(false, "newsletter_daily_digest"),
+            None
         );
     }
 
@@ -4506,30 +4537,6 @@ mod tests {
             Some(&json!("scheduled_workflow"))
         );
         assert!(metadata.principals.contains("scheduled_workflow"));
-    }
-
-    #[test]
-    fn workflow_principal_foreign_id_is_derived_from_workflow_name() {
-        assert_eq!(
-            canonical_workflow_principal_foreign_id("nightly_report"),
-            "workflow-nightly-report"
-        );
-        assert_eq!(
-            canonical_workflow_principal_foreign_id("Managing Partner Daily Briefing"),
-            "workflow-managing-partner-daily-briefing"
-        );
-    }
-
-    #[test]
-    fn workflow_principal_labels_identify_workflow_kind() {
-        let labels = workflow_principal_labels("nightly_report");
-
-        assert_eq!(labels.get("kind").map(String::as_str), Some("workflow"));
-        assert!(!labels.contains_key("purpose"));
-        assert_eq!(
-            labels.get("workflow_name").map(String::as_str),
-            Some("nightly_report")
-        );
     }
 
     #[test]

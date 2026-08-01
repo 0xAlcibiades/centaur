@@ -32,6 +32,7 @@ const DISCORD_CHANNEL_KIND: &str = "discord_channel";
 const LINEAR_ISSUE_KIND: &str = "linear_issue";
 const TEAMS_USER_KIND: &str = "teams_user";
 const TEAMS_CONVERSATION_KIND: &str = "teams_conversation";
+const WORKFLOW_KIND: &str = "workflow";
 
 /// The principal a session resolves to, as a stable upsert key plus a label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +54,20 @@ impl PrincipalRef {
             name: self.name.clone(),
             labels,
         }
+    }
+}
+
+/// Resolve the stable principal shared by a workflow host and its automatic
+/// agent turns. Workflow session thread keys remain run-specific; only the
+/// credential identity is shared across runs.
+pub fn derive_workflow_principal(workflow_name: &str) -> PrincipalRef {
+    PrincipalRef {
+        foreign_id: format!("workflow-{}", slugify(workflow_name)),
+        name: format!("Workflow {workflow_name}"),
+        labels: BTreeMap::from([
+            (KIND_LABEL.to_owned(), WORKFLOW_KIND.to_owned()),
+            ("workflow_name".to_owned(), workflow_name.to_owned()),
+        ]),
     }
 }
 
@@ -630,6 +645,30 @@ mod tests {
         assert_eq!(
             input.labels.get("kind").map(String::as_str),
             Some("slack_channel")
+        );
+    }
+
+    #[test]
+    fn workflow_principal_is_stable_and_managed() {
+        let principal = derive_workflow_principal("Managing Partner Daily Briefing");
+        assert_eq!(
+            principal.foreign_id,
+            "workflow-managing-partner-daily-briefing"
+        );
+        assert_eq!(principal.name, "Workflow Managing Partner Daily Briefing");
+        assert_eq!(
+            principal.labels.get("kind").map(String::as_str),
+            Some("workflow")
+        );
+        assert_eq!(
+            principal.labels.get("workflow_name").map(String::as_str),
+            Some("Managing Partner Daily Briefing")
+        );
+
+        let input = principal.to_identity_input("default");
+        assert_eq!(
+            input.labels.get("managed-by").map(String::as_str),
+            Some("centaur")
         );
     }
 }

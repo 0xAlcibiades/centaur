@@ -269,6 +269,10 @@ Rules:
 
 - honor explicit `thread_key`
 - otherwise derive `wf:<task_id>:agent:<step-or-message>`
+- bind automatically derived threads to the stable
+  `workflow-<slugged-workflow-name>` principal while keeping their session
+  state isolated per task
+- keep explicit thread keys on the normal session-derived principal path
 - honor explicit `message_id`
 - otherwise derive a deterministic message id from task id and call site
 - pass through `metadata`, `delivery`, `harness`, `persona`, and prompt override
