@@ -7379,7 +7379,9 @@ mod tests {
             .expect("activate trace config");
         let capabilities = SandboxCapabilities {
             metadata_trace_enabled: true,
-            metadata_trace_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(1)),
+            metadata_trace_expires_at: Some(postgres_timestamp(
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )),
             metadata_trace_subject_hash: Some("u1".to_owned()),
             metadata_trace_consent_revision: Some(1),
             metadata_trace_config_fingerprint: Some(identity.fingerprint.clone()),
@@ -7549,7 +7551,7 @@ mod tests {
             }
             fence.rollback().await.unwrap();
         };
-        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let expiry = postgres_timestamp(OffsetDateTime::now_utc() + TimeDuration::hours(1));
         let consent = store
             .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
             .await
