@@ -41,9 +41,12 @@ const ACCOUNT_FIELDS = [
   'primary',
   'secondary',
   'reset_credits',
-  'next_available_at'
+  'next_available_at',
+  'owner'
 ] as const
-const REQUIRED_ACCOUNT_FIELDS = ACCOUNT_FIELDS.filter(field => field !== 'reset_credits')
+const REQUIRED_ACCOUNT_FIELDS = ACCOUNT_FIELDS.filter(
+  field => field !== 'reset_credits' && field !== 'owner'
+)
 const RATE_LIMIT_FIELDS = [
   'used_percent',
   'resets_at',
@@ -92,6 +95,7 @@ type AutorotateAccount = {
   limits_observed_at: string | null
   login_required: boolean
   next_available_at: string | null
+  owner: string | null
   primary: RateLimitWindow | null
   reconciliation_required: boolean
   reset_credits: ResetCredits | null
@@ -121,6 +125,17 @@ type ResetCredit = {
 type ResetCredits = {
   available_count: number
   credits: ResetCredit[]
+}
+
+type ResetAccountRateLimitsOutcome =
+  | 'reset'
+  | 'already_redeemed'
+  | 'nothing_to_reset'
+  | 'no_credit'
+
+type ResetAccountRateLimitsResponse = {
+  account: AutorotateAccount
+  outcome: ResetAccountRateLimitsOutcome
 }
 
 type ActiveEnrollmentState = 'starting' | 'monitoring' | 'cancel_requested' | 'cancelling'
@@ -159,7 +174,8 @@ class AutorotateError extends Error {
   constructor(
     message: string,
     readonly status?: number,
-    readonly code?: string
+    readonly code?: string,
+    readonly retryAt?: string
   ) {
     super(message)
   }
@@ -234,6 +250,24 @@ class AutorotateClient {
     })
   }
 
+  async resetAccount(
+    accountEmail: string,
+    idempotencyKey: string
+  ): Promise<ResetAccountRateLimitsResponse> {
+    if (!safeEmail(accountEmail) || !safeIdempotencyKey(idempotencyKey)) {
+      throw new AutorotateError('invalid rate-limit reset request')
+    }
+    const payload = await this.request(
+      'POST',
+      `v1/operator/accounts/${encodeURIComponent(accountEmail)}/reset`,
+      this.operatorToken,
+      { idempotency_key: idempotencyKey }
+    )
+    return validateResetAccountRateLimits(
+      selectFields(payload, ['outcome', 'account'])
+    )
+  }
+
   async cancelEnrollment(enrollmentId: string): Promise<EnrollmentStatusResponse | null> {
     if (!ENROLLMENT_ID_PATTERN.test(enrollmentId)) {
       throw new AutorotateError('invalid enrollment id')
@@ -280,10 +314,12 @@ class AutorotateClient {
       const payload = parseJsonObject(text)
       if (!response.ok) {
         const error = isJsonObject(payload.error) ? payload.error : {}
+        const retryAt = safeTimestamp(error.retry_at)
         throw new AutorotateError(
           `Autorotate returned HTTP ${response.status}`,
           response.status,
-          stringValue(error.code)
+          stringValue(error.code),
+          retryAt ?? undefined
         )
       }
       return payload
@@ -385,6 +421,24 @@ export function createAutorotateSlackCommandHandler(
       if (!responseUrl) {
         return ephemeralResponse('Slack did not provide a safe ephemeral response channel.')
       }
+      if (command.kind === 'reset') {
+        const idempotencyKey = resetIdempotencyKey(
+          request.headers,
+          rawBody,
+          options.signingSecret
+        )
+        waitUntil(
+          respondWithRateLimitReset({
+            accountEmail: command.accountEmail,
+            client,
+            fetchFn,
+            idempotencyKey,
+            options,
+            responseUrl
+          })
+        )
+        return ephemeralResponse(`Resetting rate limits for ${escapeSlackText(command.accountEmail)}…`)
+      }
       const active = activeEnrollments.get(actorKey)
       if (command.kind === 'login_status') {
         if (active?.state === 'starting') {
@@ -456,6 +510,33 @@ async function respondWithStatus(
       responseUrl,
       'Codex account status is temporarily unavailable.',
       options.requestTimeoutMs
+    )
+  }
+}
+
+async function respondWithRateLimitReset(input: {
+  accountEmail: string
+  client: AutorotateClient
+  fetchFn: SlackbotV2Fetch
+  idempotencyKey: string
+  options: AutorotateSlackOptions
+  responseUrl: string
+}): Promise<void> {
+  try {
+    const result = await input.client.resetAccount(input.accountEmail, input.idempotencyKey)
+    await postSlackResponse(
+      input.fetchFn,
+      input.responseUrl,
+      formatRateLimitReset(result, input.accountEmail),
+      input.options.requestTimeoutMs
+    )
+  } catch (error) {
+    safeCommandWarning(input.options.logger, 'slackbotv2_autorotate_reset_failed', error)
+    await postSlackResponse(
+      input.fetchFn,
+      input.responseUrl,
+      rateLimitResetFailureText(error),
+      input.options.requestTimeoutMs
     )
   }
 }
@@ -834,6 +915,7 @@ type ParsedCommand =
   | { kind: 'login' }
   | { kind: 'login_status' }
   | { kind: 'login_cancel' }
+  | { kind: 'reset'; accountEmail: string }
 
 function parseCommand(text: string): ParsedCommand {
   const parts = text.trim().split(/\s+/).filter(Boolean)
@@ -843,6 +925,9 @@ function parseCommand(text: string): ParsedCommand {
   }
   if (parts.length === 1 && (root === 'login' || root === 'add' || root === 'relogin')) {
     return { kind: 'login' }
+  }
+  if (root === 'reset' && parts.length === 2 && safeEmail(parts[1])) {
+    return { kind: 'reset', accountEmail: parts[1] }
   }
   if (root !== 'login') return { kind: 'help' }
   if (parts.length === 2 && parts[1]?.toLowerCase() === 'status') return { kind: 'login_status' }
@@ -854,7 +939,46 @@ function helpText(): string {
   return [
     'Autorotate commands',
     '`/autorotate status` — account usability and rate limits',
-    '`/autorotate login` — add or refresh the account you authenticate'
+    '`/autorotate login` — add or refresh the account you authenticate',
+    '`/autorotate reset <account-email>` — use an available rate-limit reset credit'
+  ].join('\n')
+}
+
+function formatRateLimitReset(
+  result: ResetAccountRateLimitsResponse,
+  requestedAccountEmail: string
+): string {
+  const account = result.account
+  const identity = account.email
+    ? `${escapeSlackText(account.email)} [${escapeSlackText(account.label)}]`
+    : `account [${escapeSlackText(account.label)}]`
+  const outcome = (() => {
+    switch (result.outcome) {
+      case 'reset':
+        return 'Rate-limit reset applied'
+      case 'already_redeemed':
+        if (account.availability === 'rate_limited') {
+          return [
+            'A previous reset attempt was redeemed, but this account is still rate limited',
+            `Run /autorotate reset ${escapeSlackText(requestedAccountEmail)} again to reset the current rate-limit incident`
+          ].join('. ')
+        }
+        return 'Rate-limit reset was already applied'
+      case 'nothing_to_reset':
+        return 'No active rate limit to reset'
+      case 'no_credit':
+        return 'No rate-limit reset credit is available'
+    }
+  })()
+  const headline = result.outcome === 'already_redeemed' && account.availability === 'rate_limited'
+    ? `${outcome}.`
+    : `${outcome} for ${identity}.`
+  return [
+    headline,
+    ...rateLimitRows(account),
+    ...resetCreditRows(account.reset_credits),
+    `  observed: ${limitsObservedAt(account)}`,
+    `  next available: ${nextAvailable(account)}`
   ].join('\n')
 }
 
@@ -1043,6 +1167,10 @@ function formatUtcTimestamp(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace('T', ' ')} UTC`
 }
 
+function formatUtcRetryTimestamp(value: string): string {
+  return new Date(value).toISOString().replace('T', ' ').replace('Z', ' UTC')
+}
+
 function formatDeviceCode(enrollment: StartEnrollmentResponse): string {
   const verificationUrl = safeVerificationUrl(enrollment.verification_url)
   const userCode = safeUserCode(enrollment.user_code)
@@ -1092,6 +1220,23 @@ function enrollmentFailureText(errorCode: string | null | undefined, fallback: s
       return 'The expected email does not match that Codex account.'
     default:
       return fallback
+  }
+}
+
+function rateLimitResetFailureText(error: unknown): string {
+  const autorotateError = error instanceof AutorotateError ? error : undefined
+  const code = autorotateError?.code
+  switch (code) {
+    case 'not_found':
+    case 'account_not_found':
+      return 'Autorotate could not find that Codex account. Check the email and try again.'
+    case 'account_busy':
+      if (autorotateError?.retryAt) {
+        return `That Codex account is busy. Try the rate-limit reset again at ${formatUtcRetryTimestamp(autorotateError.retryAt)}.`
+      }
+      return 'That Codex account is busy. Try the rate-limit reset again shortly.'
+    default:
+      return 'Autorotate could not reset that account’s rate limits. Try again shortly.'
   }
 }
 
@@ -1220,6 +1365,7 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
   const resetCredits = validateResetCredits(payload.reset_credits)
   const secondary = validateRateLimitWindow(payload.secondary)
   const nextAvailableAt = payload.next_available_at
+  const owner = payload.owner
   if (
     !REQUIRED_ACCOUNT_FIELDS.every(field => Object.hasOwn(payload, field))
     || !safeAccountLabel(label)
@@ -1239,6 +1385,7 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
       nextAvailableAt !== null
       && (typeof nextAvailableAt !== 'string' || !safeTimestamp(nextAvailableAt))
     )
+    || (owner !== undefined && owner !== null && !safeOwner(owner))
   ) {
     throw new AutorotateError('Autorotate returned invalid accounts')
   }
@@ -1252,6 +1399,7 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
     limits_observed_at: limitsObservedAt,
     login_required: loginRequired,
     next_available_at: nextAvailableAt,
+    owner: typeof owner === 'string' ? owner : null,
     primary,
     reconciliation_required: reconciliationRequired,
     reset_credits: resetCredits,
@@ -1262,6 +1410,18 @@ function validateAccount(payload: JsonObject): AutorotateAccount {
     throw new AutorotateError('Autorotate returned contradictory account status')
   }
   return account
+}
+
+function validateResetAccountRateLimits(payload: JsonObject): ResetAccountRateLimitsResponse {
+  const outcome = payload.outcome
+  const account = payload.account
+  if (!isResetAccountRateLimitsOutcome(outcome) || !isJsonObject(account)) {
+    throw new AutorotateError('Autorotate returned invalid rate-limit reset')
+  }
+  return {
+    account: validateAccount(selectFields(account, ACCOUNT_FIELDS)),
+    outcome
+  }
 }
 
 function validAccountState(account: AutorotateAccount): boolean {
@@ -1445,6 +1605,13 @@ function validSlackSignature(
     && timingSafeEqual(actualBuffer, expectedBuffer)
 }
 
+function resetIdempotencyKey(headers: Headers, body: string, signingSecret: string): string {
+  const timestamp = headers.get('x-slack-request-timestamp') ?? ''
+  return createHmac('sha256', signingSecret)
+    .update(`autorotate-rate-limit-reset:v1:${timestamp}:${body}`)
+    .digest('hex')
+}
+
 function authorizedWorkspace(
   options: AutorotateSlackOptions,
   teamId: string,
@@ -1500,6 +1667,20 @@ function safeEmail(value: unknown): value is string {
     && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value)
 }
 
+function safeOwner(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length >= 1
+    && value.length <= 256
+    && /^[\x20-\x7e]+$/.test(value)
+}
+
+function safeIdempotencyKey(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length >= 8
+    && value.length <= 128
+    && /^[\x21-\x7e]+$/.test(value)
+}
+
 function safeAccountLabel(value: unknown): value is string {
   return typeof value === 'string'
     && value.length >= 1
@@ -1535,6 +1716,13 @@ function isAccountUnusableReason(value: unknown): value is AccountUnusableReason
     || value === 'login_required'
     || value === 'reconciliation_required'
     || value === 'operator_reported'
+}
+
+function isResetAccountRateLimitsOutcome(value: unknown): value is ResetAccountRateLimitsOutcome {
+  return value === 'reset'
+    || value === 'already_redeemed'
+    || value === 'nothing_to_reset'
+    || value === 'no_credit'
 }
 
 function isEnrollmentStatus(value: unknown): value is EnrollmentStatus {
