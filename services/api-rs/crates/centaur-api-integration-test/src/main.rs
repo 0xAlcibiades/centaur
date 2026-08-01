@@ -366,8 +366,8 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "idempotency_key": "api-integration-test-execute-1",
             "metadata": {
-                    "source": "centaur-api-integration-test",
-                    "model": TEST_MODEL,
+                "source": "centaur-api-integration-test",
+                "model": TEST_MODEL,
             },
             "input_lines": [input_line],
             "idle_timeout_ms": 5_000,
@@ -393,8 +393,11 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
         format!("{}/execute", session_url(base_url, &thread_key)),
         json!({
             "idempotency_key": "api-integration-test-execute-1",
-            "metadata": {"source": "centaur-api-integration-test", "replay": true},
-            "input_lines": [],
+            "metadata": {
+                "source": "centaur-api-integration-test",
+                "model": TEST_MODEL,
+            },
+            "input_lines": [input_line],
             "idle_timeout_ms": 5_000,
             "max_duration_ms": 15_000,
         }),

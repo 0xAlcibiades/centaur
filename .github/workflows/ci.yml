@@ -253,7 +253,7 @@ jobs:
           python-version: "3.11"
 
       - name: Pull the reviewed trace agent
-        run: docker pull us-west1-docker.pkg.dev/snappy-storm-496900-m0/autorotate/autorotate@sha256:d314bb1a420ec6bc2948a4314ee70dd597b6af645a25ff32e6793f044c5f0427
+        run: docker pull us-west1-docker.pkg.dev/autorotate-iam-proof-442243/autorotate-trace-agent-public/autorotate-trace-agent@sha256:0fd1cdb92fed586d4fc3a85509a6b807ffab8ba75cc88e6cfd71eaac692ba25f
 
       - name: Pull the pinned local gateway fixture
         run: docker pull python@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4

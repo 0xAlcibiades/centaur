@@ -50,7 +50,7 @@ const METADATA_TRACE_SPOOL_SIZE_LIMIT: &str = "64Mi";
 /// Reviewed upstream artifact for the consented metadata-only sidecar. This
 /// digest, not a deployment-provided source claim or mutable tag, is the
 /// executable trust boundary.
-pub const AUTOROTATE_TRACE_AGENT_IMAGE: &str = "us-west1-docker.pkg.dev/snappy-storm-496900-m0/autorotate/autorotate@sha256:d314bb1a420ec6bc2948a4314ee70dd597b6af645a25ff32e6793f044c5f0427";
+pub const AUTOROTATE_TRACE_AGENT_IMAGE: &str = "us-west1-docker.pkg.dev/autorotate-iam-proof-442243/autorotate-trace-agent-public/autorotate-trace-agent@sha256:0fd1cdb92fed586d4fc3a85509a6b807ffab8ba75cc88e6cfd71eaac692ba25f";
 const MANAGED_BY_VALUE: &str = "api-rs";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any

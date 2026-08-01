@@ -15,8 +15,9 @@ from uuid import uuid4
 
 
 IMAGE = (
-    "us-west1-docker.pkg.dev/snappy-storm-496900-m0/autorotate/autorotate"
-    "@sha256:d314bb1a420ec6bc2948a4314ee70dd597b6af645a25ff32e6793f044c5f0427"
+    "us-west1-docker.pkg.dev/autorotate-iam-proof-442243/"
+    "autorotate-trace-agent-public/autorotate-trace-agent"
+    "@sha256:0fd1cdb92fed586d4fc3a85509a6b807ffab8ba75cc88e6cfd71eaac692ba25f"
 )
 GATEWAY_IMAGE = "python@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4"
 OTLP_FIXTURES = (
@@ -247,7 +248,7 @@ class AutorotateTraceAgentContractTests(unittest.TestCase):
         current_fixture = base64.b64encode(body).decode()
         result = self.client_request(gateway, "post", endpoint, current_fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "202")
+        self.assertEqual(result.stdout.strip(), "200")
 
     def read_gateway_events(self, capture_dir: Path, count: int) -> list[dict]:
         path = capture_dir / "events.jsonl"
@@ -274,8 +275,11 @@ class AutorotateTraceAgentContractTests(unittest.TestCase):
             for sentinel in SECRET_SENTINELS:
                 self.assertNotIn(sentinel, payload)
 
-            self.assertTrue(all(set(batch) == {"batch"} for batch in batches), batches)
-            events = [event for batch in batches for event in batch["batch"]["events"]]
+            self.assertTrue(
+                all(set(batch) == {"protocol_version", "events"} and batch["protocol_version"] == 1 for batch in batches),
+                batches,
+            )
+            events = [event for batch in batches for event in batch["events"]]
             self.assertEqual(
                 {event["event"]["kind"] for event in events},
                 {"execution_started", "model_usage", "tool_use"},
@@ -344,7 +348,7 @@ class AutorotateTraceAgentContractTests(unittest.TestCase):
         )
         self.assertEqual(
             binary.stdout.split()[0],
-            "a3a2b4842556c9ea5f73ad2944c7bf1d638eccba653e37d4d913f2e82ac889a3",
+            "a210d58bec0d61f7afc0c0415bda23ef6bd93c1e2a3a90e2559bdce6e2c23495",
         )
 
 
