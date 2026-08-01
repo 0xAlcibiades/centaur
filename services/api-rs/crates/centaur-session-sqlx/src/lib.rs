@@ -6865,6 +6865,12 @@ mod tests {
             .max(active_generation.saturating_add(2))
     }
 
+    fn postgres_timestamp(value: OffsetDateTime) -> OffsetDateTime {
+        value
+            .replace_nanosecond(value.nanosecond() / 1_000 * 1_000)
+            .expect("microsecond precision is a valid nanosecond value")
+    }
+
     #[test]
     fn parses_session_event_notification_payload() {
         let notification: SessionEventNotification =
@@ -6946,7 +6952,7 @@ mod tests {
             )
             .await
             .expect("create session");
-        let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
+        let expiry = postgres_timestamp(OffsetDateTime::now_utc() + TimeDuration::hours(1));
         let capabilities = SandboxCapabilities {
             metadata_trace_enabled: true,
             metadata_trace_expires_at: Some(expiry),
@@ -7508,15 +7514,41 @@ mod tests {
             )
             .await
             .unwrap();
-        let identity = MetadataTraceConfigIdentity {
-            generation: next_trace_generation(&store).await,
-            fingerprint: format!("trace-guard-{}", Uuid::new_v4()),
-            enabled: true,
-        };
-        store
-            .activate_metadata_trace_config(&identity)
+        // Workspace tests share one Postgres database across test binaries.
+        // Fence the singleton config table during setup so another binary
+        // cannot roll the generation between assignment and guard acquisition.
+        let (identity, config_setup_fence) = loop {
+            let identity = MetadataTraceConfigIdentity {
+                generation: next_trace_generation(&store).await,
+                fingerprint: format!("trace-guard-{}", Uuid::new_v4()),
+                enabled: true,
+            };
+            match store.activate_metadata_trace_config(&identity).await {
+                Ok(()) => {}
+                Err(
+                    SessionStoreError::StaleMetadataTraceGeneration { .. }
+                    | SessionStoreError::MetadataTraceConfigConflict { .. },
+                ) => continue,
+                Err(error) => panic!("activate trace guard config: {error}"),
+            }
+            let mut fence = store.pool().begin().await.unwrap();
+            sqlx::query("lock table metadata_trace_config_state in share mode")
+                .execute(&mut *fence)
+                .await
+                .unwrap();
+            let active = sqlx::query_scalar::<_, bool>(
+                "select generation = $1 and config_fingerprint = $2 from metadata_trace_config_state where singleton = true",
+            )
+            .bind(identity.generation)
+            .bind(&identity.fingerprint)
+            .fetch_one(&mut *fence)
             .await
             .unwrap();
+            if active {
+                break (identity, fence);
+            }
+            fence.rollback().await.unwrap();
+        };
         let expiry = OffsetDateTime::now_utc() + TimeDuration::hours(1);
         let consent = store
             .grant_metadata_trace_consent("slack", &workspace_id, &user_id, expiry)
@@ -7576,6 +7608,7 @@ mod tests {
             .await
             .unwrap()
             .expect("guard");
+        config_setup_fence.commit().await.unwrap();
 
         let revoke_store = store.clone();
         let revoke_workspace_id = workspace_id.clone();
