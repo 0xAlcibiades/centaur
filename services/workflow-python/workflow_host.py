@@ -408,6 +408,11 @@ async def read_protocol_line(reader: asyncio.StreamReader, buffer: bytearray) ->
     while True:
         newline = buffer.find(b"\n", search_from)
         if newline >= 0:
+            if newline > WORKFLOW_HOST_MAX_MESSAGE_BYTES:
+                raise ProtocolError(
+                    "workflow host protocol message exceeds "
+                    f"{WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+                )
             line = bytes(buffer[: newline + 1])
             del buffer[: newline + 1]
             return line
@@ -416,6 +421,11 @@ async def read_protocol_line(reader: asyncio.StreamReader, buffer: bytearray) ->
         chunk = await reader.read(64 * 1024)
         if chunk:
             buffer.extend(chunk)
+            if len(buffer) > WORKFLOW_HOST_MAX_MESSAGE_BYTES:
+                raise ProtocolError(
+                    "workflow host protocol message exceeds "
+                    f"{WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+                )
             continue
         if buffer:
             line = bytes(buffer)

@@ -89,6 +89,20 @@ class WorkflowHostTests(unittest.TestCase):
         ):
             asyncio.run(host.RpcClient().write({"value": "x" * 128}))
 
+    def test_reader_rejects_oversized_inbound_message(self) -> None:
+        host = load_workflow_host()
+        host.WORKFLOW_HOST_MAX_MESSAGE_BYTES = 64
+
+        async def read_oversized_message() -> None:
+            reader = asyncio.StreamReader()
+            reader.feed_data(b"x" * 65)
+            await host.read_protocol_line(reader, bytearray())
+
+        with self.assertRaisesRegex(
+            host.ProtocolError, "workflow host protocol message exceeds 64 bytes"
+        ):
+            asyncio.run(read_oversized_message())
+
     @contextlib.contextmanager
     def workflow_host(
         self,
