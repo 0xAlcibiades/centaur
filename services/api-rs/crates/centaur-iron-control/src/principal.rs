@@ -33,6 +33,7 @@ const LINEAR_ISSUE_KIND: &str = "linear_issue";
 const TEAMS_USER_KIND: &str = "teams_user";
 const TEAMS_CONVERSATION_KIND: &str = "teams_conversation";
 const WORKFLOW_KIND: &str = "workflow";
+pub const WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID: &str = "workflow-host";
 
 /// The principal a session resolves to, as a stable upsert key plus a label.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -125,7 +125,7 @@ impl SessionRegistrar {
         let exists = existing.is_some();
         if let Some(existing) = existing {
             let mut labels = existing.labels;
-            labels.extend(input.labels.clone());
+            labels.extend(std::mem::take(&mut input.labels));
             input.labels = labels;
         }
         Ok(exists)
@@ -296,21 +296,23 @@ mod tests {
             .unwrap();
 
         let requests = requests.lock().unwrap();
+        assert!(request_was(
+            &requests,
+            "GET",
+            "/api/v1/principals/lookup/default/slack-channel-t123-c123"
+        ));
+        assert!(request_was(
+            &requests,
+            "PUT",
+            "/api/v1/principals/slack-channel-t123-c123"
+        ));
+        assert!(request_was(
+            &requests,
+            "POST",
+            "/api/v1/principals/prn_channel/slack_channel_permissions"
+        ));
         assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
-        );
-        assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
-        assert!(
-            requests.contains(
-                &"POST /api/v1/principals/prn_channel/slack_channel_permissions".to_owned()
-            )
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|request| request == "POST /api/v1/principals/prn_channel/roles"),
+            !request_was(&requests, "POST", "/api/v1/principals/prn_channel/roles"),
             "iron-control assigns configured default roles during principal creation"
         );
         server.abort();
@@ -333,22 +335,24 @@ mod tests {
             .unwrap();
 
         let requests = requests.lock().unwrap();
-        assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
-        );
-        assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
+        assert!(request_was(
+            &requests,
+            "GET",
+            "/api/v1/principals/lookup/default/slack-channel-t123-c123"
+        ));
+        assert!(request_was(
+            &requests,
+            "PUT",
+            "/api/v1/principals/slack-channel-t123-c123"
+        ));
         assert!(
             !requests
                 .iter()
-                .any(|request| request.ends_with("/slack_channel_permissions")),
+                .any(|request| request.path.ends_with("/slack_channel_permissions")),
             "existing principals must not have Slack permissions reset"
         );
         assert!(
-            !requests
-                .iter()
-                .any(|request| request == "POST /api/v1/principals/prn_channel/roles"),
+            !request_was(&requests, "POST", "/api/v1/principals/prn_channel/roles"),
             "existing principals must not have manually removed roles restored"
         );
         server.abort();
@@ -371,11 +375,16 @@ mod tests {
             .unwrap();
 
         let requests = requests.lock().unwrap();
-        assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
-        assert!(
-            requests
-                .contains(&"POST /api/v1/principals/prn_user/slack_channel_permissions".to_owned())
-        );
+        assert!(request_was(
+            &requests,
+            "PUT",
+            "/api/v1/principals/slack-user-t123-u123"
+        ));
+        assert!(request_was(
+            &requests,
+            "POST",
+            "/api/v1/principals/prn_user/slack_channel_permissions"
+        ));
         server.abort();
     }
 
@@ -396,15 +405,18 @@ mod tests {
             .unwrap();
 
         let requests = requests.lock().unwrap();
-        assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
+        assert!(request_was(
+            &requests,
+            "PUT",
+            "/api/v1/principals/slack-user-t123-u123"
+        ));
+        assert!(request_was(
+            &requests,
+            "POST",
+            "/api/v1/principals/prn_user/slack_channel_permissions"
+        ));
         assert!(
-            requests
-                .contains(&"POST /api/v1/principals/prn_user/slack_channel_permissions".to_owned())
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|request| request == "POST /api/v1/principals/prn_user/roles"),
+            !request_was(&requests, "POST", "/api/v1/principals/prn_user/roles"),
             "existing DM principals must not have manually removed roles restored"
         );
         server.abort();
@@ -448,74 +460,48 @@ mod tests {
 
     async fn spawn_iron_control_stub(
         principal_exists: bool,
-    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                let mut buf = [0u8; 1024];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => request.extend_from_slice(&buf[..read]),
-                    }
+    ) -> (
+        String,
+        Arc<Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_http_stub(
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
+                    if principal_exists =>
+                {
+                    ("200 OK", channel_principal_body())
                 }
-                let request = String::from_utf8_lossy(&request);
-                let first_line = request.lines().next().unwrap_or_default();
-                let mut parts = first_line.split_whitespace();
-                let method = parts.next().unwrap_or_default();
-                let path = parts.next().unwrap_or_default();
-                seen.lock().unwrap().push(format!("{method} {path}"));
-
-                let (status_line, body) = match (method, path) {
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
-                        if principal_exists =>
-                    {
-                        ("200 OK", channel_principal_body())
-                    }
-                    ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
-                        if principal_exists =>
-                    {
-                        ("200 OK", user_principal_body())
-                    }
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
-                    | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123") => {
-                        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
-                    }
-                    ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
-                        ("200 OK", channel_principal_body())
-                    }
-                    ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
-                        ("200 OK", user_principal_body())
-                    }
-                    (
-                        "POST",
-                        "/api/v1/principals/prn_channel/slack_channel_permissions"
-                        | "/api/v1/principals/prn_user/slack_channel_permissions",
-                    ) => ("200 OK", r#"{"data":{"ok":true}}"#.to_owned()),
-                    ("POST", "/api/v1/principals/prn_channel/roles") => {
-                        ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
-                    }
-                    _ => (
-                        "500 Internal Server Error",
-                        r#"{"error":"unexpected"}"#.to_owned(),
-                    ),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        (base_url, requests, handle)
+                ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
+                    if principal_exists =>
+                {
+                    ("200 OK", user_principal_body())
+                }
+                ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
+                | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123") => {
+                    ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+                }
+                ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
+                    ("200 OK", channel_principal_body())
+                }
+                ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
+                    ("200 OK", user_principal_body())
+                }
+                (
+                    "POST",
+                    "/api/v1/principals/prn_channel/slack_channel_permissions"
+                    | "/api/v1/principals/prn_user/slack_channel_permissions",
+                ) => ("200 OK", r#"{"data":{"ok":true}}"#.to_owned()),
+                ("POST", "/api/v1/principals/prn_channel/roles") => {
+                    ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+                }
+                _ => (
+                    "500 Internal Server Error",
+                    r#"{"error":"unexpected"}"#.to_owned(),
+                ),
+            },
+        )
+        .await
     }
 
     fn channel_principal_body() -> String {
@@ -529,11 +515,53 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RecordedRequest {
         method: String,
+        path: String,
         body: Value,
+    }
+
+    fn request_was(requests: &[RecordedRequest], method: &str, path: &str) -> bool {
+        requests
+            .iter()
+            .any(|request| request.method == method && request.path == path)
     }
 
     async fn spawn_workflow_principal_stub(
         existing_labels: Option<BTreeMap<String, String>>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<RecordedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_http_stub(move |request| {
+            let workflow_lookup =
+                "/api/v1/principals/lookup/default/workflow-newsletter-daily-digest";
+            let workflow_upsert = "/api/v1/principals/workflow-newsletter-daily-digest";
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", path) if path == workflow_lookup => match &existing_labels {
+                    Some(labels) => ("200 OK", workflow_principal_body(labels.clone())),
+                    None => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
+                },
+                ("PUT", path) if path == workflow_upsert => {
+                    let labels = request.body["data"]["labels"]
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(key, value)| Some((key, value.as_str()?.to_owned())))
+                        .collect();
+                    ("200 OK", workflow_principal_body(labels))
+                }
+                _ => (
+                    "500 Internal Server Error",
+                    r#"{"error":"unexpected"}"#.to_owned(),
+                ),
+            }
+        })
+        .await
+    }
+
+    async fn spawn_http_stub(
+        route: impl Fn(&RecordedRequest) -> (&'static str, String) + Send + 'static,
     ) -> (
         String,
         Arc<Mutex<Vec<RecordedRequest>>>,
@@ -590,34 +618,9 @@ mod tests {
                     &request[header_end..request.len().min(header_end + content_length)],
                 )
                 .unwrap_or(Value::Null);
-                seen.lock().unwrap().push(RecordedRequest {
-                    method: method.clone(),
-                    body: body.clone(),
-                });
-
-                let workflow_lookup =
-                    "/api/v1/principals/lookup/default/workflow-newsletter-daily-digest";
-                let workflow_upsert = "/api/v1/principals/workflow-newsletter-daily-digest";
-                let (status_line, response_body) = match (method.as_str(), path.as_str()) {
-                    ("GET", path) if path == workflow_lookup => match &existing_labels {
-                        Some(labels) => ("200 OK", workflow_principal_body(labels.clone())),
-                        None => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
-                    },
-                    ("PUT", path) if path == workflow_upsert => {
-                        let labels = body["data"]["labels"]
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|(key, value)| Some((key, value.as_str()?.to_owned())))
-                            .collect();
-                        ("200 OK", workflow_principal_body(labels))
-                    }
-                    _ => (
-                        "500 Internal Server Error",
-                        r#"{"error":"unexpected"}"#.to_owned(),
-                    ),
-                };
+                let request = RecordedRequest { method, path, body };
+                seen.lock().unwrap().push(request.clone());
+                let (status_line, response_body) = route(&request);
                 let response = format!(
                     "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
                     response_body.len(),

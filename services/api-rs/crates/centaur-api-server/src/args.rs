@@ -719,7 +719,7 @@ impl SandboxArgs {
         let workflow_host = client
             .upsert_principal(&IdentityInput {
                 namespace: namespace.clone(),
-                foreign_id: "workflow-host".to_owned(),
+                foreign_id: centaur_iron_control::WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID.to_owned(),
                 name: "Workflow host".to_owned(),
                 labels: BTreeMap::from([
                     ("managed-by".to_owned(), "centaur".to_owned()),

@@ -1366,12 +1366,6 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        let workflow_name = workflow_name.trim();
-        if workflow_name.is_empty() {
-            return Err(SessionRuntimeError::BadRequest(
-                "workflow_name must not be empty".to_owned(),
-            ));
-        }
         self.create_or_get_session_with_workflow_principal(
             thread_key,
             harness_type,
@@ -1383,7 +1377,7 @@ impl SessionRuntime {
         .await
     }
 
-    async fn create_or_get_session_with_workflow_principal(
+    pub async fn create_or_get_session_with_workflow_principal(
         &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
@@ -1392,6 +1386,12 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         workflow_name: Option<&str>,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let workflow_name = workflow_name.map(str::trim);
+        if workflow_name.is_some_and(str::is_empty) {
+            return Err(SessionRuntimeError::BadRequest(
+                "workflow_name must not be empty".to_owned(),
+            ));
+        }
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,

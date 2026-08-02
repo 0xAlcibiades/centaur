@@ -11,7 +11,10 @@ use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
     SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
 };
-use centaur_iron_control::{IronControlError, SessionRegistrar};
+use centaur_iron_control::{
+    IronControlError, SessionRegistrar, WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID,
+    derive_workflow_principal,
+};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -1658,9 +1661,26 @@ struct PythonWorkflowMetadata {
 
 fn metadata_from_discovery_payload(
     payload: PythonWorkflowDiscoveryPayload,
-) -> PythonWorkflowMetadata {
+) -> Result<PythonWorkflowMetadata, WorkflowRuntimeError> {
     let mut metadata = PythonWorkflowMetadata::default();
+    let mut principal_names = BTreeMap::new();
     for workflow in payload.workflows {
+        let principal = derive_workflow_principal(&workflow.workflow_name);
+        if principal.foreign_id == WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflow {:?} resolves to reserved principal {WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID:?}",
+                workflow.workflow_name
+            )));
+        }
+        if let Some(existing_name) =
+            principal_names.insert(principal.foreign_id.clone(), workflow.workflow_name.clone())
+            && existing_name != workflow.workflow_name
+        {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflows {existing_name:?} and {:?} resolve to the same principal {:?}",
+                workflow.workflow_name, principal.foreign_id
+            )));
+        }
         metadata
             .workflow_names
             .insert(workflow.workflow_name.clone());
@@ -1680,7 +1700,7 @@ fn metadata_from_discovery_payload(
             metadata.principals.insert(workflow.workflow_name);
         }
     }
-    metadata
+    Ok(metadata)
 }
 
 async fn prepare_workflow_host_sandbox(
@@ -1795,7 +1815,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
             Some("workflow.discovery") => {
                 let _ = child.wait().await;
                 let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(message)?;
-                let mut metadata = metadata_from_discovery_payload(payload);
+                let mut metadata = metadata_from_discovery_payload(payload)?;
                 WorkflowEnablement::from_env()?.filter_metadata(&mut metadata);
                 return Ok(metadata);
             }
@@ -2656,15 +2676,16 @@ async fn run_centaur_workflow_inner(
                 .step("agent_turn", || {
                     let session_runtime = session_runtime.clone();
                     let harness_type = input.harness_type.clone();
+                    let workflow_name = input.workflow_name.clone();
                     let thread_key =
-                        automatic_workflow_agent_thread_key(ctx.task_id(), "agent_turn");
+                        automatic_workflow_agent_thread_key(ctx.task_id(), &workflow_name);
                     let task_id = ctx.task_id().to_owned();
                     let run_id = ctx.run_id().to_owned();
                     async move {
                         let client_message_id = format!("absurd-workflow:{task_id}:native:user");
                         let metadata = json!({
                             "source": "absurd_workflow",
-                            "workflow_name": "agent_turn",
+                            "workflow_name": workflow_name.clone(),
                             "workflow_task_id": task_id,
                             "workflow_run_id": run_id,
                         });
@@ -2683,7 +2704,10 @@ async fn run_centaur_workflow_inner(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
                                 workflow_owned_thread: true,
-                                workflow_principal_name: Some("agent_turn".to_owned()),
+                                workflow_principal_name: workflow_agent_principal_name(
+                                    true,
+                                    &workflow_name,
+                                ),
                                 idle_timeout_ms,
                                 max_duration_ms,
                                 model: None,
@@ -3982,28 +4006,16 @@ async fn run_agent_session_turn(
     if workflow_owned_thread {
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
-    if let Some(workflow_name) = workflow_principal_name.as_deref() {
-        session_runtime
-            .create_or_get_workflow_agent_session(
-                &thread_key,
-                workflow_name,
-                &harness_type,
-                persona_id.as_deref(),
-                Some(session_metadata),
-                HarnessConflictPolicy::Reject,
-            )
-            .await?;
-    } else {
-        session_runtime
-            .create_or_get_session(
-                &thread_key,
-                &harness_type,
-                persona_id.as_deref(),
-                Some(session_metadata),
-                HarnessConflictPolicy::Reject,
-            )
-            .await?;
-    }
+    session_runtime
+        .create_or_get_session_with_workflow_principal(
+            &thread_key,
+            &harness_type,
+            persona_id.as_deref(),
+            Some(session_metadata),
+            HarnessConflictPolicy::Reject,
+            workflow_principal_name.as_deref(),
+        )
+        .await?;
     session_runtime
         .append_messages(
             &thread_key,
@@ -4523,7 +4535,7 @@ mod tests {
             ],
         }))
         .unwrap();
-        let metadata = metadata_from_discovery_payload(payload);
+        let metadata = metadata_from_discovery_payload(payload).unwrap();
         assert_eq!(
             metadata.workflow_names,
             BTreeSet::from([
@@ -4537,6 +4549,47 @@ mod tests {
             Some(&json!("scheduled_workflow"))
         );
         assert!(metadata.principals.contains("scheduled_workflow"));
+    }
+
+    #[test]
+    fn discovery_rejects_workflow_host_principal_collision() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [{
+                "workflow_name": "host",
+                "source_path": "workflows/host.py",
+            }],
+        }))
+        .unwrap();
+
+        let error = metadata_from_discovery_payload(payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resolves to reserved principal \"workflow-host\"")
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_colliding_workflow_principal_slugs() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [
+                {
+                    "workflow_name": "Daily Report",
+                    "source_path": "workflows/daily_report_title.py",
+                },
+                {
+                    "workflow_name": "daily_report",
+                    "source_path": "workflows/daily_report_snake.py",
+                },
+            ],
+        }))
+        .unwrap();
+
+        let error = metadata_from_discovery_payload(payload).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("\"Daily Report\""));
+        assert!(message.contains("\"daily_report\""));
+        assert!(message.contains("\"workflow-daily-report\""));
     }
 
     #[test]
@@ -4640,7 +4693,7 @@ mod tests {
         }))
         .unwrap();
 
-        let metadata = metadata_from_discovery_payload(payload);
+        let metadata = metadata_from_discovery_payload(payload).unwrap();
         let filter = metadata.webhooks[0].spec.filter.as_ref().unwrap();
         let all = filter.all.as_ref().unwrap();
         assert_eq!(all.len(), 2);
@@ -4770,7 +4823,7 @@ mod tests {
             ],
         }))
         .unwrap();
-        let mut metadata = metadata_from_discovery_payload(payload);
+        let mut metadata = metadata_from_discovery_payload(payload).unwrap();
         WorkflowEnablement::allowlist("allowed_workflow").filter_metadata(&mut metadata);
 
         assert_eq!(
