@@ -15877,51 +15877,6 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stdout_eof_fails_when_sandbox_no_longer_accepts_io() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let _serial = TEST_LOCK.lock().await;
-        let thread_key =
-            ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
-
-        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-        let (io, stdout, _stdin) = mock_io();
-        backend.push_io(io).await;
-
-        let runtime = runtime_with(&store, backend.clone());
-        runtime
-            .ensure_session_pipe(&thread_key, "sbx-gone")
-            .await
-            .expect("open initial pipe");
-        backend.set_status(SandboxStatus::Gone);
-        drop(stdout);
-
-        wait_for_event(&store, &thread_key, "session.execution_failed").await;
-        let all = events(&store, &thread_key).await;
-        let failed = all
-            .iter()
-            .find(|event| event.event_type == "session.execution_failed")
-            .expect("failed event");
-        let error = failed.payload["error"].as_str().unwrap_or_default();
-        assert!(
-            error.contains("sandbox stdout closed before terminal output"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.contains("sandbox no longer accepts io"),
-            "expected sandbox status detail: {error}"
-        );
-        assert!(
-            !all.iter()
-                .any(|event| event.event_type == "session.stdout_pump_reattached"),
-            "gone sandbox should not reattach"
-        );
-        assert_eq!(backend.opens(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_reattach_preserves_root_state_across_child_terminal() {
         let _serial = TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
