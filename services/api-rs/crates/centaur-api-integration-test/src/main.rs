@@ -553,9 +553,9 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     )
     .await
     .context("create long-running workflow run")?;
-    wait_for_workflow_run_status(http, base_url, &removed_run_id, &["running"])
+    wait_for_workflow_run_status(http, base_url, &removed_run_id, &["sleeping"])
         .await
-        .context("wait for long-running workflow run to start")?;
+        .context("wait for long-running workflow run to suspend")?;
 
     fs::remove_file(&workflow_path)
         .with_context(|| format!("remove workflow file {}", workflow_path.display()))?;
@@ -696,8 +696,6 @@ async def handler(params, ctx):
 fn write_test_workflow(path: &Path, workflow_name: &str) -> Result<()> {
     let source = format!(
         r#"
-import asyncio
-
 WORKFLOW_NAME = "{workflow_name}"
 SCHEDULE = {{
     "schedule_id": "{workflow_name}",
@@ -711,7 +709,7 @@ SCHEDULE = {{
 async def handler(params, ctx):
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
-        await asyncio.sleep(sleep_ms / 1000)
+        await ctx.sleep("integration-hold", sleep_ms / 1000)
     return {{
         "workflow_name": ctx.workflow_name,
         "run_id": ctx.run_id,
