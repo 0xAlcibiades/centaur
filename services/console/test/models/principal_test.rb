@@ -13,7 +13,143 @@ class PrincipalTest < ActiveSupport::TestCase
   test "namespace defaults to 'default'" do
     principal = Principal.new(default_attrs)
     assert_equal "default", principal.namespace
+    assert_equal Principal::UNKNOWN_KIND, principal.kind
     assert principal.valid?
+  end
+
+  test "identity fields are stored only in columns and synthesized for compatibility" do
+    principal = Principal.create!(default_attrs(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_channel_id: "D0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "ada@example.com",
+      labels: { "team" => "platform" }
+    ))
+
+    principal.reload
+    assert_equal "slack_dm", principal.kind
+    assert_equal "U0123456789", principal.slack_user_id
+    assert_equal "D0123456789", principal.slack_channel_id
+    assert_equal "T0123456789", principal.slack_team_id
+    assert_equal "ada@example.com", principal.slack_email
+    assert_equal(
+      { "team" => "platform", Principal::SANDBOX_REPO_CACHE_LABEL => "all" },
+      principal.labels
+    )
+    assert_equal(
+      {
+        "team" => "platform",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all",
+        "kind" => "slack_dm",
+        "slack_user_id" => "U0123456789",
+        "slack_channel_id" => "D0123456789",
+        "slack_team_id" => "T0123456789",
+        "slack_email" => "ada@example.com"
+      },
+      principal.labels_with_sandbox_capabilities
+    )
+  end
+
+  test "legacy identity labels are promoted into columns" do
+    principal = Principal.create!(default_attrs(
+      labels: {
+        "kind" => "slack_dm",
+        "slack_user_id" => "U0123456789",
+        "slack_team_id" => "T0123456789",
+        "slack_email" => "ada@example.com"
+      }
+    ))
+
+    principal.reload
+    assert_equal "slack_dm", principal.kind
+    assert_equal "U0123456789", principal.slack_user_id
+    assert_equal "T0123456789", principal.slack_team_id
+    assert_equal "ada@example.com", principal.slack_email
+    assert_empty principal.labels.slice(*Principal::PROMOTED_LABEL_FIELDS)
+  end
+
+  test "blank legacy Slack identity labels clear columns" do
+    principal = Principal.create!(default_attrs(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_channel_id: "D0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "ada@example.com"
+    ))
+
+    principal.update!(labels: {
+      "kind" => "slack_dm",
+      "slack_user_id" => "",
+      "slack_channel_id" => "  ",
+      "slack_team_id" => nil,
+      "slack_email" => "\t"
+    })
+
+    principal.reload
+    assert_nil principal.slack_user_id
+    assert_nil principal.slack_channel_id
+    assert_nil principal.slack_team_id
+    assert_nil principal.slack_email
+  end
+
+  test "kind accepts only known values" do
+    Principal::KINDS.each do |kind|
+      assert Principal.new(default_attrs(kind: kind)).valid?, "expected #{kind.inspect} to be valid"
+    end
+
+    %w[service future_platform].each do |kind|
+      principal = Principal.new(default_attrs(kind: kind))
+      assert_not principal.valid?
+      assert_includes principal.errors[:kind], "must be one of #{Principal::KINDS.join(", ")}"
+    end
+
+    principal = Principal.new(default_attrs(kind: "  "))
+    assert_not principal.valid?
+    assert_includes principal.errors[:kind], "can't be blank"
+  end
+
+  test "Slack identity fields must use canonical formats" do
+    {
+      slack_user_id: %w[U0123456789 W0123456789 USLACK],
+      slack_channel_id: %w[C0123456789 D0123456789 G0123456789],
+      slack_team_id: %w[T0123456789 E0123456789],
+      slack_email: %w[ada@example.com]
+    }.each do |field, values|
+      values.each do |value|
+        assert Principal.new(default_attrs(field => value)).valid?, "expected #{field}=#{value.inspect} to be valid"
+      end
+    end
+
+    {
+      slack_user_id: " U0123456789 ",
+      slack_channel_id: "C123",
+      slack_team_id: "t0123456789",
+      slack_email: "not-an-email"
+    }.each do |field, value|
+      principal = Principal.new(default_attrs(field => value))
+      assert_not principal.valid?
+      assert_predicate principal.errors[field], :any?
+    end
+  end
+
+  test "unchanged malformed migrated Slack identities do not block unrelated saves" do
+    principal = principals(:acme_user_alice)
+    principal.update_columns(
+      slack_user_id: "U12345",
+      slack_channel_id: "D123",
+      slack_team_id: "TACME",
+      slack_email: "pending"
+    )
+
+    assert principal.reload.update!(name: "Renamed legacy principal")
+
+    principal.slack_user_id = "U67890"
+    assert_not principal.valid?
+    assert_includes principal.errors[:slack_user_id], "is not a valid Slack user ID"
+
+    principal.slack_user_id = nil
+    assert principal.save!
   end
 
   test "is valid with only a name" do
@@ -235,10 +371,10 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
-  test "api server JWT does not fall back to slack channel label" do
+  test "api server JWT does not infer permissions from Slack channel identity" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
-      principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
+      principal.update!(slack_channel_id: "C0123456789")
 
       assert_nil ApiServer::Jwt.encode_for_principal(principal)
     end
@@ -328,6 +464,20 @@ class PrincipalTest < ActiveSupport::TestCase
     principal = principals(:acme_channel)
     principal.update!(name: "Acme Slack channel")
     assert_equal "Acme Slack channel", principal.reload.name
+  end
+
+  test "identity field changes invalidate the sync config cache" do
+    principal = Principal.create!(default_attrs)
+    previous_version = principal.sync_config_cache_version
+
+    principal.update!(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "a@example.com"
+    )
+
+    assert_equal previous_version + 1, principal.reload.sync_config_cache_version
   end
 
   test "declares prn as its oid prefix" do

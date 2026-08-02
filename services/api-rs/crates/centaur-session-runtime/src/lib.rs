@@ -6613,6 +6613,7 @@ async fn run_stdout_pump(
             sandbox_id,
             "session stdout pump started"
         );
+        let mut reported_lost_stdout_ownership = HashSet::new();
         let mut line_count = 0_u64;
         while let Some(line) = stdout.next().await {
             let line = match line {
@@ -6669,23 +6670,40 @@ async fn run_stdout_pump(
                 sandbox_id,
                 &output_execution_id,
             );
-            let Some(output_event) =
-                append_output_line(&ctx, &thread_key, &output_execution_id, &line)
-                    .instrument(output_span.clone())
-                    .await?
+            let Some(output_event) = append_output_line(
+                &ctx,
+                &thread_key,
+                &output_execution_id,
+                &line,
+            )
+            .instrument(output_span.clone())
+            .await?
             else {
-                warn!(
+                if reported_lost_stdout_ownership.insert(output_execution_id.clone()) {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_owner_lost",
+                        thread_key = %thread_key,
+                        execution_id = %output_execution_id,
+                        sandbox_id,
+                        stdout_owner_id = %ctx.stdout_owner_id,
+                        "stdout pump does not own execution output; skipping row until ownership changes"
+                    );
+                }
+                output_state.lock().await.forget(&output_execution_id);
+                continue;
+            };
+            if reported_lost_stdout_ownership.remove(&output_execution_id) {
+                info!(
                     component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_stdout_owner_lost",
+                    event = "session_stdout_owner_recovered",
                     thread_key = %thread_key,
                     execution_id = %output_execution_id,
                     sandbox_id,
                     stdout_owner_id = %ctx.stdout_owner_id,
-                    "stdout pump no longer owns execution output; later rows may retry after adoption"
+                    "stdout pump resumed execution output after ownership changed"
                 );
-                output_state.lock().await.forget(&output_execution_id);
-                continue;
-            };
+            }
             if active_execution
                 .as_ref()
                 .is_some_and(|execution| execution.execution_id == output_execution_id)
@@ -15786,6 +15804,121 @@ mod adoption_tests {
             Some("Completed after reattach.")
         );
         assert_eq!(backend.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_resumes_after_ownership_handoff() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:stdout-handoff-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-stdout-handoff"), true).await;
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    "previous-control-plane",
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim previous owner")
+        );
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-stdout-handoff")
+            .await
+            .expect("open stdout pump");
+
+        // A row received during the lease handoff is fenced, but must not
+        // permanently disable this pump for the execution.
+        stdout
+            .write_all(b"{\"type\":\"thread.started\",\"thread_id\":\"handoff-thread\"}\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        store
+            .release_stdout_owner(&execution_id, "previous-control-plane")
+            .await
+            .expect("release previous owner");
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim current owner")
+        );
+
+        stdout
+            .write_all(&completed_output_bytes(
+                "Completed after ownership handoff.",
+            ))
+            .await
+            .unwrap();
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Completed after ownership handoff.")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_fails_when_sandbox_no_longer_accepts_io() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .await
+            .expect("open initial pipe");
+        backend.set_status(SandboxStatus::Gone);
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox stdout closed before terminal output"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("sandbox no longer accepts io"),
+            "expected sandbox status detail: {error}"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "gone sandbox should not reattach"
+        );
+        assert_eq!(backend.opens(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

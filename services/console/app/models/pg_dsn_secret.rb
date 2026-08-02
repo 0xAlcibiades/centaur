@@ -102,7 +102,13 @@ class PgDsnSecret < ApplicationRecord
     return (setting["value"] || setting[:value]).to_s unless ref.is_a?(Hash)
 
     label = ref["principal_label"] || ref[:principal_label]
-    return principal&.labels&.fetch(label.to_s, "").to_s if label.present?
+    if label.present?
+      if Principal::PROMOTED_LABEL_FIELDS.include?(label.to_s)
+        return principal&.public_send(label).to_s
+      end
+
+      return principal&.labels&.fetch(label.to_s, "").to_s
+    end
 
     proxy_label = ref["proxy_label"] || ref[:proxy_label]
     return proxy&.labels&.fetch(proxy_label.to_s, "").to_s if proxy_label.present?

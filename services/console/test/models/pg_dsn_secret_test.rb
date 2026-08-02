@@ -134,6 +134,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
         "google_subject" => "google-sub-alice"
       }
     )
+    assert_not principal.reload.labels.key?("slack_channel_id")
     secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
       {
         "name" => "centaur.slack_channel_id",

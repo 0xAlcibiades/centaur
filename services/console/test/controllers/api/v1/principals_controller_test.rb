@@ -41,10 +41,12 @@ module Api
         assert_equal principal.oid, data["id"]
         assert_equal "acme", data["namespace"]
         assert_equal "C0123456789", data["foreign_id"]
+        Principal::PROMOTED_LABEL_FIELDS.each { |field| assert_not data.key?(field) }
         assert_equal(
           {
             "kind" => "slack_channel",
             "team" => "platform",
+            "slack_channel_id" => "C0123456789",
             Principal::SANDBOX_REPO_CACHE_LABEL => "all"
           },
           data["labels"]
@@ -180,7 +182,10 @@ module Api
 
         data = json_body.fetch("data")
         assert_equal "all", data["sandbox_repo_cache"]
-        assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, data["labels"])
+        assert_equal(
+          { Principal::SANDBOX_REPO_CACHE_LABEL => "all", "kind" => "unknown" },
+          data["labels"]
+        )
       end
 
       test "POST uses repo-cache param over conflicting label" do
@@ -199,7 +204,10 @@ module Api
 
         data = json_body.fetch("data")
         assert_equal "public", data["sandbox_repo_cache"]
-        assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "public" }, data["labels"])
+        assert_equal(
+          { Principal::SANDBOX_REPO_CACHE_LABEL => "public", "kind" => "unknown" },
+          data["labels"]
+        )
       end
 
       test "POST creates a Principal with only a human-readable name" do
@@ -277,6 +285,25 @@ module Api
         assert_response :bad_request
       end
 
+      test "POST accepts identity only through labels" do
+        post api_v1_principals_url,
+             params: {
+               data: {
+                 namespace: "acme",
+                 foreign_id: "mixed-identity",
+                 slack_email: "ada@example.com",
+                 labels: { "kind" => "user" }
+               }
+             }.to_json,
+             headers: auth_headers
+
+        assert_response :created
+        principal = Principal.find_by!(namespace: "acme", foreign_id: "mixed-identity")
+        assert_equal "user", principal.kind
+        assert_nil principal.slack_email
+        Principal::PROMOTED_LABEL_FIELDS.each { |field| assert_not json_body.fetch("data").key?(field) }
+      end
+
       test "PUT updates labels" do
         principal = principals(:acme_channel)
         body = {
@@ -289,12 +316,83 @@ module Api
         principal.reload
         assert_equal(
           {
-            "kind" => "slack_channel",
             "team" => "ops",
             Principal::SANDBOX_REPO_CACHE_LABEL => "all"
           },
           principal.labels
         )
+        assert_equal "slack_channel", json_body.dig("data", "labels", "kind")
+        assert_equal "C0123456789", json_body.dig("data", "labels", "slack_channel_id")
+      end
+
+      test "PUT promotes identity labels into columns and normalizes blank Slack values" do
+        principal = principals(:acme_channel)
+        body = {
+          data: {
+            labels: {
+              "kind" => "slack_dm",
+              "slack_user_id" => "U0123456789",
+              "slack_channel_id" => "  ",
+              "slack_team_id" => "T0123456789",
+              "slack_email" => "ada@example.com",
+              "team" => "ops"
+            }
+          }
+        }
+
+        put api_v1_principal_url(id: principal.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        principal.reload
+        assert_equal "slack_dm", principal.kind
+        assert_equal "U0123456789", principal.slack_user_id
+        assert_nil principal.slack_channel_id
+        assert_equal "T0123456789", principal.slack_team_id
+        assert_equal "ada@example.com", principal.slack_email
+        assert_equal(
+          { "team" => "ops", Principal::SANDBOX_REPO_CACHE_LABEL => "all" },
+          principal.labels
+        )
+        assert_equal "slack_dm", json_body.dig("data", "labels", "kind")
+        assert_equal "U0123456789", json_body.dig("data", "labels", "slack_user_id")
+        assert_not json_body.dig("data", "labels").key?("slack_channel_id")
+        assert_equal "T0123456789", json_body.dig("data", "labels", "slack_team_id")
+        assert_equal "ada@example.com", json_body.dig("data", "labels", "slack_email")
+      end
+
+      test "PUT rejects a blank kind" do
+        principal = principals(:acme_channel)
+
+        put api_v1_principal_url(id: principal.oid),
+            params: { data: { labels: { kind: "  " } } }.to_json,
+            headers: auth_headers
+
+        assert_response :unprocessable_content
+        assert_includes json_body.dig("error", "details", "kind"), "can't be blank"
+      end
+
+      test "PUT rejects unknown kinds and malformed Slack identity fields" do
+        principal = principals(:acme_channel)
+
+        put api_v1_principal_url(id: principal.oid),
+            params: {
+              data: {
+                labels: {
+                  kind: "future_platform",
+                  slack_user_id: " U0123456789 ",
+                  slack_channel_id: "C123",
+                  slack_team_id: "t0123456789",
+                  slack_email: "not-an-email"
+                }
+              }
+            }.to_json,
+            headers: auth_headers
+
+        assert_response :unprocessable_content
+        details = json_body.dig("error", "details")
+        %w[kind slack_user_id slack_channel_id slack_team_id slack_email].each do |field|
+          assert_predicate details.fetch(field), :any?
+        end
       end
 
       test "PUT overwrites explicit repo-cache label" do
@@ -407,6 +505,34 @@ module Api
         direct = principal.slack_channel_permissions.sole
         assert_not direct.download_enabled
         assert_not direct.history_enabled
+      end
+
+      test "GET and PUT round-trip preserves malformed migrated identity values" do
+        principal = principals(:acme_user_alice)
+        principal.update_columns(
+          slack_user_id: "U12345",
+          slack_channel_id: "D123",
+          slack_team_id: "TACME",
+          slack_email: "pending"
+        )
+
+        get api_v1_principal_url(id: principal.oid), headers: auth_headers
+        assert_response :ok
+        returned = json_body.fetch("data")
+        returned.fetch("labels")["team"] = "identity-platform"
+
+        put api_v1_principal_url(id: principal.oid),
+            params: { data: returned }.to_json,
+            headers: auth_headers
+        assert_response :ok
+
+        principal.reload
+        assert_equal "U12345", principal.slack_user_id
+        assert_equal "D123", principal.slack_channel_id
+        assert_equal "TACME", principal.slack_team_id
+        assert_equal "pending", principal.slack_email
+        assert_equal "identity-platform", principal.labels["team"]
+        assert_empty principal.labels.slice(*Principal::PROMOTED_LABEL_FIELDS)
       end
 
       test "POST leaves omitted flags unchanged on an existing permission" do
@@ -727,6 +853,25 @@ module Api
 
         foreign_ids = json_body.fetch("data").map { |p| p["foreign_id"] }
         assert_equal %w[U-alice U-bob].sort, foreign_ids.sort
+      end
+
+      test "GET index filters promoted identity labels through columns" do
+        principals(:acme_channel).update!(slack_team_id: "T0123456789", slack_email: "channel@example.com")
+
+        get api_v1_principals_url,
+            params: {
+              namespace: "acme",
+              labels: {
+                kind: "slack_channel",
+                slack_channel_id: "C0123456789",
+                slack_team_id: "T0123456789",
+                slack_email: "channel@example.com"
+              }
+            },
+            headers: auth_headers
+        assert_response :ok
+
+        assert_equal [ "C0123456789" ], json_body.fetch("data").map { |p| p["foreign_id"] }
       end
 
       test "GET index filters by sandbox repo-cache label" do
