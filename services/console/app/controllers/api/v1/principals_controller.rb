@@ -5,7 +5,8 @@ module Api
 
       def index
         records, meta = paginated_label_search(
-          Principal.includes(:slack_channel_permissions, roles: :slack_channel_permissions)
+          Principal.includes(:slack_channel_permissions, roles: :slack_channel_permissions),
+          promoted_label_columns: Principal::PROMOTED_LABEL_FIELDS
         )
         render json: { data: records.map { |p| record_payload(p) }, meta: meta }
       end

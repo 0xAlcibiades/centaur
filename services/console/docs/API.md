@@ -689,7 +689,7 @@ labels instead of storing a literal, by replacing `value` with `value_from`:
 
 | Key               | Resolves to |
 | ----------------- | ----------- |
-| `principal_label` | The named label on the assigned principal. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
+| `principal_label` | The named label on the assigned principal. Reserved identity labels resolve through their authoritative columns. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
 | `principal_field` | One of the principal's fields: `id` (the opaque `prn_...` id), `namespace`, `foreign_id`, `name`, or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
 | `proxy_label`     | The named label on the proxy. A label the proxy does not carry resolves to an empty string, so RLS-style policies fail closed. |
 
@@ -1187,9 +1187,13 @@ A principal is an identity (an application, service, or proxy owner) that can be
 | `namespace`  | optional    | Defaults to `"default"`. Immutable. |
 | `foreign_id` | optional    | Unique per namespace. Immutable. |
 | `name`       | optional    | |
-| `labels`     | optional    | |
+| `labels`     | optional    | Identity values remain represented here in this API version. Reserved keys are `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`, and `slack_email`. |
 | `slack_channel_permissions` | optional | Direct permissions owned by the principal. Full replacement when present on create or update. |
 | `effective_slack_channel_permissions` | response only | Direct permissions merged with permissions inherited from assigned roles. |
+
+Known kinds are `unknown`, `user`, `console_user`, `workflow`,
+`slack_channel`, `slack_dm`, `discord_channel`, `linear_issue`, `teams_user`,
+and `teams_conversation`. Use one of these values for the `kind` label.
 
 ### Operations
 
@@ -1208,7 +1212,7 @@ Returns `201`:
     "namespace": "default",
     "foreign_id": "api-service",
     "name": "API Service",
-    "labels": { "tier": "backend" },
+    "labels": { "tier": "backend", "kind": "unknown" },
     "slack_channel_permissions": [],
     "effective_slack_channel_permissions": [],
     "created_at": "2026-06-01T10:00:00Z",
@@ -1219,7 +1223,7 @@ Returns `201`:
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
-| `GET`  | `/api/v1/principals?namespace=default` | List. |
+| `GET`  | `/api/v1/principals?namespace=default` | List. Accepts exact-match label filters, including the reserved identity labels. |
 | `GET`  | `/api/v1/principals/:id` | Fetch one by OID. To fetch by `foreign_id`, use the lookup route below. |
 | `GET`  | `/api/v1/principals/lookup/:namespace/:foreign_id` | Fetch by namespace + foreign id. `404` if missing. |
 | `GET`  | `/api/v1/principals/:id/effective_config` | [Effective config](#effective-config) the principal resolves to. `:id` is an OID. |
@@ -1227,6 +1231,14 @@ Returns `201`:
 | `GET`  | `/api/v1/principals/:principal_id/grants` | [List the grants](#list-by-grantee) granted directly to the principal. |
 | `POST` | `/api/v1/principals/:id/slack_channel_permissions` | Idempotently create or update one direct Slack channel permission. Omitted flags default to enabled on create and remain unchanged on update. |
 | `PUT`/`PATCH` | `/api/v1/principals/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. `name`, `labels`, and direct `slack_channel_permissions` are mutable on an existing record; `namespace` and `foreign_id` apply only when creating. |
+
+The reserved identity labels are backed by authoritative principal columns but
+remain labels in this API version. They are synthesized in responses, accepted
+in writes, and translated to column filters. Sending a null, empty, or
+whitespace-only Slack identity label clears that value. A null or blank `kind`
+is rejected, as are unknown kind values and new or changed malformed nonblank
+Slack identities. Unchanged legacy values remain round-trip safe during the
+compatibility release.
 
 See [Role assignments](#role-assignments) for attaching roles to a principal.
 
