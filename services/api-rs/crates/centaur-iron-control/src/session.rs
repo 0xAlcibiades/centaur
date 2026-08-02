@@ -1,7 +1,7 @@
 //! Per-session principal registration.
 //!
 //! When a session starts, [`SessionRegistrar`] upserts the session's principal.
-//! Iron-control owns default role assignment for brand-new principals, while
+//! Console owns default role assignment for brand-new principals, while
 //! existing principals keep their current assignments so operator revocations
 //! in Console or ``centaur-perms`` remain sticky. Workflow principals use the
 //! same creation behavior. Other principals are derived from the thread key
@@ -103,9 +103,10 @@ impl SessionRegistrar {
         Ok(record)
     }
 
-    /// Ensure the stable principal for ``workflow_name`` exists without
-    /// assigning any roles. Workflow discovery and automatic agent turns share
-    /// this path so workflow permissions remain operator-managed.
+    /// Ensure the stable principal for ``workflow_name`` exists. ``api-rs``
+    /// does not assign roles here; Console applies its configured defaults if
+    /// the upsert creates the principal. Workflow discovery and automatic agent
+    /// turns share this path.
     pub async fn ensure_workflow_principal(&self, workflow_name: &str) -> Result<Principal> {
         let mut input = derive_workflow_principal(workflow_name).to_identity_input(&self.namespace);
         self.merge_existing_labels(&mut input).await?;
@@ -280,7 +281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_session_leaves_default_roles_to_iron_control() {
+    async fn register_session_leaves_default_roles_to_console() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
         let registrar =
             SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
@@ -313,7 +314,7 @@ mod tests {
         ));
         assert!(
             !request_was(&requests, "POST", "/api/v1/principals/prn_channel/roles"),
-            "iron-control assigns configured default roles during principal creation"
+            "Console assigns configured default roles during principal creation"
         );
         server.abort();
     }
@@ -423,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_workflow_principal_preserves_labels_without_seeding_roles() {
+    async fn ensure_workflow_principal_preserves_labels_and_leaves_roles_to_console() {
         let existing_labels = BTreeMap::from([("operator_label".to_owned(), "keep".to_owned())]);
         let (base_url, requests, server) =
             spawn_workflow_principal_stub(Some(existing_labels)).await;
@@ -446,7 +447,10 @@ mod tests {
             put.body["data"]["labels"]["workflow_name"],
             "newsletter_daily_digest"
         );
-        assert!(!requests.iter().any(|request| request.method == "POST"));
+        assert!(
+            !requests.iter().any(|request| request.method == "POST"),
+            "Console assigns configured default roles during principal creation"
+        );
         server.abort();
     }
 

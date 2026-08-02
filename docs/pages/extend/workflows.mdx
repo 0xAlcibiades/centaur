@@ -67,9 +67,10 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 The API derives the stable `workflow-nightly-report` principal from
 `WORKFLOW_NAME`. Automatic `ctx.agent_turn(...)` and `ctx.run_agent(...)`
 sessions use this principal while keeping a separate session for each workflow
-run. Centaur does not assign channel-style default roles to workflow
-principals. Grant every required model, harness, and tool role or secret to the
-principal explicitly.
+run. When the principal is first created, Console assigns its configured
+default roles. The default configuration includes `infra` for model and harness
+credentials. Existing principals are not backfilled if defaults later change.
+Grant every additional tool role or secret to the principal explicitly.
 
 Workflow names must produce unique slugs. Discovery fails if two names resolve
 to the same principal id. A workflow name that resolves to the reserved
