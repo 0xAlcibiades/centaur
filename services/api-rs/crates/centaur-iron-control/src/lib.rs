@@ -27,6 +27,7 @@ pub use models::{
 };
 pub use principal::{
     PrincipalRef, WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID, derive_principal, derive_workflow_principal,
+    workflow_principal_is_reserved,
 };
 pub use registry::{
     GCP_AUTH_DEFAULT_SCOPE, RegisterError, RoleSpec, SecretInput, TranslateError,

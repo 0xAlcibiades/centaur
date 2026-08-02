@@ -72,6 +72,12 @@ pub fn derive_workflow_principal(workflow_name: &str) -> PrincipalRef {
     }
 }
 
+/// Return whether a workflow name would collide with an infrastructure-owned
+/// principal rather than receiving its own workflow identity.
+pub fn workflow_principal_is_reserved(workflow_name: &str) -> bool {
+    derive_workflow_principal(workflow_name).foreign_id == WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID
+}
+
 /// Resolve the principal for a thread.
 ///
 /// ``actor_user_id`` is the acting user, when known (carried in session
@@ -671,5 +677,12 @@ mod tests {
             input.labels.get("managed-by").map(String::as_str),
             Some("centaur")
         );
+    }
+
+    #[test]
+    fn workflow_host_principal_name_is_reserved_after_slugging() {
+        assert!(workflow_principal_is_reserved("host"));
+        assert!(workflow_principal_is_reserved(" HOST! "));
+        assert!(!workflow_principal_is_reserved("host report"));
     }
 }

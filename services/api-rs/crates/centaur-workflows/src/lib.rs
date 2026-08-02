@@ -12,8 +12,7 @@ use absurd::{
     SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
 };
 use centaur_iron_control::{
-    IronControlError, SessionRegistrar, WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID,
-    derive_workflow_principal,
+    IronControlError, SessionRegistrar, derive_workflow_principal, workflow_principal_is_reserved,
 };
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
@@ -826,6 +825,7 @@ impl WorkflowRuntime {
                 "workflow_name must not be empty".to_owned(),
             ));
         }
+        reject_reserved_workflow_name(workflow_name)?;
         WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
         let client = self.client_for_workflow(workflow_name);
         let spawn = client
@@ -1666,11 +1666,14 @@ fn metadata_from_discovery_payload(
     let mut principal_names = BTreeMap::new();
     for workflow in payload.workflows {
         let principal = derive_workflow_principal(&workflow.workflow_name);
-        if principal.foreign_id == WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID {
-            return Err(WorkflowRuntimeError::BadRequest(format!(
-                "workflow {:?} resolves to reserved principal {WORKFLOW_HOST_PRINCIPAL_FOREIGN_ID:?}",
-                workflow.workflow_name
-            )));
+        if workflow_principal_is_reserved(&workflow.workflow_name) {
+            warn!(
+                workflow_name = %workflow.workflow_name,
+                source_path = %workflow.source_path,
+                principal_id = %principal.foreign_id,
+                "ignoring workflow with reserved principal identity"
+            );
+            continue;
         }
         if let Some(existing_name) =
             principal_names.insert(principal.foreign_id.clone(), workflow.workflow_name.clone())
@@ -2614,6 +2617,7 @@ async fn run_centaur_workflow_inner(
     let _heartbeat_guard = start_workflow_task_heartbeat(ctx.clone())
         .await
         .map_err(absurd_error)?;
+    reject_reserved_workflow_name(&input.workflow_name).map_err(absurd_error)?;
     WorkflowEnablement::from_env()
         .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
         .map_err(absurd_error)?;
@@ -2788,6 +2792,17 @@ async fn run_centaur_workflow_inner(
             })
         }
     }
+}
+
+fn reject_reserved_workflow_name(workflow_name: &str) -> Result<(), WorkflowRuntimeError> {
+    if workflow_principal_is_reserved(workflow_name) {
+        let principal = derive_workflow_principal(workflow_name);
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "workflow {workflow_name:?} resolves to reserved principal {:?}",
+            principal.foreign_id
+        )));
+    }
+    Ok(())
 }
 
 struct WorkflowSandboxCleanupGuard {
@@ -4552,20 +4567,39 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_workflow_host_principal_collision() {
+    fn discovery_ignores_workflow_host_principal_collision() {
         let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
-            "workflows": [{
-                "workflow_name": "host",
-                "source_path": "workflows/host.py",
-            }],
+            "workflows": [
+                {
+                    "workflow_name": "host",
+                    "source_path": "workflows/host.py",
+                    "schedule": {"schedule_id": "host", "cron": "*/5 * * * *"},
+                    "principal": true,
+                },
+                {
+                    "workflow_name": "daily_report",
+                    "source_path": "workflows/daily_report.py",
+                },
+            ],
         }))
         .unwrap();
 
-        let error = metadata_from_discovery_payload(payload).unwrap_err();
+        let metadata = metadata_from_discovery_payload(payload).unwrap();
+        assert_eq!(
+            metadata.workflow_names,
+            BTreeSet::from(["daily_report".to_owned()])
+        );
+        assert!(metadata.schedules.is_empty());
+        assert!(metadata.principals.is_empty());
+    }
+
+    #[test]
+    fn direct_ingestion_rejects_reserved_workflow_name_after_slugging() {
+        let error = reject_reserved_workflow_name(" HOST! ").unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("resolves to reserved principal \"workflow-host\"")
+                .contains("reserved principal \"workflow-host\"")
         );
     }
 

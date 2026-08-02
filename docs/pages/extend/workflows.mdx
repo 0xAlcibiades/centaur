@@ -72,8 +72,8 @@ principals. Grant every required model, harness, and tool role or secret to the
 principal explicitly.
 
 Workflow names must produce unique slugs. Discovery fails if two names resolve
-to the same principal id or if a name resolves to the reserved `workflow-host`
-principal.
+to the same principal id. A workflow name that resolves to the reserved
+`workflow-host` principal is ignored during discovery and cannot be started.
 
 `WORKFLOW_PRINCIPAL` is optional. Set it to `True` when the workflow host calls
 tools directly with `ctx.call_tool(...)`; this opts the host sandbox into the

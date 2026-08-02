@@ -150,8 +150,8 @@ cargo run -p centaur-perms -- \
 
 The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
 Workflow code cannot choose another principal id, display name, or labels.
-Workflow discovery rejects duplicate principal slugs and the reserved
-`workflow-host` principal id.
+Workflow discovery rejects duplicate principal slugs. A workflow that resolves
+to the reserved `workflow-host` principal id is ignored and cannot be started.
 `WORKFLOW_PRINCIPAL = True` requires `apiRs.workflowHostSandbox=true`, which
 renders `WORKFLOW_HOST_SANDBOX=true`; startup fails if a workflow declares a
 principal while workflow-host sandboxing is disabled.
