@@ -72,9 +72,13 @@ default roles. The default configuration includes `infra` for model and harness
 credentials. Existing principals are not backfilled if defaults later change.
 Grant every additional tool role or secret to the principal explicitly.
 
-Workflow names must produce unique slugs. Discovery fails if two names resolve
-to the same principal id. A workflow name that resolves to the reserved
-`workflow-host` principal is ignored during discovery and cannot be started.
+Workflow names must produce unique slugs. If multiple Python workflow names
+resolve to the same principal id, discovery ignores every workflow in that
+collision group. Python workflows that resolve to the reserved `workflow-host`
+principal or a built-in native workflow identity are also ignored. Their
+schedules and webhooks are not registered. An exact native name still invokes
+the native implementation; a different spelling with the same principal slug
+is rejected when a run is created.
 
 `WORKFLOW_PRINCIPAL` is optional. Set it to `True` when the workflow host calls
 tools directly with `ctx.call_tool(...)`; this opts the host sandbox into the

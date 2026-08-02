@@ -825,7 +825,7 @@ impl WorkflowRuntime {
                 "workflow_name must not be empty".to_owned(),
             ));
         }
-        reject_reserved_workflow_name(workflow_name)?;
+        validate_workflow_name_for_run(workflow_name)?;
         WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
         let client = self.client_for_workflow(workflow_name);
         let spawn = client
@@ -1034,6 +1034,49 @@ enum WorkflowQueueClass {
     SlackLive,
     Etl,
     EtlBackfill,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWorkflow {
+    Echo,
+    SleepEcho,
+    AgentTurn,
+    ToolAndSlack,
+}
+
+impl NativeWorkflow {
+    const ALL: [Self; 4] = [
+        Self::Echo,
+        Self::SleepEcho,
+        Self::AgentTurn,
+        Self::ToolAndSlack,
+    ];
+
+    fn from_name(workflow_name: &str) -> Option<Self> {
+        match workflow_name {
+            "echo" => Some(Self::Echo),
+            "sleep_echo" => Some(Self::SleepEcho),
+            "agent_turn" => Some(Self::AgentTurn),
+            "tool_and_slack" => Some(Self::ToolAndSlack),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Echo => "echo",
+            Self::SleepEcho => "sleep_echo",
+            Self::AgentTurn => "agent_turn",
+            Self::ToolAndSlack => "tool_and_slack",
+        }
+    }
+
+    fn for_principal_name(workflow_name: &str) -> Option<Self> {
+        let foreign_id = derive_workflow_principal(workflow_name).foreign_id;
+        Self::ALL
+            .into_iter()
+            .find(|native| derive_workflow_principal(native.name()).foreign_id == foreign_id)
+    }
 }
 
 fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
@@ -1663,7 +1706,33 @@ fn metadata_from_discovery_payload(
     payload: PythonWorkflowDiscoveryPayload,
 ) -> Result<PythonWorkflowMetadata, WorkflowRuntimeError> {
     let mut metadata = PythonWorkflowMetadata::default();
-    let mut principal_names = BTreeMap::new();
+    let mut principal_names = BTreeMap::<String, BTreeSet<String>>::new();
+    for workflow in &payload.workflows {
+        if workflow_principal_is_reserved(&workflow.workflow_name)
+            || NativeWorkflow::for_principal_name(&workflow.workflow_name).is_some()
+        {
+            continue;
+        }
+        let principal = derive_workflow_principal(&workflow.workflow_name);
+        principal_names
+            .entry(principal.foreign_id)
+            .or_default()
+            .insert(workflow.workflow_name.clone());
+    }
+    let colliding_principals = principal_names
+        .into_iter()
+        .filter_map(|(principal_id, workflow_names)| {
+            (workflow_names.len() > 1).then(|| {
+                warn!(
+                    principal_id,
+                    workflow_names = ?workflow_names,
+                    "ignoring Python workflows with colliding principal identity"
+                );
+                principal_id
+            })
+        })
+        .collect::<BTreeSet<_>>();
+
     for workflow in payload.workflows {
         let principal = derive_workflow_principal(&workflow.workflow_name);
         if workflow_principal_is_reserved(&workflow.workflow_name) {
@@ -1675,14 +1744,18 @@ fn metadata_from_discovery_payload(
             );
             continue;
         }
-        if let Some(existing_name) =
-            principal_names.insert(principal.foreign_id.clone(), workflow.workflow_name.clone())
-            && existing_name != workflow.workflow_name
-        {
-            return Err(WorkflowRuntimeError::BadRequest(format!(
-                "workflows {existing_name:?} and {:?} resolve to the same principal {:?}",
-                workflow.workflow_name, principal.foreign_id
-            )));
+        if let Some(native) = NativeWorkflow::for_principal_name(&workflow.workflow_name) {
+            warn!(
+                workflow_name = %workflow.workflow_name,
+                source_path = %workflow.source_path,
+                native_workflow_name = native.name(),
+                principal_id = %principal.foreign_id,
+                "ignoring Python workflow with native workflow identity"
+            );
+            continue;
+        }
+        if colliding_principals.contains(&principal.foreign_id) {
+            continue;
         }
         metadata
             .workflow_names
@@ -2200,9 +2273,10 @@ impl RemovedWorkflowReaper {
             .iter()
             .map(|(queue, task_id, name)| (format!("{queue}:{task_id}"), name.clone()))
             .collect::<Vec<_>>();
+        let known_workflow_names = known_workflow_names(&metadata.workflow_names);
         let stale_runs = select_stale_cancellations(
             &run_keyed,
-            &metadata.workflow_names,
+            &known_workflow_names,
             &mut self.workflow_miss_counts,
             self.threshold,
         );
@@ -2257,6 +2331,16 @@ impl RemovedWorkflowReaper {
         }
         Ok(())
     }
+}
+
+fn known_workflow_names(discovered: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut known = discovered.clone();
+    known.extend(
+        NativeWorkflow::ALL
+            .into_iter()
+            .map(|workflow| workflow.name().to_owned()),
+    );
+    known
 }
 
 /// Returns `(task_id, name)` for every non-terminal task in the queue, where
@@ -2617,12 +2701,12 @@ async fn run_centaur_workflow_inner(
     let _heartbeat_guard = start_workflow_task_heartbeat(ctx.clone())
         .await
         .map_err(absurd_error)?;
-    reject_reserved_workflow_name(&input.workflow_name).map_err(absurd_error)?;
+    validate_workflow_name_for_run(&input.workflow_name).map_err(absurd_error)?;
     WorkflowEnablement::from_env()
         .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
         .map_err(absurd_error)?;
-    match input.workflow_name.as_str() {
-        "echo" => {
+    match NativeWorkflow::from_name(&input.workflow_name) {
+        Some(NativeWorkflow::Echo) => {
             let output = ctx
                 .step("echo", || async {
                     Ok(json!({
@@ -2640,7 +2724,7 @@ async fn run_centaur_workflow_inner(
                 output,
             })
         }
-        "sleep_echo" => {
+        Some(NativeWorkflow::SleepEcho) => {
             let sleep_ms = input
                 .input
                 .get("sleep_ms")
@@ -2659,7 +2743,7 @@ async fn run_centaur_workflow_inner(
                 output,
             })
         }
-        "agent_turn" => {
+        Some(NativeWorkflow::AgentTurn) => {
             let prompt = input
                 .input
                 .get("prompt")
@@ -2732,7 +2816,7 @@ async fn run_centaur_workflow_inner(
                 output: serde_json::to_value(agent).map_err(absurd::Error::Json)?,
             })
         }
-        "tool_and_slack" => {
+        Some(NativeWorkflow::ToolAndSlack) => {
             let slack_channel = input
                 .input
                 .get("slack_channel")
@@ -2772,7 +2856,7 @@ async fn run_centaur_workflow_inner(
                 }),
             })
         }
-        _ => {
+        None => {
             let workflow_name = input.workflow_name.clone();
             let output = run_python_workflow_host(
                 input,
@@ -2794,12 +2878,22 @@ async fn run_centaur_workflow_inner(
     }
 }
 
-fn reject_reserved_workflow_name(workflow_name: &str) -> Result<(), WorkflowRuntimeError> {
+fn validate_workflow_name_for_run(workflow_name: &str) -> Result<(), WorkflowRuntimeError> {
     if workflow_principal_is_reserved(workflow_name) {
         let principal = derive_workflow_principal(workflow_name);
         return Err(WorkflowRuntimeError::BadRequest(format!(
             "workflow {workflow_name:?} resolves to reserved principal {:?}",
             principal.foreign_id
+        )));
+    }
+    if let Some(native) = NativeWorkflow::for_principal_name(workflow_name)
+        && NativeWorkflow::from_name(workflow_name).is_none()
+    {
+        let principal = derive_workflow_principal(workflow_name);
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "workflow {workflow_name:?} resolves to principal {:?}, which is reserved for native workflow {:?}",
+            principal.foreign_id,
+            native.name()
         )));
     }
     Ok(())
@@ -4595,7 +4689,7 @@ mod tests {
 
     #[test]
     fn direct_ingestion_rejects_reserved_workflow_name_after_slugging() {
-        let error = reject_reserved_workflow_name(" HOST! ").unwrap_err();
+        let error = validate_workflow_name_for_run(" HOST! ").unwrap_err();
         assert!(
             error
                 .to_string()
@@ -4604,7 +4698,61 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_colliding_workflow_principal_slugs() {
+    fn native_workflow_names_are_allowed_but_slug_variants_are_rejected() {
+        for native in NativeWorkflow::ALL {
+            validate_workflow_name_for_run(native.name()).unwrap();
+
+            let variant = native.name().replace('_', " ").to_uppercase();
+            let error = validate_workflow_name_for_run(&variant).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(&derive_workflow_principal(native.name()).foreign_id));
+            assert!(message.contains(&format!("native workflow {:?}", native.name())));
+        }
+    }
+
+    #[test]
+    fn removed_workflow_reaper_always_knows_native_workflows() {
+        let known = known_workflow_names(&BTreeSet::from(["daily_report".to_owned()]));
+
+        assert!(known.contains("daily_report"));
+        for native in NativeWorkflow::ALL {
+            assert!(known.contains(native.name()));
+        }
+    }
+
+    #[test]
+    fn discovery_ignores_python_workflows_with_native_principal_identities() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [
+                {
+                    "workflow_name": "agent_turn",
+                    "source_path": "workflows/native_exact.py",
+                    "schedule": {"schedule_id": "native_exact", "cron": "*/5 * * * *"},
+                    "principal": true,
+                },
+                {
+                    "workflow_name": "Agent Turn",
+                    "source_path": "workflows/native_slug.py",
+                },
+                {
+                    "workflow_name": "daily_report",
+                    "source_path": "workflows/daily_report.py",
+                },
+            ],
+        }))
+        .unwrap();
+
+        let metadata = metadata_from_discovery_payload(payload).unwrap();
+        assert_eq!(
+            metadata.workflow_names,
+            BTreeSet::from(["daily_report".to_owned()])
+        );
+        assert!(metadata.schedules.is_empty());
+        assert!(metadata.principals.is_empty());
+    }
+
+    #[test]
+    fn discovery_ignores_every_workflow_with_a_colliding_principal_slug() {
         let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
             "workflows": [
                 {
@@ -4615,15 +4763,30 @@ mod tests {
                     "workflow_name": "daily_report",
                     "source_path": "workflows/daily_report_snake.py",
                 },
+                {
+                    "workflow_name": "weekly_report",
+                    "source_path": "workflows/weekly_report.py",
+                    "schedule": {"schedule_id": "weekly_report", "cron": "*/5 * * * *"},
+                    "principal": true,
+                },
             ],
         }))
         .unwrap();
 
-        let error = metadata_from_discovery_payload(payload).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("\"Daily Report\""));
-        assert!(message.contains("\"daily_report\""));
-        assert!(message.contains("\"workflow-daily-report\""));
+        let metadata = metadata_from_discovery_payload(payload).unwrap();
+        assert_eq!(
+            metadata.workflow_names,
+            BTreeSet::from(["weekly_report".to_owned()])
+        );
+        assert_eq!(metadata.schedules.len(), 1);
+        assert_eq!(
+            metadata.schedules[0].get("workflow_name"),
+            Some(&json!("weekly_report"))
+        );
+        assert_eq!(
+            metadata.principals,
+            BTreeSet::from(["weekly_report".to_owned()])
+        );
     }
 
     #[test]
