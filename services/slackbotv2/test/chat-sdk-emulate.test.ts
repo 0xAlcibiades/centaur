@@ -103,6 +103,84 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  it('lets any signed Slack user toggle the market-label audit without an agent turn', async () => {
+    const requests: Array<{ body: unknown; headers: Headers; url: string }> = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        const request = new Request(input, init)
+        requests.push({
+          body: await request.json(),
+          headers: request.headers,
+          url: request.url
+        })
+        return Response.json({ ok: true, workflow_name: 'market-label-audit', enabled: false })
+      }
+    })
+
+    const response = await bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('strike-curve-audit off', USER_B_ID)
+    )
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      response_type: 'in_channel',
+      text: `Market-label audit disabled by <@${USER_B_ID}>.`
+    })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.url).toBe(`${codexApi.url}/api/workflows/market-label-audit/enabled`)
+    expect(requests[0]?.headers.get('authorization')).toBe('Bearer slackbotv2-api-key')
+    expect(requests[0]?.body).toEqual({
+      enabled: false,
+      updated_by: `slack:${USER_B_ID}`,
+      metadata: {
+        channel_id: CHANNEL_ID,
+        command: '/bojak strike-curve-audit',
+        team_id: TEAM_ID,
+        user_id: USER_B_ID
+      }
+    })
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('rejects unsigned workflow toggle commands', async () => {
+    const request = signedSlackCommand('strike-curve-audit on', USER_ID)
+    const headers = new Headers(request.headers)
+    headers.set('x-slack-signature', 'v0=invalid')
+
+    const response = await bot.app.request('/api/slack/commands', {
+      ...request,
+      headers
+    })
+
+    expect(response.status).toBe(401)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('returns workflow toggle usage without calling Centaur', async () => {
+    let apiCalled = false
+    bot = createTestBot({
+      fetch: async () => {
+        apiCalled = true
+        return Response.json({ ok: true })
+      }
+    })
+
+    const response = await bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('strike-curve-audit maybe', USER_ID)
+    )
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      response_type: 'ephemeral',
+      text: 'Usage: `/bojak strike-curve-audit on` or `/bojak strike-curve-audit off`.'
+    })
+    expect(apiCalled).toBe(false)
+  })
+
   it('accepts Slack events on the legacy route', async () => {
     const parent = await postUserMessage('Legacy route context.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> use the legacy route`, parent.ts)
@@ -3623,6 +3701,29 @@ function signedSlackEvent(input: {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
+      'x-slack-request-timestamp': String(timestamp),
+      'x-slack-signature': `v0=${signature}`
+    },
+    body
+  }
+}
+
+function signedSlackCommand(text: string, userId: string): RequestInit {
+  const timestamp = Math.floor(Date.now() / 1000)
+  const body = new URLSearchParams({
+    channel_id: CHANNEL_ID,
+    command: '/bojak',
+    team_id: TEAM_ID,
+    text,
+    user_id: userId
+  }).toString()
+  const signature = createHmac('sha256', SIGNING_SECRET)
+    .update(`v0:${timestamp}:${body}`)
+    .digest('hex')
+  return {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
       'x-slack-request-timestamp': String(timestamp),
       'x-slack-signature': `v0=${signature}`
     },

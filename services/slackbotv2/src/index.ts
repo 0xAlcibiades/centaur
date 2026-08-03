@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import {
   Chat,
@@ -30,7 +30,8 @@ import {
   openSessionEventStream,
   serializeAttachment,
   serializeMessage,
-  sessionStreamError
+  sessionStreamError,
+  updateWorkflowToggle
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
@@ -111,6 +112,9 @@ const SLACK_TASK_DETAILS_MAX_CHARS = 500
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
+const SLACK_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
+const MARKET_LABEL_AUDIT_WORKFLOW = 'market-label-audit'
+const MARKET_LABEL_AUDIT_COMMAND = 'strike-curve-audit'
 
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
@@ -248,12 +252,96 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
   app.post('/api/webhooks/slack', handleSlackWebhook)
   app.post('/api/slack/events', handleSlackWebhook)
+  app.post('/api/slack/commands', async c => {
+    const rawBody = await c.req.raw.clone().text()
+    if (!validSlackSignature(c.req.raw.headers, rawBody, options.signingSecret)) {
+      return c.text('invalid Slack signature', 401)
+    }
+    const form = new URLSearchParams(rawBody)
+    const command = form.get('command')?.trim().toLowerCase()
+    const args = (form.get('text') ?? '')
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+    if (
+      command !== '/bojak'
+      || args.length !== 2
+      || args[0] !== MARKET_LABEL_AUDIT_COMMAND
+      || (args[1] !== 'on' && args[1] !== 'off')
+    ) {
+      return c.json({
+        response_type: 'ephemeral',
+        text: 'Usage: `/bojak strike-curve-audit on` or `/bojak strike-curve-audit off`.'
+      })
+    }
+
+    const enabled = args[1] === 'on'
+    const userId = form.get('user_id')?.trim() || 'unknown'
+    try {
+      await updateWorkflowToggle(options, {
+        enabled,
+        workflowName: MARKET_LABEL_AUDIT_WORKFLOW,
+        updatedBy: `slack:${userId}`,
+        metadata: {
+          channel_id: form.get('channel_id') ?? '',
+          command: '/bojak strike-curve-audit',
+          team_id: form.get('team_id') ?? '',
+          user_id: userId
+        }
+      })
+    } catch (error) {
+      traceLog(
+        options,
+        'slackbotv2_workflow_toggle_failed',
+        undefined,
+        {
+          error: errorMessage(error),
+          workflow_name: MARKET_LABEL_AUDIT_WORKFLOW
+        },
+        'error'
+      )
+      return c.json({
+        response_type: 'ephemeral',
+        text: 'Bojak could not update the market-label audit workflow. Please try again.'
+      })
+    }
+
+    traceLog(options, 'slackbotv2_workflow_toggle_updated', undefined, {
+      enabled,
+      slack_user_id: userId,
+      workflow_name: MARKET_LABEL_AUDIT_WORKFLOW
+    })
+    return c.json({
+      response_type: 'in_channel',
+      text: `Market-label audit ${enabled ? 'enabled' : 'disabled'} by <@${userId}>.`
+    })
+  })
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options)
   }
 
   return { app, chat }
+}
+
+function validSlackSignature(headers: Headers, rawBody: string, signingSecret: string): boolean {
+  const timestampText = headers.get('x-slack-request-timestamp')?.trim() ?? ''
+  const timestamp = Number.parseInt(timestampText, 10)
+  if (!Number.isFinite(timestamp)) return false
+  const nowSeconds = Math.floor(Date.now() / 1000)
+  if (Math.abs(nowSeconds - timestamp) > SLACK_SIGNATURE_MAX_AGE_SECONDS) return false
+
+  const presented = headers.get('x-slack-signature')?.trim() ?? ''
+  const expected = `v0=${createHmac('sha256', signingSecret)
+    .update(`v0:${timestampText}:${rawBody}`)
+    .digest('hex')}`
+  const presentedBytes = Buffer.from(presented)
+  const expectedBytes = Buffer.from(expected)
+  return (
+    presentedBytes.length === expectedBytes.length
+    && timingSafeEqual(presentedBytes, expectedBytes)
+  )
 }
 
 async function handleSlackMessageHandoff(

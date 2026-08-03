@@ -45,7 +45,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -162,6 +162,14 @@ const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "stripe-signature",
 ];
 
+#[derive(Debug, Deserialize)]
+struct UpdateWorkflowToggleRequest {
+    enabled: bool,
+    updated_by: String,
+    #[serde(default)]
+    metadata: Value,
+}
+
 pub fn build_router_with_runtime(store: PgSessionStore, sandbox_runtime: SandboxRuntime) -> Router {
     let pool = store.pool().clone();
     build_router_with_app_state(AppState::ready_with_pool(
@@ -203,6 +211,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route("/api/workflows/schedules", get(list_workflow_schedules))
+        .route(
+            "/api/workflows/{workflow_name}/enabled",
+            post(update_workflow_toggle),
+        )
         .route(
             "/api/workflows/runs",
             post(create_workflow_run).get(list_workflow_runs),
@@ -800,6 +812,71 @@ async fn list_workflow_schedules(
     Ok(Json(json!({ "ok": true, "schedules": schedules })))
 }
 
+async fn update_workflow_toggle(
+    State(state): State<AppState>,
+    Path(workflow_name): Path<String>,
+    Json(request): Json<UpdateWorkflowToggleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_workflow_toggle_name(&workflow_name) {
+        return Err(ApiError::BadRequest("invalid workflow name".to_owned()));
+    }
+    let updated_by = request.updated_by.trim();
+    if updated_by.is_empty() || updated_by.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "updated_by must contain 1 to 256 characters".to_owned(),
+        ));
+    }
+    let metadata = if request.metadata.is_null() {
+        json!({})
+    } else if request.metadata.is_object() {
+        request.metadata
+    } else {
+        return Err(ApiError::BadRequest(
+            "metadata must be a JSON object".to_owned(),
+        ));
+    };
+    let pool = state.pool()?;
+    let row = sqlx::query(
+        "INSERT INTO workflow_toggles (workflow_name, enabled, updated_by, metadata) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (workflow_name) DO UPDATE SET \
+           enabled = EXCLUDED.enabled, \
+           updated_by = EXCLUDED.updated_by, \
+           metadata = EXCLUDED.metadata, \
+           updated_at = NOW() \
+         RETURNING enabled, updated_by, metadata",
+    )
+    .bind(&workflow_name)
+    .bind(request.enabled)
+    .bind(updated_by)
+    .bind(metadata)
+    .fetch_one(&pool)
+    .await?;
+
+    let enabled: bool = row.try_get("enabled")?;
+    let updated_by: String = row.try_get("updated_by")?;
+    let metadata: Value = row.try_get("metadata")?;
+    Ok(Json(json!({
+        "ok": true,
+        "workflow_name": workflow_name,
+        "enabled": enabled,
+        "updated_by": updated_by,
+        "metadata": metadata,
+    })))
+}
+
+fn valid_workflow_toggle_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 128
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
+}
+
 async fn get_workflow_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -1328,6 +1405,19 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
+
+    #[test]
+    fn validates_workflow_toggle_names() {
+        for name in ["market_label_audit", "market-label-audit", "audit.v2"] {
+            assert!(valid_workflow_toggle_name(name), "expected valid: {name}");
+        }
+        for name in ["", "MarketLabelAudit", "market label audit", "/audit"] {
+            assert!(
+                !valid_workflow_toggle_name(name),
+                "expected invalid: {name}"
+            );
+        }
+    }
 
     #[test]
     fn parses_form_payload_json() {

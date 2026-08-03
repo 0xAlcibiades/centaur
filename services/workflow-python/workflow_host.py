@@ -108,6 +108,24 @@ class WorkflowContext:
             }
         )
 
+    async def workflow_enabled(self, workflow_name: str, *, default: bool = True) -> bool:
+        """Return the durable operator toggle for a workflow.
+
+        Missing rows preserve the workflow definition's normal enabled state.
+        The workflow host always has a pool in production; the fallback keeps
+        local, metadata-only workflow execution backward compatible.
+        """
+        name = workflow_name.strip()
+        if not name:
+            raise ValueError("workflow_name is required")
+        if self._pool is None:
+            return default
+        row = await self._pool.fetchrow(
+            "SELECT enabled FROM workflow_toggles WHERE workflow_name = $1",
+            name,
+        )
+        return default if row is None else bool(row["enabled"])
+
 
 class RpcClient:
     def __init__(self) -> None:
