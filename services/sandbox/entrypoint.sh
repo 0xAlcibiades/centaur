@@ -495,6 +495,26 @@ cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
 EOF
 
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
+repair_workspace_origin() {
+    local repo_path="$1"
+    local workspace_dir="$2"
+    local upstream_url
+    local workspace_origin
+
+    upstream_url="$(git -C "$repo_path" config --get remote.origin.url 2>/dev/null || true)"
+    if [ -z "$upstream_url" ]; then
+        echo "AGENT_REPO cache checkout has no origin: $repo_path" >&2
+        return 1
+    fi
+    workspace_origin="$(git -C "$workspace_dir" config --get remote.origin.url 2>/dev/null || true)"
+
+    if [ -z "$workspace_origin" ]; then
+        git -C "$workspace_dir" remote add origin "$upstream_url"
+    else
+        git -C "$workspace_dir" remote set-url origin "$upstream_url"
+    fi
+}
+
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"
 else
@@ -515,8 +535,12 @@ if [ -n "${AGENT_REPO:-}" ]; then
             git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
         fi
 
+        repair_workspace_origin "$REPO_PATH" "$WORKSPACE_DIR"
+
         BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
         git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
+    else
+        repair_workspace_origin "$REPO_PATH" "$WORKSPACE_DIR"
     fi
 else
     mkdir -p "$WORKSPACE_DIR"

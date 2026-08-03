@@ -2937,12 +2937,17 @@ async fn run_centaur_workflow_inner(
                     let run_id = ctx.run_id().to_owned();
                     async move {
                         let client_message_id = format!("absurd-workflow:{task_id}:native:user");
-                        let metadata = json!({
-                            "source": "absurd_workflow",
-                            "workflow_name": "agent_turn",
-                            "workflow_task_id": task_id,
-                            "workflow_run_id": run_id,
-                        });
+                        let WorkflowAgentTurnMetadata {
+                            session_metadata,
+                            message_metadata,
+                            execution_metadata,
+                        } = workflow_agent_turn_metadata(
+                            json!({}),
+                            "agent_turn",
+                            &task_id,
+                            &run_id,
+                            None,
+                        );
                         run_agent_session_turn(
                             session_runtime,
                             AgentTurnRequest {
@@ -2951,9 +2956,9 @@ async fn run_centaur_workflow_inner(
                                 persona_id: None,
                                 parts: vec![json!({"type": "text", "text": prompt})],
                                 client_message_id: client_message_id.clone(),
-                                session_metadata: metadata.clone(),
-                                message_metadata: metadata.clone(),
-                                execution_metadata: metadata,
+                                session_metadata,
+                                message_metadata,
+                                execution_metadata,
                                 execution_idempotency_key: format!(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
@@ -3858,20 +3863,23 @@ async fn run_python_agent_turn(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("absurd-workflow:{}:{request_id}:user", ctx.task_id()));
-    let mut session_metadata = agent_metadata(&args, ctx, input, "session");
+    let WorkflowAgentTurnMetadata {
+        mut session_metadata,
+        message_metadata,
+        mut execution_metadata,
+    } = workflow_agent_turn_metadata(
+        args.get("metadata").cloned().unwrap_or_else(|| json!({})),
+        &input.workflow_name,
+        ctx.task_id(),
+        ctx.run_id(),
+        Some(request_id),
+    );
     if let Some(persona) = args.get("persona").and_then(Value::as_str) {
         object_insert(&mut session_metadata, "persona", json!(persona));
     }
     if let Some(engine) = args.get("engine").and_then(Value::as_str) {
         object_insert(&mut session_metadata, "engine", json!(engine));
     }
-    let mut message_metadata = agent_metadata(&args, ctx, input, "message");
-    object_insert(
-        &mut message_metadata,
-        "workflow_agent_request_id",
-        json!(request_id),
-    );
-    let mut execution_metadata = agent_metadata(&args, ctx, input, "execution");
     if let Some(delivery) = args.get("delivery") {
         object_insert(&mut execution_metadata, "delivery", delivery.clone());
     }
@@ -3985,20 +3993,75 @@ fn parse_agent_harness(args: &Value) -> Result<Option<HarnessType>, WorkflowRunt
     })
 }
 
+struct WorkflowAgentTurnMetadata {
+    session_metadata: Value,
+    message_metadata: Value,
+    execution_metadata: Value,
+}
+
+/// Builds metadata at its durable ownership boundary. Workflow-host request
+/// IDs and Absurd run IDs identify retry attempts, not the logical user
+/// message, so they must never alter the idempotent message payload.
+fn workflow_agent_turn_metadata(
+    caller_metadata: Value,
+    workflow_name: &str,
+    workflow_task_id: &str,
+    workflow_run_id: &str,
+    request_id: Option<&str>,
+) -> WorkflowAgentTurnMetadata {
+    let mut session_metadata = agent_metadata(
+        caller_metadata.clone(),
+        workflow_name,
+        workflow_task_id,
+        workflow_run_id,
+        "session",
+    );
+    object_remove(&mut session_metadata, "workflow_agent_request_id");
+    let mut message_metadata = agent_metadata(
+        caller_metadata.clone(),
+        workflow_name,
+        workflow_task_id,
+        workflow_run_id,
+        "message",
+    );
+    for key in ["workflow_agent_request_id", "workflow_run_id"] {
+        object_remove(&mut message_metadata, key);
+    }
+    let mut execution_metadata = agent_metadata(
+        caller_metadata,
+        workflow_name,
+        workflow_task_id,
+        workflow_run_id,
+        "execution",
+    );
+    if let Some(request_id) = request_id {
+        object_insert(
+            &mut execution_metadata,
+            "workflow_agent_request_id",
+            json!(request_id),
+        );
+    }
+    WorkflowAgentTurnMetadata {
+        session_metadata,
+        message_metadata,
+        execution_metadata,
+    }
+}
+
 fn agent_metadata(
-    args: &Value,
-    ctx: &TaskContext,
-    input: &WorkflowTaskInput,
+    mut metadata: Value,
+    workflow_name: &str,
+    workflow_task_id: &str,
+    workflow_run_id: &str,
     phase: &str,
 ) -> Value {
-    let mut metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
     if !metadata.is_object() {
         metadata = json!({});
     }
     object_insert(&mut metadata, "source", json!("absurd_workflow"));
-    object_insert(&mut metadata, "workflow_name", json!(input.workflow_name));
-    object_insert(&mut metadata, "workflow_task_id", json!(ctx.task_id()));
-    object_insert(&mut metadata, "workflow_run_id", json!(ctx.run_id()));
+    object_insert(&mut metadata, "workflow_name", json!(workflow_name));
+    object_insert(&mut metadata, "workflow_task_id", json!(workflow_task_id));
+    object_insert(&mut metadata, "workflow_run_id", json!(workflow_run_id));
     object_insert(&mut metadata, "workflow_context_phase", json!(phase));
     metadata
 }
@@ -4006,6 +4069,12 @@ fn agent_metadata(
 fn object_insert(value: &mut Value, key: &str, item: Value) {
     if let Value::Object(object) = value {
         object.insert(key.to_owned(), item);
+    }
+}
+
+fn object_remove(value: &mut Value, key: &str) {
+    if let Value::Object(object) = value {
+        object.remove(key);
     }
 }
 
@@ -4911,6 +4980,150 @@ mod tests {
         assert_eq!(value.get("provider"), Some(&json!("amazon-bedrock")));
         assert_eq!(value.get("reasoning"), Some(&json!("high")));
         assert_eq!(value.pointer("/message/content"), Some(&json!(parts)));
+    }
+
+    #[test]
+    fn python_agent_turn_retries_keep_the_durable_message_payload_stable() {
+        let args = json!({
+            "metadata": {
+                "delivery": "workflow-delivery",
+                "source_event": "evt-123",
+                "workflow_agent_request_id": "caller-provided-value"
+            }
+        });
+        let first = workflow_agent_turn_metadata(
+            args["metadata"].clone(),
+            "daily_report",
+            "task-123",
+            "run-456",
+            Some("host-request-1"),
+        );
+        let retry = workflow_agent_turn_metadata(
+            args["metadata"].clone(),
+            "daily_report",
+            "task-123",
+            "run-789",
+            Some("host-request-2"),
+        );
+        let stable_message_id = "workflow:task-123:report".to_owned();
+        let first_message = SessionMessageInput {
+            client_message_id: Some(stable_message_id.clone()),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "prepare the report"})],
+            metadata: first.message_metadata,
+        };
+        let retry_message = SessionMessageInput {
+            client_message_id: Some(stable_message_id),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "prepare the report"})],
+            metadata: retry.message_metadata,
+        };
+
+        assert_eq!(first_message, retry_message);
+        assert!(
+            first_message
+                .metadata
+                .get("workflow_agent_request_id")
+                .is_none()
+        );
+        assert!(first_message.metadata.get("workflow_run_id").is_none());
+        assert_eq!(
+            first_message.metadata["workflow_name"],
+            json!("daily_report")
+        );
+        assert_eq!(
+            first_message.metadata["workflow_task_id"],
+            json!("task-123")
+        );
+        assert_eq!(
+            first_message.metadata["workflow_context_phase"],
+            json!("message")
+        );
+        assert_eq!(
+            first_message.metadata["delivery"],
+            json!("workflow-delivery")
+        );
+        assert!(
+            first
+                .session_metadata
+                .get("workflow_agent_request_id")
+                .is_none()
+        );
+        assert_eq!(first.session_metadata["workflow_run_id"], json!("run-456"));
+        assert_eq!(retry.session_metadata["workflow_run_id"], json!("run-789"));
+        assert_eq!(
+            first.execution_metadata["workflow_agent_request_id"],
+            json!("host-request-1")
+        );
+        assert_eq!(
+            retry.execution_metadata["workflow_agent_request_id"],
+            json!("host-request-2")
+        );
+        assert_eq!(
+            first.execution_metadata["workflow_run_id"],
+            json!("run-456")
+        );
+        assert_eq!(
+            retry.execution_metadata["workflow_run_id"],
+            json!("run-789")
+        );
+
+        let distinct_message = SessionMessageInput {
+            client_message_id: retry_message.client_message_id.clone(),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "prepare a different report"})],
+            metadata: retry_message.metadata.clone(),
+        };
+        assert_ne!(retry_message, distinct_message);
+    }
+
+    #[test]
+    fn native_agent_turn_retries_keep_the_durable_message_payload_stable() {
+        let first =
+            workflow_agent_turn_metadata(json!({}), "agent_turn", "task-123", "run-456", None);
+        let retry =
+            workflow_agent_turn_metadata(json!({}), "agent_turn", "task-123", "run-789", None);
+        let stable_message_id = "absurd-workflow:task-123:native:user".to_owned();
+        let first_message = SessionMessageInput {
+            client_message_id: Some(stable_message_id.clone()),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "prepare the report"})],
+            metadata: first.message_metadata,
+        };
+        let retry_message = SessionMessageInput {
+            client_message_id: Some(stable_message_id),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "prepare the report"})],
+            metadata: retry.message_metadata,
+        };
+
+        assert_eq!(first_message, retry_message);
+        assert!(first_message.metadata.get("workflow_run_id").is_none());
+        assert!(
+            first_message
+                .metadata
+                .get("workflow_agent_request_id")
+                .is_none()
+        );
+        assert_eq!(first_message.metadata["workflow_name"], json!("agent_turn"));
+        assert_eq!(
+            first_message.metadata["workflow_task_id"],
+            json!("task-123")
+        );
+        assert_eq!(
+            first_message.metadata["workflow_context_phase"],
+            json!("message")
+        );
+        assert_eq!(first.session_metadata["workflow_run_id"], json!("run-456"));
+        assert_eq!(retry.session_metadata["workflow_run_id"], json!("run-789"));
+        assert_eq!(
+            first.execution_metadata["workflow_run_id"],
+            json!("run-456")
+        );
+        assert_eq!(
+            retry.execution_metadata["workflow_run_id"],
+            json!("run-789")
+        );
     }
 
     #[test]
