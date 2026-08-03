@@ -465,17 +465,12 @@ if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
     done
 fi
 
-# Signal readiness
-touch "$HOME_DIR/.ready"
+# Git over HTTPS uses Basic auth, whose credentials are encoded before the
+# request reaches iron-proxy. Configure Git with the mounted secret-backed
+# askpass helper instead of persisting the proxy placeholder as credentials.
+/usr/local/bin/setup-git-auth
 
-# ── Background: slow auth tasks ─────────────────────────────────────────────
-{
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        git config --global credential.helper store
-        printf 'https://oauth2:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME_DIR/.git-credentials"
-        echo "${GITHUB_TOKEN}" | gh auth login --with-token 2>/dev/null || true
-        gh auth setup-git 2>/dev/null || true
-    fi
-} &
+# Signal readiness only after Git auth setup is complete.
+touch "$HOME_DIR/.ready"
 
 exec "$@"
