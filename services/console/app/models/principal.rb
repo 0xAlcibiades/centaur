@@ -18,10 +18,12 @@ class Principal < ApplicationRecord
   has_many :mcp_oauth_authorization_codes, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   belongs_to :created_by, class_name: "User"
+  belongs_to :console_user, class_name: "User", optional: true
 
   include SlackChannelPermissionOwner
 
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
+  after_create :assign_default_roles, if: :roles_blank_for_defaulting?
   before_validation :apply_sandbox_repo_cache_label
   before_validation :promote_identity_labels_to_fields
   before_validation :strip_identity_labels
@@ -36,7 +38,6 @@ class Principal < ApplicationRecord
     unknown user console_user workflow slack_channel slack_dm discord_channel linear_issue
     teams_user teams_conversation
   ].freeze
-  PROMOTED_LABEL_FIELDS = %w[kind slack_user_id slack_channel_id slack_team_id slack_email].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
   SLACK_TEAM_ID_FORMAT = /\A[TE][A-Z0-9]{8,}\z/
@@ -55,6 +56,8 @@ class Principal < ApplicationRecord
                             allow_nil: true, if: :will_save_change_to_slack_team_id?
   validates :slack_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
                           allow_nil: true, if: :will_save_change_to_slack_email?
+  validates :console_user_email, format: { with: URI::MailTo::EMAIL_REGEXP, message: "is not a valid email address" },
+                                 allow_nil: true, if: :will_save_change_to_console_user_email?
 
   # Stand-in for an inline secret value in redacted config: operator inspection
   # reports that a control_plane source carries a value without revealing it.
@@ -123,12 +126,8 @@ class Principal < ApplicationRecord
   end
 
   def labels_with_sandbox_capabilities
-    compatibility_labels = PROMOTED_LABEL_FIELDS.to_h do |field|
-      [ field, public_send(field) ]
-    end.compact
-
     labels.to_h.merge(
-      compatibility_labels,
+      PrincipalIdentityLabels.serialize(self),
       SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache
     )
   end
@@ -224,6 +223,19 @@ class Principal < ApplicationRecord
 
   private
 
+  def roles_blank_for_defaulting?
+    association(:roles).target.empty? && !roles.exists?
+  end
+
+  def assign_default_roles
+    role_ids = Role.where(namespace: namespace, assign_by_default: true).ids
+    return if role_ids.empty?
+
+    # These assignments are part of the principal's initial state, so there is
+    # no prior sync config to invalidate.
+    PrincipalRole.insert_all!(role_ids.map { |role_id| { principal_id: id, role_id: role_id } })
+  end
+
   def auto_grant_matching_oauth_credentials
     PrincipalCredentialReconciliation.new.apply_for_principal(self)
   end
@@ -236,18 +248,11 @@ class Principal < ApplicationRecord
   # compatibility release. Promote only fields that were not assigned directly.
   # Reserved identity labels are stripped below so columns remain authoritative.
   def promote_identity_labels_to_fields
-    return unless will_save_change_to_labels?
-
-    PROMOTED_LABEL_FIELDS.each do |field|
-      next if will_save_change_to_attribute?(field) || !labels.to_h.key?(field)
-
-      value = labels.to_h[field]
-      self[field] = field == "kind" ? value : value.presence
-    end
+    PrincipalIdentityLabels.assign(self)
   end
 
   def strip_identity_labels
-    self[:labels] = labels.to_h.except(*PROMOTED_LABEL_FIELDS)
+    PrincipalIdentityLabels.strip(self)
   end
 
   def supplied_key?(attributes, key)
@@ -342,7 +347,8 @@ class Principal < ApplicationRecord
   end
 
   def sync_config_fields_changed?
-    ([ "name", "labels", "sandbox_api_server_enabled" ] + PROMOTED_LABEL_FIELDS).any? do |field|
+    identity_fields = PrincipalIdentityLabels.columns
+    ([ "name", "labels", "sandbox_api_server_enabled" ] + identity_fields).any? do |field|
       previous_changes.key?(field)
     end
   end

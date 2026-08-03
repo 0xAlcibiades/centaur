@@ -66,7 +66,45 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "U0123456789", principal.slack_user_id
     assert_equal "T0123456789", principal.slack_team_id
     assert_equal "ada@example.com", principal.slack_email
-    assert_empty principal.labels.slice(*Principal::PROMOTED_LABEL_FIELDS)
+    assert_empty principal.labels.slice(*PrincipalIdentityLabels.labels_for(principal.kind))
+  end
+
+  test "console user identity is stored only in columns and synthesized for compatibility" do
+    user = users(:acme_admin)
+    principal = Principal.create!(default_attrs(
+      kind: "console_user",
+      console_user_id: user.id,
+      console_user_email: user.email,
+      labels: { "managed-by" => "centaur" }
+    ))
+
+    principal.reload
+    assert_equal user.id, principal.console_user_id
+    assert_equal user.email, principal.console_user_email
+    assert_empty principal.labels.slice("console-user-id", "email")
+    assert_equal user.oid, principal.labels_with_sandbox_capabilities["console-user-id"]
+    assert_equal user.email, principal.labels_with_sandbox_capabilities["email"]
+  end
+
+  test "legacy console user identity labels are promoted only for console users" do
+    user = users(:acme_admin)
+    console_user = Principal.create!(default_attrs(
+      labels: {
+        "kind" => "console_user",
+        "console-user-id" => user.oid,
+        "email" => user.email
+      }
+    ))
+    ordinary_user = Principal.create!(default_attrs(
+      labels: { "kind" => "user", "email" => user.email }
+    ))
+
+    assert_equal user.id, console_user.reload.console_user_id
+    assert_equal user.email, console_user.console_user_email
+    assert_empty console_user.labels.slice("console-user-id", "email")
+    assert_nil ordinary_user.reload.console_user_id
+    assert_nil ordinary_user.console_user_email
+    assert_equal user.email, ordinary_user.labels["email"]
   end
 
   test "blank legacy Slack identity labels clear columns" do
@@ -133,6 +171,23 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
+  test "console user principals permit missing user references but require valid email" do
+    user = users(:acme_admin)
+    principal = Principal.new(default_attrs(
+      kind: "console_user",
+      console_user_id: user.id,
+      console_user_email: user.email
+    ))
+    assert principal.valid?
+
+    principal.console_user_id = nil
+    assert principal.valid?
+
+    principal.console_user_email = "not-an-email"
+    assert_not principal.valid?
+    assert_predicate principal.errors[:console_user_email], :any?
+  end
+
   test "unchanged malformed migrated Slack identities do not block unrelated saves" do
     principal = principals(:acme_user_alice)
     principal.update_columns(
@@ -193,6 +248,37 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "all", principal.sandbox_repo_cache
     assert_predicate principal, :sandbox_observability_enabled
     assert_predicate principal, :sandbox_api_server_enabled
+  end
+
+  test "new principals with no roles receive configured defaults from their namespace" do
+    Role.update_all(assign_by_default: false)
+    [ roles(:acme_infra), roles(:acme_admin_role), roles(:globex_infra) ].each do |role|
+      role.update!(assign_by_default: true)
+    end
+
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "U-default-roles"))
+
+    assert_equal [ roles(:acme_infra), roles(:acme_admin_role) ].sort_by(&:id), principal.roles.order(:id)
+  end
+
+  test "preassigned roles suppress configured defaults" do
+    roles(:acme_infra).update!(assign_by_default: true)
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "U-explicit-role"))
+    principal.roles = [ roles(:acme_admin_role) ]
+
+    principal.save!
+
+    assert_equal [ roles(:acme_admin_role) ], principal.reload.roles
+  end
+
+  test "configured defaults are not applied to existing roleless principals" do
+    principal = principals(:acme_user_bob)
+    principal.principal_roles.destroy_all
+    roles(:acme_infra).update!(assign_by_default: true)
+
+    principal.update!(name: "Still roleless")
+
+    assert_empty principal.reload.roles
   end
 
   test "default sandbox repo-cache overwrites explicit label assignment" do

@@ -103,8 +103,8 @@ class PgDsnSecret < ApplicationRecord
 
     label = ref["principal_label"] || ref[:principal_label]
     if label.present?
-      if Principal::PROMOTED_LABEL_FIELDS.include?(label.to_s)
-        return principal&.public_send(label).to_s
+      if PrincipalIdentityLabels.promoted?(principal, label)
+        return PrincipalIdentityLabels.value(principal, label).to_s
       end
 
       return principal&.labels&.fetch(label.to_s, "").to_s

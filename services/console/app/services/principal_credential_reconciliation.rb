@@ -33,7 +33,6 @@ class PrincipalCredentialReconciliation
   # provider-subject labels, which would widen the trust boundary beyond the
   # authenticated user.
   CONSOLE_USER_KIND = "console_user"
-  CONSOLE_USER_ID_LABEL = "console-user-id"
   SLACK_PROVIDER = Oauth::Providers::Slack::KEY
   GOOGLE_PROVIDER = Oauth::Providers::Google::KEY
   EMAIL_LABELS = %w[email google_email].freeze
@@ -332,24 +331,24 @@ class PrincipalCredentialReconciliation
       .uniq
   end
 
-  # Console-user principals carry the console user's oid, so every verified
+  # Console-user principals reference the console user's database row, so every verified
   # identity email of that user participates in matching -- a credential
   # registered under a secondary verified email still reaches the principal.
   # Unverified emails are excluded: an unverified address must not adopt
   # someone else's credentials.
   def console_user_emails(principal)
-    user_oid = principal.labels&.[](CONSOLE_USER_ID_LABEL)
-    return [] if user_oid.blank?
+    user_id = principal.console_user_id
+    return [] if user_id.blank?
 
     @console_user_emails ||= {}
-    @console_user_emails.fetch(user_oid) do
-      user = User.find_by_oid(user_oid)
+    @console_user_emails.fetch(user_id) do
+      user = User.find_by(id: user_id)
       emails = if user
         [ user.email ] + user.user_identities.where(email_verified: true).pluck(:email)
       else
         []
       end
-      @console_user_emails[user_oid] = emails
+      @console_user_emails[user_id] = emails
     end
   end
 
