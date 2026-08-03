@@ -256,13 +256,14 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.reload.labels)
   end
 
-  test "sandbox access defaults to enabled" do
+  test "sandbox access defaults enable runtime capabilities and disable external prompting" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-sandbox-access"))
     principal.reload
 
     assert_equal "all", principal.sandbox_repo_cache
     assert_predicate principal, :sandbox_observability_enabled
     assert_predicate principal, :sandbox_api_server_enabled
+    assert_not_predicate principal, :sandbox_external_prompting_enabled
   end
 
   test "new principals with no roles receive configured defaults from their namespace" do

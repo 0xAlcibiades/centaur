@@ -289,10 +289,11 @@ mod tests {
             "slack_conversation_name": "general"
         });
 
-        registrar
+        let principal = registrar
             .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
             .unwrap();
+        assert!(!principal.sandbox_external_prompting_enabled);
 
         let requests = requests.lock().unwrap();
         assert!(
@@ -326,10 +327,11 @@ mod tests {
             "slack_conversation_name": "general"
         });
 
-        registrar
+        let principal = registrar
             .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
             .unwrap();
+        assert!(principal.sandbox_external_prompting_enabled);
 
         let requests = requests.lock().unwrap();
         assert!(
@@ -469,7 +471,7 @@ mod tests {
                     ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
                         if principal_exists =>
                     {
-                        ("200 OK", channel_principal_body())
+                        ("200 OK", channel_principal_body(true))
                     }
                     ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
                         if principal_exists =>
@@ -481,7 +483,7 @@ mod tests {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
                     }
                     ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
-                        ("200 OK", channel_principal_body())
+                        ("200 OK", channel_principal_body(principal_exists))
                     }
                     ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
                         ("200 OK", user_principal_body())
@@ -510,8 +512,10 @@ mod tests {
         (base_url, requests, handle)
     }
 
-    fn channel_principal_body() -> String {
-        r#"{"data":{"id":"prn_channel","namespace":"default","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{}}}"#.to_owned()
+    fn channel_principal_body(external_prompting_enabled: bool) -> String {
+        format!(
+            r#"{{"data":{{"id":"prn_channel","namespace":"default","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{{}},"sandbox_external_prompting_enabled":{external_prompting_enabled}}}}}"#
+        )
     }
 
     fn user_principal_body() -> String {

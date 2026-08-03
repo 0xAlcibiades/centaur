@@ -94,6 +94,7 @@ module Api
           sandbox_repo_cache: principal.sandbox_repo_cache,
           sandbox_observability_enabled: principal.sandbox_observability_enabled,
           sandbox_api_server_enabled: principal.sandbox_api_server_enabled,
+          sandbox_external_prompting_enabled: principal.sandbox_external_prompting_enabled,
           created_at: principal.created_at,
           updated_at: principal.updated_at
         }
@@ -112,6 +113,7 @@ module Api
           :sandbox_repo_cache,
           :sandbox_observability_enabled,
           :sandbox_api_server_enabled,
+          :sandbox_external_prompting_enabled,
           labels: {}
         )
       end

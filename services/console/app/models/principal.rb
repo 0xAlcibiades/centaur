@@ -124,6 +124,9 @@ class Principal < ApplicationRecord
     unless supplied_key?(supplied, :sandbox_api_server_enabled)
       self.sandbox_api_server_enabled = defaults[:sandbox_api_server_enabled]
     end
+    unless supplied_key?(supplied, :sandbox_external_prompting_enabled)
+      self.sandbox_external_prompting_enabled = defaults[:sandbox_external_prompting_enabled]
+    end
   end
 
   def labels_with_sandbox_capabilities

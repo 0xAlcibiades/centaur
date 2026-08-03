@@ -83,6 +83,17 @@
           <span class="block text-xs text-zinc-500">Allow sandbox access to the api-rs control plane.</span>
         </span>
       </label>
+      <label class="flex items-start gap-3">
+        <%= hidden_field_tag :sandbox_external_prompting_enabled, "0" %>
+        <%= check_box_tag :sandbox_external_prompting_enabled,
+                          "1",
+                          @principal.sandbox_external_prompting_enabled,
+                          class: checkbox_class %>
+        <span>
+          <span class="block text-sm font-medium text-zinc-100">External prompting</span>
+          <span class="block text-xs text-zinc-500">Allow external Slack users from approved organizations to prompt this sandbox.</span>
+        </span>
+      </label>
       <div>
         <%= submit_tag "Save sandbox access", class: "btn-primary" %>
       </div>

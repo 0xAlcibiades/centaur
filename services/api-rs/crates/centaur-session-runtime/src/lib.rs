@@ -1220,6 +1220,23 @@ impl SessionRuntime {
         self
     }
 
+    /// Resolve the live Console entitlements for a conversation principal
+    /// without creating a durable session. Registering the principal makes a
+    /// previously unknown conversation available for operators to configure.
+    pub async fn external_prompting_enabled(
+        &self,
+        thread_key: &ThreadKey,
+        metadata: Option<&Value>,
+    ) -> Result<bool, SessionRuntimeError> {
+        let Some(registrar) = &self.iron_control else {
+            return Ok(false);
+        };
+        let principal = registrar
+            .register_session(thread_key.as_str(), metadata)
+            .await?;
+        Ok(principal.sandbox_external_prompting_enabled)
+    }
+
     /// Register the shared unauthenticated MCP tool-host principal when
     /// iron-control is enabled, so proxy-backed tool calls can resolve an
     /// effective config without minting per-user credentials in this layer.
@@ -7005,6 +7022,7 @@ mod tests {
             labels,
             sandbox_observability_enabled: true,
             sandbox_api_server_enabled: true,
+            sandbox_external_prompting_enabled: false,
         }
     }
 

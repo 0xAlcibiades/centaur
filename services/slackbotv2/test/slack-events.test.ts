@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import type { Logger, Message } from 'chat'
-import { isAllowedSlackMessage } from '../src/slack-events'
+import {
+  externalPromptingPolicyForSlackWebhook,
+  isAllowedSlackMessage,
+  isAllowedSlackWebhookBody
+} from '../src/slack-events'
+import { isExternalPromptingEnabled } from '../src/session-api'
 import type { SlackbotV2Options } from '../src/types'
 
 const logger: Logger = {
@@ -18,6 +23,22 @@ function botMessage(botId: string): Message {
     raw: { bot_id: botId, subtype: 'bot_message' },
     threadId: 'C1:1700000000.000001'
   } as Message
+}
+
+function externalWebhook(channel = 'C1', externalTeam = 'TEXTERNAL'): string {
+  return JSON.stringify({
+    event_id: 'Ev-external',
+    team_id: 'THOME',
+    type: 'event_callback',
+    event: {
+      channel,
+      team: externalTeam,
+      ts: '1700000000.000001',
+      type: 'app_mention',
+      user: 'UEXTERNAL',
+      user_team: externalTeam
+    }
+  })
 }
 
 function options(fetchImpl: SlackbotV2Options['fetch']): SlackbotV2Options {
@@ -112,6 +133,122 @@ describe('Slack trigger bot allowlist', () => {
     }
 
     expect(await isAllowedSlackMessage(botMessage('BCHANNELBOT'), config, logger)).toBe(false)
+    expect(requests).toBe(0)
+  })
+})
+
+describe('Slack external prompting entitlements', () => {
+  it('preserves allowlist-only behavior while enforcement is disabled', async () => {
+    let requests = 0
+    const config = {
+      ...options(async () => {
+        requests += 1
+        throw new Error('entitlement endpoint must not be called')
+      }),
+      allowedExternalTeamIds: ['TEXTERNAL']
+    }
+
+    expect(isAllowedSlackWebhookBody(externalWebhook(), config, logger)).toBe(true)
+    expect(externalPromptingPolicyForSlackWebhook(externalWebhook(), config)).toEqual({
+      kind: 'not_required'
+    })
+    expect(requests).toBe(0)
+  })
+
+  it('resolves external prompt identity without querying before signature verification', async () => {
+    const requests: Array<{ body: unknown; url: string }> = []
+    const config = {
+      ...options(async (input, init) => {
+        requests.push({
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+          url: String(input)
+        })
+        return Response.json({ external_prompting_enabled: true })
+      }),
+      allowedExternalTeamIds: ['TEXTERNAL'],
+      externalPromptingEntitlementsEnabled: true
+    }
+
+    expect(isAllowedSlackWebhookBody(externalWebhook(), config, logger)).toBe(true)
+    expect(externalPromptingPolicyForSlackWebhook(externalWebhook(), config)).toEqual({
+      eventId: 'Ev-external',
+      externalTeamId: 'TEXTERNAL',
+      input: {
+        channelId: 'C1',
+        teamId: 'THOME',
+        threadId: 'slack:C1:1700000000.000001',
+        userId: 'UEXTERNAL'
+      },
+      kind: 'check'
+    })
+    expect(requests).toHaveLength(0)
+
+    expect(
+      await isExternalPromptingEnabled(config, {
+        channelId: 'C1',
+        teamId: 'THOME',
+        threadId: 'slack:C1:1700000000.000001',
+        userId: 'UEXTERNAL'
+      })
+    ).toBe(true)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.url).toBe(
+      'http://session.test/api/session/slack%3AC1%3A1700000000.000001/entitlements'
+    )
+    expect(requests[0]?.body).toEqual({
+      metadata: expect.objectContaining({
+        platform: 'slack',
+        slack_channel_id: 'C1',
+        slack_team_id: 'THOME',
+        slack_user_id: 'UEXTERNAL',
+        source: 'slackbotv2'
+      })
+    })
+  })
+
+  it('resolves external DMs for entitlement enforcement', () => {
+    const config = {
+      ...options(async () => Response.json({ external_prompting_enabled: true })),
+      allowedExternalTeamIds: ['TEXTERNAL'],
+      externalPromptingEntitlementsEnabled: true
+    }
+
+    expect(externalPromptingPolicyForSlackWebhook(externalWebhook('D1'), config)).toEqual(
+      expect.objectContaining({
+        input: expect.objectContaining({ threadId: 'slack:D1:1700000000.000001' }),
+        kind: 'check'
+      })
+    )
+  })
+
+  it('does not query entitlements for external organizations outside the allowlist', async () => {
+    let requests = 0
+    const config = {
+      ...options(async () => {
+        requests += 1
+        return Response.json({ external_prompting_enabled: true })
+      }),
+      externalPromptingEntitlementsEnabled: true
+    }
+
+    expect(isAllowedSlackWebhookBody(externalWebhook(), config, logger)).toBe(false)
+    expect(requests).toBe(0)
+  })
+
+  it('does not query entitlements for internal users', async () => {
+    let requests = 0
+    const config = {
+      ...options(async () => {
+        requests += 1
+        return Response.json({ external_prompting_enabled: false })
+      }),
+      externalPromptingEntitlementsEnabled: true
+    }
+
+    expect(isAllowedSlackWebhookBody(externalWebhook('C1', 'THOME'), config, logger)).toBe(true)
+    expect(
+      externalPromptingPolicyForSlackWebhook(externalWebhook('C1', 'THOME'), config)
+    ).toEqual({ kind: 'not_required' })
     expect(requests).toBe(0)
   })
 })

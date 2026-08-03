@@ -235,6 +235,12 @@ mod tests {
                 .unwrap(),
             Request::builder()
                 .method(Method::POST)
+                .uri("/api/session/slack%3AC123%3A123.456/entitlements")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"metadata":{}}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
                 .uri("/api/session/slack%3AC123%3A123.456/execute")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"input_lines":[]}"#))
@@ -291,6 +297,37 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+
+    #[tokio::test]
+    async fn session_entitlements_fail_closed_without_console() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/session/slack%3AC123%3A123.456/entitlements")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"metadata":{"source":"slackbotv2","slack_team_id":"T123"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"external_prompting_enabled": false})
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,10 @@ const options: SlackbotV2Options = {
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
+  externalPromptingEntitlementsEnabled: booleanEnv(
+    'SLACKBOTV2_EXTERNAL_PROMPTING_ENTITLEMENTS_ENABLED',
+    false
+  ),
   // Same env vars deployers use to override the sandbox harness model
   // (sandbox.extraEnv); the chart mirrors them here so displayed defaults
   // track the deployment instead of the baked harness config.
@@ -97,6 +101,7 @@ console.log(
     service: 'slackbotv2',
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
+    external_prompting_entitlements_enabled: options.externalPromptingEntitlementsEnabled,
     message_overrides_strategy: messageOverridesStrategyMode,
     message_overrides_strategy_enabled:
       messageOverridesStrategyMode !== 'llm' || Boolean(messageOverridesStrategyApiKey),

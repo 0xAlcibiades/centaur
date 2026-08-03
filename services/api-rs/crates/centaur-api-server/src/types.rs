@@ -36,6 +36,16 @@ pub struct CreateSessionResponse {
     pub harness_assignment: Option<HarnessAssignment>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SessionEntitlementsRequest {
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionEntitlementsResponse {
+    pub external_prompting_enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HarnessAssignment {
     pub experiment: &'static str,

@@ -5186,6 +5186,67 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
   })
+
+  it('enforces external prompting entitlements without creating denied sessions', async () => {
+    const sendExternalMention = async (eventId: string, text: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: 'TEXTERNAL',
+            user_team: 'TEXTERNAL',
+            ts: mention.ts,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    bot = createTestBot({
+      allowedExternalTeamIds: ['TEXTERNAL'],
+      externalPromptingEntitlementsEnabled: true
+    })
+    await sendExternalMention('Ev-slackbotv2-entitlement-disabled', 'entitlement disabled')
+    expect(codexApi.entitlements).toHaveLength(1)
+    expect(codexApi.creates).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+
+    codexApi.reset()
+    codexApi.externalPromptingEnabled = true
+    await sendExternalMention('Ev-slackbotv2-entitlement-enabled', 'entitlement enabled')
+    expect(codexApi.entitlements).toHaveLength(1)
+    expect(codexApi.creates).toHaveLength(1)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+
+    codexApi.reset()
+    codexApi.failNextEntitlements = true
+    const logs: CapturedLog[] = []
+    bot = createTestBot({
+      allowedExternalTeamIds: ['TEXTERNAL'],
+      externalPromptingEntitlementsEnabled: true,
+      logger: captureLogger(logs)
+    })
+    await sendExternalMention('Ev-slackbotv2-entitlement-error', 'entitlement unavailable')
+    expect(codexApi.entitlements).toHaveLength(1)
+    expect(codexApi.creates).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(
+      hasLog(logs, 'slackbotv2_event_ignored_external_prompting_entitlement_lookup_failed')
+    ).toBe(true)
+  })
 })
 
 function createTestBot(
@@ -5570,6 +5631,11 @@ type MockSessionEventRequest = {
   threadKey: string
 }
 
+type MockEntitlementsRequest = {
+  body: { metadata?: Record<string, unknown> }
+  threadKey: string
+}
+
 type MockSessionEvent = {
   data: string
   event: string
@@ -5589,6 +5655,7 @@ type MockSessionApi = {
   close(): Promise<void>
   closeStreams(): void
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
+  entitlements: MockEntitlementsRequest[]
   emitOutputLine(threadKey: string, line: string, executionId?: string): void
   emitOutputLines(threadKey: string, lines: string[], executionId?: string): void
   emitSessionEvent(threadKey: string, event: string, data: unknown, executionId?: string): void
@@ -5597,6 +5664,7 @@ type MockSessionApi = {
   failNextEvents: boolean
   failNextExecute: boolean
   failNextExecuteAfterAccept: boolean
+  failNextEntitlements: boolean
   holdNextExecute(): () => void
   harnessAssignment?: {
     experiment: string
@@ -5605,6 +5673,7 @@ type MockSessionApi = {
     rollout_percent: number
   }
   resolvedHarnessType?: string
+  externalPromptingEnabled: boolean
   reset(): void
   streamCount: number
   url: string
@@ -5617,6 +5686,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
+  const entitlements: MockEntitlementsRequest[] = []
   const idempotentExecutions = new Map<string, string>()
   const streams = new Set<ServerResponse>()
   const workflowEvents: MockWorkflowEventRequest[] = []
@@ -5627,6 +5697,8 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let failNextEvents = false
   let failNextExecute = false
   let failNextExecuteAfterAccept = false
+  let failNextEntitlements = false
+  let externalPromptingEnabled = false
   let harnessAssignment: MockSessionApi['harnessAssignment']
   let resolvedHarnessType: string | undefined
   const port = await availablePort(4063)
@@ -5641,6 +5713,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       events,
       eventRequests,
       executes,
+      entitlements,
       get autoRespond() {
         return autoRespond
       },
@@ -5652,6 +5725,12 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       },
       get failNextExecuteAfterAccept() {
         return failNextExecuteAfterAccept
+      },
+      get failNextEntitlements() {
+        return failNextEntitlements
+      },
+      get externalPromptingEnabled() {
+        return externalPromptingEnabled
       },
       get failNextEvents() {
         return failNextEvents
@@ -5677,6 +5756,9 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       setFailNextExecuteAfterAccept(value) {
         failNextExecuteAfterAccept = value
       },
+      setFailNextEntitlements(value) {
+        failNextEntitlements = value
+      },
       streams,
       workflowEvents
     }).catch(error => {
@@ -5689,6 +5771,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const api: MockSessionApi = {
     appends,
     creates,
+    entitlements,
     eventRequests,
     executes,
     reset() {
@@ -5697,6 +5780,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       eventRequests.length = 0
       events.length = 0
       executes.length = 0
+      entitlements.length = 0
       idempotentExecutions.clear()
       executeHoldRelease?.()
       executeHold = null
@@ -5707,6 +5791,8 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextEvents = false
       failNextExecute = false
       failNextExecuteAfterAccept = false
+      failNextEntitlements = false
+      externalPromptingEnabled = false
       harnessAssignment = undefined
       resolvedHarnessType = undefined
       workflowEvents.length = 0
@@ -5731,6 +5817,18 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     },
     set failNextExecuteAfterAccept(value: boolean) {
       failNextExecuteAfterAccept = value
+    },
+    get failNextEntitlements() {
+      return failNextEntitlements
+    },
+    set failNextEntitlements(value: boolean) {
+      failNextEntitlements = value
+    },
+    get externalPromptingEnabled() {
+      return externalPromptingEnabled
+    },
+    set externalPromptingEnabled(value: boolean) {
+      externalPromptingEnabled = value
     },
     get failNextEvents() {
       return failNextEvents
@@ -5809,17 +5907,21 @@ async function handleMockCodexRequest(
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
     executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
+    entitlements: MockEntitlementsRequest[]
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
+    failNextEntitlements: boolean
+    externalPromptingEnabled: boolean
     harnessAssignment?: MockSessionApi['harnessAssignment']
-      idempotentExecutions: Map<string, string>
+    idempotentExecutions: Map<string, string>
     nextEventId(): number
     port: number
     resolvedHarnessType?: string
     setFailNextEvents(value: boolean): void
     setFailNextExecute(value: boolean): void
     setFailNextExecuteAfterAccept(value: boolean): void
+    setFailNextEntitlements(value: boolean): void
     streams: Set<ServerResponse>
     workflowEvents: MockWorkflowEventRequest[]
   }
@@ -5831,13 +5933,29 @@ async function handleMockCodexRequest(
     await sendWebResponse(res, Response.json({ ok: true }))
     return
   }
-  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
+  const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events|entitlements))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))
     return
   }
   const threadKey = decodeURIComponent(match[1])
   const endpoint = match[2] ?? 'session'
+
+  if (endpoint === 'entitlements') {
+    const request = await nodeRequestToWebRequest(req, url)
+    const body = (await request.json()) as MockEntitlementsRequest['body']
+    input.entitlements.push({ threadKey, body })
+    if (input.failNextEntitlements) {
+      input.setFailNextEntitlements(false)
+      await sendWebResponse(res, new Response('unavailable', { status: 503 }))
+      return
+    }
+    await sendWebResponse(
+      res,
+      Response.json({ external_prompting_enabled: input.externalPromptingEnabled })
+    )
+    return
+  }
 
   if (endpoint === 'session') {
     const request = await nodeRequestToWebRequest(req, url)

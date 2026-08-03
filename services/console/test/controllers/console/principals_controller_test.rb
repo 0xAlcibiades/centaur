@@ -66,6 +66,7 @@ module Console
       assert_equal "public", principal.sandbox_repo_cache
       assert_equal false, principal.sandbox_observability_enabled
       assert_equal false, principal.sandbox_api_server_enabled
+      assert_equal false, principal.sandbox_external_prompting_enabled
       assert_equal [ roles(:acme_infra) ], principal.roles
       assert_equal @operator, principal.created_by
     end
@@ -92,7 +93,8 @@ module Console
             params: {
               sandbox_repo_cache: "public",
               sandbox_observability_enabled: "0",
-              sandbox_api_server_enabled: "0"
+              sandbox_api_server_enabled: "0",
+              sandbox_external_prompting_enabled: "1"
             }
 
       assert_redirected_to console_principal_path(principal.oid)
@@ -102,6 +104,7 @@ module Console
       assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
       assert_equal false, principal.sandbox_observability_enabled
       assert_equal false, principal.sandbox_api_server_enabled
+      assert_equal true, principal.sandbox_external_prompting_enabled
     end
 
     test "update_slack_channel_permissions stores selected Slack channel permissions" do

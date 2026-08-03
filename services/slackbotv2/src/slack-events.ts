@@ -1,4 +1,5 @@
 import type { Logger, Message } from 'chat'
+import type { ExternalPromptingEntitlementInput } from './session-api'
 import { withSlackApiTimeout } from './session-api'
 import type { JsonValue, SlackbotV2Options } from './types'
 import { isJsonObject, stringValue } from './utils'
@@ -13,10 +14,14 @@ type RawSlackEvent = {
   app_id?: JsonValue
   bot_id?: JsonValue
   bot_profile?: RawSlackBotProfile
+  channel?: JsonValue
   source_team?: JsonValue
   subtype?: JsonValue
   team?: JsonValue
   team_id?: JsonValue
+  thread_ts?: JsonValue
+  ts?: JsonValue
+  type?: JsonValue
   user?: JsonValue
   user_team?: JsonValue
 }
@@ -49,6 +54,21 @@ const triggerBotUserAppCaches = new WeakMap<
   Map<string, Promise<string | null>>
 >()
 
+export type SlackExternalPromptingPolicy =
+  | { kind: 'not_required' }
+  | {
+      eventId?: string
+      externalTeamId: string
+      kind: 'deny'
+      teamId?: string
+    }
+  | {
+      eventId?: string
+      externalTeamId: string
+      input: ExternalPromptingEntitlementInput
+      kind: 'check'
+    }
+
 export function isAllowedSlackWebhookBody(
   rawBody: string,
   options: SlackbotV2Options,
@@ -75,6 +95,45 @@ export function isAllowedSlackWebhookBody(
     return false
   }
   return true
+}
+
+export function externalPromptingPolicyForSlackWebhook(
+  rawBody: string,
+  options: SlackbotV2Options
+): SlackExternalPromptingPolicy {
+  if (options.externalPromptingEntitlementsEnabled !== true) return { kind: 'not_required' }
+  const payload = parseSlackWebhookPayload(rawBody)
+  if (!payload || !isRawSlackEnvelope(payload) || payload.type !== 'event_callback') {
+    return { kind: 'not_required' }
+  }
+  const event = isRawSlackEvent(payload.event) ? payload.event : undefined
+  if (!event || !isPromptingEvent(event)) return { kind: 'not_required' }
+  const externalTeamId = externalSlackTeamIdForHome(stringValue(payload.team_id), event)
+  if (!externalTeamId) return { kind: 'not_required' }
+
+  const eventId = stringValue(payload.event_id)
+  const teamId = stringValue(payload.team_id)
+  const channelId = stringValue(event.channel)
+  const threadTs = stringValue(event.thread_ts) ?? stringValue(event.ts)
+  if (!channelId || !threadTs) {
+    return { eventId, externalTeamId, kind: 'deny', teamId }
+  }
+  return {
+    eventId,
+    externalTeamId,
+    input: {
+      channelId,
+      teamId,
+      threadId: `slack:${channelId}:${threadTs}`,
+      userId: stringValue(event.user)
+    },
+    kind: 'check'
+  }
+}
+
+function isPromptingEvent(event: RawSlackEvent): boolean {
+  const eventType = stringValue(event.type)
+  return eventType === 'app_mention' || eventType === 'message'
 }
 
 export function parseSlackWebhookPayload(rawBody: string): Record<string, unknown> | null {
@@ -135,7 +194,6 @@ export async function isAllowedSlackMessage(
     })
     return false
   }
-
   const triggerBotAllowlist =
     options.triggerBotAllowlist ?? splitEnvList(process.env.SLACKBOT_TRIGGER_BOT_ALLOWLIST)
   const botAuthored = message.author.isBot === true || (raw ? isBotAuthoredSlackEvent(raw) : false)

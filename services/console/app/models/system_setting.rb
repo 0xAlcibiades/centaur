@@ -1,4 +1,6 @@
 class SystemSetting < ApplicationRecord
+  DEFAULT_SANDBOX_EXTERNAL_PROMPTING_ENABLED = false
+
   attr_readonly :singleton
 
   before_validation :force_singleton, on: :create
@@ -18,7 +20,8 @@ class SystemSetting < ApplicationRecord
     {
       sandbox_repo_cache: default_sandbox_repo_cache,
       sandbox_observability_enabled: default_sandbox_observability_enabled,
-      sandbox_api_server_enabled: default_sandbox_api_server_enabled
+      sandbox_api_server_enabled: default_sandbox_api_server_enabled,
+      sandbox_external_prompting_enabled: DEFAULT_SANDBOX_EXTERNAL_PROMPTING_ENABLED
     }
   end
 

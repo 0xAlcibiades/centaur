@@ -502,6 +502,8 @@ pub struct Principal {
     pub sandbox_observability_enabled: bool,
     #[serde(default = "default_true")]
     pub sandbox_api_server_enabled: bool,
+    #[serde(default)]
+    pub sandbox_external_prompting_enabled: bool,
 }
 
 /// Request body for creating/updating one Slack permission row on a principal.
@@ -736,7 +738,20 @@ pub struct Proxy {
 
 #[cfg(test)]
 mod tests {
-    use super::{SlackChannelPermissionInput, normalize_gcp_id_token_header};
+    use super::{Principal, SlackChannelPermissionInput, normalize_gcp_id_token_header};
+
+    #[test]
+    fn principal_external_prompting_defaults_to_disabled_when_omitted() {
+        let principal: Principal = serde_json::from_value(serde_json::json!({
+            "id": "prn_test",
+            "namespace": "default",
+            "foreign_id": "slack-channel-c1",
+            "name": "Slack Channel C1"
+        }))
+        .unwrap();
+
+        assert!(!principal.sandbox_external_prompting_enabled);
+    }
 
     #[test]
     fn normalizes_supported_gcp_id_token_headers() {

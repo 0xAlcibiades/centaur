@@ -43,6 +43,7 @@ import {
   forwardToSessionApi,
   harnessRestartPreamble,
   interruptSessionExecution,
+  isExternalPromptingEnabled,
   isRetryableSessionApiError,
   openSessionEventStream,
   serializeAttachment,
@@ -64,9 +65,11 @@ import { resolveChannelDefault } from './channel-defaults'
 import { extractMessageOverrides, type HarnessOverrides } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import {
+  externalPromptingPolicyForSlackWebhook,
   isAllowedSlackMessage,
   isAllowedSlackWebhookBody,
-  parseSlackWebhookPayload
+  parseSlackWebhookPayload,
+  type SlackExternalPromptingPolicy
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
 import type {
@@ -129,6 +132,7 @@ type SlackAssistantAdapter = {
 const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
+  externalPromptingPolicy: SlackExternalPromptingPolicy
   waitUntil(promise: Promise<unknown>): void
 }
 
@@ -335,7 +339,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   chat.onNewMention(async (thread, message) => {
-    if (!(await isAllowedSlackMessage(message, options, logger))) return
+    if (!(await isAllowedSlackMessageForHandoff(message, options, logger))) return
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -352,7 +356,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   // payloads after Chat SDK has verified the webhook and before executing.
   chat.onNewMessage(/^.*$/s, async (thread, message) => {
     if (!slackRichTextMentionsUser(message.raw, options.botUserId)) return
-    if (!(await isAllowedSlackMessage(message, options, logger))) return
+    if (!(await isAllowedSlackMessageForHandoff(message, options, logger))) return
     message.isMention = true
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -365,7 +369,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
-    if (!(await isAllowedSlackMessage(message, options, logger))) return
+    if (!(await isAllowedSlackMessageForHandoff(message, options, logger))) return
     if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
     if (message.isMention !== true) {
       traceLog(
@@ -408,6 +412,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       const webhookFields = slackWebhookLogFields(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = {
+        externalPromptingPolicy: externalPromptingPolicyForSlackWebhook(rawBody, options),
         waitUntil: promise => waitUntil(c, promise)
       }
       const response = await requestContext.run(context, () => {
@@ -2693,6 +2698,42 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
     return
   }
   void promise.catch(() => undefined)
+}
+
+async function isAllowedSlackMessageForHandoff(
+  message: ChatMessage,
+  options: SlackbotV2Options,
+  logger: Logger
+): Promise<boolean> {
+  if (!(await isAllowedSlackMessage(message, options, logger))) return false
+
+  const policy = requestContext.getStore()?.externalPromptingPolicy
+  if (!policy || policy.kind === 'not_required') return true
+  if (policy.kind === 'deny') {
+    logger.warn('slackbotv2_event_ignored_external_prompting_identity_missing', {
+      event_id: policy.eventId,
+      external_team_id: policy.externalTeamId,
+      team_id: policy.teamId
+    })
+    return false
+  }
+
+  try {
+    if (await isExternalPromptingEnabled(options, policy.input)) return true
+    logger.warn('slackbotv2_event_ignored_external_prompting_disabled', {
+      event_id: policy.eventId,
+      external_team_id: policy.externalTeamId,
+      thread_id: policy.input.threadId
+    })
+  } catch (error) {
+    logger.warn('slackbotv2_event_ignored_external_prompting_entitlement_lookup_failed', {
+      error: errorMessage(error),
+      event_id: policy.eventId,
+      external_team_id: policy.externalTeamId,
+      thread_id: policy.input.threadId
+    })
+  }
+  return false
 }
 
 function createLateSlackFileRepair(options: SlackbotV2Options, state: StateAdapter) {

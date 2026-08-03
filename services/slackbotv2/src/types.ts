@@ -161,6 +161,8 @@ export type SlackbotV2Options = {
    * Defaults to codex.
    */
   defaultHarnessType?: string
+  /** Require a live Console entitlement in addition to the external-org allowlist. */
+  externalPromptingEntitlementsEnabled?: boolean
   fetch?: SlackbotV2Fetch
   /**
    * Deployment-configured default model per harness wire value (claudecode |

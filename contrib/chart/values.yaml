@@ -486,6 +486,9 @@ slackbotv2:
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
   mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
+  # Require a live per-principal Console entitlement after the external-org
+  # allowlist passes. Disabled preserves the legacy allowlist-only behavior.
+  externalPromptingEntitlementsEnabled: false
   triggerBotAllowlist: ""
   # Per-channel default harness / model / provider / reasoning, keyed by Slack
   # conversation id (the C…/G…/D… id). Each value is an object of optional

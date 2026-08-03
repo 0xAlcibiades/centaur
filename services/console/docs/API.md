@@ -1203,6 +1203,7 @@ system-managed `default/infra` role.
 | `labels`     | optional    | Extensible metadata. Compatibility identity labels are still accepted and synthesized in responses during the transition. |
 | `slack_channel_permissions` | optional | Direct permissions owned by the principal. Full replacement when present on create or update. |
 | `effective_slack_channel_permissions` | response only | Direct permissions merged with permissions inherited from assigned roles. |
+| `sandbox_external_prompting_enabled` | optional | Allows external Slack users from deployment-approved organizations to prompt this principal. Defaults to `false`. |
 
 Known kinds are `unknown`, `user`, `console_user`, `workflow`,
 `slack_channel`, `slack_dm`, `discord_channel`, `linear_issue`, `teams_user`,

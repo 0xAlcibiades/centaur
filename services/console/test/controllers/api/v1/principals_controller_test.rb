@@ -55,6 +55,7 @@ module Api
         assert_not data.key?("sandbox_repo_cache_enabled")
         assert_equal true, data["sandbox_observability_enabled"]
         assert_equal true, data["sandbox_api_server_enabled"]
+        assert_equal false, data["sandbox_external_prompting_enabled"]
       end
 
       test "GET returns 404 for an unknown oid" do
@@ -118,6 +119,7 @@ module Api
         assert_not data.key?("sandbox_repo_cache_enabled")
         assert_equal true, data["sandbox_observability_enabled"]
         assert_equal true, data["sandbox_api_server_enabled"]
+        assert_equal false, data["sandbox_external_prompting_enabled"]
       end
 
       test "POST applies system sandbox defaults when omitted" do
@@ -140,6 +142,7 @@ module Api
         assert_equal "public", data["sandbox_repo_cache"]
         assert_equal false, data["sandbox_observability_enabled"]
         assert_equal false, data["sandbox_api_server_enabled"]
+        assert_equal false, data["sandbox_external_prompting_enabled"]
       end
 
       test "POST applies configured default roles from the principal namespace" do
@@ -166,7 +169,8 @@ module Api
             foreign_id: "U-explicit-capabilities",
             sandbox_repo_cache: "all",
             sandbox_observability_enabled: true,
-            sandbox_api_server_enabled: true
+            sandbox_api_server_enabled: true,
+            sandbox_external_prompting_enabled: true
           }
         }
 
@@ -177,6 +181,7 @@ module Api
         assert_equal "all", data["sandbox_repo_cache"]
         assert_equal true, data["sandbox_observability_enabled"]
         assert_equal true, data["sandbox_api_server_enabled"]
+        assert_equal true, data["sandbox_external_prompting_enabled"]
       end
 
       test "POST overwrites explicit repo-cache label with system default" do
@@ -241,7 +246,8 @@ module Api
         principal.update!(
           sandbox_repo_cache: "none",
           sandbox_observability_enabled: false,
-          sandbox_api_server_enabled: false
+          sandbox_api_server_enabled: false,
+          sandbox_external_prompting_enabled: true
         )
         body = { data: { name: "Acme Slack channel" } }
 
@@ -253,6 +259,7 @@ module Api
         assert_equal "none", principal.sandbox_repo_cache
         assert_equal false, principal.sandbox_observability_enabled
         assert_equal false, principal.sandbox_api_server_enabled
+        assert_equal true, principal.sandbox_external_prompting_enabled
       end
 
       test "PUT updates sandbox access flags" do
@@ -261,7 +268,8 @@ module Api
           data: {
             sandbox_repo_cache: "public",
             sandbox_observability_enabled: false,
-            sandbox_api_server_enabled: false
+            sandbox_api_server_enabled: false,
+            sandbox_external_prompting_enabled: true
           }
         }
 
@@ -272,12 +280,14 @@ module Api
         assert_equal "public", principal.sandbox_repo_cache
         assert_equal false, principal.sandbox_observability_enabled
         assert_equal false, principal.sandbox_api_server_enabled
+        assert_equal true, principal.sandbox_external_prompting_enabled
 
         data = json_body.fetch("data")
         assert_equal "public", data["sandbox_repo_cache"]
         assert_not data.key?("sandbox_repo_cache_enabled")
         assert_equal false, data["sandbox_observability_enabled"]
         assert_equal false, data["sandbox_api_server_enabled"]
+        assert_equal true, data["sandbox_external_prompting_enabled"]
       end
 
       test "POST returns 422 when (namespace, foreign_id) already exists" do

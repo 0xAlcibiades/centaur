@@ -164,6 +164,45 @@ export async function withSlackApiTimeout<T>(
   return options ? withTimeout(action, slackApiTimeoutMs(options), fn) : fn()
 }
 
+export type ExternalPromptingEntitlementInput = {
+  channelId: string
+  teamId?: string
+  threadId: string
+  userId?: string
+}
+
+export async function isExternalPromptingEnabled(
+  options: SlackbotV2Options,
+  input: ExternalPromptingEntitlementInput
+): Promise<boolean> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await recordSessionApiOperation('session_entitlements', () =>
+    fetchWithTimeout(
+      fetchFn,
+      apiSessionUrl(options.apiUrl, input.threadId, 'entitlements'),
+      {
+        method: 'POST',
+        headers: apiHeaders(options),
+        body: JSON.stringify({
+          metadata: {
+            source: 'slackbotv2',
+            platform: 'slack',
+            thread_id: input.threadId,
+            slack_channel_id: input.channelId,
+            ...(input.userId ? { slack_user_id: input.userId } : {}),
+            ...(input.teamId ? { slack_team_id: input.teamId } : {})
+          }
+        })
+      },
+      Math.min(sessionApiTimeoutMs(options), 2_000),
+      'resolve session entitlements'
+    )
+  )
+  await ensureApiOk(response, 'resolve session entitlements')
+  const payload: unknown = await response.json()
+  return isJsonObject(payload) && payload.external_prompting_enabled === true
+}
+
 type ForwardSessionApiCallbacks = {
   onExecutionStarted?(execution: SlackbotV2ExecuteSessionResponse): Promise<void>
   onMessagesAppended?(): Promise<void>
@@ -1411,7 +1450,7 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: 'messages' | 'execute' | 'events' | 'interrupt'
+  suffix?: 'messages' | 'execute' | 'events' | 'interrupt' | 'entitlements'
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ''}`
   return new URL(path, ensureTrailingSlash(apiUrl)).toString()

@@ -62,7 +62,8 @@ use crate::{
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
         ExecuteSessionResponse, GithubThreadContext, HarnessAssignment,
         InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
+        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse,
+        SessionEntitlementsRequest, SessionEntitlementsResponse, SessionSseEvent,
         SlackThreadContext, stream_error_sse,
     },
 };
@@ -221,6 +222,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
+        )
+        .route(
+            "/api/session/{thread_key}/entitlements",
+            post(get_session_entitlements),
         )
         .route(
             "/api/session/{thread_key}/messages",
@@ -500,6 +505,28 @@ async fn create_or_get_session(
         session: outcome.session,
         harness_switched: outcome.harness_switched,
         harness_assignment,
+    }))
+}
+
+async fn get_session_entitlements(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<SessionEntitlementsRequest>,
+) -> Result<Json<SessionEntitlementsResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let external_prompting_enabled = state
+        .runtime()?
+        .external_prompting_enabled(&thread_key, request.metadata.as_ref())
+        .await?;
+    tracing::info!(
+        component = "api_server",
+        event = "session_entitlements_resolved",
+        thread_key = %thread_key,
+        external_prompting_enabled,
+        "resolved live session entitlements"
+    );
+    Ok(Json(SessionEntitlementsResponse {
+        external_prompting_enabled,
     }))
 }
 

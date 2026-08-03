@@ -363,6 +363,7 @@
           "enum": ["first", "always", "never"]
         },
         "responseServiceTierEnabled": { "type": "boolean" },
+        "externalPromptingEntitlementsEnabled": { "type": "boolean" },
         "metrics": {
           "type": "object",
           "properties": {
