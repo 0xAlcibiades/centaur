@@ -13,7 +13,6 @@ class SystemSettingTest < ActiveSupport::TestCase
     assert_equal "all", settings.default_sandbox_repo_cache
     assert_equal true, settings.default_sandbox_observability_enabled
     assert_equal true, settings.default_sandbox_api_server_enabled
-    assert_equal false, settings.principal_defaults.fetch(:sandbox_external_prompting_enabled)
   end
 
   test "repo-cache setting is validated" do

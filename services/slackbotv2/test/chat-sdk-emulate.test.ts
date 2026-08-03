@@ -341,7 +341,6 @@ describe('slackbotv2', () => {
       expect(response.status).toBe(200)
       await Promise.all(waits)
     }
-
     expect(codexApi.workflowEvents).toHaveLength(2)
     expect(codexApi.workflowEvents[0]).toEqual({
       event_name: 'slack.block_action.deploy.approve',
@@ -5003,6 +5002,7 @@ describe('slackbotv2', () => {
     )
     expect(allowedExternalResponse.status).toBe(200)
     await Promise.all(allowedExternalWaits)
+    expect(codexApi.entitlements).toHaveLength(0)
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
 
@@ -5211,27 +5211,27 @@ describe('slackbotv2', () => {
       expect(response.status).toBe(200)
       await Promise.all(waits)
     }
+    const expectHandoffCount = (count: number) => {
+      expect(codexApi.entitlements).toHaveLength(1)
+      for (const requests of [codexApi.creates, codexApi.appends, codexApi.executes]) {
+        expect(requests).toHaveLength(count)
+      }
+    }
 
     bot = createTestBot({
       allowedExternalTeamIds: ['TEXTERNAL'],
       externalPromptingEntitlementsEnabled: true
     })
     await sendExternalMention('Ev-slackbotv2-entitlement-disabled', 'entitlement disabled')
-    expect(codexApi.entitlements).toHaveLength(1)
-    expect(codexApi.creates).toHaveLength(0)
-    expect(codexApi.appends).toHaveLength(0)
-    expect(codexApi.executes).toHaveLength(0)
+    expectHandoffCount(0)
 
     codexApi.reset()
-    codexApi.externalPromptingEnabled = true
+    codexApi.externalPromptingResult = true
     await sendExternalMention('Ev-slackbotv2-entitlement-enabled', 'entitlement enabled')
-    expect(codexApi.entitlements).toHaveLength(1)
-    expect(codexApi.creates).toHaveLength(1)
-    expect(codexApi.appends).toHaveLength(1)
-    expect(codexApi.executes).toHaveLength(1)
+    expectHandoffCount(1)
 
     codexApi.reset()
-    codexApi.failNextEntitlements = true
+    codexApi.externalPromptingResult = 'error'
     const logs: CapturedLog[] = []
     bot = createTestBot({
       allowedExternalTeamIds: ['TEXTERNAL'],
@@ -5239,10 +5239,7 @@ describe('slackbotv2', () => {
       logger: captureLogger(logs)
     })
     await sendExternalMention('Ev-slackbotv2-entitlement-error', 'entitlement unavailable')
-    expect(codexApi.entitlements).toHaveLength(1)
-    expect(codexApi.creates).toHaveLength(0)
-    expect(codexApi.appends).toHaveLength(0)
-    expect(codexApi.executes).toHaveLength(0)
+    expectHandoffCount(0)
     expect(
       hasLog(logs, 'slackbotv2_event_ignored_external_prompting_entitlement_lookup_failed')
     ).toBe(true)
@@ -5631,10 +5628,7 @@ type MockSessionEventRequest = {
   threadKey: string
 }
 
-type MockEntitlementsRequest = {
-  body: { metadata?: Record<string, unknown> }
-  threadKey: string
-}
+type MockEntitlementsRequest = MockSessionRequest<{ metadata?: Record<string, unknown> }>
 
 type MockSessionEvent = {
   data: string
@@ -5664,7 +5658,6 @@ type MockSessionApi = {
   failNextEvents: boolean
   failNextExecute: boolean
   failNextExecuteAfterAccept: boolean
-  failNextEntitlements: boolean
   holdNextExecute(): () => void
   harnessAssignment?: {
     experiment: string
@@ -5673,7 +5666,7 @@ type MockSessionApi = {
     rollout_percent: number
   }
   resolvedHarnessType?: string
-  externalPromptingEnabled: boolean
+  externalPromptingResult: boolean | 'error'
   reset(): void
   streamCount: number
   url: string
@@ -5697,8 +5690,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let failNextEvents = false
   let failNextExecute = false
   let failNextExecuteAfterAccept = false
-  let failNextEntitlements = false
-  let externalPromptingEnabled = false
+  let externalPromptingResult: boolean | 'error' = false
   let harnessAssignment: MockSessionApi['harnessAssignment']
   let resolvedHarnessType: string | undefined
   const port = await availablePort(4063)
@@ -5726,11 +5718,8 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       get failNextExecuteAfterAccept() {
         return failNextExecuteAfterAccept
       },
-      get failNextEntitlements() {
-        return failNextEntitlements
-      },
-      get externalPromptingEnabled() {
-        return externalPromptingEnabled
+      get externalPromptingResult() {
+        return externalPromptingResult
       },
       get failNextEvents() {
         return failNextEvents
@@ -5755,9 +5744,6 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       },
       setFailNextExecuteAfterAccept(value) {
         failNextExecuteAfterAccept = value
-      },
-      setFailNextEntitlements(value) {
-        failNextEntitlements = value
       },
       streams,
       workflowEvents
@@ -5791,8 +5777,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextEvents = false
       failNextExecute = false
       failNextExecuteAfterAccept = false
-      failNextEntitlements = false
-      externalPromptingEnabled = false
+      externalPromptingResult = false
       harnessAssignment = undefined
       resolvedHarnessType = undefined
       workflowEvents.length = 0
@@ -5818,17 +5803,11 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     set failNextExecuteAfterAccept(value: boolean) {
       failNextExecuteAfterAccept = value
     },
-    get failNextEntitlements() {
-      return failNextEntitlements
+    get externalPromptingResult() {
+      return externalPromptingResult
     },
-    set failNextEntitlements(value: boolean) {
-      failNextEntitlements = value
-    },
-    get externalPromptingEnabled() {
-      return externalPromptingEnabled
-    },
-    set externalPromptingEnabled(value: boolean) {
-      externalPromptingEnabled = value
+    set externalPromptingResult(value: boolean | 'error') {
+      externalPromptingResult = value
     },
     get failNextEvents() {
       return failNextEvents
@@ -5911,8 +5890,7 @@ async function handleMockCodexRequest(
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
-    failNextEntitlements: boolean
-    externalPromptingEnabled: boolean
+    externalPromptingResult: boolean | 'error'
     harnessAssignment?: MockSessionApi['harnessAssignment']
     idempotentExecutions: Map<string, string>
     nextEventId(): number
@@ -5921,7 +5899,6 @@ async function handleMockCodexRequest(
     setFailNextEvents(value: boolean): void
     setFailNextExecute(value: boolean): void
     setFailNextExecuteAfterAccept(value: boolean): void
-    setFailNextEntitlements(value: boolean): void
     streams: Set<ServerResponse>
     workflowEvents: MockWorkflowEventRequest[]
   }
@@ -5945,14 +5922,13 @@ async function handleMockCodexRequest(
     const request = await nodeRequestToWebRequest(req, url)
     const body = (await request.json()) as MockEntitlementsRequest['body']
     input.entitlements.push({ threadKey, body })
-    if (input.failNextEntitlements) {
-      input.setFailNextEntitlements(false)
+    if (input.externalPromptingResult === 'error') {
       await sendWebResponse(res, new Response('unavailable', { status: 503 }))
       return
     }
     await sendWebResponse(
       res,
-      Response.json({ external_prompting_enabled: input.externalPromptingEnabled })
+      Response.json({ external_prompting_enabled: input.externalPromptingResult })
     )
     return
   }

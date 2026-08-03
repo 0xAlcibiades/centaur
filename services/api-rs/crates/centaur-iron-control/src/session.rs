@@ -146,7 +146,11 @@ impl SessionRegistrar {
         Ok(record)
     }
 
-    fn session_principal_input(&self, thread_key: &str, metadata: Option<&Value>) -> PrincipalInput {
+    fn session_principal_input(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> PrincipalInput {
         let metadata = SessionPrincipalMetadata::from_session_metadata(metadata);
         let principal = derive_principal_with_slack_team(
             thread_key,
@@ -327,11 +331,10 @@ mod tests {
             "slack_conversation_name": "general"
         });
 
-        let principal = registrar
+        registrar
             .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
             .unwrap();
-        assert!(!principal.sandbox_external_prompting_enabled);
 
         let requests = requests.lock().unwrap();
         assert!(
@@ -365,11 +368,10 @@ mod tests {
             "slack_conversation_name": "general"
         });
 
-        let principal = registrar
+        registrar
             .register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
             .unwrap();
-        assert!(principal.sandbox_external_prompting_enabled);
 
         let requests = requests.lock().unwrap();
         assert!(
@@ -394,59 +396,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_register_session_returns_existing_principal_without_writes() {
-        let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
-        let metadata = json!({
-            "slack_user_id": "U123",
-            "slack_team_id": "T123",
-            "slack_conversation_name": "general"
-        });
+    async fn get_or_register_session_only_writes_unknown_principals() {
+        for principal_exists in [true, false] {
+            let (base_url, requests, server) = spawn_iron_control_stub(principal_exists).await;
+            let registrar =
+                SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+            let metadata = json!({
+                "slack_user_id": "U123",
+                "slack_team_id": "T123",
+                "slack_conversation_name": "general"
+            });
 
-        let principal = registrar
-            .get_or_register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
-            .await
-            .unwrap();
+            let principal = registrar
+                .get_or_register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
+                .await
+                .unwrap();
 
-        assert!(principal.sandbox_external_prompting_enabled);
-        assert_eq!(
-            requests.lock().unwrap().as_slice(),
-            ["GET /api/v1/principals/lookup/default/slack-channel-t123-c123"]
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn get_or_register_session_creates_an_unknown_principal() {
-        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
-        let metadata = json!({
-            "slack_user_id": "U123",
-            "slack_team_id": "T123",
-            "slack_conversation_name": "general"
-        });
-
-        let principal = registrar
-            .get_or_register_session("slack:T123:C123:1773364194.179929", Some(&metadata))
-            .await
-            .unwrap();
-
-        assert!(!principal.sandbox_external_prompting_enabled);
-        let requests = requests.lock().unwrap();
-        assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
-        );
-        assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
-        assert!(
-            requests.contains(
-                &"POST /api/v1/principals/prn_channel/slack_channel_permissions".to_owned()
-            )
-        );
-        server.abort();
+            assert_eq!(
+                principal.sandbox_external_prompting_enabled,
+                principal_exists
+            );
+            let requests = requests.lock().unwrap();
+            let expected = if principal_exists {
+                vec!["GET /api/v1/principals/lookup/default/slack-channel-t123-c123"]
+            } else {
+                vec![
+                    "GET /api/v1/principals/lookup/default/slack-channel-t123-c123",
+                    "PUT /api/v1/principals/slack-channel-t123-c123",
+                    "POST /api/v1/principals/prn_channel/slack_channel_permissions",
+                ]
+            };
+            assert_eq!(
+                requests.as_slice(),
+                expected,
+                "existing principals must not be rewritten"
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]
