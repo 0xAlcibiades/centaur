@@ -5,7 +5,8 @@ import {
   defaultModelForHarness,
   defaultReasoningForHarness,
   effectiveReasoningForHarness,
-  harnessDisplayName
+  harnessDisplayName,
+  reasoningForModel
 } from '../src/console-session-link'
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
@@ -33,6 +34,65 @@ describe('harnessDisplayName', () => {
     expect(harnessDisplayName(null)).toBeUndefined()
     expect(harnessDisplayName('')).toBeUndefined()
     expect(harnessDisplayName('   ')).toBeUndefined()
+  })
+})
+
+describe('reasoningForModel', () => {
+  const allEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  const standardEfforts = ['none', 'low', 'medium', 'high', 'xhigh']
+  const proEfforts = ['medium', 'high', 'xhigh']
+  const codexModelEfforts = ['low', 'medium', 'high', 'xhigh']
+  const effortsByModel: Record<string, string[]> = {
+    'gpt-5.2': standardEfforts,
+    'gpt-5.2-codex': codexModelEfforts,
+    'gpt-5.4': standardEfforts,
+    'gpt-5.4-mini': standardEfforts,
+    'gpt-5.4-nano': standardEfforts,
+    'gpt-5.4-pro': proEfforts,
+    'gpt-5.5': standardEfforts,
+    'gpt-5.5-pro': proEfforts,
+    'gpt-5.6-luna': [...standardEfforts, 'max'],
+    'gpt-5.6-sol': [...standardEfforts, 'max'],
+    'gpt-5.6-terra': [...standardEfforts, 'max']
+  }
+
+  test('matches the reasoning efforts advertised by supported Codex models', () => {
+    for (const [model, supportedEfforts] of Object.entries(effortsByModel)) {
+      for (const effort of allEfforts) {
+        expect(reasoningForModel('codex', model, effort)).toBe(
+          supportedEfforts.includes(effort) ? effort : undefined
+        )
+      }
+    }
+  })
+
+  test('validates Nanocodex against its selected model after mapping minimal to low', () => {
+    for (const [model, supportedEfforts] of Object.entries(effortsByModel)) {
+      for (const effort of allEfforts) {
+        const effectiveEffort = effort === 'minimal' ? 'low' : effort
+        expect(reasoningForModel('nanocodex', model, effort)).toBe(
+          supportedEfforts.includes(effectiveEffort) ? effort : undefined
+        )
+      }
+    }
+  })
+
+  test('supports current model aliases and snapshots without widening their effort sets', () => {
+    expect(reasoningForModel('codex', 'gpt-5.6', 'max')).toBe('max')
+    expect(reasoningForModel('nanocodex', 'gpt-5.6', 'max')).toBe('max')
+    expect(reasoningForModel('codex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBeUndefined()
+    expect(reasoningForModel('nanocodex', 'gpt-5.6-sol-2026-07-01', 'minimal')).toBe(
+      'minimal'
+    )
+    expect(reasoningForModel('codex', 'gpt-5.5-pro-2026-07-01', 'low')).toBeUndefined()
+    expect(reasoningForModel('nanocodex', 'gpt-5.5-pro-2026-07-01', 'low')).toBeUndefined()
+    expect(reasoningForModel('codex', 'gpt-5.4-2026-03-05', 'xhigh')).toBe('xhigh')
+    expect(reasoningForModel('codex', 'gpt-5.3', 'high')).toBeUndefined()
+  })
+
+  test('rejects Codex efforts for the currently selected non-Codex model', () => {
+    expect(reasoningForModel('claudecode', 'claude-opus-4-8', 'high')).toBeUndefined()
+    expect(reasoningForModel('amp', 'fast', 'low')).toBeUndefined()
   })
 })
 

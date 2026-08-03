@@ -34,11 +34,6 @@ class ProtocolError(RuntimeError):
     pass
 
 
-@dataclasses.dataclass(frozen=True)
-class StdinReadFailure:
-    message: str
-
-
 class RpcClient:
     def __init__(self) -> None:
         self._next_request_id = 1
@@ -390,32 +385,6 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
             await pool.close()
 
 
-async def open_stdin_reader() -> tuple[asyncio.StreamReader, asyncio.Transport]:
-    reader = asyncio.StreamReader(limit=WORKFLOW_HOST_MAX_MESSAGE_BYTES)
-    protocol = asyncio.StreamReaderProtocol(reader)
-    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
-        lambda: protocol, sys.stdin
-    )
-    return reader, transport
-
-
-async def read_stdin(
-    reader: asyncio.StreamReader,
-    stdin_queue: asyncio.Queue[dict[str, Any] | StdinReadFailure | None],
-) -> None:
-    try:
-        while True:
-            line = await reader.readline()
-            if line == b"":
-                await stdin_queue.put(None)
-                return
-            await stdin_queue.put(json.loads(line))
-    except Exception:
-        await stdin_queue.put(
-            StdinReadFailure("workflow host stdin protocol failed")
-        )
-
-
 def discovery_payload() -> dict[str, Any]:
     workflows, candidate_count = discover_workflows_with_candidate_count()
     return {
@@ -434,98 +403,140 @@ def discovery_payload() -> dict[str, Any]:
     }
 
 
+async def read_protocol_line(reader: asyncio.StreamReader, buffer: bytearray) -> bytes:
+    search_from = 0
+    while True:
+        newline = buffer.find(b"\n", search_from)
+        if newline >= 0:
+            if newline > WORKFLOW_HOST_MAX_MESSAGE_BYTES:
+                raise ProtocolError(
+                    "workflow host protocol message exceeds "
+                    f"{WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+                )
+            line = bytes(buffer[: newline + 1])
+            del buffer[: newline + 1]
+            return line
+
+        search_from = len(buffer)
+        chunk = await reader.read(64 * 1024)
+        if chunk:
+            buffer.extend(chunk)
+            if len(buffer) > WORKFLOW_HOST_MAX_MESSAGE_BYTES:
+                raise ProtocolError(
+                    "workflow host protocol message exceeds "
+                    f"{WORKFLOW_HOST_MAX_MESSAGE_BYTES} bytes"
+                )
+            continue
+        if buffer:
+            line = bytes(buffer)
+            buffer.clear()
+            return line
+        return b""
+
+
 async def main() -> int:
     rpc = RpcClient()
-    stdin_queue: asyncio.Queue[dict[str, Any] | StdinReadFailure | None] = (
-        asyncio.Queue()
-    )
-    completion_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     active_workflow: asyncio.Task[dict[str, Any]] | None = None
-    stdin_reader, stdin_transport = await open_stdin_reader()
-    stdin_task = asyncio.create_task(read_stdin(stdin_reader, stdin_queue))
 
-    def watch_workflow(task: asyncio.Task[dict[str, Any]]) -> None:
-        if task.cancelled():
-            return
+    async def workflow_response(task: asyncio.Task[dict[str, Any]]) -> dict[str, Any]:
         try:
-            completion_queue.put_nowait(task.result())
+            return await task
         except Exception as exc:
-            completion_queue.put_nowait(
-                {
-                    "type": "workflow.error",
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-            )
+            return {
+                "type": "workflow.error",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    try:
+        transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    except Exception as exc:
+        await rpc.write(
+            {
+                "type": "host.error",
+                "message": f"failed to read workflow host input: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return 1
+
+    stdin_read: asyncio.Task[bytes] | None = None
+    stdin_buffer = bytearray()
 
     try:
         while True:
-            stdin_get = asyncio.create_task(stdin_queue.get())
-            completion_get = asyncio.create_task(completion_queue.get())
-            done, pending = await asyncio.wait(
-                {stdin_get, completion_get},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
+            if active_workflow is None:
+                line = await read_protocol_line(reader, stdin_buffer)
+            else:
+                stdin_read = asyncio.create_task(
+                    read_protocol_line(reader, stdin_buffer)
+                )
+                done, _ = await asyncio.wait(
+                    {stdin_read, active_workflow},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if active_workflow in done:
+                    await rpc.write(await workflow_response(active_workflow))
+                    active_workflow = None
+                    return 0
+                line = stdin_read.result()
+                stdin_read = None
 
-            if completion_get in done:
-                active_workflow = None
-                await rpc.write(completion_get.result())
+            if line == b"":
+                if active_workflow is not None:
+                    await rpc.write(await workflow_response(active_workflow))
+                    active_workflow = None
                 return 0
 
-            message = stdin_get.result()
-            if isinstance(message, StdinReadFailure):
-                if active_workflow is not None:
-                    active_workflow.cancel()
-                    try:
-                        await active_workflow
-                    except asyncio.CancelledError:
-                        pass
-                await rpc.write({"type": "host.error", "message": message.message})
+            try:
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ProtocolError("workflow host input must be a JSON object")
+            except Exception as exc:
+                await rpc.write(
+                    {
+                        "type": "host.error",
+                        "message": f"invalid workflow host input: {exc}",
+                        "traceback": traceback.format_exc(),
+                    }
+                )
                 return 1
-            if message is None:
-                if active_workflow is not None:
-                    active_workflow.cancel()
-                    try:
-                        await active_workflow
-                    except asyncio.CancelledError:
-                        pass
-                    await rpc.write(
-                        {
-                            "type": "host.error",
-                            "message": "workflow host stdin closed during an active workflow",
-                        }
-                    )
-                    return 1
-                return 0
+
             message_type = message.get("type")
             try:
                 if message_type == "ctx.response":
                     rpc.resolve(message)
+                    # Let the unblocked workflow publish its terminal result before
+                    # consuming any already-buffered follow-up input.
+                    await asyncio.sleep(0)
                     continue
                 if message_type == "workflow.discover":
                     await rpc.write(discovery_payload())
                     return 0
                 if message_type == "workflow.start":
                     if active_workflow is not None:
+                        # A context response can complete the active workflow while
+                        # another start is already buffered. Prefer that terminal
+                        # result over reporting a spurious concurrency error.
+                        await asyncio.wait({active_workflow}, timeout=0.1)
+                        if active_workflow.done():
+                            await rpc.write(await workflow_response(active_workflow))
+                            active_workflow = None
+                            return 0
                         await rpc.write(
                             {
                                 "type": "workflow.error",
                                 "message": "workflow host already has an active workflow",
                             }
                         )
-                        active_workflow.cancel()
-                        await asyncio.gather(active_workflow, return_exceptions=True)
-                        return 1
+                        continue
                     active_workflow = asyncio.create_task(run_workflow(message, rpc))
-                    active_workflow.add_done_callback(watch_workflow)
                     continue
                 raise ProtocolError(f"unknown message type {message_type!r}")
             except Exception as exc:
-                if active_workflow is not None:
-                    active_workflow.cancel()
-                    await asyncio.gather(active_workflow, return_exceptions=True)
                 await rpc.write(
                     {
                         "type": "host.error",
@@ -533,11 +544,13 @@ async def main() -> int:
                         "traceback": traceback.format_exc(),
                     }
                 )
-                return 1
     finally:
-        stdin_task.cancel()
-        await asyncio.gather(stdin_task, return_exceptions=True)
-        stdin_transport.close()
+        transport.close()
+        remaining = [task for task in (stdin_read, active_workflow) if task is not None]
+        for task in remaining:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
 
 
 if __name__ == "__main__":
