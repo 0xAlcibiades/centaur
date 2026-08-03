@@ -1232,7 +1232,7 @@ impl SessionRuntime {
             return Ok(false);
         };
         let principal = registrar
-            .register_session(thread_key.as_str(), metadata)
+            .get_or_register_session(thread_key.as_str(), metadata)
             .await?;
         Ok(principal.sandbox_external_prompting_enabled)
     }
