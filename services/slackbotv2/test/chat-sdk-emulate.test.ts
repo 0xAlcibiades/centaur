@@ -119,7 +119,7 @@ describe('slackbotv2', () => {
 
     const response = await bot.app.request(
       '/api/slack/commands',
-      signedSlackCommand('strike-curve-audit off', USER_B_ID)
+      signedSlackCommand('market-label-audit off', USER_B_ID)
     )
 
     expect(response.status).toBe(200)
@@ -135,7 +135,7 @@ describe('slackbotv2', () => {
       updated_by: `slack:${USER_B_ID}`,
       metadata: {
         channel_id: CHANNEL_ID,
-        command: '/bojak strike-curve-audit',
+        command: '/bojak market-label-audit',
         team_id: TEAM_ID,
         user_id: USER_B_ID
       }
@@ -145,7 +145,7 @@ describe('slackbotv2', () => {
   })
 
   it('rejects unsigned workflow toggle commands', async () => {
-    const request = signedSlackCommand('strike-curve-audit on', USER_ID)
+    const request = signedSlackCommand('market-label-audit on', USER_ID)
     const headers = new Headers(request.headers)
     headers.set('x-slack-signature', 'v0=invalid')
 
@@ -170,13 +170,13 @@ describe('slackbotv2', () => {
 
     const response = await bot.app.request(
       '/api/slack/commands',
-      signedSlackCommand('strike-curve-audit maybe', USER_ID)
+      signedSlackCommand('market-label-audit maybe', USER_ID)
     )
 
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({
       response_type: 'ephemeral',
-      text: 'Usage: `/bojak strike-curve-audit on` or `/bojak strike-curve-audit off`.'
+      text: 'Usage: `/bojak market-label-audit on` or `/bojak market-label-audit off`.'
     })
     expect(apiCalled).toBe(false)
   })

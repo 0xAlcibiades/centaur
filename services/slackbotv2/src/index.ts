@@ -114,7 +114,7 @@ const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 const SLACK_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
 const MARKET_LABEL_AUDIT_WORKFLOW = 'market-label-audit'
-const MARKET_LABEL_AUDIT_COMMAND = 'strike-curve-audit'
+const MARKET_LABEL_AUDIT_COMMAND = 'market-label-audit'
 
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
@@ -272,7 +272,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     ) {
       return c.json({
         response_type: 'ephemeral',
-        text: 'Usage: `/bojak strike-curve-audit on` or `/bojak strike-curve-audit off`.'
+        text: 'Usage: `/bojak market-label-audit on` or `/bojak market-label-audit off`.'
       })
     }
 
@@ -285,7 +285,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         updatedBy: `slack:${userId}`,
         metadata: {
           channel_id: form.get('channel_id') ?? '',
-          command: '/bojak strike-curve-audit',
+          command: '/bojak market-label-audit',
           team_id: form.get('team_id') ?? '',
           user_id: userId
         }
