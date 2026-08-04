@@ -1,5 +1,5 @@
+mod activity_summary;
 mod args;
-mod tool_discovery;
 
 use centaur_api_server::{AppState, build_router_with_app_state};
 use centaur_session_runtime::SessionRuntime;
@@ -25,11 +25,25 @@ async fn main() -> Result<(), ServerError> {
         "starting centaur api-rs server"
     );
 
-    let app_state = AppState::unready();
+    let app_state = AppState::unready()
+        .with_codex_nanocodex_rollout_percent(args.codex_nanocodex_rollout_percent())
+        .with_slack_session_bearer_secret(args.slack_session_bearer_secret())
+        .with_slack_trace_consent_bearer_secret(args.slack_trace_consent_bearer_secret());
     let app = build_router_with_app_state(app_state.clone());
+    let shutdown_state = app_state.clone();
+    let drain_timeout = args.shutdown_execution_drain_timeout();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                info!("shutdown signal received; handing off in-flight executions");
+                // Hand off before axum starts draining connections: open SSE
+                // streams can keep the server future alive until SIGKILL, and
+                // the lease release must not be lost to that.
+                if let Some(runtime) = shutdown_state.session_runtime() {
+                    runtime.handoff_owned_executions(drain_timeout).await;
+                }
+            })
             .await
     });
 
@@ -58,46 +72,85 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     if args.server.run_migrations {
         store.run_migrations().await?;
     }
+    if let Some(config) = args.activity_summary_config() {
+        let worker = activity_summary::ActivitySummaryWorker::new(store.clone(), config)?;
+        tokio::spawn(worker.run());
+    }
     let pool = store.pool().clone();
+    let metadata_trace_config = args.metadata_trace_config_identity()?;
+    validate_metadata_trace_startup(
+        metadata_trace_config.as_ref(),
+        store.has_persisted_metadata_trace_state().await?,
+    )?;
+    let should_run_metadata_trace_reconciler = metadata_trace_reconciler_runs(
+        metadata_trace_config.as_ref(),
+        args.slack_trace_consent_bearer_secret().is_some(),
+    );
+    if let Some(identity) = metadata_trace_config.as_ref() {
+        // Fail before readiness if this replica is stale or split-brain. A
+        // config fingerprint is not an ordering mechanism; the deployment
+        // generation is the only activation fence.
+        store.activate_metadata_trace_config(identity).await?;
+    }
     let sandbox_runtime = args.sandbox_runtime().await?;
-    let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime);
+    let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime)
+        .with_openai_session_title_generator_from_env()
+        .with_metadata_trace_config(metadata_trace_config);
     let mut warm_pool_bootstrap_principal = None;
     let mut workflow_host_principal = None;
+    let mut workflow_principal_registrar = None;
     if let Some(iron_control) = args.iron_control_runtime().await? {
         info!("iron-control session registration enabled");
         warm_pool_bootstrap_principal = Some(iron_control.warm_pool_bootstrap_principal);
         workflow_host_principal = Some(iron_control.workflow_host_principal);
+        workflow_principal_registrar = Some(iron_control.workflow_principal_registrar);
         runtime = runtime.with_iron_control(iron_control.registrar);
     }
-    if let Some(reconciler) = args.iron_control_tool_reconciler()? {
-        info!("iron-control tool secret reconciliation enabled");
-        tokio::spawn(reconciler.run());
+    // Trace revocation, expiry, and disabled-generation retirement are
+    // durable session concerns. They must keep running in deployments that do
+    // not configure the optional credential-control plane.
+    if should_run_metadata_trace_reconciler {
+        runtime = runtime.with_sandbox_capability_reconciler();
     }
     runtime = runtime.with_personas(args.persona_registry()?);
+    let sandbox_capacity_config = args.sandbox_capacity_config();
+    if let Some(config) = sandbox_capacity_config {
+        runtime = runtime.with_sandbox_capacity(config);
+    }
     if let Some(mut config) = args.warm_pool_config() {
         config.bootstrap_iron_control_principal = warm_pool_bootstrap_principal.clone();
         runtime = runtime.with_warm_pool(config);
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
+    runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(workflow_host_principal.as_deref())
         .await?;
     let workflows = Some(
-        WorkflowRuntime::new_with_workflow_host_sandbox(
+        WorkflowRuntime::new_with_workflow_host_sandbox_and_principal_registrar(
             store,
             runtime.clone(),
             workflow_host_sandbox,
+            workflow_principal_registrar,
         )
         .await?,
     );
 
-    // Adopt executions orphaned by the previous process (deploy/crash):
-    // recover finished turns from recorded sandbox output, re-attach still
-    // running sandboxes, and fail the rest so their threads unwedge.
-    let adoption_runtime = runtime.clone();
-    tokio::spawn(async move {
-        adoption_runtime.adopt_orphaned_executions().await;
-    });
+    // Adopt executions orphaned by another control plane process
+    // (deploy/crash): recover finished turns from recorded sandbox output,
+    // re-attach still running sandboxes, and fail the rest so their threads
+    // unwedge. The scan re-runs periodically because executions can be
+    // orphaned after startup — e.g. a rolling deploy terminates the previous
+    // pod mid-turn after this pod's startup scan already ran.
+    match args.execution_adoption_interval() {
+        Some(interval) => runtime.spawn_orphan_adoption(interval),
+        None => {
+            let adoption_runtime = runtime.clone();
+            tokio::spawn(async move {
+                adoption_runtime.adopt_orphaned_executions().await;
+            });
+        }
+    }
 
     app_state.mark_ready(runtime, workflows, Some(pool));
     info!("centaur api-rs runtime initialized");
@@ -108,8 +161,54 @@ fn init_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+fn metadata_trace_reconciler_runs(
+    config: Option<&centaur_session_sqlx::MetadataTraceConfigIdentity>,
+    slack_trace_consent_enabled: bool,
+) -> bool {
+    // A disabled config still fences a prior enabled generation, so this must
+    // depend on identity presence rather than the enabled bit or Iron Control.
+    config.is_some() || slack_trace_consent_enabled
+}
+
+fn validate_metadata_trace_startup(
+    config: Option<&centaur_session_sqlx::MetadataTraceConfigIdentity>,
+    has_persisted_trace_state: bool,
+) -> Result<(), ServerError> {
+    if config.is_none() && has_persisted_trace_state {
+        return Err(ServerError::UnsupportedConfig(
+            "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required when this database has metadata trace history; configure a newer disabled generation to retire prior trace assignments"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal Kubernetes
+/// sends on pod termination. The binary runs as PID 1 in its container, and
+/// PID 1 ignores signals without installed handlers: without the SIGTERM arm
+/// every rollout burned the full termination grace period and ended in
+/// SIGKILL, never reaching the graceful shutdown path.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler; using ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug, Error)]
@@ -137,11 +236,50 @@ pub(crate) enum ServerError {
     #[error(transparent)]
     Telemetry(#[from] centaur_telemetry::TelemetryError),
     #[error(transparent)]
-    ToolDiscovery(#[from] tool_discovery::ToolDiscoveryError),
+    ToolDiscovery(#[from] centaur_api_server::ToolDiscoveryError),
+    #[error(transparent)]
+    ActivitySummary(#[from] activity_summary::ActivitySummaryError),
     #[error("tool source error: {0}")]
     ToolSource(String),
     #[error("iron-proxy requires both firewall CA cert and key Secret names")]
     MissingIronProxyCaSecret,
+    #[error(
+        "iron-proxy requires a dedicated source-auth Secret name and key for non-environment secret sources"
+    )]
+    MissingIronProxySourceAuthSecret,
+    #[error("iron-proxy source-auth Secret must differ from both firewall CA Secrets")]
+    IronProxySourceAuthSecretCollision,
     #[error("{0}")]
     UnsupportedConfig(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use centaur_session_sqlx::MetadataTraceConfigIdentity;
+
+    use super::{metadata_trace_reconciler_runs, validate_metadata_trace_startup};
+
+    #[test]
+    fn trace_reconciler_starts_without_iron_control_for_disabled_identity() {
+        let disabled = MetadataTraceConfigIdentity {
+            generation: 7,
+            fingerprint: "disabled-generation".to_owned(),
+            enabled: false,
+        };
+        assert!(metadata_trace_reconciler_runs(Some(&disabled), false));
+        assert!(metadata_trace_reconciler_runs(None, true));
+        assert!(!metadata_trace_reconciler_runs(None, false));
+    }
+
+    #[test]
+    fn trace_history_requires_an_explicit_enabled_or_disabled_generation() {
+        let disabled = MetadataTraceConfigIdentity {
+            generation: 8,
+            fingerprint: "disabled".to_owned(),
+            enabled: false,
+        };
+        assert!(validate_metadata_trace_startup(None, false).is_ok());
+        assert!(validate_metadata_trace_startup(None, true).is_err());
+        assert!(validate_metadata_trace_startup(Some(&disabled), true).is_ok());
+    }
 }

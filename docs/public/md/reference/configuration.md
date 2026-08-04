@@ -6,7 +6,7 @@ description: Centaur environment variables grouped by requirement and service.
 # Configuration
 
 Most Centaur settings come from Helm values and are rendered into service
-environment variables by `contrib/chart/templates/workloads.yaml`.
+environment variables by service-specific templates under `contrib/chart/templates/`.
 
 Use these as the main extension points:
 
@@ -35,11 +35,10 @@ These must exist for the normal Helm deployment. For local development,
 | `DATABASE_URL` | `secretManager.existingSecretName`; local bootstrap generates it. | API and Slackbot Postgres connection. |
 | `SLACK_SIGNING_SECRET` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack request signature verification. |
 | `SLACKBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Static API key bootstrapped for Slackbot. |
-| `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot. |
+| `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot and api-rs Slack helpers. |
 | `SANDBOX_SIGNING_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Signing key for short-lived sandbox API tokens. |
 | `IRON_MANAGEMENT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Management key for API-created iron-proxy pods. |
-| `IRON_BROKER_TOKEN` | `secretManager.existingSecretName`; required when `tokenBroker.enabled=true`. | Bearer token iron-proxy presents to iron-token-broker and the broker enforces on its HTTP API. |
-| `OP_SERVICE_ACCOUNT_TOKEN` | Local shell, then `centaur-infra-env`; production Secret. | 1Password service-account auth when using `onepassword` secret source. |
+| `OP_SERVICE_ACCOUNT_TOKEN` | `ironProxy.sourceAuth.existingSecretName` under `serviceAccountTokenKey` for `onepassword`; `centaur-infra-env` only for `env`. | 1Password service-account auth. Non-env proxy Pods receive this one key, not the broad infra Secret. |
 | `OP_VAULT` | Local shell, then `centaur-infra-env`; defaults to `ai-agents` in code. | 1Password vault used for `op://...` secret refs. |
 
 Optional required-by-mode variables:
@@ -47,8 +46,12 @@ Optional required-by-mode variables:
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `OP_CONNECT_CREDENTIALS_FILE` | Local shell before `just deploy`. | Enables the 1Password Connect subchart and creates its credentials Secret. |
-| `OP_CONNECT_TOKEN` | Secret or local bootstrap shell env. | Token used by iron-proxy when `ironProxy.secretSource=onepassword-connect`. |
+| `OP_CONNECT_TOKEN` | `ironProxy.sourceAuth.existingSecretName` under `connectTokenKey` for `onepassword-connect`; `centaur-infra-env` only for `env`. | Token used by iron-proxy for Connect authentication. Non-env proxy Pods receive this one key, not the broad infra Secret. |
+| `CENTAUR_IRON_PROXY_SECRET_SOURCE` | Local shell before `just bootstrap-secrets` or `just up`; defaults to `onepassword`. | Passed to both the bootstrap script and Helm so environment-backed GitHub tokens are only seeded for `env` deployments. |
+| `CENTAUR_IRON_PROXY_SOURCE_AUTH_SECRET_NAME`, `CENTAUR_IRON_PROXY_SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY`, `CENTAUR_IRON_PROXY_SOURCE_AUTH_CONNECT_TOKEN_KEY` | Local shell before `just bootstrap-secrets` or `just up`; defaults to `centaur-iron-proxy-source-auth`, `OP_SERVICE_ACCOUNT_TOKEN`, and `OP_CONNECT_TOKEN`. | Keeps the local bootstrap Secret and Helm's dedicated non-env proxy key reference aligned. |
 | `LOCAL_DEV_API_KEY` | API env. | Static local admin/dev key bootstrapped into Postgres. |
+| `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
+| `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
 
 ## API
 
@@ -68,7 +71,7 @@ Optional required-by-mode variables:
 | `SLACKBOT_URL` | Chart-rendered Slackbot service URL. | API callback target for Slack delivery. |
 | `FINAL_DELIVERY_MAX_ATTEMPTS`, `FINAL_DELIVERY_READY_GRACE_S` | `api.extraEnv`. | Final-delivery retry and claim timing. |
 | `CENTAUR_ENABLE_GCLOUD_BOOTSTRAP`, `GCP_GCLOUD_CREDENTIAL`, `GCLOUD_PROJECT` | `api.extraEnv` or Secret. | Optional gcloud ADC bootstrap in the API container. |
-| `CLAUDE_MODEL`, `CODEX_MODEL` | `api.extraEnv` or request model override. | Harness model selection defaults. |
+| `CLAUDE_MODEL`, `CODEX_MODEL` | `api.extraEnv` or request model override. | Harness model selection defaults. When set via `sandbox.extraEnv`, the chart also mirrors them into slackbotv2 and the Console so their model displays track the deployment. |
 
 ## API-RS
 
@@ -82,6 +85,61 @@ Optional required-by-mode variables:
 | `apiRs.metrics.scrapeAnnotations` | Helm value, default `true`. | Adds Prometheus scrape annotations to the API-RS Pod template and Service. |
 | `apiRs.metrics.path` | Helm value, default `/metrics`. | Metrics scrape path for annotation-based discovery. |
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |
+| `apiRs.activitySummary.*` | Helm values, default disabled. | Enables API-RS to summarize live session activity into durable `session.activity_summary` events. |
+| `SLACK_BOT_TOKEN` | Explicit `secretKeyRef` from `secretManager.existingSecretName`. | Slack Web API access for api-rs Slack proxy and workflow Slack helpers. |
+| `OPENAI_API_KEY` | Secret mounted into api-rs, or `apiRs.extraEnv` for local/dev overrides. | OpenAI credential for activity summaries; the feature stays disabled when no key is present. |
+| `SESSION_ACTIVITY_SUMMARY_MODEL` | `apiRs.activitySummary.model`, default `gpt-5.4-nano`. | Model used for the short live activity sentence. |
+| `sandbox.metadataTrace.*` | Helm values, default disabled. | Makes the reviewed Autorotate digest-pinned metadata-only trace sidecar available to principals explicitly granted `sandbox_metadata_trace_enabled`. `configGeneration` is required and must increase monotonically for each deployment trace configuration change, including disabling a previous rollout; a disabled generation retires stale traced replicas independently of the derived fingerprint. The image digest is fixed in the API-RS binary, so a deployment cannot substitute a mutable tag or an operator-supplied source claim. The gateway must be an HTTPS origin and `gatewayPort` is rendered into the matching NetworkPolicy rule. Credentials are copied as mode-0600 files into a sidecar-only volume, and `networkPolicy.metadataTraceEgress.gatewayCidrs` must contain the gateway IP ranges. This path does not forward control-plane OTEL headers or alter sandbox authentication. |
+
+### Consented Codex metadata tracing
+
+This optional path is metadata-only: the sidecar reduces the pinned Codex OTLP
+contract to a closed schema before its retry spool or gateway. Prompts,
+assistant output, tool or connector names, arguments, results, raw IDs,
+provider URLs, request IDs, headers, and error text are discarded. It is not a
+generic OTLP route and must not be enabled by supplying `OTEL_*` values.
+
+1. Configure `sandbox.metadataTrace.enabled`, its HTTPS gateway origin and
+   credential Secret, then enable `networkPolicy.metadataTraceEgress` with the
+   gateway's complete current IP CIDRs. The policy selects every consented
+   sandbox pod, so its CIDRs are pod-wide egress authority rather than a
+   per-request hostname rule. Include every address the gateway may use before
+   enabling the feature; Kubernetes `NetworkPolicy` cannot enforce DNS names.
+2. Grant the principal capability
+   `sandbox_metadata_trace_enabled`. This only permits a Codex sandbox to
+   receive the sidecar; Claude and other harnesses do not receive it.
+3. Grant that sidecar credential an active, `metadata`-scoped gateway consent
+   with an explicit expiry. Both the principal capability and current gateway
+   consent are required. A denied, revoked, expired, malformed, or unreachable
+   consent response leaves intake disabled and removes the loopback capability.
+4. Revoke either gate to stop future intake: remove the principal capability
+   for new sandboxes, and revoke the gateway consent to fence a running
+   sidecar. Confirm the gateway reports no new batches before deleting any
+   incident evidence.
+
+Rotate the trace bearer and pseudonymization-key Secret as one credential
+generation. Update the gateway's corresponding credential/consent first, then
+roll the affected sandboxes so the sidecar receives fresh mode-0600 files; do
+not place either value in `sandbox.extraEnv` or an `auth.json` file. Keep the
+old gateway credential only for the planned overlap, then revoke it. The
+sidecar's local spool is bounded (8 MiB and 24 hours by default), private, and
+contains normalized metadata only. Temporary gateway failures retain bounded
+entries for retry. `401`/`403`, consent revocation/expiry, corrupt spool state,
+or an unavailable sidecar fail closed for tracing and fail open for Codex work:
+Codex authentication and normal execution continue, with no fallback upload to
+generic OTLP.
+
+Sandbox lifecycle:
+
+| Env var or value | Set from | Controls |
+| --- | --- | --- |
+| `SESSION_IDLE_TIMEOUT_MS` | `slackbotv2.extraEnv`; default is up to 3 hours. | Slackbot v2 execute idle timeout. After an execution reaches a terminal state, api-rs pauses the sandbox if no newer execution has used that sandbox. If `SESSION_MAX_DURATION_MS` is lower than 3 hours and this value is unset, Slackbot v2 caps the default idle timeout to the max duration. |
+| `SESSION_MAX_DURATION_MS` | `slackbotv2.extraEnv`. | Optional per-execution max duration forwarded to api-rs. api-rs rejects requests where `idle_timeout_ms` is greater than `max_duration_ms`. |
+| `apiRs.sandboxMaxLifetimeSecs` / `SESSION_SANDBOX_MAX_LIFETIME_SECS` | Helm value, default `259200` (72 hours). | Restart-surviving sandbox deletion backstop. The reaper stops any non-terminal sandbox older than this, regardless of whether it is running or suspended. Set `0` to disable max-lifetime reaping. |
+| `apiRs.sandboxReapIntervalSecs` / `SESSION_SANDBOX_REAP_INTERVAL_SECS` | Helm value, default `300`. | How often api-rs sweeps observed sandboxes for max-lifetime expiry. |
+
+There is no separate suspended-only delete timer. Pausing is controlled by the
+per-execution idle timeout; deletion is controlled by sandbox max lifetime.
 
 Execution tuning:
 
@@ -115,8 +173,31 @@ Execution tuning:
 | `SLACK_FEEDBACK_COMMANDS`, `SLACK_FEEDBACK_ALLOWED_CHANNELS` | `slackbot.extraEnv`. | Feedback slash commands and optional channel allowlist. |
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
 | `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
+| `SLACKBOTV2_DEFAULT_HARNESS` | `sandbox.harnessEngine`. | Base harness for new Slack threads without an explicit flag or channel default. |
+| `SESSION_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `apiRs.codexNanocodexRolloutPercent`. | Percentage of API session requests for Codex assigned to Nanocodex. Assignment is deterministic by thread key and persisted as the session harness. The API response and structured `session_harness_rollout_resolved` log identify the experiment and cohort; session and execution metadata retain the assignment for later analysis. Slack keeps the cohort unobtrusive by showing `Codex*` in the first response footer. Defaults to `50`; set to `0` to keep new Codex requests on Codex. |
+| `SLACKBOTV2_CHANNEL_DEFAULTS` | `slackbotv2.channelDefaults`. | Per-channel default harness / model / provider / reasoning as a JSON object keyed by Slack conversation id, where each value is an object of optional `harness`/`model`/`provider`/`reasoning` fields (same vocabulary as the inline flags, so `harness: claude`, `provider: bedrock`, and Claude model aliases like `opus` all work), e.g. `{"C0ENG":{"harness":"claude","model":"opus","reasoning":"high"},"C0TRIAGE":{"reasoning":"low"}}`. A model is only meaningful within a harness, so name the harness alongside it. Applied when a message in that channel carries no explicit/sticky per-thread flag (below such a flag, above the deployment/baked default) and forwarded onto the harness input line so it takes effect; setting the harness restarts a thread onto it like a `--claude`/`--codex` flag. `reasoning` affects the Codex and Nanocodex harnesses. Malformed JSON and unrecognized field values are logged and ignored. |
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
+
+## Teamsbot
+
+| Env var | Set from | Controls |
+| --- | --- | --- |
+| `PORT` | Runtime env. | Teamsbot HTTP port; defaults to `3100`. |
+| `LOG_LEVEL` | Runtime env. | Teamsbot JSON log level: `debug`, `info`, `warn`, `error`, or `silent`. |
+| `CENTAUR_API_URL` | Chart-rendered API service URL. | API base URL used by Teamsbot; local default is `http://127.0.0.1:8080`. |
+| `CENTAUR_API_KEY`, `TEAMSBOT_API_KEY` | Secret/env fallback. | Static API key used by Teamsbot to call the API. |
+| `TEAMSBOT_DATABASE_URL`, `DATABASE_URL`, `POSTGRES_URL` | Secret. | Teamsbot Postgres state store. The service refuses to boot without one unless tests/dev inject a state store. |
+| `TEAMSBOT_STATE_KEY_PREFIX` | Runtime env. | Postgres state namespace; defaults to `centaur-teamsbot`. |
+| `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Secret. | Required Bot Framework app credentials. |
+| `TEAMS_ALLOWED_TEAM_IDS`, `TEAMS_ALLOWED_CHANNEL_IDS`, `TEAMS_ALLOWED_TENANT_IDS` | `teamsbot.allowedTeamIds`, `teamsbot.allowedChannelIds`, `teamsbot.allowedTenantIds`. | Comma-separated allowlists. Empty means Teamsbot ignores all Teams messages. Personal chats require an allowed tenant id. |
+| `TEAMS_REQUIRE_MENTION` | `teamsbot.requireMention`. | Requires a bot mention before activating a thread; defaults to `true`. |
+| `TEAMS_DEFAULT_HARNESS_TYPE` | `sandbox.harnessEngine`. | Default harness requested for new Teams sessions. Existing harness conflicts retry on the session's current harness. |
+| `SESSION_IDLE_TIMEOUT_MS`, `SESSION_MAX_DURATION_MS` | Runtime env. | Forwarded to api-rs execute. `TEAMS_IDLE_TIMEOUT_MS` and `TEAMS_MAX_DURATION_MS` override these for Teams only. |
+| `TEAMS_ACTIVE_EXECUTION_TTL_MS` | Runtime env. | Stale execution timeout used to unwedge Teams threads after crashes. |
+| `TEAMS_DOWNLOAD_ATTACHMENTS` | `teamsbot.downloadAttachments`. | Enables allowed Teams attachment downloads into base64 payloads; defaults to `false`. |
+| `TEAMS_ATTACHMENT_MAX_BYTES`, `TEAMS_ATTACHMENT_ALLOWED_HOSTS` | Runtime env. | Attachment download size cap and HTTPS host allowlist. |
+| `TEAMS_GRAPH_BEARER_TOKEN`, `TEAMS_GRAPH_TOKEN_SCOPE` | Runtime env or Secret. | Optional Graph auth fallback for Graph/SharePoint-backed attachment URLs. |
 
 ## Sandbox
 
@@ -141,14 +222,14 @@ Kubernetes backend:
 | `KUBERNETES_SANDBOX_RUNTIME_CLASS_NAME`, `KUBERNETES_SANDBOX_SERVICE_ACCOUNT_NAME` | `sandbox.runtimeClassName`, `api.extraEnv`. | Pod runtime class and service account. |
 | `KUBERNETES_SANDBOX_CPU_LIMIT`, `KUBERNETES_SANDBOX_MEMORY_LIMIT`, `KUBERNETES_SANDBOX_CPU_REQUEST`, `KUBERNETES_SANDBOX_MEMORY_REQUEST` | `sandbox.resources.*`. | Sandbox pod resources. |
 | `KUBERNETES_SANDBOX_READY_TIMEOUT_S`, `KUBERNETES_ATTACH_LOG_TAIL_LINES` | `api.extraEnv`. | Sandbox readiness and attach diagnostics. |
+| `SESSION_SANDBOX_CLEANUP_INTERVAL_SECS`, `SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS` | `apiRs.sandboxCleanupIntervalSecs`, `apiRs.sandboxIdleCleanupBackstopSecs`. | DB-aware cleanup of unreferenced sandboxes and restart recovery for idle pauses. Persisted `idle_timeout_ms` is honored after restart; the backstop is the fallback for older execution rows without that metadata. |
 | `KUBERNETES_SANDBOX_EXTRA_ENV` | `sandbox.extraEnv`. | JSON list copied into each sandbox. |
 | `KUBERNETES_WORKFLOW_DIRS` | Chart-rendered from `overlays.sources[*].workflowsSubdir` (default `workflows`) using the sandbox repo-cache mount prefix. | Workflow-host sandbox discovery paths. |
 | `KUBERNETES_FIREWALL_CA_SECRET_NAME`, `KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME` | `firewall.existingCa*` or generated CA Secrets. | CA material for sandbox/proxy TLS interception. |
-| `KUBERNETES_SECRET_ENV_NAME`, `KUBERNETES_SECRET_ENV_PREFIX`, `KUBERNETES_BOOTSTRAP_SECRET_NAME` | `secretManager.*`, `secrets.bootstrapSecretName`. | Secrets read by API-created proxy/sandbox pods. |
+| `KUBERNETES_SECRET_ENV_NAME`, `KUBERNETES_BOOTSTRAP_SECRET_NAME` | `secretManager.existingSecretName`, `secrets.bootstrapSecretName`. | `env` source proxies mount static and optional bootstrap Secret `envFrom`s. 1Password and Connect proxies mount neither; Helm rejects unsafe name reuse and the static Secret must never contain a broker refresh seed. |
+| `KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME`, `KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY` | `ironProxy.sourceAuth.*`. | For 1Password and Connect only, injects exactly one dedicated source-auth `secretKeyRef` into each sandbox proxy (`OP_SERVICE_ACCOUNT_TOKEN` or `OP_CONNECT_TOKEN`). The source-auth Secret must differ from static and bootstrap Secrets. |
 | `KUBERNETES_IRON_PROXY_IMAGE`, `KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY`, `KUBERNETES_IRON_PROXY_PORT`, `KUBERNETES_IRON_PROXY_MANAGEMENT_PORT`, `KUBERNETES_IRON_PROXY_HEALTH_PORT` | `ironProxy.*`. | Per-sandbox iron-proxy image and ports. |
-| `FIREWALL_MANAGER_SECRET_SOURCE`, `FIREWALL_MANAGER_SECRET_TTL`, `KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE` | `ironProxy.secretSource`, `ironProxy.secretTtl`. | Secret source and cache TTL for rendered proxy config. |
-| `FIREWALL_MANAGER_TOKEN_BROKER_TTL` | `tokenBroker.ttl`. | Proxy-side cache TTL for access tokens minted by iron-token-broker. Applied to every `brokered_token` secret. |
-| `KUBERNETES_TOKEN_BROKER_NAME`, `KUBERNETES_TOKEN_BROKER_URL` | `tokenBroker.*`. | iron-token-broker Deployment name and ClusterIP URL. The chart owns the broker Deployment, Service, and NetworkPolicies; the API reconciles its ConfigMap and triggers a rolling restart when the rendered content changes. |
+| `FIREWALL_MANAGER_SECRET_SOURCE`, `FIREWALL_MANAGER_SECRET_TTL` | `ironProxy.secretSource`, `ironProxy.secretTtl`. | Secret source and cache TTL for rendered proxy config. |
 | `KUBERNETES_OP_CONNECT_HOST`, `KUBERNETES_OP_CONNECT_APP_NAME`, `KUBERNETES_OP_CONNECT_PORT` | Chart helper or `api.extraEnv`. | 1Password Connect endpoint details. |
 | `KUBERNETES_API_POD_LABEL_SELECTOR` | Chart-rendered labels or `api.extraEnv`. | API pod selector for API-managed proxy policies. |
 | `KUBERNETES_EGRESS_DISCOVERY_ENABLED`, `KUBERNETES_EGRESS_SERVICE_NAMESPACE`, `KUBERNETES_CLUSTER_DOMAIN`, `KUBERNETES_EGRESS_TAILNET_FQDN_ANNOTATION` | `api.egressDiscovery.*`. | Egress service discovery for sandbox NetworkPolicies. |
@@ -160,16 +241,19 @@ Sandbox entrypoint and wrappers:
 | --- | --- | --- |
 | `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Harness config directory and optional adapter executable. |
 | `CENTAUR_SKILL_DIRS` | Chart-rendered from `overlays.sources[*].skillsSubdir` (default `.agents/skills`) through `SESSION_SANDBOX_EXTRA_ENV`. | Ordered skill directories copied into the agent workspace. |
+| `CENTAUR_TOOLS_AUTO_RELOAD` | `repoCache.autoReload` via api-rs tools config; defaults to `true`. | Enables repo-cache-backed auto-refresh of local tool shims and copied skills in running sandboxes. Runtime catalog only; secret grants/proxy credentials reconcile separately. |
+| `CENTAUR_TOOLS_RELOAD_INTERVAL_SECONDS` | `sandbox.extraEnv`. | Poll interval for the repo-cache checkout watchdog. |
 | `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Workspace repo clone and persona prompt. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |
 | `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_CONTINUE_THREAD_ID` | `sandbox.extraEnv` or runtime resume. | Codex auth/config/resume behavior. |
-| `CODEX_AUTH_MODE` | `sandbox.extraEnv`. | Codex auth flow: `api_key` (default, hits `api.openai.com`) or `access_token` (hits `chatgpt.com` via the brokered ChatGPT login). See [Codex Auth Modes](/deploying-in-production#codex-auth-modes). |
+| `CODEX_AUTH_MODE` | `sandbox.codexAuthMode`. | Codex auth flow: `api_key` (default, hits `api.openai.com`) or `access_token` (hits `chatgpt.com` with a Console-managed broker credential). Helm sets it on api-rs before the matching proxy fragment is registered, then propagates it to sandboxes; do not override it through `sandbox.extraEnv`. See [Codex Auth Modes](/deploying-in-production#codex-auth-modes). |
+| `META_AI_API_KEY` | Secret mounted into api-rs. | Meta AI direct credential for Codex provider `responses` and Slack or Linear `--meta` selection. |
 | `CODEX_MODEL_REASONING_SUMMARY` | `sandbox.extraEnv`. | Sets `model_reasoning_summary` in the Codex config (`auto`, `concise`, `detailed`, `none`). Codex >= 0.139 emits no reasoning summaries unless this is set, so renderers show no thinking trace. |
-| `CODEX_MODEL_REASONING_EFFORT` | `sandbox.extraEnv`. | Overrides the codex `model_reasoning_effort` (baked into `harness/codex/config.toml`) by patching the per-sandbox `~/.codex/config.toml` at boot, without forking the image. One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`; an unknown value is ignored (the config default stands). |
+| `CODEX_MODEL_REASONING_EFFORT` | `sandbox.extraEnv`. | Overrides the Codex `model_reasoning_effort` (baked into `harness/codex/config.toml`) and Nanocodex's default thinking effort. It is mirrored into Slackbot so the first response footer displays the effective level. One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; an unknown value is ignored (the config default stands). |
 | `CODEX_BEDROCK_REGION` | `sandbox.extraEnv`. | Opt-in switch and single source of truth for the Bedrock region. When set, the control plane registers the AWS SigV4 re-signing credential (scoped to the `bedrock` service and this region, upstream `bedrock-mantle.<region>.api.aws`), injects the placeholder `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env so codex can sign requests iron-proxy re-signs with the real IAM keys, and pins codex's `amazon-bedrock` provider to this region at sandbox boot (so the in-sandbox client and the proxy agree). Unset disables Bedrock; defaults to `us-east-1`. See [Codex with Amazon Bedrock](/deploying-in-production#codex-with-amazon-bedrock). |
 | `CODEX_BEDROCK_SESSION_TOKEN` | `sandbox.extraEnv`. | Set truthy when the Bedrock IAM credentials are temporary (STS) and carry a session token, so the `AWS_SESSION_TOKEN` placeholder is declared and injected. Omit for long-term IAM user keys. |
 | `CLAUDE_MODEL`, `CLAUDE_CONTINUE_SESSION_ID` | `sandbox.extraEnv` or runtime resume. | Claude model and resume behavior. |
-| `CLAUDE_CODE_AUTH_MODE` | `sandbox.extraEnv`. | Claude Code auth flow: `api_key` (default, uses `ANTHROPIC_API_KEY`) or `access_token` (Claude.ai Pro or Max via the brokered OAuth login). See [Claude Auth Modes](/deploying-in-production#claude-auth-modes). |
+| `CLAUDE_CODE_AUTH_MODE` | `sandbox.claudeCodeAuthMode`. | Claude Code auth flow: `api_key` (default, uses `ANTHROPIC_API_KEY`) or `access_token` (Claude.ai Pro or Max through a Console-managed broker credential). Helm sets it on api-rs before the matching proxy fragment is registered, then propagates it to sandboxes; do not override it through `sandbox.extraEnv`. See [Claude Auth Modes](/deploying-in-production#claude-auth-modes). |
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
 | `CALL_TIMEOUT_SECONDS` | Sandbox env before running `call`. | Curl watchdog for API tool calls. |
 | `SLACK_CHANNEL`, `SLACK_THREAD_TS` | Sandbox env. | File-upload helper target. |
@@ -188,21 +272,32 @@ Slack ETL workflows:
 
 | Env var | Set from | Controls |
 | --- | --- | --- |
-| `SLACK_ETL_ENABLED` | `api.slackEtlEnabled`. | Master switch for Slack sync/backfill/context schedules. |
-| `SLACK_SYNC_INTERVAL_SECONDS`, `SLACK_BACKFILL_INTERVAL_SECONDS`, `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `api.*IntervalSeconds`. | Slack ETL schedule intervals. |
-| `SLACK_SYNC_BACKFILL_LOOKBACK_DAYS`, `SLACK_SYNC_THREAD_LOOKBACK_DAYS` | `api.slackSync*LookbackDays`. | Slack history/thread lookback windows. |
-| `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | `api.slackEtlExcludedChannelPatterns`. | Comma-separated channel-name globs to skip. |
-| `SLACK_BACKFILL_ENABLED`, `SLACK_BACKFILL_CHANNEL_BATCH_LIMIT`, `SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB` | `api.extraEnv` or chart batch limit. | Backfill enablement and batch sizing. |
-| `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `api.extraEnv`. | Enables company-context projection when Slack ETL is on. |
+| `SLACK_ETL_ENABLED` | `apiRs.etl.slack.enabled`. | Master switch for Slack sync/backfill/context schedules. |
+| `SLACK_SYNC_INTERVAL_SECONDS`, `SLACK_BACKFILL_INTERVAL_SECONDS`, `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `apiRs.etl.slack.syncIntervalSeconds`, `apiRs.etl.slack.backfill.intervalSeconds`, `apiRs.etl.companyContextDocuments.intervalSeconds`. | Slack ETL schedule intervals. |
+| `SLACK_SYNC_BACKFILL_LOOKBACK_DAYS`, `SLACK_SYNC_THREAD_LOOKBACK_DAYS` | `apiRs.etl.slack.syncBackfillLookbackDays`, `apiRs.etl.slack.syncThreadLookbackDays`. | Slack history/thread lookback windows. |
+| `SLACK_SYNC_INDEX_PRIVATE_CHANNELS` | `apiRs.etl.slack.indexPrivateChannels`. | Includes private channels visible to the ETL token. |
+| `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | `apiRs.etl.slack.excludedChannelPatterns`. | Comma-separated channel-name globs to skip. |
+| `SLACK_BACKFILL_ENABLED`, `SLACK_BACKFILL_CHANNEL_BATCH_LIMIT`, `SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB` | `apiRs.etl.slack.backfill.*`. | Backfill enablement and batch sizing. |
+| `SLACK_RETENTION_ENABLED`, `SLACK_RETENTION_INTERVAL_MINUTES`, `SLACK_ETL_RETENTION_DAYS`, `SLACK_DM_RETENTION_DAYS` | `apiRs.etl.slack.retention.*`. | Slack retention enablement, cadence, and separate public ETL/DM TTLs. |
+| `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `apiRs.etl.companyContextDocuments.enabled`. | Enables company-context projection when any ETL is on. |
+| `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `apiRs.etl.companyContextDocuments.maxWindowSeconds`. | Maximum source `updated_at` window projected by one company-context documents run. |
+| `COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE` | `apiRs.etl.companyContextDocuments.batchSize`. | Maximum changed source rows handled by one per-scope company-context child workflow. |
 
 Google Workspace ETL workflows:
 
 | Env var | Set from | Controls |
 | --- | --- | --- |
-| `GOOGLE_DRIVE_ETL_ENABLED` | `api.googleDriveEtlEnabled`. | Enables Google Drive Docs sync. |
-| `GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS` | `api.googleDriveSyncIntervalSeconds`. | Google Drive Docs sync schedule interval. |
-| `GOOGLE_CALENDAR_ETL_ENABLED` | `api.googleCalendarEtlEnabled`. | Enables Google Calendar sync. |
-| `GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS` | `api.googleCalendarSyncIntervalSeconds`. | Google Calendar sync schedule interval. |
+| `GOOGLE_DRIVE_ETL_ENABLED` | `apiRs.etl.googleDrive.enabled`. | Enables Google Drive Docs sync. |
+| `GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS` | `apiRs.etl.googleDrive.syncIntervalSeconds`. | Google Drive Docs sync schedule interval. |
+| `GOOGLE_CALENDAR_ETL_ENABLED` | `apiRs.etl.googleCalendar.enabled`. | Enables Google Calendar sync. |
+| `GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS` | `apiRs.etl.googleCalendar.syncIntervalSeconds`. | Google Calendar sync schedule interval. |
+
+Linear ETL workflows:
+
+| Env var | Set from | Controls |
+| --- | --- | --- |
+| `LINEAR_ETL_ENABLED` | `apiRs.etl.linear.enabled`. | Enables Linear project/issue/comment sync. |
+| `LINEAR_SYNC_INTERVAL_SECONDS` | `apiRs.etl.linear.syncIntervalSeconds`. | Linear sync schedule interval. |
 
 ## Observability and Retention
 

@@ -22,15 +22,24 @@ discordbot:
   image:
     pullPolicy: IfNotPresent
 
+teamsbot:
+  # Enable once TEAMS_* app secrets and Bot Framework routing are configured.
+  enabled: false
+  image:
+    pullPolicy: IfNotPresent
+
 apiRs:
+  image:
+    pullPolicy: IfNotPresent
+
+console:
   image:
     pullPolicy: IfNotPresent
 
 ironProxy:
   image:
     pullPolicy: IfNotPresent
-  manager:
-    secretSource: onepassword
+  secretSource: onepassword
 
 sandbox:
   image:

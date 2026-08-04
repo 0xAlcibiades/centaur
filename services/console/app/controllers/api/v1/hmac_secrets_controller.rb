@@ -59,11 +59,13 @@ module Api
         rules_attrs = build_rules(attrs)
 
         HmacSecret.transaction do
-          ref.assign_attributes(base)
-          ref.sources = sources
-          ref.rules = rules_attrs
-          ref.save!
-          ref.reload
+          with_sync_config_replacement_guard(ref, base, sources: sources, rules: rules_attrs) do
+            ref.assign_attributes(base)
+            ref.sources = sources
+            ref.rules = rules_attrs
+            ref.save!
+            ref.reload
+          end
         end
       end
 
@@ -78,13 +80,6 @@ module Api
       def permit_source(src)
         params = src.is_a?(ActionController::Parameters) ? src : ActionController::Parameters.new(src)
         params.permit(:source_type, :secret, config: {}).to_h
-      end
-
-      def build_rules(attrs)
-        Array(attrs[:rules]).each_with_index.map do |r, i|
-          permitted = ActionController::Parameters.new(r.to_unsafe_h).permit(:host, :cidr, http_methods: [], paths: [])
-          RequestRule.new(permitted.to_h.merge(position: i))
-        end
       end
 
       def record_payload(ref)

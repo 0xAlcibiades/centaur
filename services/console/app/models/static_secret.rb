@@ -48,6 +48,10 @@ class StaticSecret < ApplicationRecord
   # proxy resolves at sync; this association is the console-level link.
   belongs_to :broker_credential, optional: true
 
+  after_commit :auto_grant_wrapped_oauth_credential,
+               on: %i[create update],
+               if: :broker_credential_id?
+
   # Maps to a single entry in the iron-proxy `secrets` transform array. The
   # caller is responsible for skipping secrets without a source.
   def to_proxy_secret
@@ -61,9 +65,9 @@ class StaticSecret < ApplicationRecord
   end
 
   # The request targets this secret writes, normalized for cross-type conflict
-  # detection (see Principal#served_credentials): a header (case-insensitive) or
-  # a query param. A replace with no match_headers rewrites the body/path/query
-  # rather than a header, so it claims no target and never collides with a header
+  # detection during snapshot assembly: a header (case-insensitive) or a query
+  # param. A replace with no match_headers rewrites the body/path/query rather
+  # than a header, so it claims no target and never collides with a header
   # injector.
   def proxy_conflict_targets
     if inject_config.present?
@@ -90,6 +94,10 @@ class StaticSecret < ApplicationRecord
   validate :replace_config_matches_schema
 
   private
+
+  def auto_grant_wrapped_oauth_credential
+    PrincipalCredentialReconciliation.new.apply_for_credential(broker_credential)
+  end
 
   def labels_is_a_hash
     errors.add(:labels, "must be a hash") unless labels.is_a?(Hash)

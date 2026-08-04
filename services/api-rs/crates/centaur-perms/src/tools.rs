@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use centaur_iron_control::{GCP_ID_TOKEN_ALLOWED_HEADERS, normalize_gcp_id_token_header};
 use centaur_iron_proxy::{PgDsnSetting, PgDsnSettingValueFrom};
 use eyre::{Context, Result, bail, eyre};
 use toml::Value;
@@ -35,6 +36,10 @@ const DEFAULT_MATCH_HEADERS: &[&str] = &[
     "X-CB-ACCESS-PASSPHRASE",
     "X-CB-ACCESS-SIGNATURE",
     "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/",
+];
+
+const HTTP_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
 ];
 
 /// Enums iron-proxy's `hmac_sign` transform accepts, mirroring `_HMAC_*` in
@@ -92,6 +97,8 @@ pub struct HttpSecret {
     pub secret_ref: String,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
+    pub http_methods: Vec<String>,
+    pub paths: Vec<String>,
     // replace mode
     pub replacer: String,
     pub match_headers: Vec<String>,
@@ -123,6 +130,16 @@ pub struct GcpAuthSecret {
     pub secret_ref: String,
     pub hosts: Vec<String>,
     pub scopes: Vec<String>,
+}
+
+/// A `type = "gcp_id_token"` secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcpIdTokenSecret {
+    pub name: String,
+    pub secret_ref: String,
+    pub hosts: Vec<String>,
+    pub audience: String,
+    pub header: Option<String>,
 }
 
 /// A `type = "pg_dsn"` secret: a Postgres upstream the proxy fronts. `name` is
@@ -208,6 +225,7 @@ pub enum ParsedSecret {
     Http(HttpSecret),
     OAuthToken(OAuthTokenSecret),
     GcpAuth(GcpAuthSecret),
+    GcpIdToken(GcpIdTokenSecret),
     PgDsn(PgDsnSecret),
     Hmac(HmacSignSecret),
     BrokerToken(BrokerTokenSecret),
@@ -221,6 +239,7 @@ impl ParsedSecret {
             ParsedSecret::Http(s) => &s.name,
             ParsedSecret::OAuthToken(s) => &s.name,
             ParsedSecret::GcpAuth(s) => &s.name,
+            ParsedSecret::GcpIdToken(s) => &s.name,
             ParsedSecret::PgDsn(s) => &s.name,
             ParsedSecret::Hmac(s) => &s.name,
             ParsedSecret::BrokerToken(s) => &s.name,
@@ -356,9 +375,8 @@ pub fn parse_manifest(tool_dir: &Path) -> Result<ToolManifest> {
     let path = tool_dir.join("pyproject.toml");
     let text =
         std::fs::read_to_string(&path).wrap_err_with(|| format!("reading {}", path.display()))?;
-    let doc: Value = text
-        .parse::<Value>()
-        .wrap_err_with(|| format!("parsing {}", path.display()))?;
+    let doc: Value =
+        toml::from_str(&text).wrap_err_with(|| format!("parsing {}", path.display()))?;
     let centaur = doc
         .get("tool")
         .and_then(|t| t.get("centaur"))
@@ -416,6 +434,8 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             secret_ref: s.to_owned(),
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            http_methods: vec![],
+            paths: vec![],
             replacer: s.to_owned(),
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -442,6 +462,9 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             .to_owned(),
         None => name.clone(),
     };
+    if !matches!(secret_type, "http" | "header") {
+        reject_http_request_scope_keys(table, &name, secret_type)?;
+    }
     match secret_type {
         "http" | "header" => Ok(ParsedSecret::Http(parse_http(
             table,
@@ -451,6 +474,11 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
         )?)),
         "oauth_token" => Ok(ParsedSecret::OAuthToken(parse_oauth(table, &name)?)),
         "gcp_auth" => Ok(ParsedSecret::GcpAuth(parse_gcp(table, &name, &secret_ref)?)),
+        "gcp_id_token" => Ok(ParsedSecret::GcpIdToken(parse_gcp_id_token(
+            table,
+            &name,
+            &secret_ref,
+        )?)),
         "pg_dsn" => Ok(ParsedSecret::PgDsn(parse_pg_dsn(
             table,
             &name,
@@ -493,6 +521,8 @@ fn parse_http(
              unscoped in iron-proxy"
         ),
     };
+    let http_methods = parse_http_methods(table, name)?;
+    let paths = parse_http_paths(table, name)?;
 
     match mode {
         SecretMode::Replace => {
@@ -521,6 +551,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -557,6 +589,8 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
+                http_methods,
+                paths,
                 replacer: String::new(),
                 match_headers: vec![],
                 match_path: false,
@@ -649,6 +683,29 @@ fn parse_gcp(table: &toml::Table, name: &str, secret_ref: &str) -> Result<GcpAut
     })
 }
 
+fn parse_gcp_id_token(
+    table: &toml::Table,
+    name: &str,
+    secret_ref: &str,
+) -> Result<GcpIdTokenSecret> {
+    let hosts = non_empty_str_array(table.get("hosts")).ok_or_else(|| {
+        eyre!("gcp_id_token entry {name:?} 'hosts' must be a non-empty array of non-empty strings")
+    })?;
+    let audience = req_str(table, "audience")
+        .wrap_err_with(|| format!("gcp_id_token entry {name:?} requires a non-empty 'audience'"))?;
+    let header = opt_str(table, "header")
+        .map(validate_gcp_id_token_header)
+        .transpose()
+        .wrap_err_with(|| format!("gcp_id_token entry {name:?}"))?;
+    Ok(GcpIdTokenSecret {
+        name: name.to_owned(),
+        secret_ref: secret_ref.to_owned(),
+        hosts,
+        audience,
+        header,
+    })
+}
+
 fn parse_pg_dsn(table: &toml::Table, name: &str, secret_ref: &str) -> Result<PgDsnSecret> {
     let database = req_str(table, "database")
         .wrap_err_with(|| format!("pg_dsn entry {name:?} requires a non-empty 'database'"))?;
@@ -700,12 +757,24 @@ fn parse_pg_dsn_setting_value_from(value: Option<&Value>) -> Result<Option<PgDsn
         .ok_or_else(|| eyre!("pg_dsn setting value_from must be a table"))?;
     let principal_label = opt_str(table, "principal_label");
     let principal_field = opt_str(table, "principal_field");
-    if principal_label.is_none() && principal_field.is_none() {
-        bail!("pg_dsn setting value_from must declare principal_label or principal_field");
+    let proxy_label = opt_str(table, "proxy_label");
+    let declared = [
+        principal_label.as_ref(),
+        principal_field.as_ref(),
+        proxy_label.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some())
+    .count();
+    if declared != 1 {
+        bail!(
+            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, or proxy_label"
+        );
     }
     Ok(Some(PgDsnSettingValueFrom {
         principal_label,
         principal_field,
+        proxy_label,
     }))
 }
 
@@ -1011,6 +1080,80 @@ fn non_empty_str_array(value: Option<&Value>) -> Option<Vec<String>> {
         out.push(s.to_owned());
     }
     Some(out)
+}
+
+fn parse_http_methods(table: &toml::Table, name: &str) -> Result<Vec<String>> {
+    let methods = strict_string_array(table, name, "http_methods")?;
+    methods
+        .into_iter()
+        .map(|method| {
+            let method = method.to_ascii_uppercase();
+            if HTTP_METHODS.contains(&method.as_str()) {
+                Ok(method)
+            } else {
+                bail!(
+                    "HTTP secret {name:?} has unsupported http_methods entry {method:?}; expected one of {}",
+                    HTTP_METHODS.join(", ")
+                )
+            }
+        })
+        .collect()
+}
+
+fn parse_http_paths(table: &toml::Table, name: &str) -> Result<Vec<String>> {
+    let paths = strict_string_array(table, name, "paths")?;
+    for path in &paths {
+        if !path.starts_with('/') {
+            bail!("HTTP secret {name:?} paths entry {path:?} must start with '/'");
+        }
+    }
+    Ok(paths)
+}
+
+fn strict_string_array(table: &toml::Table, name: &str, key: &str) -> Result<Vec<String>> {
+    let Some(value) = table.get(key) else {
+        return Ok(vec![]);
+    };
+    let values = value.as_array().ok_or_else(|| {
+        eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
+                })
+        })
+        .collect()
+}
+
+fn reject_http_request_scope_keys(
+    table: &toml::Table,
+    name: &str,
+    secret_type: &str,
+) -> Result<()> {
+    for key in ["http_methods", "paths"] {
+        if table.contains_key(key) {
+            bail!(
+                "{secret_type} secret {name:?} must not declare {key:?}; request scopes are only supported by type = \"http\""
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_gcp_id_token_header(value: String) -> Result<String> {
+    normalize_gcp_id_token_header(&value).ok_or_else(|| {
+        eyre!(
+            "header must be one of {}, got {value:?}",
+            GCP_ID_TOKEN_ALLOWED_HEADERS.join(", ")
+        )
+    })
 }
 
 fn reject_keys(table: &toml::Table, name: &str, mode: &str, keys: &[&str]) -> Result<()> {

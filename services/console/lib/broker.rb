@@ -1,6 +1,5 @@
-# The Broker namespace holds the in-control port of iron-token-broker: the OAuth
-# refresh-token state machine that BrokerCredential drives, plus the error types
-# the refresh path uses to communicate outcomes.
+# The Broker namespace owns the Console's OAuth refresh-token state machine and
+# the error types the refresh path uses to communicate outcomes.
 #
 # SECURITY: every code path under Broker handles refresh tokens and access tokens
 # on the hot path. Logging is restricted to credential ids, OAuth error codes,

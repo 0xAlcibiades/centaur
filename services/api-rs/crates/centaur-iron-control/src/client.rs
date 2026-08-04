@@ -14,9 +14,10 @@ use serde_json::{Value, json};
 use crate::error::{IronControlError, Result};
 use crate::models::{
     AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope,
-    EffectiveConfig, GcpAuthSecretInput, Grant, GrantSecret, Grantee, HmacSecretInput,
-    IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal, Proxy, ProxyInput, Role,
-    SecretRecord, StaticSecretInput,
+    EffectiveConfig, GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee,
+    HmacSecretInput, IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal,
+    PrincipalInput, Proxy, ProxyInput, Role, SecretRecord, SlackChannelPermissionInput,
+    StaticSecretInput,
 };
 
 const API_PREFIX: &str = "/api/v1";
@@ -52,7 +53,7 @@ impl IronControlClient {
     // ----- principals & roles ---------------------------------------------
 
     /// Upsert a principal by ``foreign_id`` (create if absent, update if not).
-    pub async fn upsert_principal(&self, input: &IdentityInput) -> Result<Principal> {
+    pub async fn upsert_principal(&self, input: &PrincipalInput) -> Result<Principal> {
         self.write(
             Method::PUT,
             &upsert_path("principals", &input.foreign_id),
@@ -179,6 +180,20 @@ impl IronControlClient {
             .await
     }
 
+    /// Create or update one Slack channel permission row on a principal without
+    /// replacing that principal's other Slack permissions.
+    pub async fn upsert_slack_channel_permission(
+        &self,
+        principal_id: &str,
+        input: &SlackChannelPermissionInput,
+    ) -> Result<()> {
+        let path = format!(
+            "{API_PREFIX}/principals/{}/slack_channel_permissions",
+            urlencoding::encode(principal_id)
+        );
+        self.write_unit(Method::POST, &path, input).await
+    }
+
     /// List the roles assigned to a principal (by OID; this sub-resource route
     /// does not resolve ``foreign_id``s — pass the OID from [`Self::get_principal`]).
     pub async fn list_principal_roles(&self, principal: &str) -> Result<Vec<Role>> {
@@ -245,6 +260,19 @@ impl IronControlClient {
         }
     }
 
+    /// Upsert a GCP ID token secret by ``foreign_id``.
+    pub async fn upsert_gcp_id_token_secret(
+        &self,
+        input: &GcpIdTokenSecretInput,
+    ) -> Result<SecretRecord> {
+        self.write(
+            Method::PUT,
+            &upsert_path("gcp_id_token_secrets", &input.foreign_id),
+            input,
+        )
+        .await
+    }
+
     /// Upsert a Postgres DSN secret by ``foreign_id``.
     pub async fn upsert_pg_dsn_secret(&self, input: &PgDsnSecretInput) -> Result<SecretRecord> {
         self.write(
@@ -278,7 +306,8 @@ impl IronControlClient {
     /// Fetch a secret's identity (id, ``foreign_id``, ``name``) by OID. The
     /// ``collection`` is the resource path segment for the secret's type
     /// (``static_secrets``, ``oauth_token_secrets``, ``gcp_auth_secrets``,
-    /// ``pg_dsn_secrets``, ``hmac_secrets``, ``aws_auth_secrets``) — see
+    /// ``gcp_id_token_secrets``, ``pg_dsn_secrets``, ``hmac_secrets``,
+    /// ``aws_auth_secrets``) — see
     /// [`Grant::secret_target`].
     pub async fn get_secret(&self, collection: &str, oid: &str) -> Result<SecretRecord> {
         let path = format!("{API_PREFIX}/{collection}/{}", urlencoding::encode(oid));
@@ -341,6 +370,19 @@ impl IronControlClient {
     ) -> Result<Vec<BrokerCredentialRecord>> {
         self.list_collection("broker_credentials", namespace, labels)
             .await
+    }
+
+    /// Fetch a broker credential's redacted identity and lifecycle status by OID
+    /// (``bcr_…``) or ``foreign_id``. Unlike the detail endpoint, this typed
+    /// form is suitable for callers that only need to make a lifecycle decision.
+    pub async fn get_broker_credential(
+        &self,
+        namespace: &str,
+        ident: &str,
+    ) -> Result<BrokerCredentialRecord> {
+        let path = resource_path("broker_credentials", "bcr_", namespace, ident, "");
+        let resp = self.send(Method::GET, &path, None::<&Value>).await?;
+        decode_data(resp, Method::GET, &path).await
     }
 
     /// Fetch a broker credential's full resource object (every field
@@ -408,10 +450,12 @@ impl IronControlClient {
         &self,
         name: impl Into<String>,
         principal_id: impl Into<String>,
+        labels: std::collections::BTreeMap<String, String>,
     ) -> Result<Proxy> {
         let input = ProxyInput {
             name: name.into(),
             principal_id: principal_id.into(),
+            labels,
         };
         self.write(Method::POST, &collection_path("proxies"), &input)
             .await
@@ -422,14 +466,15 @@ impl IronControlClient {
     /// `/proxy/sync` (the config hash changes). This is how a warm-pool proxy,
     /// booted under a bootstrap principal, is bound to a session's principal at
     /// checkout without a restart or token swap.
-    pub async fn assign_proxy_principal(&self, id: &str, principal_id: &str) -> Result<Proxy> {
+    pub async fn assign_proxy_principal(
+        &self,
+        id: &str,
+        principal_id: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Proxy> {
         let path = format!("{API_PREFIX}/proxies/{}", urlencoding::encode(id));
-        self.write(
-            Method::PATCH,
-            &path,
-            &json!({ "principal_id": principal_id }),
-        )
-        .await
+        let body = proxy_assignment_payload(principal_id, labels);
+        self.write(Method::PATCH, &path, &body).await
     }
 
     /// Deregister a proxy by OID.
@@ -485,6 +530,20 @@ impl IronControlClient {
     }
 }
 
+fn proxy_assignment_payload(
+    principal_id: &str,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let mut body = serde_json::Map::from_iter([(
+        "principal_id".to_owned(),
+        Value::String(principal_id.to_owned()),
+    )]);
+    if !labels.is_empty() {
+        body.insert("labels".to_owned(), json!(labels));
+    }
+    Value::Object(body)
+}
+
 fn grant_body(grantee: &Grantee, secret: &GrantSecret) -> Value {
     let mut map = serde_json::Map::new();
     match grantee {
@@ -494,6 +553,7 @@ fn grant_body(grantee: &Grantee, secret: &GrantSecret) -> Value {
     let (key, id) = match secret {
         GrantSecret::Static(id) => ("static_secret_id", id),
         GrantSecret::GcpAuth(id) => ("gcp_auth_secret_id", id),
+        GrantSecret::GcpIdToken(id) => ("gcp_id_token_secret_id", id),
         GrantSecret::OAuthToken(id) => ("oauth_token_secret_id", id),
         GrantSecret::PgDsn(id) => ("pg_dsn_secret_id", id),
         GrantSecret::Hmac(id) => ("hmac_secret_id", id),
@@ -609,6 +669,18 @@ mod tests {
         assert_eq!(
             body,
             json!({ "role_id": "role_cw", "aws_auth_secret_id": "aas_cloudwatch" })
+        );
+    }
+
+    #[test]
+    fn grant_body_role_gcp_id_token() {
+        let body = grant_body(
+            &Grantee::Role("role_cloud_run".to_owned()),
+            &GrantSecret::GcpIdToken("gid_cloudrun".to_owned()),
+        );
+        assert_eq!(
+            body,
+            json!({ "role_id": "role_cloud_run", "gcp_id_token_secret_id": "gid_cloudrun" })
         );
     }
 
@@ -774,10 +846,18 @@ mod tests {
             "id": "prx_1",
             "name": "edge",
             "principal_id": "prn_1",
+            "labels": { "centaur.slack_user_id": "U1" },
             "token": "iprx_secret"
         }))
         .unwrap();
         assert_eq!(created.token.as_deref(), Some("iprx_secret"));
+        assert_eq!(
+            created
+                .labels
+                .get("centaur.slack_user_id")
+                .map(String::as_str),
+            Some("U1")
+        );
 
         let listed: Proxy = serde_json::from_value(json!({
             "id": "prx_1",
@@ -786,5 +866,51 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(listed.token, None);
+        assert!(listed.labels.is_empty());
+    }
+
+    #[test]
+    fn proxy_input_serializes_labels() {
+        let input = ProxyInput {
+            name: "edge".to_owned(),
+            principal_id: "prn_1".to_owned(),
+            labels: std::collections::BTreeMap::from([(
+                "centaur.slack_user_id".to_owned(),
+                "U1".to_owned(),
+            )]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(input).unwrap(),
+            json!({
+                "name": "edge",
+                "principal_id": "prn_1",
+                "labels": { "centaur.slack_user_id": "U1" }
+            })
+        );
+    }
+
+    #[test]
+    fn proxy_assignment_payload_omits_empty_labels() {
+        assert_eq!(
+            proxy_assignment_payload("prn_1", &std::collections::BTreeMap::new()),
+            json!({ "principal_id": "prn_1" })
+        );
+    }
+
+    #[test]
+    fn proxy_assignment_payload_includes_non_empty_labels() {
+        let labels = std::collections::BTreeMap::from([(
+            "centaur.slack_user_id".to_owned(),
+            "U1".to_owned(),
+        )]);
+
+        assert_eq!(
+            proxy_assignment_payload("prn_1", &labels),
+            json!({
+                "principal_id": "prn_1",
+                "labels": { "centaur.slack_user_id": "U1" }
+            })
+        );
     }
 }

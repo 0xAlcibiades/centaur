@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import os
 import re
+import time
+import urllib.request
+from collections import Counter
+from contextlib import suppress
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
-from centaur_sdk.tool_sdk import get_tool_context, secret
+from centaur_sdk.tool_sdk import secret
 
 DEFAULT_SEARCH_LIMIT = 10
 MAX_SEARCH_LIMIT = 50
+DEFAULT_QUERY_LIMIT = 100
+MAX_QUERY_LIMIT = 1_000
+DEFAULT_QUERY_TIMEOUT_SECONDS = 10
+MAX_QUERY_TIMEOUT_SECONDS = 30
 TITLE_MATCH_BOOST = 4
 EXACT_QUERY_TITLE_BOOST = 8
 EXACT_QUERY_BODY_BOOST = 2
@@ -25,11 +31,23 @@ THREAD_SCORE_MULTIPLIER = 1.25
 CHANNEL_DAY_SCORE_MULTIPLIER = 0.75
 DEFAULT_PREVIEW_CHARS = 280
 MAX_RELATED_CHILDREN = 25
-SLACK_LIVE_SOURCE_TYPE = "slack_live_message"
+SLACK_DM_SOURCE = "slack_dm"
+GRANOLA_SOURCE = "granola"
+GRANOLA_SOURCE_TYPE = "granola_note"
+DOCS_SOURCE = "docs"
+LEGACY_GOOGLE_DRIVE_SOURCE = "google_drive"
+GOOGLE_DOCS_SOURCE_TYPE = "google_doc"
 COMPANY_CONTEXT_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 COMPANY_CONTEXT_DATABASE_ENV = "COMPANY_CONTEXT_POSTGRES_DATABASE"
 DEFAULT_POSTGRES_DATABASE = "ai_v2"
-_SLACK_AFTER_RE = re.compile(r"\bafter:\d{4}-\d{2}-\d{2}\b", re.IGNORECASE)
+COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED_ENV = "COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED"
+VICTORIAMETRICS_PUSH_ENABLED_ENV = "VICTORIAMETRICS_PUSH_ENABLED"
+VICTORIAMETRICS_URL_ENV = "VICTORIAMETRICS_URL"
+DEFAULT_VICTORIAMETRICS_URL = "http://victoriametrics:8428"
+METRICS_PUSH_TIMEOUT_SECONDS = 1.0
+LOOKUP_REQUEST_METRIC = "company_context_lookup_requests"
+LOOKUP_RESULT_METRIC = "company_context_lookup_results"
+LOOKUP_ZERO_RESULT_METRIC = "company_context_lookup_zero_results"
 
 _SEARCH_TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*")
 _STOP_WORDS = {
@@ -125,6 +143,139 @@ def _isoformat(value: Any) -> str | None:
     return None
 
 
+def _env_flag_enabled(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)  # noqa: TID251
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _first_nonempty_env(names: list[str]) -> str | None:
+    for name in names:
+        value = os.getenv(name, "").strip()  # noqa: TID251
+        if value:
+            return value
+    return None
+
+
+def _metric_runtime_labels() -> dict[str, str]:
+    labels: dict[str, str] = {}
+    environment = _first_nonempty_env(
+        ["METRICS_ENVIRONMENT", "CENTAUR_ENVIRONMENT", "DEPLOY_ENV", "ENVIRONMENT"]
+    )
+    namespace = _first_nonempty_env(
+        ["METRICS_NAMESPACE", "CENTAUR_NAMESPACE", "POD_NAMESPACE", "NAMESPACE"]
+    )
+    if environment:
+        labels["environment"] = environment
+    if namespace:
+        labels["namespace"] = namespace
+    return labels
+
+
+def _metric_label_value(value: str | None, *, empty: str = "all") -> str:
+    normalized = str(value or "").strip()
+    return normalized if normalized else empty
+
+
+def _format_metric_labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    parts = []
+    for key in sorted(labels):
+        value = labels[key].replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        parts.append(f'{key}="{value}"')
+    return "{" + ",".join(parts) + "}"
+
+
+def _format_metric_sample(
+    metric: str,
+    value: int | float,
+    labels: dict[str, str],
+    timestamp_ms: int,
+) -> str:
+    return f"{metric}{_format_metric_labels(labels)} {value} {timestamp_ms}"
+
+
+def _company_context_lookup_metrics_enabled() -> bool:
+    return _env_flag_enabled(COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED_ENV, default=True) and (
+        _env_flag_enabled(VICTORIAMETRICS_PUSH_ENABLED_ENV, default=True)
+    )
+
+
+def _victoria_metrics_import_url() -> str:
+    base_url = os.getenv(VICTORIAMETRICS_URL_ENV, DEFAULT_VICTORIAMETRICS_URL).strip()  # noqa: TID251
+    if base_url and not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    return f"{(base_url or DEFAULT_VICTORIAMETRICS_URL).rstrip('/')}/api/v1/import/prometheus"
+
+
+def _push_company_context_lookup_metric_lines(lines: list[str]) -> None:
+    if not lines or not _company_context_lookup_metrics_enabled():
+        return
+    try:
+        body = ("\n".join(lines) + "\n").encode()
+        request = urllib.request.Request(
+            _victoria_metrics_import_url(),
+            data=body,
+            headers={"Content-Type": "text/plain; version=0.0.4"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=METRICS_PUSH_TIMEOUT_SECONDS):
+            pass
+    except Exception:
+        return
+
+
+def _emit_company_context_lookup_metrics(
+    *,
+    status: str,
+    requested_source: str | None,
+    requested_source_type: str | None,
+    occurred_after: datetime | None,
+    occurred_before: datetime | None,
+    results: list[dict[str, Any]],
+) -> None:
+    """Emit event-style lookup samples; dashboards should sum them over a range."""
+    labels = {
+        **_metric_runtime_labels(),
+        "status": _metric_label_value(status, empty="unknown"),
+        "requested_source": _metric_label_value(requested_source),
+        "requested_source_type": _metric_label_value(requested_source_type),
+        "time_window": str(occurred_after is not None or occurred_before is not None).lower(),
+    }
+    timestamp_ms = int(time.time() * 1000)
+    lines = [_format_metric_sample(LOOKUP_REQUEST_METRIC, 1, labels, timestamp_ms)]
+
+    if status == "ok" and not results:
+        lines.append(_format_metric_sample(LOOKUP_ZERO_RESULT_METRIC, 1, labels, timestamp_ms))
+
+    grouped_results = Counter(
+        (
+            _metric_label_value(str(result.get("source") or "")),
+            _metric_label_value(str(result.get("source_type") or "")),
+            _metric_label_value(str(result.get("lane") or "indexed"), empty="indexed"),
+        )
+        for result in results
+    )
+    for (source, source_type, lane), count in sorted(grouped_results.items()):
+        lines.append(
+            _format_metric_sample(
+                LOOKUP_RESULT_METRIC,
+                count,
+                {
+                    **_metric_runtime_labels(),
+                    "source": source,
+                    "source_type": source_type,
+                    "lane": lane,
+                },
+                timestamp_ms,
+            )
+        )
+
+    _push_company_context_lookup_metric_lines(lines)
+
+
 def _parse_datetime_filter(value: str | datetime | None, *, name: str) -> datetime | None:
     """Parse optional date filters for tool calls."""
     if value is None:
@@ -186,8 +337,7 @@ def _search_where_clause(term_count: int) -> str:
     ]
     for index in range(2, term_count + 2):
         clauses.append(
-            f"(title ||| ${index}::text::pdb.boost({TITLE_MATCH_BOOST}) "
-            f"OR body ||| ${index}::text)"
+            f"(title ||| ${index}::text::pdb.boost({TITLE_MATCH_BOOST}) OR body ||| ${index}::text)"
         )
     return " OR ".join(clauses)
 
@@ -246,109 +396,160 @@ def _document_summary(row: Any) -> dict[str, Any]:
     }
 
 
-def _slack_ts_to_iso(ts: str | None) -> str | None:
-    """Convert a Slack timestamp string to ISO 8601 when possible."""
-    if not ts:
-        return None
-    try:
-        return datetime.fromtimestamp(float(ts), tz=UTC).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
+def _google_doc_summary(row: Any) -> dict[str, Any]:
+    """Return the common result shape for OAuth Google Docs context chunks."""
+    metadata = _as_dict(_row_value(row, "metadata", {}))
+    metadata.update(
+        {
+            "file_id": str(_row_value(row, "file_id", "")),
+            "chunk_id": str(_row_value(row, "chunk_id", "")),
+            "drive_id": str(_row_value(row, "drive_id", "")),
+            "mime_type": str(_row_value(row, "mime_type", "")),
+            "provider_author_id": str(_row_value(row, "provider_author_id", "")),
+        }
+    )
+    return {
+        "document_id": str(_row_value(row, "document_id", "")),
+        "source": DOCS_SOURCE,
+        "source_type": GOOGLE_DOCS_SOURCE_TYPE,
+        "source_document_id": str(_row_value(row, "file_id", "")),
+        "source_chunk_id": str(_row_value(row, "chunk_id", "")),
+        "parent_document_id": None,
+        "title": str(_row_value(row, "title", "")),
+        "url": str(_row_value(row, "url", "")),
+        "author_name": str(_row_value(row, "provider_author_name", "")),
+        "access_scope": "",
+        "occurred_at": _isoformat(
+            _row_value(row, "source_created_at") or _row_value(row, "source_modified_at")
+        ),
+        "source_updated_at": _isoformat(_row_value(row, "source_modified_at")),
+        "metadata": metadata,
+    }
 
 
-def _slack_after_query(query: str, latest_date: str | None) -> str:
-    """Append a Slack after:YYYY-MM-DD modifier unless the query already has one."""
-    if not latest_date or _SLACK_AFTER_RE.search(query):
-        return query
-    return f"{query} after:{latest_date[:10]}"
+def _granola_doc_summary(row: Any) -> dict[str, Any]:
+    """Return the common result shape for user-visible Granola notes."""
+    metadata = _as_dict(_row_value(row, "metadata", {}))
+    metadata.update(
+        {
+            "note_id": str(_row_value(row, "note_id", "")),
+            "owner_id": str(_row_value(row, "owner_id", "")),
+            "owner_email": str(_row_value(row, "owner_email", "")),
+            "attendee_labels": list(_row_value(row, "attendee_labels", []) or []),
+        }
+    )
+    return {
+        "document_id": str(_row_value(row, "document_id", "")),
+        "source": GRANOLA_SOURCE,
+        "source_type": GRANOLA_SOURCE_TYPE,
+        "source_document_id": str(_row_value(row, "note_id", "")),
+        "source_chunk_id": "",
+        "parent_document_id": None,
+        "title": str(_row_value(row, "title", "")),
+        "url": str(_row_value(row, "url", "")),
+        "author_name": str(
+            _row_value(row, "owner_name", "")
+            or _row_value(row, "owner_email", "")
+            or _row_value(row, "owner_id", "")
+        ),
+        "access_scope": "granola_note",
+        "occurred_at": _isoformat(_row_value(row, "occurred_at")),
+        "source_updated_at": _isoformat(_row_value(row, "source_updated_at")),
+        "metadata": metadata,
+    }
 
 
-def _current_slack_channel_id() -> str | None:
-    """Return the channel/group id for the active Slack thread, or None for DMs."""
-    try:
-        thread_key = get_tool_context().thread_key
-    except LookupError:
-        return None
-    if not thread_key:
-        return None
-    for segment in str(thread_key).split(":")[1:]:
-        clean = segment.strip()
-        if clean.startswith(("C", "G")):
-            return clean
-        if clean.startswith("D"):
-            return None
-    return None
+def _dm_document_summary(row: Any) -> dict[str, Any]:
+    """Return metadata for user-scoped Slack conversation context records."""
+    metadata = _as_dict(_row_value(row, "metadata", {}))
+    conversation_type = str(_row_value(row, "conversation_type", ""))
+    conversation_id = str(_row_value(row, "conversation_id", ""))
+    message_ts = str(_row_value(row, "message_ts", ""))
+    user_id = str(_row_value(row, "user_id", ""))
+    bot_id = str(_row_value(row, "bot_id", ""))
+    return {
+        "document_id": str(_row_value(row, "document_id", "")),
+        "source": SLACK_DM_SOURCE,
+        "source_type": f"slack_{conversation_type}" if conversation_type else SLACK_DM_SOURCE,
+        "source_document_id": conversation_id,
+        "source_chunk_id": message_ts,
+        "parent_document_id": None,
+        "title": str(_row_value(row, "title", "")),
+        "url": str(_row_value(row, "permalink", "")),
+        "author_name": user_id or bot_id,
+        "access_scope": (
+            "slack_private_channel"
+            if conversation_type == "private_channel"
+            else "slack_dm"
+        ),
+        "occurred_at": _isoformat(_row_value(row, "occurred_at")),
+        "source_updated_at": _isoformat(_row_value(row, "source_updated_at")),
+        "conversation_id": conversation_id,
+        "conversation_type": conversation_type,
+        "message_ts": message_ts,
+        "thread_ts": _row_value(row, "thread_ts"),
+        "user_id": user_id,
+        "bot_id": bot_id,
+        "attachment_count": int(metadata.get("attachment_count") or 0),
+        "metadata": metadata,
+    }
 
 
-def _context_scope_clause(
-    param_index: int,
-    source_expr: str = "source",
-    metadata_expr: str = "metadata",
-) -> str:
-    """SQL predicate matching the app-level company_context visibility boundary."""
-    return (
-        f"${param_index}::text IS NOT NULL "
-        f"AND {source_expr} = 'slack' "
-        f"AND {metadata_expr} ->> 'channel_id' = ${param_index}::text"
+def _dm_conversation_summary(row: Any) -> dict[str, Any]:
+    """Return visible metadata for a Slack DM/MPIM conversation."""
+    return {
+        "document_id": str(_row_value(row, "document_id", "")),
+        "source": SLACK_DM_SOURCE,
+        "source_type": "slack_dm_conversation",
+        "home_team_id": str(_row_value(row, "home_team_id", "")),
+        "conversation_id": str(_row_value(row, "conversation_id", "")),
+        "conversation_type": str(_row_value(row, "conversation_type", "")),
+        "title": str(_row_value(row, "title", "")),
+        "is_ext_shared": bool(_row_value(row, "is_ext_shared", False)),
+        "last_seen_at": _isoformat(_row_value(row, "last_seen_at")),
+        "source_updated_at": _isoformat(_row_value(row, "source_updated_at")),
+        "participant_user_ids": list(_row_value(row, "participant_user_ids", []) or []),
+        "participant_labels": list(_row_value(row, "participant_labels", []) or []),
+        "participant_count": int(_row_value(row, "participant_count", 0) or 0),
+        "matched_labels": list(_row_value(row, "matched_labels", []) or []),
+        "metadata": _as_dict(_row_value(row, "metadata", {})),
+    }
+
+
+def _include_google_docs_source(source: str | None, source_type: str | None) -> bool:
+    return (source is None or source == DOCS_SOURCE) and source_type in (
+        None,
+        GOOGLE_DOCS_SOURCE_TYPE,
     )
 
 
-def _load_slack_client() -> Any:
-    """Load the sibling Slack tool client without making company_context import it eagerly."""
-    candidate_roots = [
-        Path("/app/tools/productivity/slack"),
-        Path(__file__).resolve().parent.parent / "slack",
-    ]
-    slack_dir = next((path for path in candidate_roots if (path / "client.py").exists()), None)
-    if slack_dir is None:
-        raise RuntimeError("slack tool client not found")
-
-    module_name = "_company_context_slack_client"
-    spec = importlib.util.spec_from_file_location(module_name, slack_dir / "client.py")
-    if spec is None or spec.loader is None:
-        raise RuntimeError("failed to load slack tool client")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module._client()
+def _include_slack_dms_source(source: str | None, source_type: str | None) -> bool:
+    return (source is None or source == SLACK_DM_SOURCE) and source_type in (
+        None,
+        SLACK_DM_SOURCE,
+        "slack_im",
+        "slack_mpim",
+        "slack_private_channel",
+        "slack_dm_conversation",
+    )
 
 
-def _live_slack_result(message: dict[str, Any]) -> dict[str, Any]:
-    """Normalize slack.search_messages results into company_context search result shape."""
-    channel = str(message.get("channel") or "")
-    user = str(message.get("user") or "")
-    timestamp = str(message.get("timestamp") or "")
-    title_bits = []
-    if channel:
-        title_bits.append(f"#{channel}")
-    if user:
-        title_bits.append(f"from {user}")
-    return {
-        "document_id": "",
-        "source": "slack",
-        "source_type": SLACK_LIVE_SOURCE_TYPE,
-        "source_document_id": str(message.get("thread_ts") or timestamp),
-        "source_chunk_id": timestamp,
-        "parent_document_id": None,
-        "title": " ".join(title_bits) or "Slack message",
-        "url": str(message.get("permalink") or ""),
-        "author_name": user,
-        "access_scope": "",
-        "score": None,
-        "preview": str(message.get("text") or ""),
-        "occurred_at": _slack_ts_to_iso(timestamp),
-        "source_updated_at": None,
-        "lane": "live",
-        "result_type": SLACK_LIVE_SOURCE_TYPE,
-        "metadata": {
-            "channel_name": channel,
-            "channel_id": str(message.get("channel_id") or ""),
-            "user_name": user,
-            "user_id": str(message.get("user_id") or ""),
-            "message_ts": timestamp,
-            "thread_ts": message.get("thread_ts"),
-            "reply_count": int(message.get("reply_count") or 0),
-        },
-    }
+def _include_granola_source(source: str | None, source_type: str | None) -> bool:
+    return (source is None or source == GRANOLA_SOURCE) and source_type in (
+        None,
+        GRANOLA_SOURCE,
+        GRANOLA_SOURCE_TYPE,
+    )
+
+
+def _company_context_filters_for_source(
+    source: str | None,
+    source_type: str | None,
+) -> tuple[str | None, str | None]:
+    """Map the public docs source to the legacy projected Google Drive rows."""
+    if source == DOCS_SOURCE:
+        return LEGACY_GOOGLE_DRIVE_SOURCE, source_type or GOOGLE_DOCS_SOURCE_TYPE
+    return source, source_type
 
 
 class CompanyContextClient:
@@ -368,6 +569,73 @@ class CompanyContextClient:
             command_timeout=30,
         )
 
+    async def _query_async(
+        self,
+        *,
+        sql: str,
+        limit: int,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            rows = []
+            async with conn.transaction(readonly=True):
+                await conn.execute(
+                    "SELECT set_config('statement_timeout', $1, true)",
+                    f"{timeout_seconds}s",
+                )
+                cursor = conn.cursor(
+                    sql,
+                    prefetch=min(limit + 1, 100),
+                    timeout=timeout_seconds,
+                )
+                async for row in cursor:
+                    rows.append(row)
+                    if len(rows) > limit:
+                        break
+
+            truncated = len(rows) > limit
+            visible_rows = rows[:limit]
+            columns = list(visible_rows[0].keys()) if visible_rows else []
+            return {
+                "status": "ok",
+                "row_count": len(visible_rows),
+                "limit": limit,
+                "truncated": truncated,
+                "columns": columns,
+                "rows": [dict(row) for row in visible_rows],
+            }
+        finally:
+            await conn.close()
+
+    def query(
+        self,
+        sql: str,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
+    ) -> dict:
+        """Run one read-only SQL query against the scoped company-context database."""
+        normalized_sql = sql.strip()
+        if not normalized_sql:
+            return {"status": "error", "error": "sql cannot be empty"}
+        if normalized_sql.endswith(";"):
+            normalized_sql = normalized_sql[:-1].rstrip()
+
+        try:
+            return asyncio.run(
+                self._query_async(
+                    sql=normalized_sql,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_QUERY_LIMIT),
+                    timeout_seconds=_clamp(
+                        timeout_seconds,
+                        minimum=1,
+                        maximum=MAX_QUERY_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
     async def _search_async(
         self,
         *,
@@ -380,15 +648,20 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            slack_channel_id = _current_slack_channel_id()
             terms = _search_terms(query)
             search_terms = [query, *terms]
+            results = []
+            google_docs_error = None
+            granola_error = None
+            company_source, company_source_type = _company_context_filters_for_source(
+                source,
+                source_type,
+            )
             source_param = len(search_terms) + 1
             source_type_param = len(search_terms) + 2
             occurred_after_param = len(search_terms) + 3
             occurred_before_param = len(search_terms) + 4
             limit_param = len(search_terms) + 5
-            slack_channel_param = len(search_terms) + 6
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -409,7 +682,6 @@ class CompanyContextClient:
                     paradedb.score(document_id) AS score
                 FROM company_context_documents
                 WHERE {_search_where_clause(len(terms))}
-                  AND ({_context_scope_clause(slack_channel_param)})
                   AND (${source_param}::text IS NULL OR source = ${source_param})
                   AND (${source_type_param}::text IS NULL OR source_type = ${source_type_param})
                   AND (${occurred_after_param}::timestamptz IS NULL
@@ -427,14 +699,12 @@ class CompanyContextClient:
                 LIMIT ${limit_param}
                 """,
                 *search_terms,
-                source,
-                source_type,
+                company_source,
+                company_source_type,
                 occurred_after,
                 occurred_before,
                 limit,
-                slack_channel_id,
             )
-            results = []
             for row in rows:
                 result = _document_summary(row)
                 result["score"] = float(_row_value(row, "score", 0.0) or 0.0)
@@ -446,55 +716,183 @@ class CompanyContextClient:
                 result["result_type"] = str(result["source_type"] or "indexed_document")
                 results.append(result)
 
-            latest = None
-            live_results: list[dict[str, Any]] = []
-            live_error = None
-            should_search_live_slack = source == "slack" and (
-                source_type is None or source_type.startswith("slack")
-            )
-            should_search_live_slack = (
-                should_search_live_slack and occurred_after is None and occurred_before is None
-            )
-            if should_search_live_slack:
-                latest = await self._latest_date_for_connection(
-                    conn,
-                    source="slack",
-                    source_type=source_type,
-                )
+            if _include_google_docs_source(source, source_type):
                 try:
-                    if slack_channel_id is None:
-                        live_error = "live Slack search requires a channel-scoped thread"
-                    else:
-                        live_query = _slack_after_query(query, latest.get("latest_date"))
-                        live_messages = _load_slack_client().search_messages(
-                            live_query,
-                            max_results=limit,
-                            channels=[slack_channel_id],
+                    google_rows = await self._search_google_docs_async(
+                        conn,
+                        search_terms=search_terms,
+                        term_count=len(terms),
+                        limit=limit,
+                        modified_after=occurred_after,
+                        modified_before=occurred_before,
+                    )
+                    for row in google_rows:
+                        result = _google_doc_summary(row)
+                        result["score"] = float(_row_value(row, "score", 0.0) or 0.0)
+                        result["preview"] = _body_preview(
+                            str(_row_value(row, "body", "") or ""),
+                            query=query,
                         )
-                        live_results = [_live_slack_result(message) for message in live_messages]
-                except Exception as exc:
-                    live_error = str(exc)
+                        result["lane"] = "indexed"
+                        result["result_type"] = GOOGLE_DOCS_SOURCE_TYPE
+                        results.append(result)
+                except asyncpg.UndefinedTableError as exc:
+                    google_docs_error = str(exc)
 
-            return {
+            if _include_granola_source(source, source_type):
+                try:
+                    granola_rows = await self._search_granola_async(
+                        conn,
+                        search_terms=search_terms,
+                        term_count=len(terms),
+                        limit=limit,
+                        occurred_after=occurred_after,
+                        occurred_before=occurred_before,
+                    )
+                    for row in granola_rows:
+                        result = _granola_doc_summary(row)
+                        result["score"] = float(_row_value(row, "score", 0.0) or 0.0)
+                        result["preview"] = _body_preview(
+                            str(_row_value(row, "body", "") or ""),
+                            query=query,
+                        )
+                        result["lane"] = "indexed"
+                        result["result_type"] = GRANOLA_SOURCE_TYPE
+                        results.append(result)
+                except asyncpg.UndefinedTableError as exc:
+                    granola_error = str(exc)
+
+            results.sort(
+                key=lambda item: (
+                    float(item.get("score") or 0.0),
+                    str(item.get("source_updated_at") or ""),
+                ),
+                reverse=True,
+            )
+            results = results[:limit]
+
+            _emit_company_context_lookup_metrics(
+                status="ok",
+                requested_source=source,
+                requested_source_type=source_type,
+                occurred_after=occurred_after,
+                occurred_before=occurred_before,
+                results=results,
+            )
+
+            response = {
                 "status": "ok",
                 "query": query,
                 "source": source,
                 "source_type": source_type,
                 "occurred_after": _isoformat(occurred_after),
                 "occurred_before": _isoformat(occurred_before),
-                "count": len(results) + len(live_results),
+                "count": len(results),
                 "indexed_count": len(results),
-                "live_count": len(live_results),
-                "indexed_cutoff": latest.get("latest_date") if latest else None,
-                "latest_source_updated_at": (
-                    latest.get("latest_source_updated_at") if latest else None
-                ),
-                "latest_occurred_at": latest.get("latest_occurred_at") if latest else None,
-                "live_error": live_error,
-                "results": [*results, *live_results],
+                "results": results,
             }
+            if google_docs_error:
+                response["google_docs_error"] = google_docs_error
+            if granola_error:
+                response["granola_error"] = granola_error
+            return response
         finally:
             await conn.close()
+
+    async def _search_google_docs_async(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        search_terms: list[str],
+        term_count: int,
+        limit: int,
+        modified_after: datetime | None,
+        modified_before: datetime | None,
+    ) -> list[Any]:
+        modified_after_param = len(search_terms) + 1
+        modified_before_param = len(search_terms) + 2
+        limit_param = len(search_terms) + 3
+        return await conn.fetch(
+            f"""
+            SELECT
+                document_id,
+                file_id,
+                chunk_id,
+                title,
+                body,
+                url,
+                provider_author_id,
+                provider_author_name,
+                mime_type,
+                drive_id,
+                source_created_at,
+                source_modified_at,
+                metadata,
+                paradedb.score(document_id) AS score
+            FROM google_docs_context_documents
+            WHERE {_search_where_clause(term_count)}
+              AND (${modified_after_param}::timestamptz IS NULL
+                   OR source_modified_at >= ${modified_after_param})
+              AND (${modified_before_param}::timestamptz IS NULL
+                   OR source_modified_at < ${modified_before_param})
+            ORDER BY paradedb.score(document_id) DESC,
+                     source_modified_at DESC NULLS LAST,
+                     document_id ASC
+            LIMIT ${limit_param}
+            """,
+            *search_terms,
+            modified_after,
+            modified_before,
+            limit,
+        )
+
+    async def _search_granola_async(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        search_terms: list[str],
+        term_count: int,
+        limit: int,
+        occurred_after: datetime | None,
+        occurred_before: datetime | None,
+    ) -> list[Any]:
+        occurred_after_param = len(search_terms) + 1
+        occurred_before_param = len(search_terms) + 2
+        limit_param = len(search_terms) + 3
+        return await conn.fetch(
+            f"""
+            SELECT
+                document_id,
+                note_id,
+                title,
+                body,
+                url,
+                owner_id,
+                owner_email,
+                owner_name,
+                access_emails,
+                attendee_labels,
+                occurred_at,
+                source_updated_at,
+                metadata,
+                paradedb.score(document_id) AS score
+            FROM granola_context_documents
+            WHERE {_search_where_clause(term_count)}
+              AND (${occurred_after_param}::timestamptz IS NULL
+                   OR occurred_at >= ${occurred_after_param})
+              AND (${occurred_before_param}::timestamptz IS NULL
+                   OR occurred_at < ${occurred_before_param})
+            ORDER BY paradedb.score(document_id) DESC,
+                     occurred_at DESC NULLS LAST,
+                     source_updated_at DESC NULLS LAST,
+                     document_id ASC
+            LIMIT ${limit_param}
+            """,
+            *search_terms,
+            occurred_after,
+            occurred_before,
+            limit,
+        )
 
     async def _latest_date_for_connection(
         self,
@@ -504,32 +902,28 @@ class CompanyContextClient:
         source_type: str | None,
     ) -> dict[str, Any]:
         """Return latest indexed date using an existing DB connection."""
+        if source == SLACK_DM_SOURCE:
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+        company_source, company_source_type = _company_context_filters_for_source(
+            source,
+            source_type,
+        )
         row = await conn.fetchrow(
-            f"""
+            """
             SELECT
                 MAX(COALESCE(source_updated_at, occurred_at)) AS latest_date,
                 MAX(source_updated_at) AS latest_source_updated_at,
                 MAX(occurred_at) AS latest_occurred_at,
                 COUNT(*)::bigint AS document_count
             FROM company_context_documents
-            WHERE ({_context_scope_clause(1)})
-              AND ($2::text IS NULL OR source = $2)
-              AND ($3::text IS NULL OR source_type = $3)
+            WHERE ($1::text IS NULL OR source = $1)
+              AND ($2::text IS NULL OR source_type = $2)
             """,
-            _current_slack_channel_id(),
-            source,
-            source_type,
+            company_source,
+            company_source_type,
         )
         if not row or int(row["document_count"] or 0) == 0:
-            return {
-                "status": "ok",
-                "source": source,
-                "source_type": source_type,
-                "document_count": 0,
-                "latest_date": None,
-                "latest_source_updated_at": None,
-                "latest_occurred_at": None,
-            }
+            return self._empty_latest_date_result(source=source, source_type=source_type)
         return {
             "status": "ok",
             "source": source,
@@ -538,6 +932,203 @@ class CompanyContextClient:
             "latest_date": _isoformat(row["latest_date"]),
             "latest_source_updated_at": _isoformat(row["latest_source_updated_at"]),
             "latest_occurred_at": _isoformat(row["latest_occurred_at"]),
+        }
+
+    async def _latest_google_docs_for_connection(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        source: str | None,
+        source_type: str | None,
+    ) -> dict[str, Any]:
+        if not _include_google_docs_source(source, source_type):
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+        row = await conn.fetchrow(
+            """
+            SELECT
+                MAX(COALESCE(source_modified_at, source_created_at)) AS latest_date,
+                MAX(source_modified_at) AS latest_source_updated_at,
+                MAX(source_created_at) AS latest_occurred_at,
+                COUNT(*)::bigint AS document_count
+            FROM google_docs_context_documents
+            """
+        )
+        if not row or int(row["document_count"] or 0) == 0:
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+        return {
+            "status": "ok",
+            "source": source,
+            "source_type": source_type,
+            "document_count": int(row["document_count"] or 0),
+            "latest_date": _isoformat(row["latest_date"]),
+            "latest_source_updated_at": _isoformat(row["latest_source_updated_at"]),
+            "latest_occurred_at": _isoformat(row["latest_occurred_at"]),
+        }
+
+    async def _latest_granola_for_connection(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        source: str | None,
+        source_type: str | None,
+    ) -> dict[str, Any]:
+        if not _include_granola_source(source, source_type):
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+        row = await conn.fetchrow(
+            """
+            SELECT
+                MAX(COALESCE(source_updated_at, occurred_at)) AS latest_date,
+                MAX(source_updated_at) AS latest_source_updated_at,
+                MAX(occurred_at) AS latest_occurred_at,
+                COUNT(*)::bigint AS document_count
+            FROM granola_context_documents
+            """
+        )
+        return self._latest_date_result_from_row(
+            row,
+            source=source,
+            source_type=source_type,
+        )
+
+    async def _latest_slack_dms_for_connection(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        source: str | None,
+        source_type: str | None,
+    ) -> dict[str, Any]:
+        if not _include_slack_dms_source(source, source_type):
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+
+        message_conversation_type = None
+        include_messages = source_type in (
+            None,
+            SLACK_DM_SOURCE,
+            "slack_im",
+            "slack_mpim",
+            "slack_private_channel",
+        )
+        if source_type in ("slack_im", "slack_mpim", "slack_private_channel"):
+            message_conversation_type = source_type.removeprefix("slack_")
+        include_conversations = source_type in (None, SLACK_DM_SOURCE, "slack_dm_conversation")
+
+        messages = self._empty_latest_date_result(source=source, source_type=source_type)
+        conversations = self._empty_latest_date_result(source=source, source_type=source_type)
+
+        if include_messages:
+            with suppress(asyncpg.UndefinedTableError):
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        MAX(COALESCE(source_updated_at, occurred_at)) AS latest_date,
+                        MAX(source_updated_at) AS latest_source_updated_at,
+                        MAX(occurred_at) AS latest_occurred_at,
+                        COUNT(*)::bigint AS document_count
+                    FROM slack_private_context_documents
+                    WHERE ($1::text IS NULL OR conversation_type = $1)
+                    """,
+                    message_conversation_type,
+                )
+                messages = self._latest_date_result_from_row(
+                    row,
+                    source=source,
+                    source_type=source_type,
+                )
+
+        if include_conversations:
+            with suppress(asyncpg.UndefinedTableError):
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        MAX(COALESCE(source_updated_at, last_seen_at)) AS latest_date,
+                        MAX(source_updated_at) AS latest_source_updated_at,
+                        MAX(last_seen_at) AS latest_occurred_at,
+                        COUNT(*)::bigint AS document_count
+                    FROM slack_private_conversation_context_documents
+                    """,
+                )
+                conversations = self._latest_date_result_from_row(
+                    row,
+                    source=source,
+                    source_type=source_type,
+                )
+
+        return self._merge_latest_dates(
+            source=source,
+            source_type=source_type,
+            indexed=messages,
+            google_docs=conversations,
+        )
+
+    def _empty_latest_date_result(
+        self,
+        *,
+        source: str | None,
+        source_type: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "source": source,
+            "source_type": source_type,
+            "document_count": 0,
+            "latest_date": None,
+            "latest_source_updated_at": None,
+            "latest_occurred_at": None,
+        }
+
+    def _latest_date_result_from_row(
+        self,
+        row: Any,
+        *,
+        source: str | None,
+        source_type: str | None,
+    ) -> dict[str, Any]:
+        if not row or int(row["document_count"] or 0) == 0:
+            return self._empty_latest_date_result(source=source, source_type=source_type)
+        return {
+            "status": "ok",
+            "source": source,
+            "source_type": source_type,
+            "document_count": int(row["document_count"] or 0),
+            "latest_date": _isoformat(row["latest_date"]),
+            "latest_source_updated_at": _isoformat(row["latest_source_updated_at"]),
+            "latest_occurred_at": _isoformat(row["latest_occurred_at"]),
+        }
+
+    def _merge_latest_dates(
+        self,
+        *,
+        source: str | None,
+        source_type: str | None,
+        indexed: dict[str, Any],
+        google_docs: dict[str, Any],
+        slack_dms: dict[str, Any] | None = None,
+        granola: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        def latest(values: list[str | None]) -> str | None:
+            present = [value for value in values if value]
+            return max(present) if present else None
+
+        latest_results = [indexed, google_docs]
+        if slack_dms is not None:
+            latest_results.append(slack_dms)
+        if granola is not None:
+            latest_results.append(granola)
+
+        return {
+            "status": "ok",
+            "source": source,
+            "source_type": source_type,
+            "document_count": sum(
+                int(result.get("document_count") or 0) for result in latest_results
+            ),
+            "latest_date": latest([result.get("latest_date") for result in latest_results]),
+            "latest_source_updated_at": latest(
+                [result.get("latest_source_updated_at") for result in latest_results]
+            ),
+            "latest_occurred_at": latest(
+                [result.get("latest_occurred_at") for result in latest_results]
+            ),
         }
 
     def search(
@@ -549,7 +1140,220 @@ class CompanyContextClient:
         occurred_after: str | datetime | None = None,
         occurred_before: str | datetime | None = None,
     ) -> dict:
-        """Search company context documents and return candidate document ids."""
+        """Search indexed company context documents and return candidate document ids."""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return {"status": "error", "error": "query cannot be empty"}
+
+        normalized_source = source.strip() if source else None
+        normalized_source_type = source_type.strip() if source_type else None
+        try:
+            parsed_occurred_after = _parse_datetime_filter(
+                occurred_after,
+                name="occurred_after",
+            )
+            parsed_occurred_before = _parse_datetime_filter(
+                occurred_before,
+                name="occurred_before",
+            )
+            _validate_date_window(parsed_occurred_after, parsed_occurred_before)
+            return asyncio.run(
+                self._search_async(
+                    query=normalized_query,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_SEARCH_LIMIT),
+                    source=normalized_source,
+                    source_type=normalized_source_type,
+                    occurred_after=parsed_occurred_after,
+                    occurred_before=parsed_occurred_before,
+                )
+            )
+        except Exception as exc:
+            _emit_company_context_lookup_metrics(
+                status="error",
+                requested_source=normalized_source,
+                requested_source_type=normalized_source_type,
+                occurred_after=None,
+                occurred_before=None,
+                results=[],
+            )
+            return {"status": "error", "error": str(exc)}
+
+    async def _search_dm_conversations_async(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            terms = _search_terms(query)
+            search_terms = [query, *terms]
+            limit_param = len(search_terms) + 1
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    document_id,
+                    home_team_id,
+                    conversation_id,
+                    conversation_type,
+                    title,
+                    body,
+                    is_ext_shared,
+                    last_seen_at,
+                    source_updated_at,
+                    participant_user_ids,
+                    participant_labels,
+                    participant_count,
+                    metadata,
+                    paradedb.score(document_id) AS score
+                FROM slack_private_conversation_context_documents
+                WHERE {_search_where_clause(len(terms))}
+                ORDER BY paradedb.score(document_id) DESC,
+                         last_seen_at DESC NULLS LAST,
+                         source_updated_at DESC NULLS LAST
+                LIMIT ${limit_param}
+                """,
+                *search_terms,
+                limit,
+            )
+            results = []
+            query_terms = [term.lower() for term in _search_terms(query)]
+            for row in rows:
+                result = _dm_conversation_summary(row)
+                result["score"] = float(_row_value(row, "score", 0.0) or 0.0)
+                result["preview"] = _body_preview(
+                    str(_row_value(row, "body", "") or ""),
+                    query=query,
+                )
+                result["matched_labels"] = [
+                    label
+                    for label in result["participant_labels"]
+                    if any(term in str(label).lower() for term in query_terms)
+                ]
+                results.append(result)
+            return {
+                "status": "ok",
+                "query": query,
+                "source": SLACK_DM_SOURCE,
+                "count": len(results),
+                "results": results,
+            }
+        finally:
+            await conn.close()
+
+    def search_dm_conversations(
+        self,
+        query: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> dict:
+        """Find Slack DM and group DM conversations visible to the current Slack user."""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return {"status": "error", "error": "query cannot be empty"}
+
+        try:
+            return asyncio.run(
+                self._search_dm_conversations_async(
+                    query=normalized_query,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_SEARCH_LIMIT),
+                )
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    async def _search_dms_async(
+        self,
+        *,
+        query: str,
+        limit: int,
+        conversation_id: str | None,
+        occurred_after: datetime | None,
+        occurred_before: datetime | None,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            terms = _search_terms(query)
+            search_terms = [query, *terms]
+            conversation_id_param = len(search_terms) + 1
+            occurred_after_param = len(search_terms) + 2
+            occurred_before_param = len(search_terms) + 3
+            limit_param = len(search_terms) + 4
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    document_id,
+                    home_team_id,
+                    conversation_id,
+                    message_ts,
+                    conversation_type,
+                    thread_ts,
+                    parent_message_ts,
+                    is_thread_root,
+                    user_id,
+                    user_team_id,
+                    bot_id,
+                    message_type,
+                    message_subtype,
+                    title,
+                    body,
+                    permalink,
+                    occurred_at,
+                    source_updated_at,
+                    metadata,
+                    paradedb.score(document_id) AS score
+                FROM slack_private_context_documents
+                WHERE {_search_where_clause(len(terms))}
+                  AND (${conversation_id_param}::text IS NULL
+                       OR conversation_id = ${conversation_id_param})
+                  AND (${occurred_after_param}::timestamptz IS NULL
+                       OR occurred_at >= ${occurred_after_param})
+                  AND (${occurred_before_param}::timestamptz IS NULL
+                       OR occurred_at < ${occurred_before_param})
+                ORDER BY paradedb.score(document_id) DESC,
+                         occurred_at DESC NULLS LAST,
+                         source_updated_at DESC NULLS LAST
+                LIMIT ${limit_param}
+                """,
+                *search_terms,
+                conversation_id,
+                occurred_after,
+                occurred_before,
+                limit,
+            )
+            results = []
+            for row in rows:
+                result = _dm_document_summary(row)
+                result["score"] = float(_row_value(row, "score", 0.0) or 0.0)
+                result["preview"] = _body_preview(
+                    str(_row_value(row, "body", "") or ""),
+                    query=query,
+                )
+                result["lane"] = "indexed"
+                result["result_type"] = str(result["source_type"] or SLACK_DM_SOURCE)
+                results.append(result)
+
+            return {
+                "status": "ok",
+                "query": query,
+                "source": SLACK_DM_SOURCE,
+                "conversation_id": conversation_id,
+                "occurred_after": _isoformat(occurred_after),
+                "occurred_before": _isoformat(occurred_before),
+                "count": len(results),
+                "results": results,
+            }
+        finally:
+            await conn.close()
+
+    def search_dms(
+        self,
+        query: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        conversation_id: str | None = None,
+        occurred_after: str | datetime | None = None,
+        occurred_before: str | datetime | None = None,
+    ) -> dict:
+        """Search private Slack context visible to the current Slack user."""
         normalized_query = query.strip()
         if not normalized_query:
             return {"status": "error", "error": "query cannot be empty"}
@@ -565,11 +1369,10 @@ class CompanyContextClient:
             )
             _validate_date_window(parsed_occurred_after, parsed_occurred_before)
             return asyncio.run(
-                self._search_async(
+                self._search_dms_async(
                     query=normalized_query,
                     limit=_clamp(limit, minimum=1, maximum=MAX_SEARCH_LIMIT),
-                    source=source.strip() if source else None,
-                    source_type=source_type.strip() if source_type else None,
+                    conversation_id=conversation_id.strip() if conversation_id else None,
                     occurred_after=parsed_occurred_after,
                     occurred_before=parsed_occurred_before,
                 )
@@ -588,9 +1391,15 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            slack_channel_id = _current_slack_channel_id()
+            results = []
+            google_docs_error = None
+            granola_error = None
+            company_source, company_source_type = _company_context_filters_for_source(
+                source,
+                source_type,
+            )
             rows = await conn.fetch(
-                f"""
+                """
                 SELECT
                     document_id,
                     source,
@@ -607,28 +1416,70 @@ class CompanyContextClient:
                     source_updated_at,
                     metadata
                 FROM company_context_documents
-                WHERE ({_context_scope_clause(1)})
-                  AND ($2::text IS NULL OR source = $2)
-                  AND ($3::text IS NULL OR source_type = $3)
-                  AND ($4::timestamptz IS NULL OR occurred_at >= $4)
-                  AND ($5::timestamptz IS NULL OR occurred_at < $5)
+                WHERE ($1::text IS NULL OR source = $1)
+                  AND ($2::text IS NULL OR source_type = $2)
+                  AND ($3::timestamptz IS NULL OR occurred_at >= $3)
+                  AND ($4::timestamptz IS NULL OR occurred_at < $4)
                 ORDER BY occurred_at ASC NULLS LAST, source_updated_at DESC NULLS LAST,
                          document_id ASC
-                LIMIT $6
+                LIMIT $5
                 """,
-                slack_channel_id,
-                source,
-                source_type,
+                company_source,
+                company_source_type,
                 occurred_after,
                 occurred_before,
                 limit,
             )
-            results = []
             for row in rows:
                 result = _document_summary(row)
-                result["preview"] = _body_preview(str(_row_value(row, "body", "") or ""), query="")
+                result["preview"] = _body_preview(
+                    str(_row_value(row, "body", "") or ""),
+                    query="",
+                )
                 results.append(result)
-            return {
+            if _include_google_docs_source(source, source_type):
+                try:
+                    google_rows = await self._list_google_docs_async(
+                        conn,
+                        limit=limit,
+                        modified_after=occurred_after,
+                        modified_before=occurred_before,
+                    )
+                    for row in google_rows:
+                        result = _google_doc_summary(row)
+                        result["preview"] = _body_preview(
+                            str(_row_value(row, "body", "") or ""),
+                            query="",
+                        )
+                        results.append(result)
+                except asyncpg.UndefinedTableError as exc:
+                    google_docs_error = str(exc)
+            if _include_granola_source(source, source_type):
+                try:
+                    granola_rows = await self._list_granola_async(
+                        conn,
+                        limit=limit,
+                        occurred_after=occurred_after,
+                        occurred_before=occurred_before,
+                    )
+                    for row in granola_rows:
+                        result = _granola_doc_summary(row)
+                        result["preview"] = _body_preview(
+                            str(_row_value(row, "body", "") or ""),
+                            query="",
+                        )
+                        results.append(result)
+                except asyncpg.UndefinedTableError as exc:
+                    granola_error = str(exc)
+            results.sort(
+                key=lambda item: (
+                    str(item.get("occurred_at") or ""),
+                    str(item.get("source_updated_at") or ""),
+                    str(item.get("document_id") or ""),
+                )
+            )
+            results = results[:limit]
+            response = {
                 "status": "ok",
                 "source": source,
                 "source_type": source_type,
@@ -637,8 +1488,85 @@ class CompanyContextClient:
                 "count": len(results),
                 "results": results,
             }
+            if google_docs_error:
+                response["google_docs_error"] = google_docs_error
+            if granola_error:
+                response["granola_error"] = granola_error
+            return response
         finally:
             await conn.close()
+
+    async def _list_google_docs_async(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        limit: int,
+        modified_after: datetime | None,
+        modified_before: datetime | None,
+    ) -> list[Any]:
+        return await conn.fetch(
+            """
+            SELECT
+                document_id,
+                file_id,
+                chunk_id,
+                title,
+                body,
+                url,
+                provider_author_id,
+                provider_author_name,
+                mime_type,
+                drive_id,
+                source_created_at,
+                source_modified_at,
+                metadata
+            FROM google_docs_context_documents
+            WHERE ($1::timestamptz IS NULL OR source_modified_at >= $1)
+              AND ($2::timestamptz IS NULL OR source_modified_at < $2)
+            ORDER BY source_modified_at DESC NULLS LAST, source_created_at DESC NULLS LAST,
+                     document_id ASC
+            LIMIT $3
+            """,
+            modified_after,
+            modified_before,
+            limit,
+        )
+
+    async def _list_granola_async(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        limit: int,
+        occurred_after: datetime | None,
+        occurred_before: datetime | None,
+    ) -> list[Any]:
+        return await conn.fetch(
+            """
+            SELECT
+                document_id,
+                note_id,
+                title,
+                body,
+                url,
+                owner_id,
+                owner_email,
+                owner_name,
+                access_emails,
+                attendee_labels,
+                occurred_at,
+                source_updated_at,
+                metadata
+            FROM granola_context_documents
+            WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
+              AND ($2::timestamptz IS NULL OR occurred_at < $2)
+            ORDER BY occurred_at DESC NULLS LAST, source_updated_at DESC NULLS LAST,
+                     document_id ASC
+            LIMIT $3
+            """,
+            occurred_after,
+            occurred_before,
+            limit,
+        )
 
     def list_documents(
         self,
@@ -679,10 +1607,38 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            return await self._latest_date_for_connection(
+            indexed = await self._latest_date_for_connection(
                 conn,
                 source=source,
                 source_type=source_type,
+            )
+            google_docs = self._empty_latest_date_result(source=source, source_type=source_type)
+            with suppress(asyncpg.UndefinedTableError):
+                google_docs = await self._latest_google_docs_for_connection(
+                    conn,
+                    source=source,
+                    source_type=source_type,
+                )
+            slack_dms = self._empty_latest_date_result(source=source, source_type=source_type)
+            slack_dms = await self._latest_slack_dms_for_connection(
+                conn,
+                source=source,
+                source_type=source_type,
+            )
+            granola = self._empty_latest_date_result(source=source, source_type=source_type)
+            with suppress(asyncpg.UndefinedTableError):
+                granola = await self._latest_granola_for_connection(
+                    conn,
+                    source=source,
+                    source_type=source_type,
+                )
+            return self._merge_latest_dates(
+                source=source,
+                source_type=source_type,
+                indexed=indexed,
+                google_docs=google_docs,
+                slack_dms=slack_dms,
+                granola=granola,
             )
         finally:
             await conn.close()
@@ -708,9 +1664,8 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         parent = None
         if row["parent_document_id"]:
-            slack_channel_id = _current_slack_channel_id()
             parent_row = await conn.fetchrow(
-                f"""
+                """
                 SELECT
                     document_id,
                     source,
@@ -727,16 +1682,14 @@ class CompanyContextClient:
                     metadata
                 FROM company_context_documents
                 WHERE document_id = $1
-                  AND ({_context_scope_clause(2)})
                 """,
                 row["parent_document_id"],
-                slack_channel_id,
             )
             if parent_row:
                 parent = _document_summary(parent_row)
 
         child_rows = await conn.fetch(
-            f"""
+            """
             SELECT
                 document_id,
                 source,
@@ -753,13 +1706,11 @@ class CompanyContextClient:
                 metadata
             FROM company_context_documents
             WHERE parent_document_id = $1
-              AND ({_context_scope_clause(3)})
             ORDER BY occurred_at ASC NULLS LAST, document_id ASC
             LIMIT $2
             """,
             row["document_id"],
             max_children,
-            _current_slack_channel_id(),
         )
         children = [_document_summary(child_row) for child_row in child_rows]
         return {
@@ -778,9 +1729,8 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            slack_channel_id = _current_slack_channel_id()
             row = await conn.fetchrow(
-                f"""
+                """
                 SELECT
                     document_id,
                     source,
@@ -798,12 +1748,26 @@ class CompanyContextClient:
                     metadata
                 FROM company_context_documents
                 WHERE document_id = $1
-                  AND ({_context_scope_clause(2)})
                 """,
                 document_id,
-                slack_channel_id,
             )
             if not row:
+                try:
+                    google_doc = await self._read_google_doc_async(conn, document_id, max_chars)
+                except asyncpg.UndefinedTableError:
+                    google_doc = None
+                if google_doc is not None:
+                    return google_doc
+                try:
+                    granola_doc = await self._read_granola_doc_async(
+                        conn,
+                        document_id,
+                        max_chars,
+                    )
+                except asyncpg.UndefinedTableError:
+                    granola_doc = None
+                if granola_doc is not None:
+                    return granola_doc
                 return {
                     "status": "error",
                     "error": f"document not found: {document_id}",
@@ -829,6 +1793,90 @@ class CompanyContextClient:
             return result
         finally:
             await conn.close()
+
+    async def _read_google_doc_async(
+        self,
+        conn: asyncpg.Connection,
+        document_id: str,
+        max_chars: int | None,
+    ) -> dict[str, Any] | None:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                document_id,
+                file_id,
+                chunk_id,
+                title,
+                body,
+                url,
+                provider_author_id,
+                provider_author_name,
+                mime_type,
+                drive_id,
+                source_created_at,
+                source_modified_at,
+                metadata
+            FROM google_docs_context_documents
+            WHERE document_id = $1
+            """,
+            document_id,
+        )
+        if not row:
+            return None
+
+        body = str(row["body"] or "")
+        content = body if max_chars is None else body[:max_chars]
+        truncated = max_chars is not None and len(body) > max_chars
+        return {
+            "status": "ok",
+            **_google_doc_summary(row),
+            "chars": len(content),
+            "total_chars": len(body),
+            "truncated": truncated,
+            "content": content,
+        }
+
+    async def _read_granola_doc_async(
+        self,
+        conn: asyncpg.Connection,
+        document_id: str,
+        max_chars: int | None,
+    ) -> dict[str, Any] | None:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                document_id,
+                note_id,
+                title,
+                body,
+                url,
+                owner_id,
+                owner_email,
+                owner_name,
+                access_emails,
+                attendee_labels,
+                occurred_at,
+                source_updated_at,
+                metadata
+            FROM granola_context_documents
+            WHERE document_id = $1
+            """,
+            document_id,
+        )
+        if not row:
+            return None
+
+        body = str(row["body"] or "")
+        content = body if max_chars is None else body[:max_chars]
+        truncated = max_chars is not None and len(body) > max_chars
+        return {
+            "status": "ok",
+            **_granola_doc_summary(row),
+            "chars": len(content),
+            "total_chars": len(body),
+            "truncated": truncated,
+            "content": content,
+        }
 
     def read_document(
         self,

@@ -10,6 +10,7 @@ pub struct SandboxIo {
     stdout: SandboxRead,
     stderr: SandboxRead,
     guard: SandboxIoGuard,
+    resource_uid: Option<String>,
 }
 
 pub struct SandboxIoParts {
@@ -17,6 +18,9 @@ pub struct SandboxIoParts {
     pub stdout: SandboxRead,
     pub stderr: SandboxRead,
     pub guard: SandboxIoGuard,
+    /// Kubernetes backends bind this to the exact object attached to.  Callers
+    /// must not treat a same-name replacement as the traced assignment.
+    pub resource_uid: Option<String>,
 }
 
 pub struct SandboxIoGuard {
@@ -39,7 +43,13 @@ impl SandboxIo {
             stdout,
             stderr,
             guard: SandboxIoGuard::new(guard),
+            resource_uid: None,
         }
+    }
+
+    pub fn with_resource_uid(mut self, resource_uid: Option<String>) -> Self {
+        self.resource_uid = resource_uid;
+        self
     }
 
     pub fn into_parts(self) -> SandboxIoParts {
@@ -48,6 +58,7 @@ impl SandboxIo {
             stdout: self.stdout,
             stderr: self.stderr,
             guard: self.guard,
+            resource_uid: self.resource_uid,
         }
     }
 }

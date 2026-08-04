@@ -20,7 +20,7 @@ jobs:
   release:
     permissions:
       contents: write
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -62,6 +62,9 @@ jobs:
 
       - name: Lint chart
         run: helm lint contrib/chart
+
+      - name: Test 1Password source-auth rendering
+        run: contrib/chart/test-source-auth-render.sh
 
       - name: Install yq
         uses: mikefarah/yq@5a7e72a743649b1b3a47d1a1d8214f3453173c51 # v4

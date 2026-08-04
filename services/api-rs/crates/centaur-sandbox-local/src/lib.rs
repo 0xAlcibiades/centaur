@@ -4,14 +4,7 @@
 //! child process per sandbox and wires byte-oriented stdin/stdout/stderr through
 //! the shared sandbox trait.
 
-use std::{
-    collections::HashMap,
-    process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, process::Stdio, sync::Arc};
 
 use async_trait::async_trait;
 use centaur_sandbox_core::{
@@ -30,7 +23,6 @@ pub struct LocalSandboxBackend {
 
 #[derive(Default)]
 struct Inner {
-    next_id: AtomicU64,
     sandboxes: Mutex<HashMap<SandboxId, Arc<Mutex<LocalSandbox>>>>,
 }
 
@@ -48,8 +40,7 @@ impl LocalSandboxBackend {
     }
 
     fn next_id(&self) -> SandboxId {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        SandboxId::new(format!("local-{id}"))
+        SandboxId::new(format!("local-{}", uuid::Uuid::new_v4().simple()))
     }
 
     async fn sandbox(&self, id: &SandboxId) -> SandboxResult<Arc<Mutex<LocalSandbox>>> {
@@ -104,7 +95,8 @@ impl SandboxBackend for LocalSandboxBackend {
             })),
         );
 
-        Ok(SandboxHandle::new(id, self.name()))
+        Ok(SandboxHandle::new(id.clone(), self.name())
+            .with_resource_uid(Some(id.as_str().to_owned())))
     }
 
     async fn open_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
@@ -136,7 +128,8 @@ impl SandboxBackend for LocalSandboxBackend {
             Box::pin(stdin) as SandboxWrite,
             Box::pin(stdout) as SandboxRead,
             Box::pin(stderr) as SandboxRead,
-        ))
+        )
+        .with_resource_uid(Some(id.as_str().to_owned())))
     }
 
     async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {
@@ -146,11 +139,10 @@ impl SandboxBackend for LocalSandboxBackend {
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
-        Ok(ObservedSandbox::new(
-            id.clone(),
-            self.name(),
-            self.status(id).await?,
-        ))
+        Ok(
+            ObservedSandbox::new(id.clone(), self.name(), self.status(id).await?)
+                .with_resource_uid(Some(id.as_str().to_owned())),
+        )
     }
 
     async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -182,19 +174,80 @@ impl SandboxBackend for LocalSandboxBackend {
         Ok(())
     }
 
+    async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if let Some(expected_resource_uid) = expected_resource_uid
+            && expected_resource_uid != id.as_str()
+        {
+            return Err(SandboxError::backend(
+                "local sandbox resource UID changed before exact stop",
+            ));
+        }
+        self.stop(id).await
+    }
+
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         let sandbox = self.sandbox(id).await?;
         let mut sandbox = sandbox.lock().await;
-        send_signal(&sandbox.child, "STOP").await?;
+        send_signal(&sandbox.child, libc::SIGSTOP)?;
         sandbox.status = SandboxStatus::Suspended;
         Ok(())
+    }
+
+    async fn pause_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some_and(|uid| uid != id.as_str()) {
+            return Err(SandboxError::backend(
+                "local sandbox resource UID changed before exact pause",
+            ));
+        }
+        self.pause(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         let sandbox = self.sandbox(id).await?;
         let mut sandbox = sandbox.lock().await;
-        send_signal(&sandbox.child, "CONT").await?;
+        send_signal(&sandbox.child, libc::SIGCONT)?;
         sandbox.status = SandboxStatus::Running;
+        Ok(())
+    }
+
+    async fn resume_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some_and(|uid| uid != id.as_str()) {
+            return Err(SandboxError::backend(
+                "local sandbox resource UID changed before exact resume",
+            ));
+        }
+        self.resume(id).await
+    }
+
+    async fn ensure_running_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: &str,
+        _fence_nonce: &str,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid != id.as_str() {
+            return Err(SandboxError::backend(
+                "local sandbox resource UID changed before running fence",
+            ));
+        }
+        let sandbox = self.sandbox(id).await?;
+        let mut sandbox = sandbox.lock().await;
+        if sandbox.status == SandboxStatus::Suspended {
+            send_signal(&sandbox.child, libc::SIGCONT)?;
+            sandbox.status = SandboxStatus::Running;
+        }
         Ok(())
     }
 }
@@ -236,27 +289,23 @@ async fn refresh_status(sandbox: &mut LocalSandbox) -> SandboxResult<SandboxStat
     }
 }
 
-async fn send_signal(child: &Child, signal: &str) -> SandboxResult<()> {
+fn send_signal(child: &Child, signal: libc::c_int) -> SandboxResult<()> {
     let Some(pid) = child.id() else {
         return Err(SandboxError::NotReady(
             "local process has no pid".to_owned(),
         ));
     };
 
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(pid.to_string())
-        .status()
-        .await
-        .map_err(|err| SandboxError::backend_source(format!("failed to send SIG{signal}"), err))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SandboxError::backend(format!(
-            "kill -{signal} {pid} exited with {status}"
-        )))
+    // This syscall completes before the future can be cancelled; unlike a
+    // spawned `kill` subprocess it cannot send a detached late signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        return Ok(());
     }
+    Err(SandboxError::backend_source(
+        format!("failed to send signal {signal} to {pid}"),
+        std::io::Error::last_os_error(),
+    ))
 }
 
 #[cfg(test)]
@@ -273,11 +322,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn local_identity_is_restart_unique_and_exact_stop_is_fenced() {
+        let first = LocalSandboxBackend::new();
+        let first_handle = first.create(cat_spec()).await.unwrap();
+        let second = LocalSandboxBackend::new();
+        let second_handle = second.create(cat_spec()).await.unwrap();
+
+        assert_ne!(first_handle.id, second_handle.id);
+        assert_ne!(first_handle.resource_uid, second_handle.resource_uid);
+        assert!(
+            second
+                .stop_exact(&second_handle.id, first_handle.resource_uid.as_deref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            second.status(&second_handle.id).await.unwrap(),
+            SandboxStatus::Running
+        );
+
+        first
+            .stop_exact(&first_handle.id, first_handle.resource_uid.as_deref())
+            .await
+            .unwrap();
+        second
+            .stop_exact(&second_handle.id, second_handle.resource_uid.as_deref())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn local_backend_round_trips_bytes_through_manager() {
         let backend = Arc::new(LocalSandboxBackend::new());
         let manager = SandboxManager::new(backend);
         let handle = manager.create_running(cat_spec()).await.unwrap();
         let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
+        assert_eq!(io.resource_uid, handle.resource_uid);
 
         io.stdin.write_all(b"ping\n").await.unwrap();
         io.stdin.flush().await.unwrap();
@@ -336,6 +416,39 @@ mod tests {
         ));
 
         manager.resume(&handle.id).await.unwrap();
+        assert_eq!(
+            manager.status(&handle.id).await.unwrap(),
+            SandboxStatus::Running
+        );
+        assert!(matches!(
+            manager.desired_state(&handle.id),
+            Some(DesiredSandboxState::Running(_))
+        ));
+
+        manager.stop(&handle.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_exact_pause_cannot_leave_a_detached_stop_after_running_fence() {
+        let backend = Arc::new(LocalSandboxBackend::new());
+        let manager = SandboxManager::new(backend);
+        let handle = manager.create_running(cat_spec()).await.unwrap();
+        let uid = handle.resource_uid.as_deref().unwrap();
+
+        // `pause_exact` executes the signal syscall while holding the sandbox
+        // mutex. There is no spawned helper whose STOP can outlive this future.
+        timeout(
+            Duration::from_millis(1),
+            manager.pause_exact(&handle.id, Some(uid)),
+        )
+        .await
+        .expect("synchronous SIGSTOP cannot detach")
+        .unwrap();
+        manager
+            .ensure_running_exact(&handle.id, uid, "successor-fence")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(20)).await;
         assert_eq!(
             manager.status(&handle.id).await.unwrap(),
             SandboxStatus::Running

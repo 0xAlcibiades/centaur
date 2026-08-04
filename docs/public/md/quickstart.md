@@ -48,6 +48,9 @@ The `Justfile` builds local images named `centaur-api-rs:latest`,
 
 The default local chart expects one infra Secret named `centaur-infra-env`.
 `just bootstrap-secrets` creates it from your shell environment.
+The local recipes pass the same `CENTAUR_IRON_PROXY_SECRET_SOURCE` value to the
+bootstrap script and Helm; it defaults to `onepassword`, matching the chart.
+Set it to `env` only when deploying environment-backed credentials.
 
 `just bootstrap-secrets` currently requires these shell variables:
 
@@ -69,6 +72,14 @@ and `SLACKBOT_API_KEY` are API boot requirements in the current chart.
 `SLACK_BOT_TOKEN` is required by the default local bootstrap because Slackbot is
 enabled in `values.dev.yaml`; use a real token if you want to test Slack.
 
+With the default `onepassword` source, bootstrap writes
+`OP_SERVICE_ACCOUNT_TOKEN` only to the dedicated
+`centaur-iron-proxy-source-auth` Secret. Sandbox proxy Pods receive that one
+key through `secretKeyRef`, never the full `centaur-infra-env` Secret. To use
+Connect instead, set `CENTAUR_IRON_PROXY_SECRET_SOURCE=onepassword-connect`
+and export `OP_CONNECT_TOKEN` (plus `OP_CONNECT_CREDENTIALS_FILE`) rather than
+using the service-account token.
+
 `SLACKBOT_API_KEY` is a static service token. The API bootstraps that value into
 Postgres on startup, so it must exist before `just up`.
 
@@ -77,50 +88,6 @@ Application-level model and tool secrets, such as `OPENAI_API_KEY`,
 1Password or the configured [iron-proxy](https://docs.iron.sh) secret source. Sandboxes receive
 placeholder values and [iron-proxy](https://docs.iron.sh) injects the real credentials only on approved
 outbound requests.
-
-### Optional local Codex and Claude auth
-
-The normal path uses API keys through [iron-proxy](https://docs.iron.sh). If you
-need Codex subscription auth or Claude Code subscription/card auth, import local
-CLI auth state explicitly:
-
-```bash
-bun run auth:bootstrap
-```
-
-The command writes only secret payload values to `.env.local`. Store Codex
-`CODEX_AUTH_JSON` in the configured 1Password field used by iron-proxy. Source
-`.env.local` before `just bootstrap-secrets` so the Claude Code OAuth
-refresh-token fields, when present, are copied into the separate
-`centaur-harness-auth` Secret. They are not added to `centaur-infra-env`,
-which the API consumes with `envFrom`.
-
-If local auth is missing, run the command it prints, or use:
-
-```bash
-bun run auth:bootstrap -- --login
-```
-
-That opt-in mode streams `codex login --device-auth` or
-`claude auth login`. For Claude on macOS, bootstrap imports the Claude Code
-Keychain credential and writes the refresh token for iron-proxy; on Linux, it
-imports `$CLAUDE_CONFIG_DIR/.credentials.json` or
-`~/.claude/.credentials.json`.
-
-Enable local auth only for deployments that need it:
-
-```yaml
-sandbox:
-  extraEnv:
-    CODEX_USE_LOCAL_AUTH: "true"
-    CLAUDE_USE_LOCAL_AUTH: "true"
-```
-
-The API scopes auth payloads to the matching engine: Codex auth stays in
-iron-proxy, Claude proxy pods receive Claude refresh-token material, and Amp
-pods receive neither. This is less isolated than the default [iron-proxy](https://docs.iron.sh)
-API-key path because provider CLI login state is still used instead of normal
-provider API keys.
 
 The default harness is `codex`, so `OPENAI_API_KEY` must exist in the configured
 secret source before Slack agent turns can complete. Use explicit harness
@@ -203,6 +170,11 @@ https://<your-host>/api/webhooks/slack
 
 In your Slack app's **Event Subscriptions** settings, set the Request URL to the
 Slackbot webhook URL above.
+
+To use Block Kit buttons or selects, enable **Interactivity & Shortcuts** and
+set its Request URL to the same Slackbot webhook URL. Each interaction is
+delivered to workflows as `slack.block_action.<action_id>` with the selected
+value and sanitized Slack user, team, channel, thread, and message metadata.
 
 Subscribe to the `app_mention` bot event. For a minimal channel-mention test,
 the app also needs Bot Token Scopes that let it read mentions and write replies,

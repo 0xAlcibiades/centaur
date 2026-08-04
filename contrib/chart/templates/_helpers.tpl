@@ -43,6 +43,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- required "secretManager.existingSecretName is required" .Values.secretManager.existingSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.traceConsentSecretName" -}}
+{{- required "slackbotv2.traceConsent.apiKeySecretName is required" .Values.slackbotv2.traceConsent.apiKeySecretName | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "centaur.trustedCaSecretName" -}}
 {{- required "firewall.existingCaSecretName is required" .Values.firewall.existingCaSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -59,6 +63,27 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 {{- end -}}
 
+{{- define "centaur.repoCachePvcName" -}}
+{{- if .Values.repoCache.storage.persistentVolumeClaim.existingClaim -}}
+{{- .Values.repoCache.storage.persistentVolumeClaim.existingClaim | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-repo-cache" (include "centaur.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "centaur.repoCacheStorageType" -}}
+{{- $storageType := default "hostPath" .Values.repoCache.storage.type -}}
+{{- if and (ne $storageType "hostPath") (ne $storageType "persistentVolumeClaim") -}}
+{{- fail "repoCache.storage.type must be either hostPath or persistentVolumeClaim" -}}
+{{- end -}}
+{{- $storageType -}}
+{{- end -}}
+
+{{- define "centaur.repositoryVisibility" -}}
+{{- $visibility := lower (default "private" .) -}}
+{{- if eq $visibility "public" -}}public{{- else -}}private{{- end -}}
+{{- end -}}
+
 {{- define "centaur.overlaySources" -}}
 {{- $sources := list -}}
 {{- with .Values.overlays.sources -}}
@@ -66,6 +91,7 @@ app.kubernetes.io/component: {{ .component }}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo -}}
 {{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- /*
 Subdir defaults: an omitted key falls back to the conventional layout
 (tools, workflows, .agents/skills); a key explicitly set to "" disables
@@ -96,11 +122,13 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- if and .Values.toolServer.enabled .Values.toolServer.repo -}}
 {{- $source := dict "repo" .Values.toolServer.repo "toolsSubdir" (default "tools" .Values.toolServer.subdir) "workflowsSubdir" "workflows" "skillsSubdir" ".agents/skills" -}}
 {{- with .Values.toolServer.ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .Values.toolServer.visibility) -}}
 {{- $sources = append $sources $source -}}
 {{- range .Values.toolServer.extraSources -}}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo "toolsSubdir" (default "tools" .subdir) "workflowsSubdir" (default "workflows" .workflowsSubdir) "skillsSubdir" (default ".agents/skills" .skillsSubdir) -}}
 {{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- $sources = append $sources $source -}}
 {{- end -}}
 {{- end -}}
@@ -131,6 +159,10 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- toJson $payload | sha256sum -}}
 {{- end -}}
 
+{{- define "centaur.traceConsentSecretChecksum" -}}
+{{- include "centaur.secretResourceVersion" (dict "root" . "name" (include "centaur.traceConsentSecretName" .)) | sha256sum -}}
+{{- end -}}
+
 {{- /*
 The upstream 1Password Connect subchart names its Service after
 `connect.applicationName` (default `onepassword-connect`) and exposes the
@@ -155,8 +187,7 @@ namespace as this release, so a short DNS name is enough.
 
 {{- /*
 console — Rails control plane (formerly "iron-control") for authenticated API
-access and encrypted secret storage. Flag-gated (console.enabled), in-cluster
-ClusterIP Service.
+access and encrypted secret storage. Required in-cluster ClusterIP Service.
 
 Backwards compatibility: the canonical values key is `console`; `ironControl` is
 a deprecated alias that is still honored. `centaur.consoleValues` returns the

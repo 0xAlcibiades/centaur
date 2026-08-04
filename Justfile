@@ -3,6 +3,12 @@ set dotenv-load := true
 namespace := env_var_or_default("CENTAUR_NAMESPACE", "centaur")
 release := env_var_or_default("CENTAUR_RELEASE", "centaur")
 source := env_var_or_default("CENTAUR_IMAGE_SOURCE", "local")
+# Source used by both bootstrap-secrets and Helm. Keep it explicit so a
+# 1Password deployment never seeds a tool credential into centaur-infra-env.
+iron_proxy_secret_source := env_var_or_default("CENTAUR_IRON_PROXY_SECRET_SOURCE", "onepassword")
+iron_proxy_source_auth_secret_name := env_var_or_default("CENTAUR_IRON_PROXY_SOURCE_AUTH_SECRET_NAME", "centaur-iron-proxy-source-auth")
+iron_proxy_source_auth_service_account_token_key := env_var_or_default("CENTAUR_IRON_PROXY_SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY", "OP_SERVICE_ACCOUNT_TOKEN")
+iron_proxy_source_auth_connect_token_key := env_var_or_default("CENTAUR_IRON_PROXY_SOURCE_AUTH_CONNECT_TOKEN_KEY", "OP_CONNECT_TOKEN")
 chart := "contrib/chart"
 dev_values := "contrib/chart/values.dev.yaml"
 # Command used to import images into k3s's containerd. Override for rootless or
@@ -30,7 +36,7 @@ build:
       just _build-all-sequential
     else
       pids=()
-      for recipe in _build-api-rs _build-iron-proxy _build-slackbotv2 _build-discordbot _build-agent _build-console; do
+      for recipe in _build-api-rs _build-iron-proxy _build-slackbotv2 _build-linearbot _build-discordbot _build-githubbot _build-teamsbot _build-agent _build-console; do
         just "$recipe" &
         pids+=("$!")
       done
@@ -45,7 +51,10 @@ _build-all-sequential:
     just _build-api-rs
     just _build-iron-proxy
     just _build-slackbotv2
+    just _build-linearbot
     just _build-discordbot
+    just _build-githubbot
+    just _build-teamsbot
     just _build-agent
     just _build-console
 
@@ -56,8 +65,12 @@ build-one service:
       api-rs) just _build-api-rs ;;
       iron-proxy) just _build-iron-proxy ;;
       slackbotv2) just _build-slackbotv2 ;;
+      linearbot) just _build-linearbot ;;
       discordbot) just _build-discordbot ;;
+      githubbot) just _build-githubbot ;;
+      teamsbot) just _build-teamsbot ;;
       agent|sandbox) just _build-agent ;;
+      workflow-python) just _build-workflow-python ;;
       console) just _build-console ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
     esac
@@ -71,11 +84,25 @@ _build-iron-proxy:
 _build-slackbotv2:
     docker build -t centaur-slackbotv2:latest -f services/slackbotv2/Dockerfile .
 
+_build-linearbot:
+    docker build -t centaur-linearbot:latest -f services/linearbot/Dockerfile .
+
 _build-discordbot:
     docker build -t centaur-discordbot:latest -f services/discordbot/Dockerfile .
 
+_build-githubbot:
+    docker build -t centaur-githubbot:latest -f services/githubbot/Dockerfile .
+
+_build-teamsbot:
+    docker build -t centaur-teamsbot:latest -f services/teamsbot/Dockerfile .
+
 _build-agent:
     docker build --target "{{agent_build_target}}" -t "{{agent_image}}" -f "{{agent_dockerfile}}" .
+
+# The Python workflow host is embedded in both consumer images.
+_build-workflow-python:
+    just _build-api-rs
+    just _build-agent
 
 # The console builds from its own subdirectory context (services/console), unlike
 # the other services which build from the repo root.
@@ -88,7 +115,7 @@ _build-console:
 _push-registry:
     #!/usr/bin/env bash
     set -euo pipefail
-    for img in centaur-api-rs centaur-iron-proxy centaur-slackbotv2 centaur-discordbot centaur-agent centaur-console; do
+    for img in centaur-api-rs centaur-iron-proxy centaur-slackbotv2 centaur-linearbot centaur-discordbot centaur-githubbot centaur-teamsbot centaur-agent centaur-console; do
       target="{{registry}}/library/${img}:latest"
       echo "pushing ${img}:latest -> ${target}..."
       docker tag "${img}:latest" "${target}"
@@ -101,19 +128,35 @@ _push-registry:
 _import-k3s:
     #!/usr/bin/env bash
     set -euo pipefail
-    for img in centaur-api-rs centaur-iron-proxy centaur-slackbotv2 centaur-discordbot centaur-agent centaur-console; do
+    for img in centaur-api-rs centaur-iron-proxy centaur-slackbotv2 centaur-linearbot centaur-discordbot centaur-githubbot centaur-teamsbot centaur-agent centaur-console; do
       echo "importing ${img}:latest into k3s containerd..."
       docker save "${img}:latest" | {{k3s_ctr}} images import -
     done
 
 bootstrap-secrets *args:
-    contrib/scripts/bootstrap-k8s-secrets.sh --namespace {{namespace}} {{args}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    secret_source="{{iron_proxy_secret_source}}"
+    if [[ -n "${OP_CONNECT_CREDENTIALS_FILE:-}" ]]; then
+      secret_source="onepassword-connect"
+    fi
+    bootstrap_args=(
+      --namespace {{namespace}}
+      --secret-source "$secret_source"
+      --source-auth-secret-name "{{iron_proxy_source_auth_secret_name}}"
+      --source-auth-service-account-token-key "{{iron_proxy_source_auth_service_account_token_key}}"
+      --source-auth-connect-token-key "{{iron_proxy_source_auth_connect_token_key}}"
+    )
+    # Keep the source/auth settings last so --force and other extra flags remain
+    # available without allowing bootstrap to diverge from the Helm recipe.
+    contrib/scripts/bootstrap-k8s-secrets.sh {{args}} "${bootstrap_args[@]}"
 
 deploy:
     #!/usr/bin/env bash
     set -euo pipefail
     helm dependency update {{chart}} >/dev/null
     extra_args=()
+    secret_source="{{iron_proxy_secret_source}}"
     case "{{source}}" in
       local) ;;
       ghcr)
@@ -121,7 +164,10 @@ deploy:
           --set apiRs.image.repository=ghcr.io/paradigmxyz/centaur/centaur-api-rs
           --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur/centaur-iron-proxy
           --set slackbotv2.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbotv2
+          --set linearbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-linearbot
           --set discordbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-discordbot
+          --set githubbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-githubbot
+          --set teamsbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-teamsbot
           --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur/centaur-agent
           --set console.image.repository=ghcr.io/paradigmxyz/centaur/centaur-console
         )
@@ -129,9 +175,17 @@ deploy:
       *) echo "unknown source: {{source}} (expected local or ghcr)" >&2; exit 2 ;;
     esac
     if [[ -n "${OP_CONNECT_CREDENTIALS_FILE:-}" ]]; then
+      secret_source="onepassword-connect"
       extra_args+=(
-        --set ironProxy.secretSource=onepassword-connect
         --set onepasswordConnect.connect.create=true
+      )
+    fi
+    extra_args+=(--set ironProxy.secretSource="$secret_source")
+    if [[ "$secret_source" != "env" ]]; then
+      extra_args+=(
+        --set-string ironProxy.sourceAuth.existingSecretName="{{iron_proxy_source_auth_secret_name}}"
+        --set-string ironProxy.sourceAuth.serviceAccountTokenKey="{{iron_proxy_source_auth_service_account_token_key}}"
+        --set-string ironProxy.sourceAuth.connectTokenKey="{{iron_proxy_source_auth_connect_token_key}}"
       )
     fi
     if [[ -n "${CODEX_AUTH_MODE:-}" ]]; then

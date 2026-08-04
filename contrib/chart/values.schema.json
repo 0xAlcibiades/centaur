@@ -5,8 +5,8 @@
     "consoleConfig": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
         "replicaCount": { "type": "integer" },
+        "publicUrl": { "type": "string" },
         "railsEnv": { "type": "string" },
         "image": {
           "type": "object",
@@ -20,6 +20,12 @@
           "type": "object",
           "properties": {
             "name": { "type": "string" }
+          }
+        },
+        "slackDmSync": {
+          "type": "object",
+          "properties": {
+            "oauthAppSlug": { "type": "string" }
           }
         },
         "service": {
@@ -42,7 +48,6 @@
         "worker": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
             "replicaCount": { "type": "integer" },
             "resources": { "type": "object" }
           }
@@ -87,7 +92,19 @@
           }
         },
         "secretSource": { "type": "string" },
-        "secretTtl": { "type": "string" }
+        "secretTtl": { "type": "string" },
+        "sourceAuth": {
+          "type": "object",
+          "properties": {
+            "existingSecretName": { "type": "string" },
+            "serviceAccountTokenKey": { "type": "string" },
+            "connectTokenKey": { "type": "string" }
+          }
+        },
+        "upstreamDenyCidrs": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       }
     },
     "toolServer": {
@@ -97,6 +114,7 @@
         "port": { "type": "integer" },
         "repo": { "type": "string" },
         "ref": { "type": "string" },
+        "visibility": { "type": "string" },
         "subdir": { "type": "string" },
         "extraSources": {
           "type": "array",
@@ -105,6 +123,7 @@
             "properties": {
               "repo": { "type": "string" },
               "ref": { "type": "string" },
+              "visibility": { "type": "string" },
               "subdir": { "type": "string" }
             },
             "required": ["repo"]
@@ -137,6 +156,7 @@
             "properties": {
               "repo": { "type": "string" },
               "ref": { "type": "string" },
+              "visibility": { "type": "string" },
               "toolsSubdir": { "type": "string" },
               "workflowsSubdir": { "type": "string" },
               "skillsSubdir": { "type": "string" },
@@ -153,17 +173,45 @@
       "properties": {
         "runtimeClassName": { "type": "string" },
         "reposPath": { "type": "string" },
-        "resources": { "type": "object" }
+        "resources": { "type": "object" },
+        "metadataTrace": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configGeneration": { "type": "integer", "minimum": 1 },
+            "gatewayUrl": { "type": "string", "format": "uri" },
+            "gatewayPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "credentialSecretName": { "type": "string" },
+            "credentialSecretVersion": { "type": "string" },
+            "bearerSecretKey": { "type": "string" },
+            "pseudonymKeySecretKey": { "type": "string" }
+          },
+          "required": ["configGeneration"]
+        }
       }
     },
     "repoCache": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
+        "autoReload": { "type": "boolean" },
         "hostPath": { "type": "string" },
         "repositories": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "anyOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "properties": {
+                  "repo": { "type": "string" },
+                  "ref": { "type": "string" },
+                  "visibility": { "type": "string" }
+                },
+                "required": ["repo"]
+              }
+            ]
+          }
         },
         "repositoryRefs": {
           "type": "object",
@@ -236,6 +284,81 @@
       "type": "object",
       "properties": {
         "syncInfraSecrets": { "type": "boolean" },
+        "mcpPublicUrl": { "type": "string" },
+        "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
+        "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
+        "workflowHostSandbox": { "type": "boolean" },
+        "etl": {
+          "type": "object",
+          "properties": {
+            "slack": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncIntervalSeconds": { "type": "integer" },
+                "syncBackfillLookbackDays": { "type": "integer" },
+                "syncThreadLookbackDays": { "type": "integer" },
+                "indexPrivateChannels": { "type": "boolean" },
+                "excludedChannelPatterns": { "type": "string" },
+                "attachments": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "maxBytes": { "type": "integer" }
+                  }
+                },
+                "backfill": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "intervalSeconds": { "type": "integer" },
+                    "channelBatchLimit": { "type": "integer" },
+                    "channelPagesPerJob": { "type": "integer" }
+                  }
+                },
+                "retention": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "intervalMinutes": { "type": "integer" },
+                    "etlDays": { "type": "integer" },
+                    "dmDays": { "type": "integer" }
+                  }
+                }
+              }
+            },
+            "linear": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncIntervalSeconds": { "type": "integer" }
+              }
+            },
+            "googleDrive": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncIntervalSeconds": { "type": "integer" }
+              }
+            },
+            "googleCalendar": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncIntervalSeconds": { "type": "integer" }
+              }
+            },
+            "companyContextDocuments": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "intervalSeconds": { "type": "integer" },
+                "maxWindowSeconds": { "type": "integer" },
+                "batchSize": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        },
         "metrics": {
           "type": "object",
           "properties": {
@@ -256,6 +379,27 @@
     "slackbotv2": {
       "type": "object",
       "properties": {
+        "mcpPublicUrl": { "type": "string" },
+        "autorotate": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "url": { "type": "string" },
+            "credentialsSecretName": { "type": "string" },
+            "observerTokenKey": { "type": "string" },
+            "operatorTokenKey": { "type": "string" },
+            "controlTokenKey": { "type": "string" },
+            "operatorSlackTeamIds": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "operatorSlackUserIds": {
+              "description": "Workspace-qualified Slack TEAM_ID:USER_ID principals allowed to drain or resume Autorotate maintenance. Fleet and status reads remain workspace-wide.",
+              "type": "array",
+              "items": { "type": "string", "pattern": "^T[A-Za-z0-9]+:[UW][A-Za-z0-9]+$" }
+            }
+          }
+        },
         "metrics": {
           "type": "object",
           "properties": {
@@ -281,6 +425,13 @@
           "properties": {
             "subPath": { "type": "string" }
           }
+        },
+        "sharedMemory": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "sizeLimit": { "type": "string" }
+          }
         }
       }
     },
@@ -299,6 +450,64 @@
         "ingressControllerNamespaces": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "apiServerPort": { "type": "integer" },
+        "otlpEgress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "namespace": { "type": "string" },
+            "port": { "type": "integer" }
+          }
+        },
+        "observabilityEgress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "destinations": {
+              "type": "array",
+              "minItems": 0,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "namespace": { "type": "string" },
+                  "namespaceSelector": { "type": "object" },
+                  "podSelector": { "type": "object" },
+                  "ports": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "port": {
+                          "oneOf": [
+                            { "type": "integer" },
+                            { "type": "string" }
+                          ]
+                        },
+                        "protocol": {
+                          "type": "string",
+                          "enum": ["TCP", "UDP", "SCTP"]
+                        }
+                      },
+                      "required": ["port"]
+                    }
+                  }
+                },
+                "required": ["ports"]
+              }
+            }
+          }
+        },
+        "metadataTraceEgress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "gatewayCidrs": {
+              "type": "array",
+              "items": { "type": "string", "format": "cidr" }
+            }
+          }
         }
       }
     }

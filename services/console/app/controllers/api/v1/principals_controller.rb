@@ -1,8 +1,13 @@
 module Api
   module V1
     class PrincipalsController < Api::BaseController
+      include SlackChannelPermissionApi
+
       def index
-        records, meta = paginated_label_search(Principal.all)
+        records, meta = paginated_label_search(
+          Principal.includes(:console_user, :slack_channel_permissions, roles: :slack_channel_permissions),
+          label_filter: PrincipalIdentityLabels.method(:apply_filters)
+        )
         render json: { data: records.map { |p| record_payload(p) }, meta: meta }
       end
 
@@ -24,8 +29,13 @@ module Api
       def create
         principal = Principal.new(namespace: upsert_namespace, foreign_id: data_params[:foreign_id],
                                   created_by: current_user)
-        principal.assign_attributes(data_params.permit(:name, labels: {}))
-        principal.save!
+        ActiveRecord::Base.transaction do
+          validate_identity_consistency!(principal)
+          principal.assign_attributes(principal_params)
+          principal.apply_default_sandbox_capabilities!(principal_params)
+          principal.save!
+          replace_slack_channel_permissions!(principal) if data_params.key?(:slack_channel_permissions)
+        end
         render status: :created, json: { data: record_payload(principal) }
       rescue ActiveRecord::RecordInvalid => e
         render_validation_error(e.record)
@@ -37,8 +47,13 @@ module Api
       def update
         principal = resolve_for_upsert(Principal)
         was_new = principal.new_record?
-        principal.assign_attributes(data_params.permit(:name, labels: {}))
-        principal.save!
+        ActiveRecord::Base.transaction do
+          validate_identity_consistency!(principal)
+          principal.assign_attributes(principal_params)
+          principal.apply_default_sandbox_capabilities!(principal_params) if was_new
+          principal.save!
+          replace_slack_channel_permissions!(principal) if data_params.key?(:slack_channel_permissions)
+        end
         render status: (was_new ? :created : :ok), json: { data: record_payload(principal) }
       rescue ActiveRecord::RecordInvalid => e
         render_validation_error(e.record)
@@ -58,7 +73,7 @@ module Api
       # grants and must never be served from a cache.
       def effective_config
         principal = params[:foreign_id].present? ? find_by_foreign_id!(Principal) : Principal.find_by_oid!(params[:id])
-        body = { data: { id: principal.oid }.merge(principal.effective_config) }.to_json
+        body = { data: { id: principal.oid }.merge(PrincipalSyncConfigSnapshot.redacted_config_for(principal)) }.to_json
 
         response.headers["ETag"] = %("#{Digest::SHA256.hexdigest(body)}")
         response.headers["Cache-Control"] = "no-store"
@@ -73,10 +88,41 @@ module Api
           namespace: principal.namespace,
           foreign_id: principal.foreign_id,
           name: principal.name,
-          labels: principal.labels,
+          labels: principal.labels_with_sandbox_capabilities,
+          slack_channel_permissions: principal.slack_channel_permissions_payload,
+          effective_slack_channel_permissions: principal.effective_slack_channel_permissions_payload,
+          sandbox_repo_cache: principal.sandbox_repo_cache,
+          sandbox_observability_enabled: principal.sandbox_observability_enabled,
+          sandbox_api_server_enabled: principal.sandbox_api_server_enabled,
           created_at: principal.created_at,
           updated_at: principal.updated_at
         }
+      end
+
+      def principal_params
+        data_params.permit(
+          :name,
+          :kind,
+          :slack_user_id,
+          :slack_channel_id,
+          :slack_team_id,
+          :slack_email,
+          :console_user_id,
+          :console_user_email,
+          :sandbox_repo_cache,
+          :sandbox_observability_enabled,
+          :sandbox_api_server_enabled,
+          labels: {}
+        )
+      end
+
+      def validate_identity_consistency!(principal)
+        PrincipalIdentityLabels.validate_request_consistency(principal, data_params)
+        raise ActiveRecord::RecordInvalid.new(principal) if principal.errors.any?
+      end
+
+      def slack_channel_permission_owner
+        Principal.find_by_oid!(params[:id])
       end
     end
   end

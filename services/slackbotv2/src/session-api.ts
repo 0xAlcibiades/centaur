@@ -1,21 +1,28 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
-import type { Attachment, Message } from 'chat'
+import type { Attachment, LinkPreview, Message } from 'chat'
+import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
 import type {
   ForwardSessionInput,
   JsonObject,
+  SlackbotV2BlockActionPayload,
   JsonValue,
   SlackbotV2ApiAttachment,
+  SlackbotV2ApiMessageLink,
   SlackbotV2ApiMessage,
   SlackbotV2AppendMessagesRequest,
   SlackbotV2CreateSessionRequest,
   SlackbotV2ExecuteSessionRequest,
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2Fetch,
+  SlackbotV2HarnessAssignment,
+  SlackbotV2InterruptSessionResponse,
   SlackbotV2Options,
   SlackbotV2RendererSource,
-  SlackbotV2SessionMessage
+  SlackbotV2SessionMessage,
+  SlackbotV2SlackWorkspaceContext
 } from './types'
 import { observeSeconds, slackbotMetrics } from './metrics'
+import { rawSlackUserId } from './slack-user'
 import {
   elapsedMs,
   errorMessage,
@@ -59,8 +66,17 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   return error.name === 'AbortError' || error.name === 'TypeError'
 }
 
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
 const DEFAULT_SESSION_API_TIMEOUT_MS = 30_000
 const DEFAULT_SLACK_API_TIMEOUT_MS = 5_000
+
+function sessionIdleTimeoutMs(options: SlackbotV2Options): number {
+  if (options.idleTimeoutMs !== undefined) return options.idleTimeoutMs
+  if (options.maxDurationMs !== undefined) {
+    return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, options.maxDurationMs)
+  }
+  return DEFAULT_SESSION_IDLE_TIMEOUT_MS
+}
 
 class FetchTimeoutError extends Error {
   constructor(action: string, timeoutMs: number) {
@@ -114,7 +130,7 @@ async function withTimeout<T>(
   }
 }
 
-async function fetchWithTimeout(
+export async function fetchWithTimeout(
   fetchFn: SlackbotV2Fetch,
   input: RequestInfo | URL,
   init: RequestInit,
@@ -137,16 +153,26 @@ function sessionApiTimeoutMs(options: SlackbotV2Options): number {
   return options.sessionApiTimeoutMs ?? DEFAULT_SESSION_API_TIMEOUT_MS
 }
 
-function slackApiTimeoutMs(options: SlackbotV2Options): number {
+export function slackApiTimeoutMs(options: SlackbotV2Options): number {
   return options.slackApiTimeoutMs ?? DEFAULT_SLACK_API_TIMEOUT_MS
+}
+
+export async function withSlackApiTimeout<T>(
+  options: SlackbotV2Options | undefined,
+  action: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  return options ? withTimeout(action, slackApiTimeoutMs(options), fn) : fn()
 }
 
 type ForwardSessionApiCallbacks = {
   onExecutionStarted?(execution: SlackbotV2ExecuteSessionResponse): Promise<void>
   onMessagesAppended?(): Promise<void>
+  onSessionCreated?(outcome: CreateSessionOutcome): Promise<void>
   /**
    * Fires when session creation restarted the thread onto a new harness
-   * (explicit --claude/--amp/--codex on a thread pinned to another harness).
+   * (sticky --claude/--amp/--codex/--nanocodex state on a thread pinned to
+   * another harness).
    * Runs before append/execute, so the callback may set
    * `input.contextPreamble` to re-feed thread history to the fresh harness.
    */
@@ -155,7 +181,9 @@ type ForwardSessionApiCallbacks = {
 
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
-  currentMessage: Message
+  currentMessage: Message,
+  options?: SlackbotV2Options,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
 ): Promise<SlackbotV2ApiMessage[]> {
   const messages: Message[] = []
   try {
@@ -164,7 +192,7 @@ export async function collectInitialContext(
     }
   } catch (error) {
     if (!isSlackThreadNotFoundError(error)) throw error
-    return [await serializeMessage(currentMessage)]
+    return [await serializeMessage(currentMessage, options, workspaceContext)]
   }
 
   const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
@@ -176,7 +204,7 @@ export async function collectInitialContext(
 
   const serialized: SlackbotV2ApiMessage[] = []
   for (const message of messages) {
-    serialized.push(await serializeMessage(message))
+    serialized.push(await serializeMessage(message, options, workspaceContext))
   }
   return serialized
 }
@@ -193,11 +221,22 @@ function isSlackThreadNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('thread_not_found')
 }
 
-export async function serializeMessage(message: Message): Promise<SlackbotV2ApiMessage> {
+export async function serializeMessage(
+  message: Message,
+  options?: SlackbotV2Options,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
+): Promise<SlackbotV2ApiMessage> {
   const attachments: SlackbotV2ApiAttachment[] = []
   for (const attachment of message.attachments) {
-    attachments.push(await serializeAttachment(attachment))
+    attachments.push(await serializeAttachment(attachment, options))
   }
+  if (attachments.length === 0) {
+    for (const attachment of slackRawFileAttachments(message.raw, options)) {
+      attachments.push(await serializeAttachment(attachment, options))
+    }
+  }
+  const displayText = renderSlackDisplayText({ raw: message.raw, text: message.text })
+  const slackWorkspace = slackWorkspaceContextForMessage(message.raw, workspaceContext)
 
   return {
     attachments,
@@ -208,14 +247,231 @@ export async function serializeMessage(message: Message): Promise<SlackbotV2ApiM
       userId: message.author.userId,
       userName: message.author.userName
     },
+    actorTeamId: slackWorkspace.actorTeamId,
+    displayText: displayText.text,
+    displayTextSource: displayText.source,
     id: message.id,
     isMention: message.isMention === true,
+    links: serializeMessageLinks(message.links, message.raw),
     raw: message.raw,
-    teamId: slackTeamId(message.raw) as string,
+    rawSlackAttachmentCount: displayText.rawAttachmentCount,
+    rawSlackBlockCount: displayText.rawBlockCount,
+    hostTeamId: slackWorkspace.hostTeamId,
+    teamId: slackWorkspace.hostTeamId as string,
     text: message.text,
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString()
   }
+}
+
+/**
+ * Select the actor workspace only from Slack-owned event fields. Do not accept
+ * generic metadata keys here: callers use this value for trace attribution.
+ */
+export function slackWorkspaceContextForMessage(
+  raw: unknown,
+  workspaceContext?: SlackbotV2SlackWorkspaceContext
+): SlackbotV2SlackWorkspaceContext {
+  const event = isJsonObject(raw) ? raw : undefined
+  const hostTeamId = workspaceContext?.hostTeamId ?? slackTeamId(event)
+  const actorTeamId =
+    stringValue(event?.user_team) ?? stringValue(event?.source_team) ?? hostTeamId
+  return {
+    ...(actorTeamId ? { actorTeamId } : {}),
+    ...(hostTeamId ? { hostTeamId } : {})
+  }
+}
+
+function slackRawFileAttachments(raw: unknown, options?: SlackbotV2Options): Attachment[] {
+  const files = slackRawFiles(raw)
+  if (files.length === 0) return []
+  return files.map(file => slackRawFileAttachment(file, raw, options))
+}
+
+function slackRawFiles(raw: unknown): JsonObject[] {
+  const records = slackRawRecords(raw)
+  const files: JsonObject[] = []
+  for (const record of records) {
+    const rawFiles = record.files
+    if (!Array.isArray(rawFiles)) continue
+    for (const file of rawFiles) {
+      if (isJsonObject(file)) files.push(file)
+    }
+  }
+  return files
+}
+
+function slackRawFileAttachment(
+  file: JsonObject,
+  raw: unknown,
+  options?: SlackbotV2Options
+): Attachment {
+  const url = stringValue(file.url_private_download) ?? stringValue(file.url_private)
+  const mimeType = stringValue(file.mimetype)
+  const fetchMetadata: Record<string, string> = {}
+  const teamId = slackTeamId(raw)
+  if (url) fetchMetadata.url = url
+  if (teamId) fetchMetadata.teamId = teamId
+  return {
+    fetchData: url && options ? () => fetchSlackRawFile(options, url) : undefined,
+    fetchMetadata: Object.keys(fetchMetadata).length > 0 ? fetchMetadata : undefined,
+    height: numberValue(file.original_h),
+    mimeType,
+    name: stringValue(file.name) ?? stringValue(file.title) ?? stringValue(file.id),
+    size: numberValue(file.size),
+    type: slackRawFileAttachmentType(mimeType),
+    url,
+    width: numberValue(file.original_w)
+  }
+}
+
+async function fetchSlackRawFile(options: SlackbotV2Options, url: string): Promise<Buffer> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchFn(url, {
+    headers: { authorization: `Bearer ${options.botToken}` }
+  })
+  if (!response.ok) {
+    throw new Error(`failed to fetch Slack file: ${response.status} ${response.statusText}`)
+  }
+  return Buffer.from(await response.arrayBuffer())
+}
+
+function slackRawFileAttachmentType(mimeType: string | undefined): Attachment['type'] {
+  if (mimeType?.startsWith('image/')) return 'image'
+  if (mimeType?.startsWith('video/')) return 'video'
+  if (mimeType?.startsWith('audio/')) return 'audio'
+  return 'file'
+}
+
+function numberValue(value: JsonValue | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+const SLACK_MESSAGE_URL_PATTERN = /^https:\/\/[^/\s]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/i
+
+export function serializeMessageLinks(
+  links: readonly LinkPreview[] | undefined,
+  raw: unknown
+): SlackbotV2ApiMessageLink[] | undefined {
+  return normalizeApiLinks([
+    ...(links ?? []).map(serializeLinkPreview),
+    ...extractRawSlackLinks(raw)
+  ])
+}
+
+function serializeLinkPreview(link: LinkPreview): SlackbotV2ApiMessageLink {
+  return {
+    description: link.description,
+    imageUrl: link.imageUrl,
+    isSlackMessage: Boolean(link.fetchMessage) || isSlackMessageUrl(link.url),
+    siteName: link.siteName,
+    title: link.title,
+    url: link.url
+  }
+}
+
+function extractRawSlackLinks(raw: unknown): SlackbotV2ApiMessageLink[] {
+  const links: SlackbotV2ApiMessageLink[] = []
+  for (const record of slackRawRecords(raw)) {
+    extractRawSlackBlockLinks(record.blocks, links)
+    extractRawSlackTextLinks(record.text, links)
+    extractRawSlackAttachmentLinks(record.attachments, links)
+  }
+  return links
+}
+
+function slackRawRecords(raw: unknown): JsonObject[] {
+  const records: JsonObject[] = []
+  const seen = new Set<JsonObject>()
+  const add = (value: unknown): void => {
+    if (!isJsonObject(value) || seen.has(value)) return
+    records.push(value)
+    seen.add(value)
+  }
+
+  add(raw)
+  if (isJsonObject(raw)) {
+    add(raw.event)
+    add(raw.message)
+    if (isJsonObject(raw.event)) add(raw.event.message)
+  }
+  return records
+}
+
+function extractRawSlackBlockLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!Array.isArray(value)) return
+  for (const block of value) extractRawSlackElementLinks(block, links)
+}
+
+function extractRawSlackElementLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!isJsonObject(value)) return
+  if (value.type === 'link') {
+    const url = stringValue(value.url)
+    if (url) links.push({ isSlackMessage: isSlackMessageUrl(url), url })
+  }
+  for (const key of ['elements', 'fields']) {
+    const children = value[key]
+    if (Array.isArray(children)) {
+      for (const child of children) extractRawSlackElementLinks(child, links)
+    }
+  }
+  extractRawSlackElementLinks(value.text, links)
+  extractRawSlackElementLinks(value.accessory, links)
+}
+
+function extractRawSlackTextLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  const text = stringValue(value)
+  if (!text) return
+  for (const match of text.matchAll(/<([a-z]+:\/\/[^>|]+)(?:\|[^>]+)?>/gi)) {
+    const url = match[1]
+    if (url) links.push({ isSlackMessage: isSlackMessageUrl(url), url })
+  }
+}
+
+function extractRawSlackAttachmentLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!Array.isArray(value)) return
+  for (const attachment of value) {
+    if (!isJsonObject(attachment)) continue
+    const url = stringValue(attachment.from_url) ?? stringValue(attachment.original_url)
+    if (!url) continue
+    links.push({
+      description: stringValue(attachment.text),
+      isSlackMessage: isSlackMessageUrl(url),
+      siteName: stringValue(attachment.service_name),
+      title: stringValue(attachment.title),
+      url
+    })
+  }
+}
+
+function normalizeApiLinks(
+  links: SlackbotV2ApiMessageLink[]
+): SlackbotV2ApiMessageLink[] | undefined {
+  const seen = new Set<string>()
+  const normalized: SlackbotV2ApiMessageLink[] = []
+  for (const link of links) {
+    const url = link.url.trim()
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    normalized.push({ ...link, url })
+  }
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function isSlackMessageUrl(url: string): boolean {
+  return SLACK_MESSAGE_URL_PATTERN.test(url)
 }
 
 function slackTeamId(raw: unknown): string | undefined {
@@ -224,10 +480,6 @@ function slackTeamId(raw: unknown): string | undefined {
   if (typeof raw.team_id === 'string' && raw.team_id) return raw.team_id
   if (typeof team === 'string' && team) return team
   if (isJsonObject(team) && typeof team.id === 'string' && team.id) return team.id
-  const user = raw.user
-  if (isJsonObject(user) && typeof user.team_id === 'string' && user.team_id) {
-    return user.team_id
-  }
   return undefined
 }
 
@@ -252,10 +504,16 @@ export async function forwardToSessionApi(
     sessionApiTimeoutMs(options),
     'create session'
   )
+  if (created.harnessType) input.metadataHarnessType = created.harnessType
+  input.harnessAssignment = created.harnessAssignment
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
+    ab_test_experiment: created.harnessAssignment?.experiment,
+    ab_test_cohort: created.harnessAssignment?.cohort,
+    harness_type: created.harnessType,
     harness_switched: created.harnessSwitched,
     phase_ms: elapsedMs(createStartedAtMs)
   })
+  await callbacks.onSessionCreated?.(created)
   if (created.harnessSwitched) {
     await callbacks.onSessionRestarted?.()
   }
@@ -290,7 +548,10 @@ export async function forwardToSessionApi(
       input.executeContextMessages,
       input.contextPreamble,
       input.reasoning,
-      input.provider
+      input.provider,
+      input.metadataModel,
+      input.metadataHarnessType,
+      input.harnessAssignment
     ),
     sessionApiTimeoutMs(options),
     'execute session'
@@ -303,6 +564,34 @@ export async function forwardToSessionApi(
   if (!input.openStream) return null
 
   return openSessionEventStream(options, input)
+}
+
+export async function dispatchSlackBlockAction(
+  options: SlackbotV2Options,
+  payload: SlackbotV2BlockActionPayload
+): Promise<void> {
+  const action = `dispatch Slack block action ${payload.action_id}`
+  const response = await recordSessionApiOperation(
+    'emit_workflow_event',
+    () =>
+      fetchWithTimeout(
+        options.fetch ?? globalThis.fetch,
+        new URL('/api/workflows/events', ensureTrailingSlash(options.apiUrl)),
+        {
+          body: JSON.stringify({
+            event_name: `slack.block_action.${payload.action_id}`,
+            payload
+          }),
+          headers: apiHeaders(options),
+          method: 'POST'
+        },
+        sessionApiTimeoutMs(options),
+        action
+      ),
+    sessionApiTimeoutMs(options),
+    action
+  )
+  await ensureApiOk(response, action)
 }
 
 export async function openSessionEventStream(
@@ -329,6 +618,20 @@ export async function openSessionEventStream(
   return stream
 }
 
+export async function interruptSessionExecution(
+  options: SlackbotV2Options,
+  threadId: string,
+  reason: string,
+  metadata: JsonObject = {}
+): Promise<SlackbotV2InterruptSessionResponse> {
+  return recordSessionApiOperation(
+    'interrupt_session',
+    () => postInterruptSessionExecution(options, threadId, reason, metadata),
+    sessionApiTimeoutMs(options),
+    'interrupt session'
+  )
+}
+
 const RESTART_CONTEXT_MAX_CHARS = 24_000
 
 /**
@@ -344,7 +647,7 @@ export function harnessRestartPreamble(
   const lines: string[] = []
   for (const item of history) {
     if (item.id === currentMessageId) continue
-    const text = item.text.trim()
+    const text = slackMessagePromptText(item).trim()
     if (!text) continue
     const author = item.author.isMe
       ? 'assistant'
@@ -376,7 +679,10 @@ export const MAX_INLINE_ATTACHMENT_BYTES = 100 * 1024 * 1024
 const MAX_CODEX_INPUT_LINE_CHARS = 900 * 1024
 const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024
 
-export async function serializeAttachment(attachment: Attachment): Promise<SlackbotV2ApiAttachment> {
+export async function serializeAttachment(
+  attachment: Attachment,
+  options?: SlackbotV2Options
+): Promise<SlackbotV2ApiAttachment> {
   const serialized: SlackbotV2ApiAttachment = {
     fetchMetadata: attachment.fetchMetadata,
     height: attachment.height,
@@ -394,7 +700,7 @@ export async function serializeAttachment(attachment: Attachment): Promise<Slack
   }
 
   try {
-    const data = attachment.data ?? (await attachment.fetchData?.())
+    const data = attachment.data ?? (await fetchAttachmentData(attachment, options))
     if (data) {
       // Re-check the actual byte count: Slack size metadata can be absent.
       const byteLength = Buffer.isBuffer(data) ? data.length : data.size
@@ -409,6 +715,17 @@ export async function serializeAttachment(attachment: Attachment): Promise<Slack
   }
 
   return serialized
+}
+
+async function fetchAttachmentData(
+  attachment: Attachment,
+  options?: SlackbotV2Options
+): Promise<Buffer | Blob | undefined> {
+  if (!attachment.fetchData) return undefined
+  if (!options) return attachment.fetchData()
+  return withSlackApiTimeout(options, 'fetch Slack attachment', () =>
+    attachment.fetchData?.() ?? Promise.resolve(undefined)
+  )
 }
 
 function attachmentTooLargeError(bytes: number): string {
@@ -428,7 +745,9 @@ type RequesterIdentity = {
   githubHandleSource?: string
   githubUnavailableReason?: string
   slackDisplayName?: string
+  slackEmail?: string
   slackMention?: string
+  slackTeamId?: string
   slackUserId?: string
   slackUserName?: string
 }
@@ -460,6 +779,10 @@ export function clearConversationNameCacheForTests(): void {
 }
 
 type CreateSessionOutcome = {
+  /** The harness persisted by the API after applying control-plane policy. */
+  harnessType?: string
+  /** The experiment/cohort used to select the persisted harness. */
+  harnessAssignment?: SlackbotV2HarnessAssignment
   /** The API restarted the thread onto the requested harness. */
   harnessSwitched: boolean
 }
@@ -471,8 +794,8 @@ async function createSession(
   message?: SlackbotV2ApiMessage
 ): Promise<CreateSessionOutcome> {
   const requested = harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE
-  // An explicit --claude/--amp/--codex restarts a thread pinned to another
-  // harness; the implicit default never forces a switch.
+  // A sticky --claude/--amp/--codex/--nanocodex selection restarts a thread
+  // pinned to another harness; the implicit default never forces a switch.
   const response = await postCreateSession(
     options,
     threadId,
@@ -481,7 +804,7 @@ async function createSession(
     harnessType ? 'restart' : undefined
   )
   if (response.ok) {
-    return { harnessSwitched: await harnessSwitchedFromResponse(response) }
+    return sessionOutcomeFromResponse(response)
   }
 
   let body = ''
@@ -498,7 +821,7 @@ async function createSession(
   if (existing && existing !== requested) {
     const retry = await postCreateSession(options, threadId, existing, message)
     await ensureApiOk(retry, 'create session')
-    return { harnessSwitched: false }
+    return sessionOutcomeFromResponse(retry)
   }
   throw new SessionApiError({
     action: 'create session',
@@ -521,13 +844,17 @@ async function postCreateSession(
   // iron-control; resolve it here so it rides the create-session metadata that
   // api-rs reads when it registers the principal.
   const conversationName = message ? await resolveConversationName(options, message) : undefined
+  const requesterIdentity =
+    message && slackConversationKind(slackConversationId(message)) === 'dm'
+      ? await resolveRequesterIdentity(options, message)
+      : undefined
   const body: SlackbotV2CreateSessionRequest = {
     harness_type: harnessType,
     metadata: {
       source: 'slackbotv2',
       platform: 'slack',
       thread_id: threadId,
-      ...sessionRequesterMetadata(message),
+      ...sessionRequesterMetadata(message, requesterIdentity),
       ...(conversationName ? { slack_conversation_name: conversationName } : {})
     },
     ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {})
@@ -545,13 +872,39 @@ async function postCreateSession(
   )
 }
 
-async function harnessSwitchedFromResponse(response: Response): Promise<boolean> {
+async function sessionOutcomeFromResponse(response: Response): Promise<CreateSessionOutcome> {
   try {
     const payload = await response.json()
-    return isJsonObject(payload) && payload.harness_switched === true
+    const harnessType = isJsonObject(payload) ? stringValue(payload.harness_type) : undefined
+    const harnessAssignment = isJsonObject(payload)
+      ? harnessAssignmentFromResponse(payload.harness_assignment)
+      : undefined
+    return {
+      harnessSwitched: isJsonObject(payload) && payload.harness_switched === true,
+      ...(harnessType ? { harnessType } : {}),
+      ...(harnessAssignment ? { harnessAssignment } : {})
+    }
   } catch {
-    return false
+    return { harnessSwitched: false }
   }
+}
+
+function harnessAssignmentFromResponse(value: unknown): SlackbotV2HarnessAssignment | undefined {
+  if (!isJsonObject(value)) return undefined
+  const experiment = stringValue(value.experiment)
+  const requestedHarness = stringValue(value.requested_harness)
+  const cohort = stringValue(value.cohort)
+  const rolloutPercent = value.rollout_percent
+  if (
+    !experiment ||
+    !requestedHarness ||
+    !cohort ||
+    typeof rolloutPercent !== 'number' ||
+    !Number.isFinite(rolloutPercent)
+  ) {
+    return undefined
+  }
+  return { experiment, requestedHarness, cohort, rolloutPercent }
 }
 
 function existingHarnessFromConflict(body: string): string | undefined {
@@ -576,14 +929,36 @@ function sessionRequesterMetadata(
   identity?: RequesterIdentity
 ): JsonObject {
   const slackUserId = identity?.slackUserId ?? messageRequesterUserId(message)
+  const slackTeamId = identity?.slackTeamId ?? messageSlackTeamId(message)
+  const slackActorTeamId = messageActorTeamId(message)
+  const slackChannelId = message ? slackConversationId(message) : undefined
   const slackUserName = identity?.slackUserName ?? message?.author.userName
   const slackDisplayName = identity?.slackDisplayName ?? message?.author.fullName
+  const slackEmail = identity?.slackEmail
   return {
     ...(slackUserId ? { slack_user_id: slackUserId } : {}),
+    ...(slackUserId ? { slack_actor_user_id: slackUserId } : {}),
+    ...(slackActorTeamId ? { slack_actor_team_id: slackActorTeamId } : {}),
+    ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
+    ...(slackChannelId ? { slack_channel_id: slackChannelId } : {}),
     ...(slackUserName ? { slack_user_name: slackUserName } : {}),
     ...(slackDisplayName ? { slack_display_name: slackDisplayName } : {}),
+    ...(slackEmail ? { slack_user_email: slackEmail } : {}),
     ...(identity?.githubHandle ? { github_handle: identity.githubHandle } : {})
   }
+}
+
+function messageSlackTeamId(message: SlackbotV2ApiMessage | undefined): string | undefined {
+  if (!message) return undefined
+  return message.hostTeamId ?? message.teamId ?? slackTeamId(message.raw)
+}
+
+function messageActorTeamId(message: SlackbotV2ApiMessage | undefined): string | undefined {
+  if (!message) return undefined
+  return (
+    message.actorTeamId ??
+    slackWorkspaceContextForMessage(message.raw, { hostTeamId: messageSlackTeamId(message) }).actorTeamId
+  )
 }
 
 function messageRequesterUserId(message: SlackbotV2ApiMessage | undefined): string | undefined {
@@ -591,19 +966,6 @@ function messageRequesterUserId(message: SlackbotV2ApiMessage | undefined): stri
   const rawUserId = rawSlackUserId(message.raw)
   const authorUserId = stringValue(message.author.userId)
   return authorUserId ?? rawUserId
-}
-
-function rawSlackUserId(raw: unknown): string | undefined {
-  if (!isJsonObject(raw)) return undefined
-  const directUser = stringValue(raw.user)
-  if (directUser) return directUser
-  const user = raw.user
-  if (isJsonObject(user)) {
-    return stringValue(user.id) ?? stringValue(user.user_id)
-  }
-  const botProfile = raw.bot_profile
-  if (isJsonObject(botProfile)) return stringValue(botProfile.user_id)
-  return undefined
 }
 
 async function resolveRequesterIdentity(
@@ -614,6 +976,7 @@ async function resolveRequesterIdentity(
   const identity: RequesterIdentity = {
     slackDisplayName: stringValue(message.author.fullName),
     slackMention: slackUserId ? `<@${slackUserId}>` : undefined,
+    slackTeamId: messageSlackTeamId(message),
     slackUserId,
     slackUserName: stringValue(message.author.userName)
   }
@@ -635,6 +998,7 @@ async function resolveRequesterIdentity(
     ?? stringValue(profile.real_name)
     ?? stringValue(profile.name)
     ?? identity.slackDisplayName
+  identity.slackEmail = stringValue(profile.email) ?? identity.slackEmail
   identity.slackUserName = stringValue(profile.name) ?? identity.slackUserName
 
   const github = extractGithubHandleFromSlackProfile(profile)
@@ -685,7 +1049,9 @@ function mergeRequesterIdentity(
     ...fallback,
     ...cached,
     slackDisplayName: cached.slackDisplayName ?? fallback.slackDisplayName,
+    slackEmail: cached.slackEmail ?? fallback.slackEmail,
     slackMention: fallback.slackMention ?? cached.slackMention,
+    slackTeamId: fallback.slackTeamId ?? cached.slackTeamId,
     slackUserId: fallback.slackUserId ?? cached.slackUserId,
     slackUserName: cached.slackUserName ?? fallback.slackUserName
   }
@@ -709,6 +1075,7 @@ async function fetchSlackUserProfile(
     if (!user && !profile) return null
     return {
       ...(user ?? {}),
+      ...(userProfile ?? {}),
       ...(profile ?? {}),
       ...(profile?.fields ? { fields: profile.fields } : {}),
       ...(profile?.custom_fields ? { custom_fields: profile.custom_fields } : {})
@@ -818,7 +1185,7 @@ async function slackApiGet(
 ): Promise<JsonObject | null> {
   const url = slackApiMethodUrl(options.slackApiUrl, method)
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value)
-  return withTimeout(`Slack API ${method}`, slackApiTimeoutMs(options), async () => {
+  return withSlackApiTimeout(options, `Slack API ${method}`, async () => {
     const response = await fetchWithTimeout(
       fetch,
       url,
@@ -943,13 +1310,40 @@ async function executeSession(
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
   reasoning?: string,
-  provider?: string
+  provider?: string,
+  metadataModel?: string,
+  metadataHarnessType?: string,
+  harnessAssignment?: SlackbotV2HarnessAssignment
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
+  const idleTimeoutMs = sessionIdleTimeoutMs(options)
+  const recordedModel = metadataModel ?? model
   const body: SlackbotV2ExecuteSessionRequest = {
     idempotency_key: message.id,
-    metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
+    // Record the model this execution runs on (explicit override, else the
+    // configured/baked harness default) so readers like the Console can show
+    // it. Metadata only; the harness receives `model` via input_lines and only
+    // when explicitly overridden.
+    metadata: sessionMetadata(
+      message,
+      {
+        action: 'execute',
+        ...(recordedModel ? { model: recordedModel } : {}),
+        ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {}),
+        ...(harnessAssignment
+          ? {
+              harness_assignment: {
+                experiment: harnessAssignment.experiment,
+                requested_harness: harnessAssignment.requestedHarness,
+                cohort: harnessAssignment.cohort,
+                rollout_percent: harnessAssignment.rolloutPercent
+              }
+            }
+          : {})
+      },
+      requesterIdentity
+    ),
     input_lines: toCodexInputLines(
       message,
       threadId,
@@ -960,7 +1354,7 @@ async function executeSession(
       reasoning,
       provider
     ),
-    ...(options.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: options.idleTimeoutMs }),
+    idle_timeout_ms: idleTimeoutMs,
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
   }
   const response = await fetchWithTimeout(
@@ -976,6 +1370,28 @@ async function executeSession(
   )
   await ensureApiOk(response, 'execute session')
   return (await response.json()) as SlackbotV2ExecuteSessionResponse
+}
+
+async function postInterruptSessionExecution(
+  options: SlackbotV2Options,
+  threadId: string,
+  reason: string,
+  metadata: JsonObject
+): Promise<SlackbotV2InterruptSessionResponse> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchWithTimeout(
+    fetchFn,
+    apiSessionUrl(options.apiUrl, threadId, 'interrupt'),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify({ reason, metadata })
+    },
+    sessionApiTimeoutMs(options),
+    'interrupt session'
+  )
+  await ensureApiOk(response, 'interrupt session')
+  return (await response.json()) as SlackbotV2InterruptSessionResponse
 }
 
 async function ensureApiOk(response: Response, action: string): Promise<void> {
@@ -1028,7 +1444,7 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: 'messages' | 'execute' | 'events'
+  suffix?: 'messages' | 'execute' | 'events' | 'interrupt'
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ''}`
   return new URL(path, ensureTrailingSlash(apiUrl)).toString()
@@ -1104,8 +1520,9 @@ function sessionMessageParts(
   if (requesterContext) {
     parts.push({ type: 'text', text: requesterContext })
   }
-  if (message.text.trim()) {
-    parts.push({ type: 'text', text: message.text })
+  const promptText = slackMessagePromptText(message)
+  if (promptText.trim()) {
+    parts.push({ type: 'text', text: promptText })
   }
   for (const attachment of message.attachments) {
     parts.push(sessionAttachmentPart(attachment))
@@ -1139,9 +1556,25 @@ function sessionMetadata(
     timestamp: message.timestamp,
     user_id: message.author.userId,
     user_name: message.author.userName,
+    ...sessionSlackTextMetadata(message),
     ...sessionRequesterMetadata(message, requesterIdentity),
     ...extra
   }
+}
+
+function sessionSlackTextMetadata(message: SlackbotV2ApiMessage): JsonObject {
+  const fields: JsonObject = {}
+  if (message.displayTextSource) fields.slack_text_source = message.displayTextSource
+  const displayText = slackMessagePromptText(message)
+  if (message.displayTextSource) fields.slack_display_text_chars = displayText.length
+  if (typeof message.rawSlackBlockCount === 'number') {
+    fields.slack_raw_block_count = message.rawSlackBlockCount
+  }
+  if (typeof message.rawSlackAttachmentCount === 'number') {
+    fields.slack_raw_attachment_count = message.rawSlackAttachmentCount
+  }
+  if (message.links?.length) fields.slack_link_count = message.links.length
+  return fields
 }
 
 function toCodexInputLines(
@@ -1265,6 +1698,7 @@ function stagedAttachmentInputLines(
 
 function requesterIdentityContext(identity: RequesterIdentity | undefined): string | undefined {
   if (!identity?.slackUserId && !identity?.slackUserName && !identity?.githubHandle) return undefined
+  const slackAttributionName = requesterSlackAttributionName(identity)
 
   const lines = [
     '# Requester Context',
@@ -1292,6 +1726,7 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
       `- Assign the PR to the requester when possible: \`${githubLogin}\``
     )
   } else {
+    const promptedBy = slackAttributionName ?? 'unknown Slack requester'
     lines.push(
       '- GitHub handle from Slack profile: unavailable',
       `- GitHub handle unavailable reason: ${identity.githubUnavailableReason ?? 'not resolved'}`,
@@ -1299,14 +1734,32 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
       '',
       '## GitHub PR Attribution',
       '',
-      '- If you create a GitHub PR for this Slack request, do not infer a GitHub '
-        + 'username from Slack display name, real name, or email.',
-      '- Omit the `Prompted by` line unless a verified GitHub handle is present.'
+      '- If you create a GitHub PR for this Slack request, '
+        + `the PR body MUST contain this standalone line: \`Prompted by: ${promptedBy}\``,
+      '- Use the requester\'s Slack display name or username because no verified GitHub '
+        + 'handle is available.',
+      '- Do not infer a GitHub username from Slack display name, real name, or email.',
+      '- The credited prompter is the requester in this section, not the Slack thread OP/root author.',
+      '- This is a GitHub PR body requirement, not a Slack response mention rule.'
     )
   }
 
   lines.push('', 'The user message follows in the next content block.', '---')
   return lines.join('\n')
+}
+
+function requesterSlackAttributionName(identity: RequesterIdentity): string | undefined {
+  return (
+    nonEmptyString(identity.slackDisplayName)
+    ?? nonEmptyString(identity.slackUserName)
+    ?? nonEmptyString(identity.slackMention)
+    ?? nonEmptyString(identity.slackUserId)
+  )
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
 }
 
 function codexInputContent(
@@ -1317,6 +1770,10 @@ function codexInputContent(
   contextPreamble?: string
 ): JsonValue[] {
   const content: JsonValue[] = []
+  const slackSessionContext = slackUploadSessionContext(message.threadId)
+  if (slackSessionContext) {
+    content.push({ type: 'text', text: slackSessionContext })
+  }
   const requesterContext = requesterIdentityContext(requesterIdentity)
   if (requesterContext) {
     content.push({ type: 'text', text: requesterContext })
@@ -1340,13 +1797,53 @@ function codexInputContent(
       codexAttachmentInput(contextAttachment.attachment, staged.get(contextAttachment.attachment))
     )
   }
-  if (message.text.trim()) {
-    content.push({ type: 'text', text: message.text })
+  const promptText = slackMessagePromptText(message)
+  if (promptText.trim()) {
+    content.push({ type: 'text', text: promptText })
   }
   for (const attachment of message.attachments) {
     content.push(codexAttachmentInput(attachment, staged.get(attachment)))
   }
   return content.length > 0 ? content : [{ type: 'text', text: 'continue' }]
+}
+
+type SlackThreadDestination = {
+  channelId: string
+  teamId?: string
+  threadTs: string
+}
+
+function slackUploadSessionContext(threadId: string): string | undefined {
+  const destination = slackThreadDestination(threadId)
+  if (!destination) return undefined
+
+  const lines = [
+    '# Slack Session Context',
+    '',
+    'API-owned Slack upload destination for this turn:',
+    ...(destination.teamId ? [`- session_context.slack.team_id: ${destination.teamId}`] : []),
+    `- session_context.slack.channel_id: ${destination.channelId}`,
+    `- session_context.slack.thread_ts: ${destination.threadTs}`,
+    `- thread_key: ${threadId}`,
+    '',
+    'Use these exact IDs for Slack file uploads in this thread.',
+    `Example: slack upload ${destination.channelId} /path/to/file --thread ${destination.threadTs}`,
+    'Do not recover this destination with Slack search.',
+    '---'
+  ]
+  return lines.join('\n')
+}
+
+function slackThreadDestination(threadId: string): SlackThreadDestination | undefined {
+  const parts = threadId.split(':')
+  if (parts[0] !== 'slack') return undefined
+  if (parts.length === 3 && parts[1] && parts[2]) {
+    return { channelId: parts[1], threadTs: parts[2] }
+  }
+  if (parts.length === 4 && parts[1] && parts[2] && parts[3]) {
+    return { teamId: parts[1], channelId: parts[2], threadTs: parts[3] }
+  }
+  return undefined
 }
 
 function slackThreadContext(
@@ -1397,7 +1894,7 @@ function slackContextAuthor(message: SlackbotV2ApiMessage): string {
 }
 
 function slackContextMessageText(message: SlackbotV2ApiMessage): string {
-  const fields = [message.text.trim()]
+  const fields = [slackMessagePromptText(message).trim()]
   for (const attachment of message.attachments) {
     fields.push(attachmentDescription(attachment))
   }
@@ -1423,18 +1920,6 @@ function codexAttachmentInput(
       name: attachment.name,
       mimeType: attachment.mimeType,
       size: attachment.size
-    }
-  }
-  const dataUrl =
-    attachment.dataBase64 && attachment.mimeType
-      ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
-      : undefined
-  if (attachment.type === 'image' && (dataUrl || attachment.url)) {
-    return {
-      type: 'image',
-      url: dataUrl ?? attachment.url,
-      detail: 'auto',
-      name: attachment.name
     }
   }
   if (attachment.dataBase64) {
@@ -1487,6 +1972,15 @@ async function* parseSessionEventStream(
       if (isTerminalCodexOutputLine(event.data)) return
       continue
     }
+    if (event.event === 'session.activity_summary') {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event
+      } satisfies RustSessionStreamEvent
+      continue
+    }
     if (event.event === 'session.execution_failed' || event.event === 'session.stream_error') {
       yield {
         data: { error: sessionErrorMessage(event) },
@@ -1498,7 +1992,7 @@ async function* parseSessionEventStream(
     }
     if (event.event === 'session.execution_cancelled') {
       yield {
-        data: { error: sessionErrorMessage(event, 'Execution cancelled') },
+        data: { error: sessionErrorMessage(event, 'Execution interrupted') },
         event: event.event,
         eventId: event.id,
         eventKind: event.event
@@ -1519,38 +2013,70 @@ async function* parseSessionEventStream(
 
 async function* parseSseEvents(stream: ReadableStream<Uint8Array>): AsyncIterable<ParsedSessionEvent> {
   const reader = stream.getReader()
+  // Tracks the underlying network connection. Each open stream occupies one
+  // slot of Bun's global fetch pool (BUN_CONFIG_MAX_HTTP_REQUESTS, default
+  // 256); the 2026-07-06 incident wedged Slackbot by leaking one abandoned
+  // stream per completed turn until the pool was exhausted.
+  slackbotMetrics.sessionEventStreamsOpen.inc()
+  let connectionReleased = false
+  const releaseConnection = (reason: 'cancelled' | 'done' | 'error') => {
+    if (connectionReleased) return
+    connectionReleased = true
+    slackbotMetrics.sessionEventStreamsOpen.dec()
+    slackbotMetrics.sessionEventStreamClosures.inc({ reason })
+  }
   const decoder = new TextDecoder()
   let buffer = ''
   let eventName: string | undefined
   let eventId: number | undefined
   let data: string[] = []
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split(/\r?\n/)
-    buffer = lines.pop() ?? ''
+  try {
+    while (true) {
+      let done: boolean
+      let value: Uint8Array | undefined
+      try {
+        ;({ done, value } = await reader.read())
+      } catch (error) {
+        releaseConnection('error')
+        throw error
+      }
+      if (done) {
+        releaseConnection('done')
+        break
+      }
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
-      const emitted = parseSseLine(line, { data, eventId, eventName })
+      for (const line of lines) {
+        const emitted = parseSseLine(line, { data, eventId, eventName })
+        data = emitted.state.data
+        eventId = emitted.state.eventId
+        eventName = emitted.state.eventName
+        if (emitted.event) yield emitted.event
+      }
+    }
+
+    buffer += decoder.decode()
+    if (buffer) {
+      const emitted = parseSseLine(buffer, { data, eventId, eventName })
       data = emitted.state.data
       eventId = emitted.state.eventId
       eventName = emitted.state.eventName
       if (emitted.event) yield emitted.event
     }
-  }
-
-  buffer += decoder.decode()
-  if (buffer) {
-    const emitted = parseSseLine(buffer, { data, eventId, eventName })
-    data = emitted.state.data
-    eventId = emitted.state.eventId
-    eventName = emitted.state.eventName
-    if (emitted.event) yield emitted.event
-  }
-  if (data.length > 0) {
-    yield { data: data.join('\n'), event: eventName, id: eventId }
+    if (data.length > 0) {
+      yield { data: data.join('\n'), event: eventName, id: eventId }
+    }
+  } finally {
+    // Runs when a consumer abandons this generator early — typically
+    // parseSessionEventStream returning on a terminal event. Cancelling the
+    // reader closes the connection, freeing its fetch-pool slot and letting
+    // api-rs drop the stream's server-side resources. Without this, every
+    // completed turn leaked one connection until all outbound HTTP wedged.
+    releaseConnection('cancelled')
+    await reader.cancel().catch(() => {})
   }
 }
 

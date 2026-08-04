@@ -10,18 +10,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use centaur_iron_control::{
-    AwsAuthSecretInput, GcpAuthSecretInput, HmacSecretHeader, HmacSecretInput, InjectConfig,
-    OAuthTokenSecretInput, PgDsnSecretInput, PgDsnSettingInput, PgDsnSettingValueFromInput,
-    ReplaceConfig, RequestRule, SecretInput, SecretSource, StaticSecretInput,
-    gcp_auth_scopes_or_default, managed_labels, slugify, source_from_placeholder,
-    unique_foreign_id,
+    AwsAuthSecretInput, GcpAuthSecretInput, GcpIdTokenSecretInput, HmacSecretHeader,
+    HmacSecretInput, InjectConfig, OAuthTokenSecretInput, PgDsnSecretInput, PgDsnSettingInput,
+    PgDsnSettingValueFromInput, ReplaceConfig, RequestRule, SecretInput, SecretSource,
+    StaticSecretInput, gcp_auth_scopes_or_default, managed_labels, slugify,
+    source_from_placeholder, unique_foreign_id,
 };
 use centaur_iron_proxy::SourcePolicy;
 use centaur_iron_proxy::{PgDsnSetting, PgDsnSettingValueFrom};
 
 use crate::tools::{
-    AwsAuthSecret, BrokerTokenSecret, FieldSource, GcpAuthSecret, HmacSignSecret, HttpSecret,
-    OAuthTokenSecret, ParsedSecret, PgDsnSecret, SecretMode,
+    AwsAuthSecret, BrokerTokenSecret, FieldSource, GcpAuthSecret, GcpIdTokenSecret, HmacSignSecret,
+    HttpSecret, OAuthTokenSecret, ParsedSecret, PgDsnSecret, SecretMode,
 };
 
 /// The result of translating a tool's secrets: the iron-control inputs to upsert.
@@ -38,6 +38,19 @@ pub struct ToolLabels {
 
 fn rules_from_hosts(hosts: &[String]) -> Vec<RequestRule> {
     hosts.iter().map(RequestRule::host).collect()
+}
+
+fn rules_from_http_secret(secret: &HttpSecret) -> Vec<RequestRule> {
+    secret
+        .hosts
+        .iter()
+        .map(|host| RequestRule {
+            host: Some(host.clone()),
+            cidr: None,
+            http_methods: secret.http_methods.clone(),
+            paths: secret.paths.clone(),
+        })
+        .collect()
 }
 
 /// Translate every secret declared by a tool into iron-control inputs to grant
@@ -107,6 +120,16 @@ fn translate_with_labels(
             }
             ParsedSecret::GcpAuth(gcp) => {
                 out.inputs.push(SecretInput::GcpAuth(gcp_input(
+                    namespace,
+                    role_foreign_id,
+                    gcp,
+                    policy,
+                    labels,
+                    &mut used,
+                )));
+            }
+            ParsedSecret::GcpIdToken(gcp) => {
+                out.inputs.push(SecretInput::GcpIdToken(gcp_id_token_input(
                     namespace,
                     role_foreign_id,
                     gcp,
@@ -199,7 +222,7 @@ fn static_input(
         inject_config,
         replace_config,
         source: source_from_placeholder(policy, &http.secret_ref, None),
-        rules: rules_from_hosts(&http.hosts),
+        rules: rules_from_http_secret(http),
     }
 }
 
@@ -251,6 +274,32 @@ fn gcp_input(
     }
 }
 
+fn gcp_id_token_input(
+    namespace: &str,
+    role: &str,
+    gcp: &GcpIdTokenSecret,
+    policy: &SourcePolicy,
+    labels: &BTreeMap<String, String>,
+    used: &mut BTreeSet<String>,
+) -> GcpIdTokenSecretInput {
+    let mut identity = format!("{}-{}", gcp.secret_ref, gcp.audience);
+    if let Some(header) = &gcp.header {
+        identity.push('-');
+        identity.push_str(header);
+    }
+    GcpIdTokenSecretInput {
+        namespace: namespace.to_owned(),
+        foreign_id: unique_foreign_id(format!("{role}-gcp-id-token-{}", slugify(&identity)), used),
+        name: Some(format!("GCP ID Token ({role})")),
+        description: None,
+        labels: labels.clone(),
+        audience: gcp.audience.clone(),
+        header: gcp.header.clone(),
+        keyfile: source_from_placeholder(policy, &gcp.secret_ref, None),
+        rules: rules_from_hosts(&gcp.hosts),
+    }
+}
+
 /// Translate a `pg_dsn` secret into a [`PgDsnSecretInput`].
 ///
 /// Unlike the other secret types, the pg_dsn `foreign_id` is **not**
@@ -286,10 +335,12 @@ fn pg_setting_input(setting: &PgDsnSetting) -> PgDsnSettingInput {
             |PgDsnSettingValueFrom {
                  principal_label,
                  principal_field,
+                 proxy_label,
              }| {
                 PgDsnSettingValueFromInput {
                     principal_label: principal_label.clone(),
                     principal_field: principal_field.clone(),
+                    proxy_label: proxy_label.clone(),
                 }
             },
         ),

@@ -59,35 +59,34 @@ Supported v2 primitives:
 | `handler(inp, ctx)` | Supported |
 | `ctx.step(name, fn)` | Supported |
 | `ctx.agent_turn(...)` / `ctx.run_agent(...)` | Supported |
-| `ctx.call_tool(...)` | Supported through the configured tool API proxy |
+| `ctx.call_tool(...)` | Supported through the generated `centaur-tools call` bridge in the workflow-host sandbox |
 | `ctx.post_to_slack(...)` | Supported |
 | `ctx._pool` | Supported when the workflow-host sandbox receives `DATABASE_URL` |
 | `WEBHOOKS` | Supported |
 | `SCHEDULE` | Supported |
+| `WORKFLOW_PRINCIPAL` | Supported for scoped workflow-host and agent-sandbox permissions |
 
 ## Required migrations
 
 ### Keep imports narrow
 
-Workflow files should import only the workflow context compatibility module:
+Workflow files should import only the supported workflow-host API surface they
+need:
 
 ```python
 from api.workflow_engine import WorkflowContext
+from api.runtime_control import ControlPlaneError
 ```
 
-Do not import Python API internals such as:
+Supported workflow-host modules are `api.workflow_engine`,
+`api.runtime_control`, `api.app`, and `api.metrics`.
 
-```python
-from api.runtime_control import canonical_json
-from api.vm_metrics import workflow_counter
-```
-
-Those modules were implementation details of the Python API service. In v2,
-the workflow host provides a small compatibility surface instead of the whole
-Python API package.
+Do not import unrelated API-service internals or another workflow domain's local
+helpers. Domain-specific helpers should live next to the workflows that own
+them, for example `workflows/slack/metrics.py`.
 
 If a workflow needs a helper, move it into the workflow file, a shared overlay
-module, or a supported workflow-host compatibility shim.
+module, or a supported workflow-host API module.
 
 ### Put side effects behind steps
 
@@ -110,15 +109,85 @@ Use `ctx.agent_turn(...)` when the workflow needs an agent sandbox:
 ```python
 result = await ctx.agent_turn(
     "Investigate this alert and return the next action.",
-    thread_key=f"workflow:{ctx.run_id}:agent",
     harness="codex",
+    model="gpt-5.2",
+    reasoning="high",
     metadata={"workflow": WORKFLOW_NAME},
 )
 ```
 
 The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
-session runtime.
+session runtime. Unscoped workflows may pass an explicit `thread_key` when they
+intentionally need a shared thread. Scoped workflows must omit it; api-rs owns a
+fresh per-task thread and reuses that thread only for turns in the same task.
+
+Agent-turn results include the raw `output_lines` event stream by default for
+compatibility. When a workflow only needs the terminal answer, pass
+`include_output_lines=False`; the response omits `output_lines` and keeps the
+authoritative terminal answer in `result_text`.
+
+#### Declare Workflow Permissions
+
+When a workflow or one of its agent turns needs scoped tools, declare the
+principal that should own those permissions:
+
+```python
+WORKFLOW_NAME = "nightly_report"
+WORKFLOW_PRINCIPAL = True
+```
+
+The API derives and registers the `workflow-nightly-report` principal in the
+Centaur Console, runs that workflow's host sandbox under it, and binds its agent
+sessions to the same principal. Grant only the roles or secrets that workflow
+needs:
+
+```bash
+cargo run -p centaur-perms -- \
+  principals grant workflow-nightly-report \
+  --workflow-name nightly_report \
+  --tool slack
+```
+
+The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
+Workflow code cannot choose another principal id, display name, or labels. An
+The required `--workflow-name` flag makes pre-granting create those exact labels;
+it can explicitly claim an older untyped Centaur-managed principal with the same
+canonical id, but rejects a conflicting typed identity. api-rs likewise fails
+closed instead of reusing a principal left by a differently named workflow.
+Scoped `ctx.agent_turn(...)` calls cannot choose `thread_key`, so a workflow
+cannot attach its grants to an unrelated session. `WORKFLOW_PRINCIPAL = True`
+requires `apiRs.workflowHostSandbox=true`, which renders
+`WORKFLOW_HOST_SANDBOX=true`; startup fails if a workflow declares a principal
+while workflow-host sandboxing is disabled.
+
+#### Pick the model and reasoning effort
+
+`ctx.agent_turn(...)` accepts optional `model`, `provider`, and `reasoning`
+kwargs. They ride the turn exactly like the Slack `--model` / `--bedrock` /
+`-rsn` flags: `model` selects the model within the harness, `reasoning` sets the
+codex reasoning effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`),
+and `provider` selects the codex model provider. `provider` and `reasoning` only
+affect the codex harness; claude and amp ignore them. `reasoning` also accepts
+the `reasoning_effort` and `effort` aliases. When a kwarg is omitted the
+deployment/baked harness default stands — dispatched turns are no longer pinned
+to the deployment default.
+
+To set a default for **every** turn in a workflow, declare a module-level
+`AGENT_DEFAULTS` dict. Explicit per-call kwargs override it key by key:
+
+```python
+WORKFLOW_NAME = "nightly_report"
+AGENT_DEFAULTS = {"harness": "codex", "model": "gpt-5.2", "reasoning": "high"}
+
+async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
+    await ctx.agent_turn("Draft the report.")            # gpt-5.2 @ high
+    await ctx.agent_turn("Tidy formatting.", reasoning="low")  # gpt-5.2 @ low
+```
+
+Keep `harness` and `model` together — a model is only meaningful within its
+harness, and because kwargs override `AGENT_DEFAULTS` key by key, overriding one
+without the other can strand a model on the wrong harness.
 
 ### Declare webhook metadata in the workflow
 
@@ -153,11 +222,15 @@ Schedules can live beside the handler:
 ```python
 SCHEDULE = {
     "type": "cron",
-    "cron": "0 9 * * 1-5",
+    "cron": "0 9 * * MON-FRI",
     "timezone": "America/New_York",
     "input": {"profile": "default"},
 }
 ```
+
+Write day-of-week as names (`MON-FRI`), not numbers: the parser is Quartz-style
+(1 = Sunday), so a Unix-style `1-5` fires Sunday–Thursday. See
+[Schedule a workflow](/extend/workflows#schedule-a-workflow) for details.
 
 `api-rs` reconciles enabled schedule metadata into Absurd schedule tasks. ETL
 workflows can be routed to a separate queue so long-running sync jobs do not
@@ -194,14 +267,15 @@ For each existing workflow:
 
 ## Known gaps
 
-The v2 POC supports the workflow model, but it does not yet emulate the full
-Python API package. Workflows that import `api.runtime_control`, `api.vm_metrics`,
-or other Python API internals need a compatibility shim or a small local helper
-before they are v2-ready.
+The v2 workflow host intentionally exposes a narrow Python API package.
+Workflows that import unrelated API-service internals should move that behavior
+into the workflow-host API surface or a small local helper owned by the workflow
+domain before they are v2-ready.
 
-The tool runtime is also still proxied. `ctx.call_tool(...)` works through the
-configured tool API, but a fully native `api-rs` tool runtime is a separate
-migration step.
+`ctx.call_tool(...)` is a compatibility surface in the Python workflow host. It
+uses the generated `centaur-tools call` bridge against the installed tool
+package; agent sandboxes should use direct tool CLIs instead of deprecated
+`/tools/...` HTTP routes.
 
 ## Verify a migration
 
@@ -219,7 +293,6 @@ Then create a real run:
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $WORKFLOW_API_KEY" \
   -d '{
     "workflow_name": "nightly_report",
     "input": {"topic": "open incidents"}

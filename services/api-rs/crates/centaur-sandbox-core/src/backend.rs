@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 
 use crate::{
     ObservedSandbox, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
@@ -53,12 +54,29 @@ pub trait SandboxBackend: Send + Sync {
     /// Stop the sandbox and clean up backend-owned runtime resources.
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()>;
 
+    /// Stop only the resource generation observed by the caller. Backends
+    /// without resource UIDs retain the ordinary stop behavior.
+    async fn stop_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "stop_exact",
+            });
+        }
+        self.stop(id).await
+    }
+
     /// Rebind a running sandbox's managed iron-proxy to a different
     /// iron-control principal.
     async fn assign_iron_control_proxy_principal(
         &self,
         _id: &SandboxId,
         _principal_id: &str,
+        _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Err(crate::SandboxError::Unsupported {
             backend: self.name(),
@@ -66,9 +84,65 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// Ensure a running sandbox's managed iron-proxy resources are present and
+    /// usable for the supplied iron-control principal without otherwise
+    /// changing the sandbox lifecycle.
+    async fn ensure_iron_control_proxy_resources(
+        &self,
+        _id: &SandboxId,
+        _principal_id: &str,
+        _labels: &BTreeMap<String, String>,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+
     /// Suspend the sandbox while preserving any backend-supported runtime state.
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()>;
 
+    /// Suspend only the resource generation observed by the caller.
+    async fn pause_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "pause_exact",
+            });
+        }
+        self.pause(id).await
+    }
+
     /// Resume a previously suspended sandbox and wait until it can serve I/O.
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()>;
+
+    /// Resume only the resource generation observed by the caller.
+    async fn resume_exact(
+        &self,
+        id: &SandboxId,
+        expected_resource_uid: Option<&str>,
+    ) -> SandboxResult<()> {
+        if expected_resource_uid.is_some() {
+            return Err(crate::SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "resume_exact",
+            });
+        }
+        self.resume(id).await
+    }
+
+    /// Fence a successor's reuse of a running sandbox generation. Backends
+    /// must make an exact, observable write even when it is already running.
+    async fn ensure_running_exact(
+        &self,
+        _id: &SandboxId,
+        _expected_resource_uid: &str,
+        _fence_nonce: &str,
+    ) -> SandboxResult<()> {
+        Err(crate::SandboxError::Unsupported {
+            backend: self.name(),
+            operation: "ensure_running_exact",
+        })
+    }
 }

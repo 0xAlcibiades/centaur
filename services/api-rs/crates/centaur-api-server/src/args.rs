@@ -11,47 +11,38 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use centaur_api_server::SandboxRuntime;
+use centaur_api_server::{
+    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
+    discover_tool_proxy_fragment,
+};
 use centaur_iron_control::{
-    IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
-    register_role,
+    IdentityInput, IronControlClient, IronControlError, PrincipalInput, RegisterError, RoleSpec,
+    SessionRegistrar, register_role,
 };
 use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    IronProxySecretEnv, MetadataTraceSidecarConfig, OtlpEgressTarget, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
-use centaur_session_runtime::{PersonaRegistry, SandboxWorkloadMode};
-use centaur_workflows::WorkflowHostSandboxRuntime;
-use clap::{Args as ClapArgs, Parser, ValueEnum};
-use tracing::{error, info, warn};
-
-use crate::{
-    ServerError,
-    tool_discovery::{
-        DiscoveredToolProxyFragment, ToolDiscoveryConfig, discover_persona_registry,
-        discover_tool_proxy_fragment,
-    },
+use centaur_session_runtime::{
+    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
 };
+use centaur_session_sqlx::MetadataTraceConfigIdentity;
+use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
+use clap::{Args as ClapArgs, Parser, ValueEnum};
+use tracing::{info, warn};
+
+use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
-
-/// OTLP env always forwarded from the api-rs process into codex sandboxes,
-/// mirroring the Python control plane's `_SANDBOX_PASSTHROUGH_ENV_KEYS`. The
-/// wrapper inside the sandbox reads these to configure codex's trace export
-/// (endpoint, Laminar ingest auth header, resource attributes).
-const SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS: [&str; 4] = [
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-    "OTEL_RESOURCE_ATTRIBUTES",
-];
+const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
+const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the Centaur API Rust session control plane")]
@@ -60,9 +51,40 @@ pub(crate) struct Args {
     pub(crate) server: ServerArgs,
     #[command(flatten)]
     sandbox: SandboxArgs,
+    #[command(flatten)]
+    activity_summary: ActivitySummaryArgs,
 }
 
 impl Args {
+    pub(crate) fn metadata_trace_config_identity(
+        &self,
+    ) -> Result<Option<MetadataTraceConfigIdentity>, ServerError> {
+        let config = self.sandbox.metadata_trace_sidecar_config()?;
+        let Some(generation) = self.sandbox.metadata_trace_config_generation else {
+            // Plain binary/local deployments that have never enabled tracing
+            // must not acquire a retirement generation just to start.
+            if config.is_none() {
+                return Ok(None);
+            }
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION is required when metadata tracing is enabled"
+                    .to_owned(),
+            ));
+        };
+        if generation <= 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION must be positive".to_owned(),
+            ));
+        }
+        Ok(Some(MetadataTraceConfigIdentity {
+            generation,
+            fingerprint: config
+                .as_ref()
+                .map_or_else(|| "disabled".to_owned(), |config| config.fingerprint()),
+            enabled: config.is_some(),
+        }))
+    }
+
     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
         self.sandbox.runtime().await
     }
@@ -73,12 +95,6 @@ impl Args {
         self.sandbox.iron_control_runtime().await
     }
 
-    pub(crate) fn iron_control_tool_reconciler(
-        &self,
-    ) -> Result<Option<IronControlToolReconciler>, ServerError> {
-        self.sandbox.iron_control_tool_reconciler()
-    }
-
     pub(crate) fn persona_registry(&self) -> Result<PersonaRegistry, ServerError> {
         self.sandbox.persona_registry()
     }
@@ -87,8 +103,16 @@ impl Args {
         self.sandbox.warm_pool_config()
     }
 
+    pub(crate) fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
+        self.sandbox.sandbox_capacity_config()
+    }
+
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
         self.sandbox.sandbox_reaper_config()
+    }
+
+    pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
+        self.sandbox.sandbox_cleanup_config()
     }
 
     pub(crate) async fn workflow_host_sandbox_runtime(
@@ -99,22 +123,124 @@ impl Args {
             .workflow_host_sandbox_runtime(bootstrap_iron_control_principal)
             .await
     }
+
+    pub(crate) fn activity_summary_config(&self) -> Option<ActivitySummaryConfig> {
+        self.activity_summary.config()
+    }
+
+    pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.server.shutdown_execution_drain_timeout_secs)
+    }
+
+    pub(crate) fn codex_nanocodex_rollout_percent(&self) -> u8 {
+        self.server.codex_nanocodex_rollout_percent
+    }
+
+    pub(crate) fn slack_trace_consent_bearer_secret(&self) -> Option<String> {
+        self.server
+            .slack_trace_consent_bearer_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn slack_session_bearer_secret(&self) -> Option<String> {
+        self.server
+            .slack_session_bearer_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn execution_adoption_interval(&self) -> Option<Duration> {
+        (self.server.execution_adoption_interval_secs > 0)
+            .then(|| Duration::from_secs(self.server.execution_adoption_interval_secs))
+    }
 }
 
 pub(crate) struct IronControlRuntime {
     pub(crate) registrar: SessionRegistrar,
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
+    pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
 }
 
-pub(crate) struct IronControlToolReconciler {
-    client: IronControlClient,
-    namespace: String,
-    source_policy: SourcePolicy,
-    base_infra_fragment: ProxyFragment,
-    tool_dirs: Vec<PathBuf>,
-    tool_git_sources: Vec<ToolGitSource>,
-    interval: Duration,
+#[derive(Debug, ClapArgs)]
+struct ActivitySummaryArgs {
+    /// Enable API-side model summaries of durable Codex App Server activity.
+    #[arg(
+        long = "session-activity-summary-enabled",
+        env = "SESSION_ACTIVITY_SUMMARY_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    enabled: bool,
+    #[arg(
+        long = "session-activity-summary-model",
+        env = "SESSION_ACTIVITY_SUMMARY_MODEL",
+        default_value = "gpt-5.4-nano"
+    )]
+    model: String,
+    #[arg(
+        long = "session-activity-summary-openai-base-url",
+        env = "SESSION_ACTIVITY_SUMMARY_OPENAI_BASE_URL",
+        default_value = "https://api.openai.com/v1"
+    )]
+    openai_base_url: String,
+    #[arg(
+        long = "session-activity-summary-min-interval-secs",
+        env = "SESSION_ACTIVITY_SUMMARY_MIN_INTERVAL_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    min_interval_secs: u64,
+    #[arg(
+        long = "session-activity-summary-timeout-secs",
+        env = "SESSION_ACTIVITY_SUMMARY_TIMEOUT_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    timeout_secs: u64,
+    #[arg(
+        long = "session-activity-summary-max-facts",
+        env = "SESSION_ACTIVITY_SUMMARY_MAX_FACTS",
+        default_value_t = 12,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    max_facts: u64,
+    #[arg(
+        long = "session-activity-summary-max-output-tokens",
+        env = "SESSION_ACTIVITY_SUMMARY_MAX_OUTPUT_TOKENS",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    max_output_tokens: u64,
+}
+
+impl ActivitySummaryArgs {
+    fn config(&self) -> Option<ActivitySummaryConfig> {
+        if !self.enabled {
+            return None;
+        }
+        let Some(api_key) = clean_optional_value(env::var("OPENAI_API_KEY").ok().as_deref()) else {
+            warn!(
+                "session activity summaries are enabled but no OpenAI credential is configured; \
+                 set OPENAI_API_KEY in the api-rs environment"
+            );
+            return None;
+        };
+        Some(ActivitySummaryConfig {
+            base_url: self.openai_base_url.clone(),
+            api_key,
+            max_facts: usize::try_from(self.max_facts).unwrap_or(usize::MAX),
+            max_output_tokens: u16::try_from(self.max_output_tokens).unwrap_or(u16::MAX),
+            min_interval: Duration::from_secs(self.min_interval_secs),
+            model: self.model.clone(),
+            timeout: Duration::from_secs(self.timeout_secs),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,79 +252,6 @@ struct ToolGitSource {
     repo_cache_path: Option<String>,
 }
 
-impl IronControlToolReconciler {
-    pub(crate) async fn run(self) {
-        let mut interval = tokio::time::interval(self.interval);
-        // The startup path already registered once; wait a full period so this
-        // task only handles post-start git/volume updates.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(error) = self.reconcile_once().await {
-                error!(%error, "failed to reconcile iron-control tool secrets");
-            }
-        }
-    }
-
-    async fn reconcile_once(&self) -> Result<(), ServerError> {
-        let tool_dirs = self.tool_dirs()?;
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
-        let mut infra = self.base_infra_fragment.clone();
-        if let Some(tool_fragment) = &tool_fragment {
-            merge_fragment(&mut infra, tool_fragment.fragment.clone());
-        }
-        let role_id = register_role(
-            &self.client,
-            &self.namespace,
-            &RoleSpec::infra(),
-            &infra,
-            &self.source_policy,
-        )
-        .await?;
-        info!(
-            role_id,
-            tool_dirs = ?tool_dirs,
-            tool_count = tool_fragment
-                .as_ref()
-                .map_or(0, |fragment| fragment.tool_count),
-            secret_count = tool_fragment
-                .as_ref()
-                .map_or(0, |fragment| fragment.secret_count),
-            "reconciled iron-control tool secrets"
-        );
-        Ok(())
-    }
-
-    fn discover_tool_proxy_fragment(
-        &self,
-    ) -> Result<Option<DiscoveredToolProxyFragment>, ServerError> {
-        let tool_dirs = self.tool_dirs()?;
-        let discovered = discover_tool_proxy_fragment(&tool_dirs)?;
-        if discovered.secret_count == 0 {
-            return Ok(None);
-        }
-        Ok(Some(discovered))
-    }
-
-    fn tool_dirs(&self) -> Result<Vec<PathBuf>, ServerError> {
-        if !self.tool_git_sources.is_empty() {
-            let mut dirs = Vec::with_capacity(self.tool_git_sources.len());
-            for source in &self.tool_git_sources {
-                source.sync()?;
-                let tools_dir = source.tools_dir();
-                // Skip sources without a tools tree (chart-defaulted subdirs
-                // make this a normal case for non-tool overlay repos).
-                if !tools_dir.is_dir() {
-                    continue;
-                }
-                dirs.push(tools_dir);
-            }
-            return Ok(dirs);
-        }
-        Ok(self.tool_dirs.clone())
-    }
-}
-
 impl ToolGitSource {
     fn from_config(tools: &ToolsConfig) -> Vec<Self> {
         let mut sources = vec![Self::from_source(
@@ -206,6 +259,7 @@ impl ToolGitSource {
                 repo: tools.repo.clone(),
                 git_ref: tools.git_ref.clone(),
                 source_subdir: tools.source_subdir.clone(),
+                visibility: tools.visibility.clone(),
             },
             tools.repo_cache_path.clone(),
         )];
@@ -448,6 +502,57 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// Ordinary Slackbot-to-api-rs service credential. It authenticates Slack
+    /// actor metadata on session endpoints, but cannot mutate trace consent.
+    #[arg(
+        long = "slack-session-bearer-secret",
+        env = "SLACKBOT_API_KEY",
+        hide_env_values = true
+    )]
+    slack_session_bearer_secret: Option<String>,
+    /// Dedicated credential used exclusively by the verified Slack ingress when
+    /// it relays a member's trace-consent request to api-rs.
+    #[arg(
+        long = "slack-trace-consent-bearer-secret",
+        env = "SLACK_TRACE_CONSENT_API_KEY",
+        hide_env_values = true
+    )]
+    slack_trace_consent_bearer_secret: Option<String>,
+    /// Percentage of sessions requesting Codex that are assigned to
+    /// Nanocodex. The assignment is deterministic by thread key and the
+    /// resolved harness is persisted on the session.
+    #[arg(
+        long = "session-codex-nanocodex-rollout-percent",
+        env = "SESSION_CODEX_NANOCODEX_ROLLOUT_PERCENT",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    codex_nanocodex_rollout_percent: u8,
+    /// How long shutdown waits for in-flight executions to finish before
+    /// releasing their stdout-owner leases for adoption by a peer. Keep
+    /// below the pod's terminationGracePeriodSeconds (35s in the chart) so
+    /// the release happens before SIGKILL. 0 releases immediately.
+    #[arg(
+        long = "shutdown-execution-drain-timeout-secs",
+        env = "SHUTDOWN_EXECUTION_DRAIN_TIMEOUT_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(0..=600)
+    )]
+    shutdown_execution_drain_timeout_secs: u64,
+    /// How often to re-run the orphaned-execution adoption scan after the
+    /// startup pass. Executions orphaned while the process is already
+    /// running (e.g. a rolling deploy terminating the previous pod mid-turn
+    /// after this pod's startup scan) are only recovered by these re-scans,
+    /// so the interval bounds how long a handed-off turn stays frozen. A
+    /// steady-state tick is a single SELECT (executions with a live
+    /// stdout-owner lease are skipped before any session or sandbox reads).
+    /// 0 disables re-scans and keeps the startup-only behavior.
+    #[arg(
+        long = "session-execution-adoption-interval-secs",
+        env = "SESSION_EXECUTION_ADOPTION_INTERVAL_SECS",
+        default_value_t = 15
+    )]
+    execution_adoption_interval_secs: u64,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -525,21 +630,29 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
-    /// Stop sandboxes that have been idle-paused longer than this. 0 disables
-    /// the idle sweep.
+    /// Hard cap on observed running-like sandboxes. 0 disables capacity
+    /// admission.
     #[arg(
-        long = "session-sandbox-idle-stop-ttl-secs",
-        env = "SESSION_SANDBOX_IDLE_STOP_TTL_SECS",
-        default_value_t = 3600
+        long = "session-sandbox-running-limit",
+        env = "SESSION_SANDBOX_RUNNING_LIMIT",
+        default_value_t = 0
     )]
-    sandbox_idle_stop_ttl_secs: u64,
+    sandbox_running_limit: usize,
+    /// Do not evict assigned idle sandboxes that were active within this
+    /// window. Warm sandboxes can still be discarded first.
+    #[arg(
+        long = "session-sandbox-hot-idle-grace-secs",
+        env = "SESSION_SANDBOX_HOT_IDLE_GRACE_SECS",
+        default_value_t = 300
+    )]
+    sandbox_hot_idle_grace_secs: u64,
     /// Stop any sandbox older than this regardless of status; sessions replace
     /// reaped sandboxes on their next message. 0 disables the max-lifetime
     /// sweep.
     #[arg(
         long = "session-sandbox-max-lifetime-secs",
         env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
-        default_value_t = 86_400
+        default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
     #[arg(
@@ -549,6 +662,18 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     sandbox_reap_interval_secs: u64,
+    #[arg(
+        long = "session-sandbox-cleanup-interval-secs",
+        env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
+        default_value_t = 300
+    )]
+    sandbox_cleanup_interval_secs: u64,
+    #[arg(
+        long = "session-sandbox-idle-cleanup-backstop-secs",
+        env = "SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS",
+        default_value_t = 21_600
+    )]
+    sandbox_idle_cleanup_backstop_secs: u64,
     #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
@@ -564,6 +689,8 @@ struct SandboxArgs {
     centaur_api_url: Option<String>,
     #[arg(long = "repos-path", env = "REPOS_PATH")]
     repos_path: Option<String>,
+    #[arg(long = "repos-pvc", env = "REPOS_PVC")]
+    repos_pvc: Option<String>,
     #[arg(
         long = "session-sandbox-passthrough-env",
         env = "SESSION_SANDBOX_PASSTHROUGH_ENV",
@@ -577,6 +704,57 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    /// Enable the consent-gated metadata-only Codex trace sidecar. It is
+    /// inactive until a principal explicitly has the matching capability.
+    #[arg(
+        long = "session-sandbox-metadata-trace-enabled",
+        env = "SESSION_SANDBOX_METADATA_TRACE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    metadata_trace_enabled: bool,
+    /// Deployment-owned monotonic trace configuration generation. This is
+    /// deliberately independent of the derived configuration fingerprint.
+    #[arg(
+        long = "session-sandbox-metadata-trace-config-generation",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CONFIG_GENERATION"
+    )]
+    metadata_trace_config_generation: Option<i64>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-gateway-url",
+        env = "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_URL"
+    )]
+    metadata_trace_gateway_url: Option<String>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-gateway-port",
+        env = "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_PORT",
+        default_value_t = 443
+    )]
+    metadata_trace_gateway_port: u16,
+    #[arg(
+        long = "session-sandbox-metadata-trace-credential-secret-name",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_NAME"
+    )]
+    metadata_trace_credential_secret_name: Option<String>,
+    /// Opaque generation for the projected trace Secret. Bump this when the
+    /// Secret is rotated so the durable sandbox fingerprint recreates it.
+    #[arg(
+        long = "session-sandbox-metadata-trace-credential-secret-version",
+        env = "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_VERSION"
+    )]
+    metadata_trace_credential_secret_version: Option<String>,
+    #[arg(
+        long = "session-sandbox-metadata-trace-bearer-secret-key",
+        env = "SESSION_SANDBOX_METADATA_TRACE_BEARER_SECRET_KEY",
+        default_value = "bearer"
+    )]
+    metadata_trace_bearer_secret_key: String,
+    #[arg(
+        long = "session-sandbox-metadata-trace-pseudonym-key-secret-key",
+        env = "SESSION_SANDBOX_METADATA_TRACE_PSEUDONYM_KEY_SECRET_KEY",
+        default_value = "pseudonym_key"
+    )]
+    metadata_trace_pseudonym_key_secret_key: String,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -604,12 +782,6 @@ struct SandboxArgs {
     kubernetes_workflow_dirs: Option<String>,
     #[command(flatten)]
     tools_source: ToolsArgs,
-    #[arg(
-        long = "tool-proxy-reconcile-interval-secs",
-        env = "TOOL_PROXY_RECONCILE_INTERVAL_SECS",
-        default_value_t = 60
-    )]
-    tool_proxy_reconcile_interval_secs: u64,
 }
 
 impl SandboxArgs {
@@ -620,33 +792,25 @@ impl SandboxArgs {
             return Ok(None);
         };
         let namespace = self.iron_control.namespace.clone();
-        let role_ids = if self.iron_control_sync_infra_secrets {
+        if self.iron_control_sync_infra_secrets {
             let policy = self.iron_proxy.source_policy();
-            let tool_fragment = self.discover_tool_proxy_fragment()?;
-            let roles = self.iron_proxy.roles_to_register(tool_fragment.as_ref())?;
-            let mut role_ids = Vec::with_capacity(roles.len());
+            let roles = self.iron_proxy.roles_to_register()?;
             for (spec, fragment) in &roles {
-                role_ids.push(
-                    register_role_with_retry(&client, &namespace, spec, fragment, &policy).await?,
-                );
+                register_role_with_retry(&client, &namespace, spec, fragment, &policy).await?;
             }
-            role_ids
         } else {
             let spec = RoleSpec::infra();
-            vec![
-                client
-                    .upsert_role(&IdentityInput {
-                        namespace: namespace.clone(),
-                        foreign_id: spec.foreign_id,
-                        name: spec.name,
-                        labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
-                    })
-                    .await?
-                    .id,
-            ]
-        };
+            client
+                .upsert_role(&IdentityInput {
+                    namespace: namespace.clone(),
+                    foreign_id: spec.foreign_id,
+                    name: spec.name,
+                    labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
+                })
+                .await?;
+        }
         let bootstrap = client
-            .upsert_principal(&IdentityInput {
+            .upsert_principal(&PrincipalInput {
                 namespace: namespace.clone(),
                 foreign_id: "warm-pool-bootstrap".to_owned(),
                 name: "Warm pool bootstrap".to_owned(),
@@ -654,10 +818,15 @@ impl SandboxArgs {
                     ("managed-by".to_owned(), "centaur".to_owned()),
                     ("purpose".to_owned(), "warm-pool-bootstrap".to_owned()),
                 ]),
+                kind: None,
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
             })
             .await?;
         let workflow_host = client
-            .upsert_principal(&IdentityInput {
+            .upsert_principal(&PrincipalInput {
                 namespace: namespace.clone(),
                 foreign_id: "workflow-host".to_owned(),
                 name: "Workflow host".to_owned(),
@@ -665,56 +834,31 @@ impl SandboxArgs {
                     ("managed-by".to_owned(), "centaur".to_owned()),
                     ("purpose".to_owned(), "workflow-host".to_owned()),
                 ]),
+                kind: None,
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
             })
             .await?;
-        for role_id in &role_ids {
-            client.assign_role(&workflow_host.id, role_id).await?;
-        }
         Ok(Some(IronControlRuntime {
-            registrar: SessionRegistrar::new(client, namespace, role_ids),
+            registrar: SessionRegistrar::new(client.clone(), namespace.clone()),
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
-        }))
-    }
-
-    /// Background registration for git/volume-backed tool updates. The startup
-    /// registrar grants every principal the stable infra role; re-upserting that
-    /// role here adds newly discovered tool secrets to existing and future
-    /// principals without restarting api-rs or sandboxes.
-    fn iron_control_tool_reconciler(
-        &self,
-    ) -> Result<Option<IronControlToolReconciler>, ServerError> {
-        if !self.iron_control_sync_infra_secrets {
-            return Ok(None);
-        }
-        let Some(client) = self.iron_control.client() else {
-            return Ok(None);
-        };
-        if self.tool_proxy_reconcile_interval_secs == 0 {
-            return Ok(None);
-        }
-        Ok(Some(IronControlToolReconciler {
-            client,
-            namespace: self.iron_control.namespace.clone(),
-            source_policy: self.iron_proxy.source_policy(),
-            base_infra_fragment: self.iron_proxy.infra_fragment()?,
-            tool_dirs: self.tools.resolve_tool_dirs()?,
-            tool_git_sources: self
-                .tools_source
-                .to_config()
-                .as_ref()
-                .map(ToolGitSource::from_config)
-                .unwrap_or_default(),
-            interval: Duration::from_secs(self.tool_proxy_reconcile_interval_secs),
+            workflow_principal_registrar: WorkflowPrincipalRegistrar::new(client, namespace),
         }))
     }
 
     fn persona_registry(&self) -> Result<PersonaRegistry, ServerError> {
         let default_persona_id = clean_optional_value(self.default_persona.as_deref());
-        Ok(discover_persona_registry(
-            &self.tools.resolve_tool_dirs()?,
-            default_persona_id,
-        )?)
+        let public_source_roots = self
+            .tools
+            .resolve_public_tool_dirs()
+            .into_iter()
+            .map(|path| path.display().to_string());
+        let registry =
+            discover_persona_registry(&self.tools.resolve_tool_dirs()?, default_persona_id)?;
+        Ok(registry.with_public_source_roots(public_source_roots))
     }
 
     async fn runtime(&self) -> Result<SandboxRuntime, ServerError> {
@@ -822,13 +966,7 @@ impl SandboxArgs {
             && let Some(repos_path) = clean_optional_value(self.repos_path.as_deref())
         {
             spec = spec.mount(
-                Mount::new(
-                    MountKind::Bind {
-                        source_path: repos_path,
-                    },
-                    SANDBOX_REPOS_MOUNT_PATH,
-                )
-                .read_only(),
+                Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH).read_only(),
             );
         }
         for (name, value) in self.workflow_host_env_template()? {
@@ -903,13 +1041,8 @@ impl SandboxArgs {
                 );
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
-                        Mount::new(
-                            MountKind::Bind {
-                                source_path: repos_path,
-                            },
-                            SANDBOX_REPOS_MOUNT_PATH,
-                        )
-                        .read_only(),
+                        Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH)
+                            .read_only(),
                     );
                 }
                 Ok(workload)
@@ -917,15 +1050,17 @@ impl SandboxArgs {
         }
     }
 
+    fn repos_mount_kind(&self, repos_path: String) -> MountKind {
+        if let Some(claim_name) = clean_optional_value(self.repos_pvc.as_deref()) {
+            return MountKind::NamedVolume(claim_name);
+        }
+        MountKind::Bind {
+            source_path: repos_path,
+        }
+    }
+
     fn codex_app_server_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let mut envs = vec![(
-            "CENTAUR_API_URL".to_owned(),
-            self.centaur_api_url_override
-                .as_deref()
-                .or(self.centaur_api_url.as_deref())
-                .unwrap_or("http://api:8000")
-                .to_owned(),
-        )];
+        let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
         // Single source of truth: propagate this control plane's harness auth
         // modes into the sandbox so the agent's auth.json matches the
@@ -943,9 +1078,10 @@ impl SandboxArgs {
 
         // Inject the infra/harness placeholder credentials so env-based
         // consumers send the proxy_value iron-proxy replaces with the real
-        // secret: codex's OPENAI_API_KEY (api_key mode → codex logs in and
+        // secret: codex's OPENAI_API_KEY (api_key mode -> codex logs in and
         // hits api.openai.com instead of falling back to the ChatGPT
-        // auth.json), git's GITHUB_TOKEN, and the rest of the infra set.
+        // auth.json), git/gh's GITHUB_TOKEN, the slack tool's
+        // SLACK_BOT_TOKEN, and the rest of the infra set.
         for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             if !envs.iter().any(|(existing, _)| existing == &name) {
                 envs.push((name, value));
@@ -967,6 +1103,12 @@ impl SandboxArgs {
                 "OPENROUTER_API_KEY".to_owned(),
             ));
         }
+        if !envs
+            .iter()
+            .any(|(existing, _)| existing == "META_AI_API_KEY")
+        {
+            envs.push(("META_AI_API_KEY".to_owned(), "META_AI_API_KEY".to_owned()));
+        }
         // When Bedrock is enabled, codex's `amazon-bedrock` provider signs with
         // these placeholder AWS credentials and iron-proxy re-signs (SigV4) with
         // the real IAM keys. `aws_auth` is not a `secrets` transform, so the
@@ -974,21 +1116,6 @@ impl SandboxArgs {
         for (name, value) in centaur_iron_proxy::bedrock_sandbox_env() {
             if !envs.iter().any(|(existing, _)| existing == &name) {
                 envs.push((name, value));
-            }
-        }
-
-        // OTLP trace wiring rides from this process into every sandbox (the
-        // same hardcoded set the Python control plane forwarded). The harness
-        // wrapper needs the endpoint + auth header to configure codex's OTLP
-        // export — codex's `session_task.turn` spans carry the token usage
-        // Laminar prices into cost. The headers value is a secret (Laminar
-        // ingest key, ideally ingest-only): it reaches the api-rs process via
-        // the chart's secret envFrom, never via values.
-        for name in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref())
-                && !envs.iter().any(|(existing, _)| existing == name)
-            {
-                envs.push((name.to_owned(), value));
             }
         }
 
@@ -1063,11 +1190,10 @@ impl SandboxArgs {
             .collect()
     }
 
-    /// Per-sandbox OTLP egress NetworkPolicy target, derived from the OTLP
-    /// endpoint the codex sandbox env will carry. Only in-cluster service DNS
-    /// endpoints (`<service>.<namespace>.svc[...]`) map to a namespace
-    /// selector; anything else gets no rule and a warning, because a silently
-    /// missing rule means harness usage/cost spans never reach the collector.
+    /// Per-sandbox proxy OTLP egress NetworkPolicy target, derived from the
+    /// OTLP endpoint the codex sandbox env will carry. Only in-cluster service
+    /// DNS endpoints (`<service>.<namespace>.svc[...]`) map to a namespace
+    /// selector.
     fn sandbox_otlp_egress_target(&self) -> Result<Option<OtlpEgressTarget>, ServerError> {
         if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
             return Ok(None);
@@ -1092,7 +1218,7 @@ impl SandboxArgs {
                     namespace = %target.namespace,
                     port = target.port,
                     endpoint = %endpoint,
-                    "sandbox OTLP egress enabled"
+                    "sandbox proxy OTLP egress enabled"
                 );
                 Ok(Some(target))
             }
@@ -1100,15 +1226,51 @@ impl SandboxArgs {
                 warn!(
                     endpoint = %endpoint,
                     "sandbox OTLP endpoint is not an in-cluster service DNS name; \
-                     no sandbox egress NetworkPolicy rule will be created for it"
+                     no proxy egress NetworkPolicy rule will be created for it"
                 );
                 Ok(None)
             }
         }
     }
 
+    pub(crate) fn metadata_trace_sidecar_config(
+        &self,
+    ) -> Result<Option<MetadataTraceSidecarConfig>, ServerError> {
+        if !self.metadata_trace_enabled {
+            return Ok(None);
+        }
+        let required = |value: Option<&str>, name: &str| {
+            clean_optional_value(value).ok_or_else(|| {
+                ServerError::UnsupportedConfig(format!(
+                    "{name} is required when SESSION_SANDBOX_METADATA_TRACE_ENABLED=true"
+                ))
+            })
+        };
+        let config = MetadataTraceSidecarConfig::pinned(
+            required(
+                self.metadata_trace_gateway_url.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_GATEWAY_URL",
+            )?,
+            self.metadata_trace_gateway_port,
+            required(
+                self.metadata_trace_credential_secret_name.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_NAME",
+            )?,
+            required(
+                self.metadata_trace_credential_secret_version.as_deref(),
+                "SESSION_SANDBOX_METADATA_TRACE_CREDENTIAL_SECRET_VERSION",
+            )?,
+            self.metadata_trace_bearer_secret_key.clone(),
+            self.metadata_trace_pseudonym_key_secret_key.clone(),
+        );
+        config
+            .validate()
+            .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))?;
+        Ok(Some(config))
+    }
+
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let mut envs = Vec::new();
+        let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
         for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
@@ -1150,6 +1312,14 @@ impl SandboxArgs {
         }
 
         Ok(envs)
+    }
+
+    fn centaur_api_url(&self) -> String {
+        self.centaur_api_url_override
+            .as_deref()
+            .or(self.centaur_api_url.as_deref())
+            .unwrap_or("http://api:8000")
+            .to_owned()
     }
 
     fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
@@ -1200,6 +1370,15 @@ impl SandboxArgs {
             target_size: self.warm_pool_size,
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
             bootstrap_iron_control_principal: None,
+            max_running_sandboxes: (self.sandbox_running_limit > 0)
+                .then_some(self.sandbox_running_limit),
+        })
+    }
+
+    fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
+        (self.sandbox_running_limit > 0).then(|| SandboxCapacityConfig {
+            max_running: self.sandbox_running_limit,
+            hot_idle_grace: Duration::from_secs(self.sandbox_hot_idle_grace_secs),
         })
     }
 
@@ -1207,8 +1386,15 @@ impl SandboxArgs {
         let ttl = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
-            idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+        }
+    }
+
+    fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
+        let duration = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
+        SessionSandboxCleanupConfig {
+            interval: duration(self.sandbox_cleanup_interval_secs),
+            idle_backstop: duration(self.sandbox_idle_cleanup_backstop_secs),
         }
     }
 }
@@ -1263,6 +1449,8 @@ fn should_retry_iron_control_register(error: &RegisterError) -> bool {
 struct ToolDiscoveryArgs {
     #[arg(long = "tool-dirs", env = "TOOL_DIRS")]
     tool_dirs: Option<String>,
+    #[arg(long = "public-tool-dirs", env = "KUBERNETES_PUBLIC_TOOL_DIRS")]
+    public_tool_dirs: Option<String>,
     #[arg(long = "tools-path", env = "TOOLS_PATH")]
     tools_path: Option<PathBuf>,
     #[arg(long = "tools-overlay-path", env = "TOOLS_OVERLAY_PATH")]
@@ -1277,12 +1465,25 @@ impl ToolDiscoveryArgs {
     fn resolve_tool_dirs(&self) -> Result<Vec<PathBuf>, ServerError> {
         Ok(ToolDiscoveryConfig {
             tool_dirs: self.tool_dirs.clone(),
+            public_tool_dirs: self.public_tool_dirs.clone(),
             tools_path: self.tools_path.clone(),
             tools_overlay_path: self.tools_overlay_path.clone(),
             plugins_dir: self.plugins_dir.clone(),
             tools_config: self.tools_config.clone(),
         }
         .resolve_tool_dirs()?)
+    }
+
+    fn resolve_public_tool_dirs(&self) -> Vec<PathBuf> {
+        ToolDiscoveryConfig {
+            tool_dirs: self.tool_dirs.clone(),
+            public_tool_dirs: self.public_tool_dirs.clone(),
+            tools_path: self.tools_path.clone(),
+            tools_overlay_path: self.tools_overlay_path.clone(),
+            plugins_dir: self.plugins_dir.clone(),
+            tools_config: self.tools_config.clone(),
+        }
+        .resolve_public_tool_dirs()
     }
 }
 
@@ -1300,28 +1501,24 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
-        config.iron_proxy = args.iron_proxy.to_config()?;
-        if let Some(proxy) = config.iron_proxy.as_mut() {
-            // `to_config` only ships the harness fragment, so add infra and
-            // discovered tool fragments for any static proxy placeholder
-            // metadata the backend needs.
-            let mut fragments = vec![args.iron_proxy.infra_fragment()?];
-            if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
-                fragments.push(tool_fragment.fragment);
-            }
-            fragments.append(&mut proxy.fragments);
-            proxy.fragments = fragments;
+        let mut proxy = args.iron_proxy.to_config()?;
+        let mut fragments = vec![args.iron_proxy.infra_fragment()?];
+        if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
+            fragments.push(tool_fragment.fragment);
         }
+        fragments.append(&mut proxy.fragments);
+        proxy.fragments = fragments;
+        config.iron_proxy = Some(proxy);
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
-        // Direct harness OTLP export (codex usage/cost spans) needs a hole in
-        // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
-        // OTLP endpoint env so there is a single source of truth.
+        // The chart label policy handles sandbox OTLP egress; keep the
+        // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
+        config.metadata_trace_sidecar = args.metadata_trace_sidecar_config()?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
-        if config.iron_proxy.is_some() && config.iron_control.is_none() {
+        if config.iron_control.is_none() {
             return Err(ServerError::UnsupportedConfig(
                 "iron-proxy requires iron-control: set IRON_CONTROL_URL and IRON_CONTROL_API_KEY"
                     .to_owned(),
@@ -1391,6 +1588,29 @@ struct ToolsArgs {
         env = "KUBERNETES_TOOLS_REPO_CACHE_PATH"
     )]
     repo_cache_path: Option<String>,
+    // Optional PVC claim backing the repo-cache root. When set, sandbox pods mount
+    // the repo cache from this PVC instead of using a hostPath.
+    #[arg(
+        id = "tools_repo_cache_pvc",
+        long = "kubernetes-tools-repo-cache-pvc",
+        env = "KUBERNETES_TOOLS_REPO_CACHE_PVC"
+    )]
+    repo_cache_pvc: Option<String>,
+    #[arg(
+        id = "tools_visibility",
+        long = "kubernetes-tools-visibility",
+        env = "KUBERNETES_TOOLS_VISIBILITY",
+        default_value = "private"
+    )]
+    visibility: Option<String>,
+    #[arg(
+        id = "tools_auto_reload",
+        long = "kubernetes-tools-auto-reload",
+        env = "KUBERNETES_TOOLS_AUTO_RELOAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    auto_reload: bool,
     #[arg(
         id = "tools_extra_sources",
         long = "kubernetes-tools-extra-sources",
@@ -1432,6 +1652,7 @@ impl ToolsArgs {
         let mut config = ToolsConfig::new(repo, image);
         config.image_pull_policy = self.image_pull_policy.clone();
         config.git_ref = clean_optional_value(self.git_ref.as_deref());
+        config.visibility = repository_visibility(self.visibility.as_deref());
         if let Some(subdir) = clean_optional_value(Some(self.source_subdir.as_str())) {
             config.source_subdir = subdir;
         }
@@ -1443,6 +1664,8 @@ impl ToolsArgs {
             });
         }
         config.repo_cache_path = clean_optional_value(self.repo_cache_path.as_deref());
+        config.repo_cache_pvc = clean_optional_value(self.repo_cache_pvc.as_deref());
+        config.auto_reload = self.auto_reload;
         config.extra_sources = self.extra_sources();
         Some(config)
     }
@@ -1455,6 +1678,8 @@ struct ToolSourceArg {
     git_ref: Option<String>,
     #[serde(default)]
     subdir: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
 }
 
 impl ToolSourceArg {
@@ -1470,19 +1695,20 @@ impl ToolSourceArg {
                 .as_deref()
                 .and_then(|value| clean_optional_value(Some(value)))
                 .unwrap_or_else(|| "tools".to_owned()),
+            visibility: repository_visibility(self.visibility.as_deref()),
         })
+    }
+}
+
+fn repository_visibility(value: Option<&str>) -> String {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("public") => "public".to_owned(),
+        _ => "private".to_owned(),
     }
 }
 
 #[derive(Debug, ClapArgs)]
 struct IronProxyArgs {
-    #[arg(
-        long = "kubernetes-sandbox-iron-proxy-mode",
-        env = "KUBERNETES_SANDBOX_IRON_PROXY_MODE",
-        value_enum,
-        default_value = "auto"
-    )]
-    mode: IronProxyMode,
     #[arg(
         long = "kubernetes-iron-proxy-image",
         env = "KUBERNETES_IRON_PROXY_IMAGE",
@@ -1494,6 +1720,12 @@ struct IronProxyArgs {
         env = "KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY"
     )]
     image_pull_policy: Option<String>,
+    #[arg(
+        long = "kubernetes-iron-proxy-upstream-deny-cidrs",
+        env = "KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS",
+        value_delimiter = ','
+    )]
+    upstream_deny_cidrs: Vec<String>,
     #[command(flatten)]
     ca: IronProxyCaArgs,
     #[command(flatten)]
@@ -1515,24 +1747,29 @@ struct IronProxyArgs {
 }
 
 impl IronProxyArgs {
-    fn to_config(&self) -> Result<Option<IronProxyConfig>, ServerError> {
-        let mode = self.mode;
-        let ca = self.ca.secrets(mode)?;
-        // The harness auth fragment (infra) is always present, so iron-proxy is
-        // enabled whenever a CA is available (or mode forces it).
-        if !mode.enabled(true, ca.is_some()) {
-            return Ok(None);
+    fn to_config(&self) -> Result<IronProxyConfig, ServerError> {
+        let (ca_cert_secret_name, ca_key_secret_name) = self.ca.secrets()?;
+        let secret_env = self.secret_env()?;
+        if secret_env.iter().any(|secret| {
+            secret.secret_name == ca_cert_secret_name || secret.secret_name == ca_key_secret_name
+        }) {
+            return Err(ServerError::IronProxySourceAuthSecretCollision);
         }
-        let (ca_cert_secret_name, ca_key_secret_name) =
-            ca.ok_or(ServerError::MissingIronProxyCaSecret)?;
 
         let harness_fragments = self.harness.fragments()?;
         let mut config =
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
+        config.upstream_deny_cidrs = self
+            .upstream_deny_cidrs
+            .iter()
+            .filter_map(|cidr| non_empty(Some(cidr.as_str())))
+            .map(ToOwned::to_owned)
+            .collect();
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
+        config.secret_env = secret_env;
         if let Some(labels) = self
             .api_pod_label_selector
             .as_ref()
@@ -1540,7 +1777,7 @@ impl IronProxyArgs {
         {
             config.api_pod_labels = labels.clone();
         }
-        Ok(Some(config))
+        Ok(config)
     }
 
     fn source_policy(&self) -> SourcePolicy {
@@ -1548,22 +1785,15 @@ impl IronProxyArgs {
     }
 
     /// The role to register in iron-control. The shared `infra` role contains
-    /// infra, harness, and discovered tool secrets, and every session principal
-    /// is granted that single role (see [`SessionRegistrar`]).
-    fn roles_to_register(
-        &self,
-        tool_fragment: Option<&DiscoveredToolProxyFragment>,
-    ) -> Result<Vec<(RoleSpec, ProxyFragment)>, ServerError> {
-        let mut infra = self.infra_fragment()?;
-        if let Some(tool_fragment) = tool_fragment {
-            merge_fragment(&mut infra, tool_fragment.fragment.clone());
-        }
+    /// infra and harness secrets, and every session principal is granted that
+    /// role (see [`SessionRegistrar`]).
+    fn roles_to_register(&self) -> Result<Vec<(RoleSpec, ProxyFragment)>, ServerError> {
+        let infra = self.infra_fragment()?;
         Ok(vec![(RoleSpec::infra(), infra)])
     }
 
     /// The full infra fragment: the shared infra secrets plus every available
-    /// harness auth fragment (also infra), selected by auth mode. Discovered
-    /// tool secrets are folded into the same infra role at registration time.
+    /// harness auth fragment (also infra), selected by auth mode.
     fn infra_fragment(&self) -> Result<ProxyFragment, ServerError> {
         let mut infra = infra_fragment()?;
         for fragment in self.harness.fragments()? {
@@ -1574,27 +1804,47 @@ impl IronProxyArgs {
 
     /// Placeholder env (`PLACEHOLDER=PLACEHOLDER`) for the infra/harness
     /// secrets, whose consumers read credentials straight from the environment
-    /// (codex's `OPENAI_API_KEY`, git's `GITHUB_TOKEN`, …). Discovered tool
+    /// (for example codex's `OPENAI_API_KEY`). Discovered tool
     /// secrets contribute nothing here: tools read credentials through the SDK,
     /// whose `StubBackend` already returns the key name iron-proxy matches on,
     /// and the cloudwatch tool embeds its own throwaway SigV4 credentials.
     fn sandbox_placeholder_env(&self) -> Result<BTreeMap<String, String>, ServerError> {
-        Ok(centaur_iron_proxy::placeholder_env(&[
-            self.infra_fragment()?
-        ]))
+        let mut env = centaur_iron_proxy::placeholder_env(&[self.infra_fragment()?]);
+        env.entry(GITHUB_TOKEN_ENV.to_owned())
+            .or_insert_with(|| GITHUB_TOKEN_ENV.to_owned());
+        env.entry(SLACK_BOT_TOKEN_ENV.to_owned())
+            .or_insert_with(|| SLACK_BOT_TOKEN_ENV.to_owned());
+        Ok(env)
     }
 
     fn env_from_secret_names(&self) -> Vec<String> {
+        if !self.source.uses_static_secret_env() {
+            return Vec::new();
+        }
         let mut names = BTreeSet::new();
         if let Some(secret_name) = non_empty(self.secret_env_name.as_deref()) {
             names.insert(secret_name.to_owned());
         }
-        if self.source.uses_bootstrap_secret()
-            && let Some(secret_name) = non_empty(self.bootstrap_secret_name.as_deref())
-        {
+        if let Some(secret_name) = non_empty(self.bootstrap_secret_name.as_deref()) {
             names.insert(secret_name.to_owned());
         }
         names.into_iter().collect()
+    }
+
+    fn secret_env(&self) -> Result<Vec<IronProxySecretEnv>, ServerError> {
+        let Some(env_name) = self.source.proxy_source_auth_env_name() else {
+            return Ok(Vec::new());
+        };
+        let secret_name = non_empty(self.source.source_auth_secret_name.as_deref())
+            .ok_or(ServerError::MissingIronProxySourceAuthSecret)?;
+        let secret_key = non_empty(self.source.source_auth_secret_key.as_deref())
+            .ok_or(ServerError::MissingIronProxySourceAuthSecret)?;
+
+        Ok(vec![IronProxySecretEnv {
+            name: env_name.to_owned(),
+            secret_name: secret_name.to_owned(),
+            secret_key: secret_key.to_owned(),
+        }])
     }
 }
 
@@ -1613,14 +1863,13 @@ struct IronProxyCaArgs {
 }
 
 impl IronProxyCaArgs {
-    fn secrets(&self, mode: IronProxyMode) -> Result<Option<(String, String)>, ServerError> {
+    fn secrets(&self) -> Result<(String, String), ServerError> {
         match (&self.cert_secret_name, &self.key_secret_name) {
-            (Some(cert), Some(key)) => Ok(Some((cert.clone(), key.clone()))),
-            (None, None) if mode == IronProxyMode::Enabled => Ok(Some((
+            (Some(cert), Some(key)) => Ok((cert.clone(), key.clone())),
+            (None, None) => Ok((
                 "centaur-firewall-ca".to_owned(),
                 "centaur-firewall-ca-key".to_owned(),
-            ))),
-            (None, None) => Ok(None),
+            )),
             _ => Err(ServerError::MissingIronProxyCaSecret),
         }
     }
@@ -1657,6 +1906,16 @@ struct IronProxySourceArgs {
         env = "KUBERNETES_OP_CONNECT_PORT"
     )]
     op_connect_port: Option<u16>,
+    #[arg(
+        long = "kubernetes-iron-proxy-source-auth-secret-name",
+        env = "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_NAME"
+    )]
+    source_auth_secret_name: Option<String>,
+    #[arg(
+        long = "kubernetes-iron-proxy-source-auth-secret-key",
+        env = "KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_KEY"
+    )]
+    source_auth_secret_key: Option<String>,
 }
 
 impl IronProxySourceArgs {
@@ -1686,8 +1945,20 @@ impl IronProxySourceArgs {
         }
     }
 
-    fn uses_bootstrap_secret(&self) -> bool {
-        matches!(self.source, SourceKind::Env | SourceKind::OnePassword)
+    fn uses_static_secret_env(&self) -> bool {
+        matches!(self.source, SourceKind::Env)
+    }
+
+    /// The 1Password source is fully described by the `op://` reference sent
+    /// through iron-control. The proxy needs only the credential that
+    /// authenticates its source backend; the static infra Secret must not be
+    /// mounted wholesale into the sandbox pod.
+    fn proxy_source_auth_env_name(&self) -> Option<&'static str> {
+        match self.source {
+            SourceKind::Env => None,
+            SourceKind::OnePassword => Some("OP_SERVICE_ACCOUNT_TOKEN"),
+            SourceKind::OnePasswordConnect => Some("OP_CONNECT_TOKEN"),
+        }
     }
 }
 
@@ -1716,7 +1987,7 @@ impl IronProxyHarnessArgs {
 
     /// The harness auth fragment — infra, baked in and selected by auth mode.
     /// Carries the harness credential secret(s) and, for access_token, the
-    /// token-broker credential.
+    /// Console-managed broker credential.
     fn fragment(&self) -> Result<ProxyFragment, ServerError> {
         let engine = harness_fragment_engine_name(&self.engine);
         let auth_mode = self.resolved_auth_mode();
@@ -1739,7 +2010,7 @@ impl IronProxyHarnessArgs {
             HarnessType::ClaudeCode,
             HarnessType::Amp,
         ] {
-            if engine == self.engine {
+            if harness_fragment_engine_name(&engine) == harness_fragment_engine_name(&self.engine) {
                 continue;
             }
             let auth_mode = harness_auth_mode_env(&engine).unwrap_or_else(|| "api_key".to_owned());
@@ -1752,6 +2023,9 @@ impl IronProxyHarnessArgs {
         if let Some(fragment) = harness_auth_fragment("openrouter", "api_key")? {
             fragments.push(fragment);
         }
+        if let Some(fragment) = harness_auth_fragment("meta-ai", "api_key")? {
+            fragments.push(fragment);
+        }
         // Bedrock is opt-in (not the default codex provider): only register its
         // SigV4 re-signing fragment when the operator has set CODEX_BEDROCK_REGION,
         // since the fragment expects AWS keys in the secrets backend.
@@ -1761,23 +2035,6 @@ impl IronProxyHarnessArgs {
             fragments.push(fragment);
         }
         Ok(fragments)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum IronProxyMode {
-    Auto,
-    Enabled,
-    Disabled,
-}
-
-impl IronProxyMode {
-    fn enabled(self, has_fragments: bool, has_ca_config: bool) -> bool {
-        match self {
-            IronProxyMode::Auto => has_fragments || has_ca_config,
-            IronProxyMode::Enabled => true,
-            IronProxyMode::Disabled => false,
-        }
     }
 }
 
@@ -1818,6 +2075,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
+        HarnessType::Nanocodex => "codex",
     }
 }
 
@@ -1835,6 +2093,7 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        HarnessType::Nanocodex => Some("api_key".to_owned()),
     }
 }
 
@@ -1843,8 +2102,8 @@ fn parse_host_port(value: &str) -> Option<u16> {
 }
 
 /// Map an OTLP endpoint URL onto a NetworkPolicy egress target. Only
-/// in-cluster service DNS hosts (`<service>.<namespace>.svc[.<cluster-domain>]`)
-/// are mapped; the namespace label is the policy's `kubernetes.io/metadata.name`
+/// in-cluster service DNS hosts (`<service>.<namespace>.svc[...]`) are mapped;
+/// the namespace label is the policy's `kubernetes.io/metadata.name`
 /// selector. Ports default by scheme when absent.
 fn parse_otlp_egress_target(endpoint: &str) -> Option<OtlpEgressTarget> {
     let trimmed = endpoint.trim();
@@ -1968,6 +2227,55 @@ mod tests {
     }
 
     #[test]
+    fn activity_summary_uses_direct_openai_key_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-test"),
+            ("FIREWALL_MANAGER_SECRET_SOURCE", "env"),
+            ("KUBERNETES_OP_CONNECT_HOST", ""),
+            ("OP_CONNECT_TOKEN", ""),
+            ("OP_VAULT", ""),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-activity-summary-enabled",
+            "true",
+        ])
+        .unwrap();
+
+        let config = args.activity_summary_config().unwrap();
+        assert_eq!(config.api_key, "sk-test");
+    }
+
+    #[test]
+    fn activity_summary_uses_mounted_openai_key_even_with_onepassword_connect_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-mounted"),
+            ("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword-connect"),
+            (
+                "KUBERNETES_OP_CONNECT_HOST",
+                "http://onepassword-connect:8080",
+            ),
+            ("OP_CONNECT_TOKEN", "op-token"),
+            ("OP_VAULT", "centaur-agent"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-activity-summary-enabled",
+            "true",
+        ])
+        .unwrap();
+
+        let config = args.activity_summary_config().unwrap();
+        assert_eq!(config.api_key, "sk-mounted");
+    }
+
+    #[test]
     fn parses_session_sandbox_flags() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -1985,8 +2293,6 @@ mod tests {
             "17",
             "--session-sandbox-k8s-context",
             "kind-test",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -1995,6 +2301,104 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn parses_codex_nanocodex_rollout_percent() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-codex-nanocodex-rollout-percent",
+            "50",
+        ])
+        .unwrap();
+
+        assert_eq!(args.codex_nanocodex_rollout_percent(), 50);
+    }
+
+    #[test]
+    fn rejects_invalid_codex_nanocodex_rollout_percent() {
+        let result = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-codex-nanocodex-rollout-percent",
+            "101",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execution_adoption_rescans_every_fifteen_seconds_by_default() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.execution_adoption_interval(),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn execution_adoption_interval_zero_disables_rescans() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-execution-adoption-interval-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.execution_adoption_interval(), None);
+    }
+
+    #[test]
+    fn shutdown_drain_defaults_to_twenty_seconds() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.shutdown_execution_drain_timeout(),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--shutdown-execution-drain-timeout-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.shutdown_execution_drain_timeout(), Duration::ZERO);
+    }
+
+    #[test]
+    fn sandbox_reaper_defaults_delete_after_max_lifetime() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        let config = args.sandbox_reaper_config();
+        assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
     }
 
     #[test]
@@ -2007,8 +2411,6 @@ mod tests {
             "agent-k8s",
             "--kubernetes-namespace",
             "centaur-test",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2032,8 +2434,12 @@ mod tests {
             "github-access-token-read-packages, extra-secret ",
             "--session-sandbox-ready-timeout-secs",
             "42",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--kubernetes-firewall-manager-secret-source",
+            "env",
         ])
         .unwrap();
 
@@ -2045,7 +2451,102 @@ mod tests {
             vec!["github-access-token-read-packages", "extra-secret"]
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
-        assert!(config.iron_proxy.is_none());
+        assert!(config.iron_proxy.is_some());
+    }
+
+    #[test]
+    fn metadata_trace_sidecar_requires_pinned_https_configuration() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-enabled",
+            "true",
+            "--session-sandbox-metadata-trace-config-generation",
+            "1",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--kubernetes-firewall-manager-secret-source",
+            "env",
+        ])
+        .unwrap();
+        assert!(AgentSandboxConfig::try_from(&args.sandbox).is_err());
+
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-enabled",
+            "true",
+            "--session-sandbox-metadata-trace-gateway-url",
+            "https://traces.example:8443",
+            "--session-sandbox-metadata-trace-config-generation",
+            "1",
+            "--session-sandbox-metadata-trace-gateway-port",
+            "8443",
+            "--session-sandbox-metadata-trace-credential-secret-name",
+            "consumer-trace-credentials",
+            "--session-sandbox-metadata-trace-credential-secret-version",
+            "generation-1",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--kubernetes-firewall-manager-secret-source",
+            "env",
+        ])
+        .unwrap();
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let trace = config.metadata_trace_sidecar.unwrap();
+        assert_eq!(trace.gateway_url, "https://traces.example:8443");
+        assert_eq!(trace.credential_secret_version, "generation-1");
+        assert_eq!(
+            args.metadata_trace_config_identity()
+                .unwrap()
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(
+            args.metadata_trace_config_identity()
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn disabled_metadata_trace_with_a_generation_activates_a_retirement_fence() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-metadata-trace-config-generation",
+            "2",
+        ])
+        .unwrap();
+        let identity = args.metadata_trace_config_identity().unwrap().unwrap();
+        assert_eq!(identity.generation, 2);
+        assert_eq!(identity.fingerprint, "disabled");
+        assert!(!identity.enabled);
+    }
+
+    #[test]
+    fn absent_metadata_trace_configuration_does_not_require_a_generation() {
+        let mut args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+        // The test runner may provide the production deployment environment.
+        // Exercise the absent-input state directly instead of depending on
+        // process-global environment inherited by this test binary.
+        args.sandbox.metadata_trace_enabled = false;
+        args.sandbox.metadata_trace_config_generation = None;
+        assert!(args.metadata_trace_config_identity().unwrap().is_none());
     }
 
     #[test]
@@ -2056,8 +2557,12 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--kubernetes-firewall-manager-secret-source",
+            "env",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-ref",
@@ -2066,6 +2571,8 @@ mod tests {
             "centaur-agent:test",
             "--kubernetes-tools-repo-cache-path",
             "/var/lib/centaur/repos",
+            "--kubernetes-tools-visibility",
+            "public",
             "--kubernetes-tools-github-token-secret",
             "centaur-repo-cache-github-token",
         ])
@@ -2075,14 +2582,42 @@ mod tests {
         assert_eq!(tools.repo, "paradigmxyz/centaur");
         assert_eq!(tools.git_ref.as_deref(), Some("main"));
         assert_eq!(tools.source_subdir, "tools");
+        assert_eq!(tools.visibility, "public");
         assert_eq!(tools.image, "centaur-agent:test");
         assert_eq!(
             tools.repo_cache_path.as_deref(),
             Some("/var/lib/centaur/repos")
         );
+        assert!(tools.auto_reload);
         let token = tools.github_token.expect("token should be Some");
         assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
         assert_eq!(token.secret_key, "token");
+    }
+
+    #[test]
+    fn tools_config_reads_auto_reload_flag() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-auto-reload",
+            "false",
+        ])
+        .unwrap();
+
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let tools = config.tools.expect("tools should be Some");
+        assert!(!tools.auto_reload);
     }
 
     #[test]
@@ -2093,8 +2628,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-runner-image",
@@ -2122,8 +2655,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2141,8 +2672,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--tools-path",
@@ -2192,6 +2721,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_k8s_workflow_host_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec(None).unwrap();
+
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
+        }));
+    }
+
+    #[test]
     fn workflow_host_env_template_splits_passthrough_env_from_environment() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[
@@ -2208,13 +2761,20 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--session-sandbox-centaur-api-url",
+            "http://centaur-api-rs:8080",
         ])
         .unwrap();
 
         let spec = args.sandbox.workflow_host_spec(None).unwrap();
 
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "CENTAUR_API_URL")
+                .map(|env| env.value.as_str()),
+            Some("http://centaur-api-rs:8080")
+        );
         assert_eq!(
             spec.env
                 .iter()
@@ -2229,10 +2789,26 @@ mod tests {
                 .map(|env| env.value.as_str()),
             Some("true")
         );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == GITHUB_TOKEN_ENV)
+                .map(|env| env.value.as_str()),
+            Some(GITHUB_TOKEN_ENV)
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == SLACK_BOT_TOKEN_ENV)
+                .map(|env| env.value.as_str()),
+            Some(SLACK_BOT_TOKEN_ENV)
+        );
     }
 
     #[test]
     fn codex_app_server_env_template_injects_auth_mode_and_placeholder() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "api_key")]);
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -2265,7 +2841,19 @@ mod tests {
         );
         assert!(
             env.iter()
+                .any(|(name, value)| name == GITHUB_TOKEN_ENV && value == GITHUB_TOKEN_ENV)
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == SLACK_BOT_TOKEN_ENV && value == SLACK_BOT_TOKEN_ENV)
+        );
+        assert!(
+            env.iter()
                 .any(|(name, value)| name == "OPENROUTER_API_KEY" && value == "OPENROUTER_API_KEY")
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "META_AI_API_KEY" && value == "META_AI_API_KEY")
         );
     }
 
@@ -2364,67 +2952,6 @@ mod tests {
         assert_eq!(mock.sandbox.sandbox_otlp_egress_target().unwrap(), None);
     }
 
-    /// The only test that mutates the process-level OTLP env keys: keeps all
-    /// assertions that depend on their presence or absence sequential so
-    /// parallel tests never race on them.
-    #[test]
-    fn codex_app_server_env_template_forwards_process_otlp_env() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
-        ])
-        .unwrap();
-
-        unsafe {
-            for key in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-                env::remove_var(key);
-            }
-        }
-        let envs = args.sandbox.codex_app_server_env_template().unwrap();
-        assert!(!envs.iter().any(|(name, _)| name.starts_with("OTEL_")));
-        assert_eq!(args.sandbox.sandbox_otlp_egress_target().unwrap(), None);
-
-        unsafe {
-            env::set_var(
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                "http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces",
-            );
-            env::set_var("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer test");
-        }
-        let envs = args.sandbox.codex_app_server_env_template().unwrap();
-        let value = |key: &str| {
-            envs.iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.as_str())
-        };
-        // The harness wrapper reads these to configure codex's OTLP export
-        // (endpoint + Laminar ingest auth header).
-        assert_eq!(
-            value("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
-            Some("http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces")
-        );
-        assert_eq!(
-            value("OTEL_EXPORTER_OTLP_HEADERS"),
-            Some("authorization=Bearer test")
-        );
-        // The egress target derives from the same forwarded endpoint.
-        assert_eq!(
-            args.sandbox.sandbox_otlp_egress_target().unwrap(),
-            Some(OtlpEgressTarget {
-                namespace: "laminar".to_owned(),
-                port: 8000,
-            })
-        );
-        unsafe {
-            for key in SANDBOX_OTLP_PASSTHROUGH_ENV_KEYS {
-                env::remove_var(key);
-            }
-        }
-    }
-
     #[test]
     fn parse_otlp_egress_target_accepts_only_in_cluster_service_dns() {
         assert_eq!(
@@ -2465,8 +2992,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "enabled",
             "--kubernetes-firewall-ca-secret-name",
             "centaur-firewall-ca",
             "--kubernetes-firewall-ca-key-secret-name",
@@ -2487,62 +3012,129 @@ mod tests {
                 "centaur-secret-env".to_owned()
             ]
         );
+        assert!(args.sandbox.iron_proxy.secret_env().unwrap().is_empty());
     }
 
     #[test]
-    fn iron_control_registers_discovered_tool_secrets_on_infra_role() {
-        use centaur_iron_proxy::{Secret, SecretReplace, Transform, TransformConfig};
-
+    fn onepassword_secret_source_mounts_only_service_account_key_into_iron_proxy() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-iron-proxy-harness-auth-mode",
-            "api_key",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword",
+            "--kubernetes-bootstrap-secret-name",
+            "centaur-infra-env",
+            "--kubernetes-secret-env-name",
+            "centaur-secret-env",
+            "--kubernetes-iron-proxy-source-auth-secret-name",
+            "centaur-iron-proxy-source-auth",
+            "--kubernetes-iron-proxy-source-auth-secret-key",
+            "service-account",
         ])
         .unwrap();
-        let tool_fragment = DiscoveredToolProxyFragment {
-            fragment: ProxyFragment {
-                transforms: vec![Transform {
-                    name: "secrets".to_owned(),
-                    config: TransformConfig {
-                        secrets: vec![Secret {
-                            id: Some("TOOL_API_KEY".to_owned()),
-                            replace: Some(SecretReplace {
-                                proxy_value: Some("TOOL_API_KEY".to_owned()),
-                                ..Default::default()
-                            }),
-                            rules: vec![serde_yaml::from_str("{host: api.tool.test}").unwrap()],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            tool_count: 1,
-            secret_count: 1,
-        };
 
-        let roles = args
-            .sandbox
-            .iron_proxy
-            .roles_to_register(Some(&tool_fragment))
+        assert_eq!(
+            args.sandbox.iron_proxy.env_from_secret_names(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            args.sandbox.iron_proxy.secret_env().unwrap(),
+            vec![IronProxySecretEnv {
+                name: "OP_SERVICE_ACCOUNT_TOKEN".to_owned(),
+                secret_name: "centaur-iron-proxy-source-auth".to_owned(),
+                secret_key: "service-account".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn onepassword_connect_secret_source_mounts_only_connect_token_into_iron_proxy() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword-connect",
+            "--kubernetes-bootstrap-secret-name",
+            "centaur-infra-env",
+            "--kubernetes-secret-env-name",
+            "centaur-secret-env",
+            "--kubernetes-iron-proxy-source-auth-secret-name",
+            "centaur-iron-proxy-source-auth",
+            "--kubernetes-iron-proxy-source-auth-secret-key",
+            "connect-token",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.iron_proxy.env_from_secret_names(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            args.sandbox.iron_proxy.secret_env().unwrap(),
+            vec![IronProxySecretEnv {
+                name: "OP_CONNECT_TOKEN".to_owned(),
+                secret_name: "centaur-iron-proxy-source-auth".to_owned(),
+                secret_key: "connect-token".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn onepassword_secret_source_requires_dedicated_source_auth_secret() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-firewall-manager-secret-source",
+            "onepassword",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.sandbox.iron_proxy.to_config(),
+            Err(ServerError::MissingIronProxySourceAuthSecret)
+        ));
+    }
+
+    #[test]
+    fn onepassword_source_auth_secret_must_not_collide_with_firewall_secrets() {
+        for source_auth_secret in ["centaur-firewall-ca", "centaur-firewall-ca-key"] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-firewall-ca-secret-name",
+                "centaur-firewall-ca",
+                "--kubernetes-firewall-ca-key-secret-name",
+                "centaur-firewall-ca-key",
+                "--kubernetes-firewall-manager-secret-source",
+                "onepassword",
+                "--kubernetes-iron-proxy-source-auth-secret-name",
+                source_auth_secret,
+                "--kubernetes-iron-proxy-source-auth-secret-key",
+                "service-account",
+            ])
             .unwrap();
 
-        assert_eq!(roles.len(), 1);
-        assert_eq!(roles[0].0.foreign_id, "infra");
-        assert!(roles[0].1.transforms.iter().any(|transform| {
-            transform.config.secrets.iter().any(|secret| {
-                secret.id.as_deref() == Some("TOOL_API_KEY")
-                    && secret
-                        .replace
-                        .as_ref()
-                        .and_then(|replace| replace.proxy_value.as_deref())
-                        == Some("TOOL_API_KEY")
-            })
-        }));
+            assert!(matches!(
+                args.sandbox.iron_proxy.to_config(),
+                Err(ServerError::IronProxySourceAuthSecretCollision)
+            ));
+        }
     }
 
     #[test]
@@ -2561,11 +3153,31 @@ mod tests {
         .unwrap();
 
         assert!(!args.sandbox.iron_control_sync_infra_secrets);
-        assert!(
-            args.sandbox
-                .iron_control_tool_reconciler()
-                .unwrap()
-                .is_none()
+    }
+
+    #[test]
+    fn iron_proxy_upstream_deny_cidrs_are_parsed() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-iron-proxy-upstream-deny-cidrs",
+            "127.0.0.0/8,10.42.0.0/16,10.43.0.0/16",
+        ])
+        .unwrap();
+
+        let config = args.sandbox.iron_proxy.to_config().unwrap();
+        assert_eq!(
+            config.upstream_deny_cidrs,
+            vec![
+                "127.0.0.0/8".to_owned(),
+                "10.42.0.0/16".to_owned(),
+                "10.43.0.0/16".to_owned(),
+            ]
         );
     }
 
@@ -2602,6 +3214,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_workload_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let workload = args.sandbox.container_workload_mode().unwrap();
+        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        assert!(mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
+        }));
+    }
+
+    #[test]
     fn parses_harness_type_enum_for_iron_proxy() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2615,6 +3254,18 @@ mod tests {
         assert_eq!(
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn nanocodex_reuses_the_codex_proxy_fragment() {
+        assert_eq!(
+            harness_fragment_engine_name(&HarnessType::Nanocodex),
+            harness_fragment_engine_name(&HarnessType::Codex)
+        );
+        assert_eq!(
+            harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
+            Some("api_key")
         );
     }
 }

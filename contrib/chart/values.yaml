@@ -28,8 +28,26 @@ ironProxy:
     # a single listener (routing by database name); NetworkPolicies allow this
     # one port so callers can reach it.
     pgPort: 5432
+  # CIDRs iron-proxy must never dial upstream, even when the host allowlist
+  # matches. Keep the local/IMDS defaults and include the default k3s pod/service
+  # CIDRs so sandboxes cannot proxy back into in-cluster services like
+  # onepassword-connect.
+  upstreamDenyCidrs:
+    - "169.254.169.254/32"
+    - "fd00:ec2::254/128"
+    - "127.0.0.0/8"
+    - "::1/128"
+    - "10.42.0.0/16"
+    - "10.43.0.0/16"
   secretSource: onepassword
   secretTtl: 10m
+  # Dedicated Kubernetes Secret that authenticates only the per-sandbox proxy
+  # to the selected 1Password source. It must not be the broad infra or broker
+  # bootstrap Secret.
+  sourceAuth:
+    existingSecretName: centaur-iron-proxy-source-auth
+    serviceAccountTokenKey: OP_SERVICE_ACCOUNT_TOKEN
+    connectTokenKey: OP_CONNECT_TOKEN
 
 # Base tools delivery for api-rs sandboxes. When enabled, repo-cache keeps `repo`
 # fresh on each node and a tools-bootstrap init container copies `subdir` into
@@ -48,6 +66,9 @@ toolServer:
   # this to the tool set the api-rs image was built with so the creds api-rs
   # grants match the tools the sandbox installs.
   ref: ""
+  # Repo visibility for sandbox repo-cache access. Defaults to private; set to
+  # public only for repos safe to expose to principals with sandbox_repo_cache=public.
+  visibility: private
   # Subdirectory in the repo holding the tools tree (mounted at /app/tools).
   subdir: tools
   # Additional repo/subdir sources copied after the base tools source. Duplicate
@@ -56,6 +77,7 @@ toolServer:
   extraSources: []
   # - repo: tempoxyz/centaur-tempo
   #   ref: ""
+  #   visibility: private
   #   subdir: tools
   # Image the tools-bootstrap init container runs in; empty fields fall back to
   # sandbox.image, which carries git and install-tool-shims.
@@ -70,7 +92,7 @@ toolServer:
     secretKey: token
 
 # console — Rails control plane (formerly "iron-control") for authenticated API
-# access + encrypted secret storage. Off by default; enable per-environment.
+# access + encrypted secret storage. The console is a required chart component.
 # Uses a dedicated `iron_control_production` database on the bundled Postgres
 # (its own logical DB so its Rails schema_migrations table never collides with
 # the API's migration table); an init container creates the DB idempotently.
@@ -83,8 +105,25 @@ toolServer:
 # on top of these `console` defaults (see the `centaur.consoleValues` helper), so
 # existing values files keep working. Prefer `console` for new configuration.
 console:
-  enabled: false
   replicaCount: 1
+  # Public URL users reach in a browser (e.g. https://console.example.com), used
+  # as CENTAUR_CONSOLE_PUBLIC_URL. Set this when console is exposed behind
+  # Tailscale/Ingress so MCP OAuth issuer metadata and JWT validation agree.
+  # When set, the slackbotv2 deployment also links the first assistant message
+  # in a Slack thread to the Console session view; leave empty to omit the link.
+  publicUrl: ""
+  # Break-glass email/password login. Disable when console is reachable from
+  # the public internet and SSO is configured.
+  passwordLoginEnabled: true
+  # When enabled, every authenticated Console user can browse conversations
+  # originating in public Slack channels. Private channels and DMs remain
+  # owner-only. Requires apiRs.etl.slack.enabled so channel privacy is synced;
+  # visibility fails closed without that catalog. Individual chats can still
+  # be shared by their owner from the Threads UI.
+  publicSlackThreadsEnabled: false
+  # Optional SSO admission policy. When non-empty, only identities whose email
+  # domain matches this list can sign in through Google or Slack.
+  ssoEmailDomains: []
   image:
     repository: centaur-console
     tag: latest
@@ -106,6 +145,21 @@ console:
   # _SECRET), which must exist or the console pods CreateContainerConfigError.
   googleOauth:
     enabled: false
+  # Slack as an OIDC identity provider for console sign-in. Off by default —
+  # not every deployment uses Slack to log in. When enabled, the
+  # CENTAUR_CONSOLE_SLACK_CLIENT_ID and CENTAUR_CONSOLE_SLACK_CLIENT_SECRET
+  # env vars are sourced from the shared infra Secret (keys
+  # <secretManager.envPrefix>CENTAUR_CONSOLE_SLACK_CLIENT_ID / _SECRET), which
+  # must exist or the console pods CreateContainerConfigError. This is the
+  # Sign-in-with-Slack OIDC app (scopes openid/email/profile, redirect URL
+  # <publicUrl>/auth/slack/callback) — not the DB-managed Slack OAuth app the
+  # bot and DM sync use.
+  slackOauth:
+    enabled: false
+  # OAuth app slug whose user-level Slack credentials are used by the DM sync
+  # worker. Keep this aligned with the Console OAuth app users authorize.
+  slackDmSync:
+    oauthAppSlug: slack
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale
@@ -134,11 +188,10 @@ console:
   resources: {}
   # Solid Queue worker (`bin/jobs`) that runs the console's background jobs —
   # most importantly the broker-credential OAuth refresh loop that mints and
-  # refreshes the access tokens delivered inline via `token_broker` sources
-  # (e.g. the `openai-codex` brokered token). The web Puma pod runs no worker, so
-  # without this those jobs never execute. Active only when console.enabled.
+  # refreshes the access tokens delivered inline via `token_broker` sources.
+  # The web Puma pod runs no worker, so
+  # without this those jobs never execute.
   worker:
-    enabled: true
     replicaCount: 1
     resources: {}
 
@@ -172,14 +225,19 @@ overlay:
 # only need `repo`; set `ref` to a branch, tag, or commit when you do not want
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# Repo visibility defaults to private; set visibility: public only for repos
+# safe to expose to principals with sandbox_repo_cache=public.
 overlays:
   sources: []
   # - repo: paradigmxyz/centaur
   #   ref: ""
+  #   visibility: public
   # - repo: your-org/centaur-overlay
   #   ref: main
+  #   visibility: private
   # - repo: your-org/workflows-only
   #   ref: main
+  #   visibility: private
   #   toolsSubdir: ""
   #   skillsSubdir: ""
 
@@ -209,7 +267,30 @@ sandbox:
   # their session's harness via container args; the sandbox image CMD only
   # matters for containers started outside api-rs.
   harnessEngine: codex
+  # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here are also
+  # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT is
+  # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
+  # with the policy the sandbox actually runs.
   extraEnv: {}
+  # Consent-gated metadata-only Codex tracing. Enabling this only makes the
+  # sidecar available; each principal remains opt-in. Supply an immutable
+  # image digest, an HTTPS gateway, and a per-consumer Secret containing the
+  # two named keys. Neither credential is placed in an environment variable.
+  # Set credentialSecretVersion to an opaque Secret generation or versioned
+  # name, and change it with every rotation. It changes the sandbox fingerprint
+  # so existing sandboxes are recreated without hashing secret content.
+  metadataTrace:
+    enabled: false
+    # Required in both enabled and disabled states. Increment for every trace
+    # configuration change, including disabling a prior rollout; this durable
+    # fence is separate from the sidecar fingerprint.
+    configGeneration: 1
+    gatewayUrl: ""
+    gatewayPort: 443
+    credentialSecretName: ""
+    credentialSecretVersion: ""
+    bearerSecretKey: bearer
+    pseudonymKeySecretKey: pseudonym_key
   stateVolume:
     enabled: false
     size: 10Gi
@@ -222,10 +303,30 @@ sandbox:
 
 repoCache:
   enabled: true
+  autoReload: true
   hostPath: /var/lib/centaur/repos
-  # Additional repos to cache. toolServer.repo is cached automatically when the
-  # tool server is enabled.
+  storage:
+    # hostPath preserves the existing DaemonSet/node-local behavior. Set to
+    # persistentVolumeClaim for GKE Autopilot or other clusters that disallow
+    # writable hostPath.
+    type: hostPath
+    persistentVolumeClaim:
+      # When set, use this existing claim. It must support ReadWriteMany if
+      # repo-cache, api-rs, and sandboxes can schedule on different nodes.
+      existingClaim: ""
+      create: false
+      accessModes:
+        - ReadWriteMany
+      storageClassName: ""
+      size: 20Gi
+  # Additional repos to cache. Entries can be strings (visibility defaults to
+  # private) or objects with repo/ref/visibility. toolServer.repo is cached
+  # automatically when the tool server is enabled.
   repositories: []
+  # - paradigmxyz/public-docs
+  # - repo: your-org/public-docs
+  #   ref: main
+  #   visibility: public
   repositoryRefs: {}
   syncIntervalSeconds: 30
   image:
@@ -274,12 +375,24 @@ apiRs:
     tag: latest
     pullPolicy: Always
   port: 8080
+  # Sticky percentage of session requests for Codex assigned to Nanocodex.
+  # The API hashes the thread key once and persists the resolved harness on the
+  # session. Set to 0 to keep new Codex requests on Codex.
+  codexNanocodexRolloutPercent: 50
+  # Public/local MCP endpoint advertised through OAuth protected-resource
+  # metadata. Empty falls back to slackbotv2.mcpPublicUrl.
+  mcpPublicUrl: ""
   runMigrations: true
   sandboxBackend: agent-k8s
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
   sandboxWarmPoolReplenishIntervalSecs: 5
+  # Capacity manager: when nonzero, api-rs keeps observed running-like
+  # sandboxes at or below this limit by discarding ready warm sandboxes first,
+  # then pausing least-recently-active idle session sandboxes. 0 disables.
+  sandboxRunningLimit: 0
+  sandboxHotIdleGraceSecs: 300
   # When true, api-rs upserts the shared iron-control infra role and its
   # backing secrets at startup and on tool-secret reconciliation intervals.
   # Set false when multiple Centaur instances share one console/1Password
@@ -288,15 +401,65 @@ apiRs:
   # Workflow enablement policy. Production defaults to all workflows enabled.
   # Set workflowEnableMode: allowlist in staging and list allowed workflow names
   # in workflowAllowedNames as a comma/whitespace-separated string.
+  workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
-  # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
-  # the max lifetime. 0 disables that sweep. Interval must be >= 1.
-  sandboxIdleStopTtlSecs: 10800 # 3 hours
+  # Scheduled ETL workflow configuration. The chart renders these into api-rs
+  # env so workflow discovery sees the right schedules, then derives the
+  # workflow-host passthrough list from the same non-secret config.
+  etl:
+    slack:
+      enabled: false
+      syncIntervalSeconds: 3600
+      syncBackfillLookbackDays: 30
+      syncThreadLookbackDays: 3
+      indexPrivateChannels: false
+      excludedChannelPatterns: ""
+      attachments:
+        enabled: true
+        maxBytes: 10485760
+      backfill:
+        enabled: true
+        intervalSeconds: 600
+        channelBatchLimit: 50
+        channelPagesPerJob: 5
+      retention:
+        enabled: true
+        intervalMinutes: 60
+        etlDays: 0
+        dmDays: 0
+    linear:
+      enabled: false
+      syncIntervalSeconds: 14400
+    googleDrive:
+      enabled: false
+      syncIntervalSeconds: 14400
+    googleCalendar:
+      enabled: false
+      syncIntervalSeconds: 14400
+    companyContextDocuments:
+      enabled: true
+      intervalSeconds: 14400
+      maxWindowSeconds: 21600
+      batchSize: 50
+  # Reaper: stop sandboxes older than the max lifetime, regardless of whether
+  # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
-  ironProxy:
-    mode: enabled
+  # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
+  # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
+  # The idle backstop is only used when older execution rows have no persisted
+  # idle_timeout_ms. 0 disables the corresponding arm.
+  sandboxCleanupIntervalSecs: 300
+  sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
+  activitySummary:
+    enabled: false
+    model: gpt-5.4-nano
+    openaiBaseUrl: https://api.openai.com/v1
+    minIntervalSecs: 20
+    timeoutSecs: 5
+    maxFacts: 12
+    maxOutputTokens: 128
   metrics:
     # The Rust API always serves Prometheus text metrics at /metrics. This flag
     # only controls scrape annotations for Prometheus/VictoriaMetrics-style
@@ -329,20 +492,134 @@ apiRs:
 slackbotv2:
   enabled: true
   replicaCount: 1
+  # This Secret is deliberately separate from the shared infra Secret.  It is
+  # mounted only as the trace-consent bearer and never via envFrom.
+  traceConsent:
+    apiKeySecretName: centaur-trace-consent
+    apiKeySecretKey: SLACK_TRACE_CONSENT_API_KEY
   image:
     repository: centaur-slackbotv2
     tag: latest
     pullPolicy: Always
   userName: centaur
   assistantStatus: ""
+  # Join newly-created public channels after subscribed channel_created events.
+  # Requires the Slack app to grant channels:read and channels:join.
+  autoJoinCreatedChannels: false
+  # Signed, pre-session `/autorotate` Slack command. Every subcommand can be
+  # invoked from any Slack conversation by every member of an allowed workspace;
+  # responses remain ephemeral. Trace consent is always for the signed invoking
+  # workspace/member, so it has no target selector. Read-only fleet and
+  # maintenance status are workspace-wide; drain/resume use the member list.
+  # Observer, operator, and dedicated control tokens come from a dedicated Secret so no broker administration
+  # credential enters Slack, a sandbox, or the shared infra Secret.
+  autorotate:
+    enabled: false
+    url: ""
+    credentialsSecretName: ""
+    observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
+    operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
+    controlTokenKey: AUTOROTATE_CONTROL_TOKEN
+    operatorSlackTeamIds: []
+    # Required `TEAM_ID:USER_ID` principals for `/autorotate maintenance
+    # drain|resume`. Slack Connect users are authorized in their signed actor
+    # workspace, so an unqualified user ID never grants access elsewhere.
+    operatorSlackUserIds: []
+  # Public/local MCP endpoint shown in MCP SSO setup messages. The default
+  # assumes users connect through `kubectl port-forward ... 3000:8080`.
+  mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  # Per-channel default harness / model / provider / reasoning, keyed by Slack
+  # conversation id (the C…/G…/D… id). Each value is an object of optional
+  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # the inline Slack flags (harness: claude|codex|nanocodex|amp, provider: bedrock|meta,
+  # model accepts Claude aliases like opus). A model is only meaningful within a
+  # harness, so name the harness alongside it. Applied when a message in that
+  # channel carries no explicit/sticky per-thread flag, below such a flag and
+  # above the deployment/baked harness default, and forwarded onto the harness
+  # input line so it takes effect. reasoning only affects the codex harness.
+  # Example:
+  #   channelDefaults:
+  #     C0ENG: { harness: claude, model: opus, reasoning: high }
+  #     C0TRIAGE: { reasoning: low }
+  channelDefaults: {}
+  # Message overrides strategy for Slack message text. "flags" keeps the legacy
+  # deterministic --model/--claude/-rsn strategy. "llm" asks a small model for
+  # normalized overrides, allowing natural language requests such as
+  # "use max effort and the sol model". In llm mode,
+  # set OPENAI_API_KEY in the shared secret or provide
+  # SLACKBOTV2_MESSAGE_OVERRIDES_OPENAI_API_KEY via extraEnv.
+  messageOverridesStrategy:
+    mode: flags
+    model: gpt-5.4-nano
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 1500
+    maxOutputTokens: 300
   metrics:
     # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
     # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
     scrapeAnnotations: true
     path: /metrics
     annotations: {}
+  extraEnv: {}
+  resources: {}
+
+# Chat SDK Linear bot — Linear agent (actor=app) ingress. Receives
+# AgentSessionEvent webhooks on /api/webhooks/linear, forwards sessions to the
+# api-rs control plane (:8080), and renders runs as Linear agent activities.
+# Disabled by default: requires the LINEAR_ACCESS_TOKEN / LINEARBOT_WEBHOOK_SECRET
+# secrets from the Linear OAuth app install (see contrib/scripts/bootstrap-k8s-secrets.sh).
+linearbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-linearbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  extraEnv: {}
+  resources: {}
+
+# Chat SDK GitHub bot — GitHub teammate (PAT) ingress. Receives issue/PR comment
+# webhooks on /api/webhooks/github (the @chat-adapter/github adapter), answers in
+# the comment thread, and runs a review when the bot account is requested as a
+# reviewer. Forwards sessions to the api-rs control plane (:8080). Disabled by
+# default: requires the GITHUBBOT_TOKEN (PAT) and GITHUBBOT_WEBHOOK_SECRET secrets
+# (see contrib/scripts/bootstrap-k8s-secrets.sh). userName must be the bot
+# account's GitHub login so @-mention and review-request matching work.
+githubbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-githubbot
+    tag: latest
+    pullPolicy: Always
+  userName: ""
+  # v2 PR self-management (only acts on PRs assigned to the bot account).
+  # Auto-merge respects branch protection and is paused per-PR by the hold label
+  # / draft status.
+  autoMerge: true
+  mergeMethod: squash
+  # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
+  escalationHandle: ""
+  # Optional review / issue-work methodology overrides. When set, the chart writes
+  # each into a ConfigMap, mounts it as a file, and points the bot at it via
+  # GITHUBBOT_REVIEW_PROMPT_FILE / GITHUBBOT_ISSUE_PROMPT_FILE. Empty = the bot's
+  # bundled default is used. Supply the whole methodology; it's used verbatim.
+  reviewPrompt: ""
+  issuePrompt: ""
+  # Extra guidance prepended to owned-PR management turns (CI-fix / conflict /
+  # address-review) — the riskiest autonomous surface. Same delivery as the
+  # review/issue prompts (ConfigMap + mounted file). Empty = built-in preamble only.
+  managementPrompt: ""
+  # GitHub author_association values allowed to drive the comment-mention path.
+  # Empty = the bot's safe default (OWNER, MEMBER, COLLABORATOR). Use "*" to allow
+  # everyone (e.g. a fully-private repo). Comma-separated.
+  allowedAuthorAssociations: ""
+  # How long (seconds) to let in-flight turns finish on shutdown before the pod is
+  # killed, so a deploy doesn't drop running CI fixes / reviews / issue work.
+  terminationGracePeriodSeconds: 120
   extraEnv: {}
   resources: {}
 
@@ -362,6 +639,30 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  extraEnv: {}
+  resources: {}
+
+# Microsoft Teams chat ingress. Forwards Teams Bot Framework activities to the
+# api-rs control plane (:8080) and renders session events back to Teams. Off by
+# default; needs a Teams app registration and Bot Framework endpoint routing.
+teamsbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-teamsbot
+    tag: latest
+    pullPolicy: Always
+  allowedTeamIds: ""
+  allowedChannelIds: ""
+  allowedTenantIds: ""
+  requireMention: true
+  downloadAttachments: false
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
   extraEnv: {}
   resources: {}
 
@@ -387,6 +688,11 @@ postgres:
     size: 20Gi
     storageClassName: ""
     subPath: ""
+  # PostgreSQL uses /dev/shm for dynamic shared memory during parallel queries.
+  # This memory-backed volume counts against the pod's memory limit.
+  sharedMemory:
+    enabled: true
+    sizeLimit: 1Gi
   resources: {}
 
 ingress:
@@ -414,15 +720,48 @@ networkPolicy:
   # on clusters whose API server endpoint already listens on 443.
   apiServerPort: 6443
   # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
-  # namespace. api-rs needs this to export its own spans; sandboxes get their
-  # equivalent per-sandbox rule from api-rs, derived from the OTLP endpoint in
-  # sandbox.extraEnv. The collector's own namespace must also admit ingress
-  # from this namespace's pods.
+  # namespace. The policy selects only pods labeled
+  # centaur.ai/observability-enabled=true, matching observabilityEgress. api-rs
+  # always receives that label; sandboxes and proxy pods receive it only when
+  # their principal has observability enabled. The collector's own namespace
+  # must also admit ingress from this namespace's pods.
   otlpEgress:
     enabled: false
     # kubernetes.io/metadata.name of the collector's namespace, e.g. "laminar".
     namespace: ""
     port: 8000
+  # Egress to observability backends such as VictoriaLogs or VictoriaMetrics.
+  # This policy selects only pods labeled centaur.ai/observability-enabled=true.
+  # Sandboxes receive that label only when their principal has the observability
+  # sandbox capability.
+  observabilityEgress:
+    enabled: false
+    destinations: []
+    # Example:
+    # destinations:
+    #   - namespace: observability
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/instance: vls
+    #         app.kubernetes.io/name: victoria-logs-single
+    #     ports:
+    #       - port: 9428
+    #         protocol: TCP
+    #   - namespace: observability
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/instance: vms
+    #         app.kubernetes.io/name: victoria-metrics-single
+    #     ports:
+    #       - port: 8428
+    #         protocol: TCP
+  # Kubernetes NetworkPolicy is pod-wide: an egress rule selected for a
+  # metadata-trace-enabled sandbox applies to both the trace sidecar and Codex
+  # container. Keep these gateway CIDRs narrow (/32 IPv4 or /64+ IPv6) because
+  # NetworkPolicy cannot restrict a rule to one container or hostname.
+  metadataTraceEgress:
+    enabled: false
+    gatewayCidrs: []
 
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch

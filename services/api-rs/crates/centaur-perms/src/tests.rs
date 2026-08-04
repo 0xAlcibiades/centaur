@@ -2,16 +2,363 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use centaur_iron_control::SecretInput;
+use centaur_iron_control::{BrokerCredentialRecord, IronControlClient, SecretInput};
 use centaur_iron_proxy::{SourcePolicy, pg_sandbox_env_var};
+use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::tools::{self, ParsedSecret, SecretMode};
 use crate::translate;
+use crate::{
+    BrokerCmd, Cli, Command, PrincipalsCmd, broker_create, ensure_reseed_allowed,
+    labels_for_explicit_workflow_claim, normalize_refresh_seed, read_refresh_seed_file,
+    require_exact_workflow_labels, resolve_grant_principal, validate_broker_seed_args,
+};
 
 fn entry(toml_src: &str) -> toml::Value {
     let v: toml::Value = toml::from_str(&format!("x = {toml_src}")).expect("valid toml");
     v.get("x").expect("x key").clone()
+}
+
+fn broker_create_argv(extra: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "broker",
+        "create",
+        "--foreign-id",
+        "test-broker",
+        "--token-endpoint",
+        "https://auth.example.test/token",
+        "--client-id",
+        "client-id",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    argv
+}
+
+fn broker_create_args(extra: &[&str]) -> crate::BrokerCreateArgs {
+    let cli =
+        Cli::try_parse_from(broker_create_argv(extra)).expect("broker create args should parse");
+    let Command::Broker(BrokerCmd::Create(args)) = cli.command else {
+        panic!("expected broker create command");
+    };
+    *args
+}
+
+fn broker_create_cli(base_url: &str, extra: &[&str]) -> Cli {
+    let mut argv = vec![
+        "centaur-perms".to_owned(),
+        "--iron-control-url".to_owned(),
+        base_url.to_owned(),
+        "--iron-control-api-key".to_owned(),
+        "iak_test".to_owned(),
+        "broker".to_owned(),
+        "create".to_owned(),
+        "--foreign-id".to_owned(),
+        "test-broker".to_owned(),
+        "--token-endpoint".to_owned(),
+        "https://auth.example.test/token".to_owned(),
+        "--client-id".to_owned(),
+        "client-id".to_owned(),
+    ];
+    argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    Cli::try_parse_from(argv).expect("broker create args should parse")
+}
+
+#[test]
+fn explicit_workflow_claim_upgrades_only_an_unclaimed_centaur_principal() {
+    let required = std::collections::BTreeMap::from([
+        ("kind".to_owned(), "workflow".to_owned()),
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        (
+            "workflow_name".to_owned(),
+            "planetscale_daily_audit".to_owned(),
+        ),
+    ]);
+    let old_generic = std::collections::BTreeMap::from([
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        ("grant-owner".to_owned(), "operator".to_owned()),
+    ]);
+
+    let upgraded = labels_for_explicit_workflow_claim(&old_generic, &required)
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded.get("kind").map(String::as_str), Some("workflow"));
+    assert_eq!(
+        upgraded.get("workflow_name").map(String::as_str),
+        Some("planetscale_daily_audit")
+    );
+    assert_eq!(
+        upgraded.get("grant-owner").map(String::as_str),
+        Some("operator")
+    );
+    assert!(
+        labels_for_explicit_workflow_claim(&upgraded, &required)
+            .unwrap()
+            .is_none()
+    );
+
+    let conflicting = std::collections::BTreeMap::from([
+        ("kind".to_owned(), "workflow".to_owned()),
+        ("managed-by".to_owned(), "centaur".to_owned()),
+        ("workflow_name".to_owned(), "other".to_owned()),
+    ]);
+    assert!(labels_for_explicit_workflow_claim(&conflicting, &required).is_err());
+    assert!(require_exact_workflow_labels(&conflicting, &required).is_err());
+    assert!(require_exact_workflow_labels(&upgraded, &required).is_ok());
+}
+
+#[test]
+fn workflow_principal_namespace_requires_an_explicit_workflow_name() {
+    let cli = Cli::try_parse_from([
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "principals",
+        "grant",
+        "workflow-planetscale-daily-audit",
+        "--tool",
+        "planetscale_mcp",
+    ])
+    .unwrap();
+    let Command::Principals(PrincipalsCmd::Grant(args)) = &cli.command else {
+        panic!("expected principal grant command");
+    };
+
+    let error = resolve_grant_principal(&cli, args).unwrap_err();
+    assert!(error.to_string().contains("pass --workflow-name"));
+}
+
+async fn spawn_live_broker_stub() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            let first_line = request.lines().next().unwrap_or_default();
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            seen.lock().unwrap().push(format!("{method} {path}"));
+
+            let (status_line, body) = match (method, path) {
+                ("GET", "/api/v1/broker_credentials/lookup/default/test-broker") => (
+                    "200 OK",
+                    r#"{"data":{"id":"bcr_test","namespace":"default","foreign_id":"test-broker","name":null,"status":"live","client_id":"client-id"}}"#,
+                ),
+                _ => ("500 Internal Server Error", r#"{"error":"unexpected"}"#),
+            };
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (base_url, requests, server)
+}
+
+fn broker_record(status: Option<&str>) -> BrokerCredentialRecord {
+    BrokerCredentialRecord {
+        id: "bcr_test".to_owned(),
+        namespace: "default".to_owned(),
+        foreign_id: Some("test-broker".to_owned()),
+        name: None,
+        status: status.map(ToOwned::to_owned),
+        client_id: Some("client-id".to_owned()),
+    }
+}
+
+#[test]
+fn broker_refresh_seed_cli_rejects_literal_argv_value() {
+    let err = Cli::try_parse_from([
+        "centaur-perms",
+        "--iron-control-url",
+        "https://console.example.test",
+        "--iron-control-api-key",
+        "iak_test",
+        "broker",
+        "create",
+        "--foreign-id",
+        "test-broker",
+        "--token-endpoint",
+        "https://auth.example.test/token",
+        "--client-id",
+        "client-id",
+        "--refresh-token",
+        "secret-must-not-be-an-argument",
+    ])
+    .unwrap_err();
+    assert!(err.to_string().contains("--refresh-token"), "{err}");
+}
+
+#[test]
+fn broker_refresh_seed_cli_accepts_only_the_safe_source_flags() {
+    let stdin = broker_create_args(&["--refresh-token-stdin"]);
+    assert!(stdin.refresh_token_stdin);
+    assert!(stdin.refresh_token_file.is_none());
+    assert!(validate_broker_seed_args(&stdin).unwrap());
+
+    let file = broker_create_args(&["--refresh-token-file", "/tmp/seed"]);
+    assert!(!file.refresh_token_stdin);
+    assert_eq!(
+        file.refresh_token_file.as_deref(),
+        Some(Path::new("/tmp/seed"))
+    );
+    assert!(validate_broker_seed_args(&file).unwrap());
+}
+
+#[test]
+fn broker_refresh_seed_cli_rejects_multiple_sources() {
+    let err = Cli::try_parse_from(broker_create_argv(&[
+        "--refresh-token-stdin",
+        "--refresh-token-file",
+        "/tmp/seed",
+    ]))
+    .unwrap_err();
+    assert!(err.to_string().contains("cannot be used with"), "{err}");
+}
+
+#[test]
+fn broker_force_reauth_requires_a_safe_refresh_seed_source() {
+    let args = broker_create_args(&["--force-reauth"]);
+    let err = validate_broker_seed_args(&args).unwrap_err();
+    assert!(
+        err.to_string().contains("requires --refresh-token-stdin"),
+        "{err}"
+    );
+}
+
+#[test]
+fn broker_reseed_guard_allows_only_missing_or_dead_states_by_default() {
+    assert!(ensure_reseed_allowed(None, false, "test-broker").is_ok());
+    assert!(
+        ensure_reseed_allowed(Some(&broker_record(Some("dead"))), false, "test-broker").is_ok()
+    );
+    let err = ensure_reseed_allowed(
+        Some(&broker_record(Some("bootstrapping"))),
+        false,
+        "test-broker",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert!(
+        ensure_reseed_allowed(
+            Some(&broker_record(Some("bootstrapping"))),
+            true,
+            "test-broker"
+        )
+        .is_ok()
+    );
+
+    let err = ensure_reseed_allowed(Some(&broker_record(Some("live"))), false, "test-broker")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert!(ensure_reseed_allowed(Some(&broker_record(Some("live"))), true, "test-broker").is_ok());
+
+    let err = ensure_reseed_allowed(Some(&broker_record(None)), false, "test-broker").unwrap_err();
+    assert!(
+        err.to_string().contains("lifecycle status is unavailable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn broker_create_refuses_a_live_credential_before_consuming_or_writing_a_seed() {
+    let (base_url, requests, server) = spawn_live_broker_stub().await;
+    let cli = broker_create_cli(
+        &base_url,
+        &["--refresh-token-file", "/path/that/must/not/be/read"],
+    );
+    let Command::Broker(BrokerCmd::Create(args)) = &cli.command else {
+        panic!("expected broker create command");
+    };
+    let client = IronControlClient::new(&cli.iron_control_url, &cli.iron_control_api_key);
+
+    let err = broker_create(&cli, &client, args).await.unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to replace active"),
+        "{err}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        ["GET /api/v1/broker_credentials/lookup/default/test-broker"]
+    );
+    server.abort();
+}
+
+#[test]
+fn refresh_seed_normalization_allows_one_trailing_newline_only() {
+    assert_eq!(
+        normalize_refresh_seed("seed\n".to_owned(), "test").unwrap(),
+        "seed"
+    );
+    assert_eq!(
+        normalize_refresh_seed("seed\r\n".to_owned(), "test").unwrap(),
+        "seed"
+    );
+    let err = normalize_refresh_seed("seed\nsecond".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("exactly one token"), "{err}");
+    let err = normalize_refresh_seed("seed\n\n".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("exactly one token"), "{err}");
+    let err = normalize_refresh_seed("\n".to_owned(), "test").unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_seed_file_must_be_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+        "centaur-perms-refresh-seed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, "seed\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(read_refresh_seed_file(&path).unwrap(), "seed");
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let err = read_refresh_seed_file(&path).unwrap_err();
+    assert!(err.to_string().contains("mode 0600"), "{err}");
+    fs::remove_file(&path).unwrap();
 }
 
 // ----- secrets routing -----------------------------------------------------
@@ -31,6 +378,10 @@ fn secret_type_routes_by_oid_prefix() {
         secret_type_for_oid("gas_3").map(|t| t.1),
         Some("gcp_auth_secrets")
     );
+    assert_eq!(
+        secret_type_for_oid("gid_7").map(|t| t.1),
+        Some("gcp_id_token_secrets")
+    );
     assert_eq!(secret_type_for_oid("pgs_4").map(|t| t.0), Some("pg_dsn"));
     assert_eq!(secret_type_for_oid("hms_5").map(|t| t.0), Some("hmac"));
     assert_eq!(
@@ -46,7 +397,7 @@ fn secret_type_routes_by_oid_prefix() {
 #[test]
 fn parses_http_replace_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+        &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"], http_methods = ["get", "POST"], paths = ["/api/auth.test", "/api/conversations.*"]}"#),
         &[],
     )
     .unwrap();
@@ -59,6 +410,53 @@ fn parses_http_replace_secret() {
     assert_eq!(http.replacer, "SLACK_BOT_TOKEN");
     assert_eq!(http.match_headers, vec!["Authorization".to_owned()]);
     assert_eq!(http.hosts, vec!["slack.com".to_owned()]);
+    assert_eq!(http.http_methods, vec!["GET".to_owned(), "POST".to_owned()]);
+    assert_eq!(
+        http.paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn http_request_scopes_reject_invalid_metadata_and_other_secret_types() {
+    let invalid_method = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], http_methods = ["TRACE"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        invalid_method
+            .to_string()
+            .contains("unsupported http_methods")
+    );
+
+    let invalid_path = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = ["v1/insights"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(invalid_path.to_string().contains("must start with '/'"));
+
+    let empty_entry = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", match_headers = ["Authorization"], hosts = ["api.example.com"], paths = [""]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(empty_entry.to_string().contains("non-empty strings"));
+
+    let wrong_type = tools::parse_secret(
+        &entry(r#"{type = "pg_dsn", name = "DB", database = "app", http_methods = ["GET"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        wrong_type
+            .to_string()
+            .contains("only supported by type = \"http\"")
+    );
 }
 
 #[test]
@@ -304,6 +702,37 @@ fn parses_aws_auth_with_session_token_and_regions() {
 }
 
 #[test]
+fn parses_gcp_id_token_secret() {
+    let parsed = tools::parse_secret(
+        &entry(
+            r#"{ type = "gcp_id_token", name = "CLOUD_RUN_KEYFILE", audience = "https://my-service-abc123-uc.a.run.app", header = "X-Serverless-Authorization", hosts = ["my-service-abc123-uc.a.run.app"] }"#,
+        ),
+        &[],
+    )
+    .unwrap();
+    let ParsedSecret::GcpIdToken(gcp) = parsed else {
+        panic!("expected gcp_id_token")
+    };
+    assert_eq!(gcp.name, "CLOUD_RUN_KEYFILE");
+    assert_eq!(gcp.secret_ref, "CLOUD_RUN_KEYFILE");
+    assert_eq!(gcp.audience, "https://my-service-abc123-uc.a.run.app");
+    assert_eq!(gcp.header.as_deref(), Some("x-serverless-authorization"));
+    assert_eq!(gcp.hosts, vec!["my-service-abc123-uc.a.run.app"]);
+}
+
+#[test]
+fn gcp_id_token_requires_audience() {
+    let err = tools::parse_secret(
+        &entry(
+            r#"{ type = "gcp_id_token", name = "CLOUD_RUN_KEYFILE", hosts = ["my-service-abc123-uc.a.run.app"] }"#,
+        ),
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("audience"), "{err}");
+}
+
+#[test]
 fn aws_auth_requires_access_key_id() {
     let err = tools::parse_secret(
         &entry(
@@ -337,7 +766,7 @@ fn aws_auth_requires_hosts() {
 #[test]
 fn parses_pg_dsn_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }] }"#),
+        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }, { name = "centaur.slack_user_id", value_from = { proxy_label = "centaur.slack_user_id" } }] }"#),
         &[],
     )
     .unwrap();
@@ -348,7 +777,7 @@ fn parses_pg_dsn_secret() {
     assert_eq!(pg.database, "pmadmin");
     assert_eq!(pg.secret_ref, "RESHIFT_DSN");
     assert_eq!(pg.role.as_deref(), Some("centaur_slack_reader"));
-    assert_eq!(pg.settings.len(), 1);
+    assert_eq!(pg.settings.len(), 2);
     assert_eq!(pg.settings[0].name, "centaur.slack_channel_id");
     assert_eq!(
         pg.settings[0]
@@ -356,6 +785,28 @@ fn parses_pg_dsn_secret() {
             .as_ref()
             .and_then(|value_from| value_from.principal_label.as_deref()),
         Some("slack_channel_id")
+    );
+    assert_eq!(pg.settings[1].name, "centaur.slack_user_id");
+    assert_eq!(
+        pg.settings[1]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.proxy_label.as_deref()),
+        Some("centaur.slack_user_id")
+    );
+}
+
+#[test]
+fn rejects_pg_dsn_value_from_with_multiple_selectors() {
+    let err = tools::parse_secret(
+        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", settings = [{ name = "centaur.slack_user_id", value_from = { principal_label = "slack_user_id", proxy_label = "centaur.slack_user_id" } }] }"#),
+        &[],
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("must declare exactly one"),
+        "{err}"
     );
 }
 
@@ -391,7 +842,7 @@ fn legacy_string_shim_is_replace_secret() {
 fn translates_http_replace_to_static_input() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]}"#),
+            &entry(r#"{type = "http", name = "SLACK_BOT_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com", "hooks.slack.com"], http_methods = ["get"], paths = ["/api/auth.test", "/api/conversations.*"]}"#),
             &[],
         )
         .unwrap(),
@@ -411,8 +862,25 @@ fn translates_http_replace_to_static_input() {
         input.source.config,
         serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
     );
-    assert_eq!(input.rules.len(), 1);
+    assert_eq!(input.rules.len(), 2);
     assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(input.rules[0].http_methods, vec!["GET".to_owned()]);
+    assert_eq!(
+        input.rules[0].paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
+    assert_eq!(input.rules[1].host.as_deref(), Some("hooks.slack.com"));
+    assert_eq!(input.rules[1].http_methods, vec!["GET".to_owned()]);
+    assert_eq!(
+        input.rules[1].paths,
+        vec![
+            "/api/auth.test".to_owned(),
+            "/api/conversations.*".to_owned()
+        ]
+    );
 }
 
 #[test]
@@ -434,6 +902,43 @@ fn translates_gcp_auth_defaults_scopes_when_unset() {
     assert_eq!(
         input.scopes,
         vec!["https://www.googleapis.com/auth/cloud-platform".to_owned()]
+    );
+}
+
+#[test]
+fn translates_gcp_id_token_to_input() {
+    let secrets = vec![
+        tools::parse_secret(
+            &entry(
+                r#"{ type = "gcp_id_token", name = "CLOUD_RUN_KEYFILE", audience = "https://my-service-abc123-uc.a.run.app", header = "x-serverless-authorization", hosts = ["my-service-abc123-uc.a.run.app"] }"#,
+            ),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let out = translate::translate("default", "tool-cloudrun", &secrets, &SourcePolicy::env());
+    let SecretInput::GcpIdToken(input) = &out.inputs[0] else {
+        panic!("expected gcp_id_token")
+    };
+    assert_eq!(
+        input.foreign_id,
+        "tool-cloudrun-gcp-id-token-cloud-run-keyfile-https-my-service-abc123-uc-a-run-app-x-serverless-authorization"
+    );
+    assert_eq!(input.name.as_deref(), Some("GCP ID Token (tool-cloudrun)"));
+    assert_eq!(
+        input.audience,
+        "https://my-service-abc123-uc.a.run.app".to_owned()
+    );
+    assert_eq!(input.header.as_deref(), Some("x-serverless-authorization"));
+    assert_eq!(input.keyfile.source_type, "env");
+    assert_eq!(
+        input.keyfile.config,
+        serde_json::json!({ "var": "CLOUD_RUN_KEYFILE" })
+    );
+    assert_eq!(input.rules.len(), 1);
+    assert_eq!(
+        input.rules[0].host.as_deref(),
+        Some("my-service-abc123-uc.a.run.app")
     );
 }
 
@@ -469,7 +974,7 @@ fn translates_oauth_with_json_key_fields() {
 fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }] }"#),
+            &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }, { name = "centaur.slack_user_id", value_from = { proxy_label = "centaur.slack_user_id" } }] }"#),
             &[],
         )
         .unwrap(),
@@ -485,13 +990,20 @@ fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
     assert_eq!(input.name, "RESHIFT_DSN");
     assert_eq!(input.database, "pmadmin");
     assert_eq!(input.role.as_deref(), Some("centaur_slack_reader"));
-    assert_eq!(input.settings.len(), 1);
+    assert_eq!(input.settings.len(), 2);
     assert_eq!(
         input.settings[0]
             .value_from
             .as_ref()
             .and_then(|value_from| value_from.principal_label.as_deref()),
         Some("slack_channel_id")
+    );
+    assert_eq!(
+        input.settings[1]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.proxy_label.as_deref()),
+        Some("centaur.slack_user_id")
     );
     assert_eq!(input.dsn.source_type, "env");
     assert_eq!(

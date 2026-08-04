@@ -25,24 +25,30 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # ── Python deps ──────────────────────────────────────────────────────────────
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip3 install --break-system-packages --no-compile \
+    pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
+    && pip3 install --break-system-packages --no-compile \
     python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
     asyncpg==0.30.0 \
+    boto3>=1.40.0 \
     google-api-python-client>=2.100.0 \
     google-auth-httplib2>=0.2.0 \
     google-auth-oauthlib>=1.2.0 \
+    "google-cloud-bigquery>=3.25.0" \
+    feedparser>=6.0.0 \
     httplib2>=0.20.0 \
     httpx>=0.28.0 \
     opentelemetry-proto==1.42.1 \
+    "psycopg[binary]>=3.2.0" \
     pysocks>=1.7.1 \
+    rich>=13.0.0 \
     slack-sdk==3.39.0 \
     tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
-# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI (single layer, cached) ─────────────
+# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -54,7 +60,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
       | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      | tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli google-cloud-cli \
+    && gcloud --version >/dev/null \
+    && bq version >/dev/null \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -62,10 +74,16 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.154
-ARG CODEX_VERSION=0.139.0
+ARG CODEX_VERSION=0.146.0
+# npm's SRI for @openai/codex 0.146.0. Keep the package acquisition pinned to
+# reviewed bytes instead of trusting a mutable registry response at build time.
+ARG CODEX_NPM_SHA512=c86dec3d635d6bfd980084080eaf4caeb8e8093210eebc5833921ab2b1b754172e8422d39207a0fc9cea989ab557df11138309e630b10d75d094e8eb762b4547
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
+ARG KACHE_VERSION=v0.7.0
+ARG PLANETSCALE_MCP_COMMIT=56a05b658de1d2035510708f3a51ec224048f4ee
+ARG PLANETSCALE_MCP_SHA256=e27b7b6d802ecb89cb871a02e61c4481688af8856e0fbee49df79f2ca0cb2c6d
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -104,9 +122,12 @@ RUN set -eux; \
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm install -g --prefer-online --force \
+    codex_package="$(npm pack --silent "@openai/codex@${CODEX_VERSION}")" \
+    && echo "${CODEX_NPM_SHA512}  ${codex_package}" | sha512sum -c - \
+    && npm install -g --prefer-online --force "${codex_package}" \
+    && rm -f "${codex_package}" \
+    && npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-      "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
@@ -114,6 +135,26 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
+
+# ── PlanetScale MCP server ──────────────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    set -eux; \
+    curl -fsSL \
+      "https://github.com/planetscale/mcp-server/archive/${PLANETSCALE_MCP_COMMIT}.tar.gz" \
+      -o /tmp/planetscale-mcp.tar.gz; \
+    echo "${PLANETSCALE_MCP_SHA256}  /tmp/planetscale-mcp.tar.gz" | sha256sum -c -; \
+    install -d -m 0755 /opt/planetscale-mcp; \
+    tar -xzf /tmp/planetscale-mcp.tar.gz -C /opt/planetscale-mcp --strip-components=1; \
+    cd /opt/planetscale-mcp; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    env -u PLANETSCALE_API_TOKEN sh -c 'printf "%s\n" \
+      '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"centaur-image-smoke","version":"1.0"}}}'\'' \
+      '\''{"jsonrpc":"2.0","method":"notifications/initialized"}'\'' \
+      '\''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'\'' \
+      | node /opt/planetscale-mcp/src/server.ts 2>/tmp/planetscale-mcp-smoke.log \
+      | jq -e '\''select(.id == 2) | [.result.tools[].name] | index("get_insights") != null'\'''; \
+    chmod -R a+rX /opt/planetscale-mcp; \
+    rm -f /tmp/planetscale-mcp.tar.gz /tmp/planetscale-mcp-smoke.log
 
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
@@ -145,11 +186,13 @@ ARG BUN_VERSION=bun-v1.3.13
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --component rustfmt --component clippy \
+      | sh -s -- -y --profile minimal --default-toolchain nightly --component rustfmt --component clippy \
+    && rustup toolchain install stable --profile minimal \
     && rustc --version \
     && cargo --version \
-    && rustfmt --version \
-    && clippy-driver --version \
+    && cargo +stable --version \
+    && cargo +nightly fmt --version \
+    && cargo +nightly clippy --version \
     && rm -rf "$HOME/.rustup/toolchains"/*/share/doc "$HOME/.rustup/toolchains"/*/share/man
 ARG SCCACHE_VERSION=0.15.0
 RUN set -eux; \
@@ -168,6 +211,12 @@ RUN set -eux; \
     rm -rf /tmp/sccache.tar.gz /tmp/sccache.sha256 "/tmp/${sccache_pkg}"; \
     mkdir -p "$HOME/.cache/sccache"; \
     sccache --version
+RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,target=/home/agent/.cache/kache-install-target,uid=1001,gid=1001,sharing=locked \
+    CARGO_TARGET_DIR=/home/agent/.cache/kache-install-target \
+    cargo install --git https://github.com/kunobi-ninja/kache --tag "${KACHE_VERSION}" --locked kache \
+    && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
@@ -202,10 +251,14 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
     npx -y skills add vercel-labs/agent-browser
+# git-branch configures each writable clone with the publishing GitHub account.
+# A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
 RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
+    && git config --global core.hooksPath /opt/centaur/git-hooks \
     && git config --global --add safe.directory '*' \
+    && git config --global user.useConfigOnly true \
     && git config --global user.name "pseudolabel" \
     && git config --global user.email "sudolabel@safeon.de"
 
@@ -224,6 +277,8 @@ RUN rm -f /etc/sudoers.d/agent
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
 RUN install -d -m 0755 /etc/centaur /opt/centaur
 COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
+COPY --link --chmod=0755 services/sandbox/git-hooks/ /opt/centaur/git-hooks/
+COPY --link --chown=1001:1001 tools/ /opt/centaur/tools/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/github-gist.sh /usr/local/bin/github-gist
@@ -232,24 +287,26 @@ COPY --link --chmod=755 services/sandbox/share-artifact.sh /usr/local/bin/share-
 COPY --link --chmod=755 services/sandbox/slack-upload.sh /usr/local/bin/slack-upload
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
+COPY --link services/workflow-python/api/ /usr/local/bin/api/
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims
+COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/centaur-tool-host
+COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
+COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
+COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
+COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
 
 USER agent
 WORKDIR /home/agent
 
-# Build from a bind mount instead of COPY: COPY --link into /tmp rebuilds the
-# parent directory chain in its own layer, clobbering /tmp's root:root 1777
-# sticky metadata with agent:agent 0755, which broke /tmp writes for any
-# non-1001 user (e.g. the root-with-dropped-caps repo-cache). A bind mount
-# leaves no trace in the image and caches on source content just like COPY.
-RUN --mount=type=bind,source=crates/harness-server,target=/harness-server-src \
-    --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
+# Keep harness-server source as a real image input so crate changes invalidate
+# the install layer. Do not COPY into /tmp; that can clobber /tmp's sticky bit.
+RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cache/harness-server-target,uid=1001,gid=1001,sharing=locked \
     CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
-    cargo install --locked --path /harness-server-src --root /home/agent/.local
+    cargo +stable install --locked --path /opt/centaur/harness-server-src --root /home/agent/.local
 
 # No RUN instructions after these — all repo-local content at the very end.
 COPY --link --chown=1001:1001 .agents/skills/ /home/agent/.agents/skills/

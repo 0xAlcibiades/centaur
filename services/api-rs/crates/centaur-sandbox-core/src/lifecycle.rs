@@ -47,6 +47,11 @@ pub struct SandboxHandle {
     pub id: SandboxId,
     /// Name of the backend that owns this sandbox.
     pub backend: String,
+    /// Stable backend resource identity captured by the create operation.
+    /// Callers must use this value, rather than re-observing a reusable name,
+    /// when persisting or cleaning up ownership.
+    #[serde(default)]
+    pub resource_uid: Option<String>,
 }
 
 impl SandboxHandle {
@@ -54,7 +59,13 @@ impl SandboxHandle {
         Self {
             id: id.into(),
             backend: backend.into(),
+            resource_uid: None,
         }
+    }
+
+    pub fn with_resource_uid(mut self, resource_uid: Option<String>) -> Self {
+        self.resource_uid = resource_uid;
+        self
     }
 }
 
@@ -96,10 +107,15 @@ pub struct ObservedSandbox {
     pub id: SandboxId,
     /// Name of the backend that produced the observation.
     pub backend: String,
+    /// Backend resource UID observed for this sandbox, when the backend has a
+    /// stable object identity distinct from its human-readable name.
+    pub resource_uid: Option<String>,
     /// Current portable lifecycle status.
     pub status: SandboxStatus,
     /// Backend-owned diagnostic reason for the observed status.
     pub reason: Option<String>,
+    /// Backend component metadata, when the backend records it.
+    pub component: Option<String>,
     /// When the backend created the sandbox, if the backend records it.
     pub created_at: Option<SystemTime>,
     /// When the sandbox was suspended, if it is currently suspended and the
@@ -116,8 +132,10 @@ impl ObservedSandbox {
         Self {
             id: id.into(),
             backend: backend.into(),
+            resource_uid: None,
             status,
             reason: None,
+            component: None,
             created_at: None,
             suspended_since: None,
         }
@@ -125,6 +143,16 @@ impl ObservedSandbox {
 
     pub fn with_created_at(mut self, created_at: Option<SystemTime>) -> Self {
         self.created_at = created_at;
+        self
+    }
+
+    pub fn with_component(mut self, component: Option<String>) -> Self {
+        self.component = component;
+        self
+    }
+
+    pub fn with_resource_uid(mut self, resource_uid: Option<String>) -> Self {
+        self.resource_uid = resource_uid;
         self
     }
 

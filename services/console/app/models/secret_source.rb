@@ -4,6 +4,7 @@ class SecretSource < ApplicationRecord
   include SyncConfigOwnerInvalidation
 
   SOURCE_TYPES = %w[env aws_sm aws_ssm 1password 1password_connect control_plane token_broker].freeze
+  SYNC_CONFIG_REPLACEMENT_ATTRIBUTES = %w[source_type config secret role role_kind].freeze
 
   UNIVERSAL_OPTIONAL = %w[json_key ttl].freeze
 
@@ -20,10 +21,12 @@ class SecretSource < ApplicationRecord
   # A source belongs to exactly one owner. static_secret feeds the `secrets`
   # transform; gcp_auth_secret is a gcp_auth keyfile; oauth_token_secret holds
   # one oauth_token entry's credential fields and token-endpoint headers;
+  # gcp_id_token_secret is a gcp_id_token keyfile;
   # pg_dsn_secret is a Postgres upstream's connection string; hmac_secret holds
   # one hmac_sign entry's HMAC key and any additional named credentials.
   belongs_to :static_secret, optional: true
   belongs_to :gcp_auth_secret, optional: true
+  belongs_to :gcp_id_token_secret, optional: true
   belongs_to :aws_auth_secret, optional: true
   belongs_to :oauth_token_secret, optional: true
   belongs_to :pg_dsn_secret, optional: true
@@ -59,7 +62,7 @@ class SecretSource < ApplicationRecord
   # Whether this source can currently deliver a value to a proxy. Always true
   # except for a token_broker source whose credential has not minted an access
   # token yet (bootstrapping) or is dead -- those are omitted from sync so the
-  # proxy never receives an empty inline value (see Principal#sync_secrets).
+  # proxy never receives an empty inline value.
   def deliverable?
     return brokered_credential&.access_token.present? if source_type == "token_broker"
     true
@@ -78,7 +81,9 @@ class SecretSource < ApplicationRecord
     )
   end
 
-  OWNER_ASSOCIATIONS = %i[static_secret gcp_auth_secret aws_auth_secret oauth_token_secret pg_dsn_secret hmac_secret].freeze
+  OWNER_ASSOCIATIONS = %i[
+    static_secret gcp_auth_secret gcp_id_token_secret aws_auth_secret oauth_token_secret pg_dsn_secret hmac_secret
+  ].freeze
 
   # Owners whose sources fill a named role (credential field or endpoint header).
   # aws_auth's sources are credential fields (access_key_id, secret_access_key,

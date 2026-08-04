@@ -221,6 +221,24 @@ module Console
       )
     end
 
+    test "POST create captures proxy label settings via the kind select" do
+      post console_pg_dsn_secrets_url, params: {
+        secret: { namespace: "acme", foreign_id: "ui-proxy-label", database: "proxylabeldb" },
+        settings: {
+          "0" => { name: "centaur.slack_user_id", kind: "proxy_label", value: "centaur.slack_user_id" }
+        },
+        source: { source_type: "env", reference: "PROXY_LABEL_DSN" }
+      }
+      secret = PgDsnSecret.find_by!(namespace: "acme", foreign_id: "ui-proxy-label")
+      assert_redirected_to console_secret_path("pg_dsn", secret.oid)
+      assert_equal(
+        [
+          { "name" => "centaur.slack_user_id", "value_from" => { "proxy_label" => "centaur.slack_user_id" } }
+        ],
+        secret.settings
+      )
+    end
+
     test "POST create rejects an unknown principal_field from the console form" do
       assert_no_difference "PgDsnSecret.count" do
         post console_pg_dsn_secrets_url, params: {
@@ -335,6 +353,72 @@ module Console
       assert_nil secret.keyfile_source
       assert_nil secret.subject
       assert_equal({ "type" => "workload_identity" }, secret.credentials_provider)
+    end
+
+    # --- gcp_id_token -----------------------------------------------------
+
+    test "GET new and edit render without error for gcp_id_token" do
+      get new_console_gcp_id_token_secret_url
+      assert_response :ok
+      get edit_console_gcp_id_token_secret_url(gcp_id_token_secrets(:acme_cloud_run).oid)
+      assert_response :ok
+    end
+
+    test "POST create builds a gcp_id_token secret with a keyfile source and rule" do
+      assert_difference -> { GcpIdTokenSecret.count } => 1,
+                        -> { SecretSource.count } => 1,
+                        -> { RequestRule.count } => 1 do
+        post console_gcp_id_token_secrets_url, params: {
+          secret: { namespace: "acme", foreign_id: "ui-cloud-run", name: "ui cloud run" },
+          gcp_id_token: {
+            audience: "https://ui-service-abc123-uc.a.run.app",
+            header: "x-serverless-authorization"
+          },
+          source: { source_type: "env", reference: "UI_CLOUD_RUN_KEYFILE" },
+          rules: { "0" => { host: "ui-service-abc123-uc.a.run.app", http_methods: "GET", paths: "/" } }
+        }
+      end
+
+      secret = GcpIdTokenSecret.find_by!(namespace: "acme", foreign_id: "ui-cloud-run")
+      assert_redirected_to console_secret_path("gcp_id_token", secret.oid)
+      assert_equal "https://ui-service-abc123-uc.a.run.app", secret.audience
+      assert_equal "x-serverless-authorization", secret.header
+      assert_equal({ "var" => "UI_CLOUD_RUN_KEYFILE" }, secret.keyfile_source.config)
+      assert_equal [ "ui-service-abc123-uc.a.run.app" ], secret.rules.map(&:host)
+    end
+
+    test "POST create gcp_id_token without rules is rejected without writing" do
+      assert_no_difference [ "GcpIdTokenSecret.count", "SecretSource.count", "RequestRule.count" ] do
+        post console_gcp_id_token_secrets_url, params: {
+          secret: { namespace: "acme", foreign_id: "ui-cloud-run-no-rules" },
+          gcp_id_token: { audience: "https://ui-service-abc123-uc.a.run.app" },
+          source: { source_type: "env", reference: "UI_CLOUD_RUN_KEYFILE" }
+        }
+      end
+      assert_response :unprocessable_entity
+      assert_match "Rules must include at least one rule", response.body
+      assert_match "must include at least one rule", response.body
+    end
+
+    test "PATCH update changes a gcp_id_token secret keyfile audience header and rules" do
+      secret = gcp_id_token_secrets(:acme_cloud_run)
+
+      patch console_gcp_id_token_secret_url(secret.oid), params: {
+        secret: { namespace: secret.namespace, foreign_id: secret.foreign_id },
+        gcp_id_token: {
+          audience: "https://updated-service-abc123-uc.a.run.app",
+          header: ""
+        },
+        source: { source_type: "env", reference: "UPDATED_CLOUD_RUN_KEYFILE" },
+        rules: { "0" => { host: "updated-service-abc123-uc.a.run.app", http_methods: "POST", paths: "" } }
+      }
+
+      assert_redirected_to console_secret_path("gcp_id_token", secret.oid)
+      secret.reload
+      assert_equal "https://updated-service-abc123-uc.a.run.app", secret.audience
+      assert_nil secret.header
+      assert_equal "UPDATED_CLOUD_RUN_KEYFILE", secret.keyfile_source.config["var"]
+      assert_equal [ "updated-service-abc123-uc.a.run.app" ], secret.rules.map(&:host)
     end
 
     # --- role grants ------------------------------------------------------

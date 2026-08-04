@@ -347,9 +347,11 @@ Internally, execution follows this shape:
 
 ```text
 load session
-claim session execution lock
+persist exact input frames and claim a generation-fenced delivery lease
 ensure current sandbox exists
-write request input_lines to sandbox stdin
+revalidate the execution, actor boundary, and exact sandbox assignment
+flush request input_lines while holding the durable delivery transaction
+commit session.input_flushed (an ambiguous crash is replayed at least once)
 persist stdout lines as session.output.line events
 mark execution terminal
 release execution lock

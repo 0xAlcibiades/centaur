@@ -5,11 +5,14 @@ description: Add Centaur tool plugins with client.py, pyproject metadata, and ty
 
 # Creating Tools
 
-Tools are Python plugins that Centaur discovers at API startup and exposes as
-REST endpoints at `/tools/{name}/{method}`. Put organization-specific tools in
-an overlay repo under `tools/` so the base Centaur repo stays generic. See
-[Using an overlay](/extend/overlay) for packaging, mount paths, and chart
-configuration.
+Tools are Python plugins that Centaur discovers from ordered tool directories.
+api-rs reads their metadata for secret grants, while agent sandboxes install
+their `[project.scripts]` entries as local CLI shims. Agents use
+`centaur-tools list`, `<tool> --help`, and the direct tool CLI; api-rs does not
+serve legacy HTTP tool-method routes as the current sandbox registry. Put
+organization-specific tools in an overlay repo under `tools/` so the base
+Centaur repo stays generic. See [Using an overlay](/extend/overlay) for
+packaging, mount paths, and chart configuration.
 
 Tools are loaded from `TOOL_DIRS`. In an overlay deployment, the tool must exist
 under the source's `toolsSubdir` — by default `tools/` — in its repo-cache
@@ -34,6 +37,9 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.27.0"]
 
+[project.scripts]
+warehouse = "warehouse.cli:app"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -41,7 +47,7 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 secrets = [
-    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"]},
+    {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"], http_methods = ["POST"], paths = ["/query"]},
 ]
 ```
 
@@ -61,17 +67,16 @@ Each entry in `secrets` declares one credential the tool can request with
   auth). For `jwt_bearer` (RFC 7523), supply `issuer`, `subject`, and
   `private_key` (an RSA PEM) in `fields`, plus a top-level `audience`; an
   optional `private_key_id` field is emitted as the JWT `kid` header.
-- `type = "brokered_token"` routes OAuth2 refresh-token rotation through
-  iron-token-broker instead of iron-proxy. Use this when the upstream IdP
-  rotates refresh tokens with strict reuse detection (OpenAI Codex, Anthropic
-  Claude Code OAuth, modern Okta or Auth0 with rotation enabled) and more
-  than one proxy shares the credential. Required `fields`: `client_id`,
-  `refresh_token`. Optional: `client_secret`. The `refresh_token` field names
-  the writable credential blob the broker rewrites on every rotation; the
-  other fields are read-only. Read-side fields and `token_endpoint_headers`
-  entries accept `json_key` to pluck a value out of a JSON-encoded secret;
-  the `refresh_token` field does not (the broker rewrites the whole
-  document).
+- `type = "brokered_token"` consumes a separately provisioned Console broker
+  credential. The Console stores its refresh-token state encrypted in Postgres,
+  performs all rotation, and sends only the current access token to iron-proxy.
+  Use this when several proxies need one OAuth credential with strict refresh
+  token reuse rules. Configure the consumer's `name`, `hosts`, and optional
+  `credential` or injection settings. Do not put refresh-token fields,
+  `token_endpoint`, or `scopes` in a tool declaration: those legacy fields are
+  ignored. Never use a mutable 1Password item as the broker's ongoing state;
+  seed or re-authenticate the Console broker credential through its management
+  path instead.
 - `type = "gcp_auth"` is for Google service-account JSON. iron-proxy resolves
   the keyfile, mints Google OAuth tokens for `scopes`, and injects them for the
   configured Google API `hosts`. If omitted, hosts default to
@@ -85,6 +90,11 @@ Each entry in `secrets` declares one credential the tool can request with
   request the placeholder is allowed to appear. At least one is required.
 - `hosts` is the upstream allowlist for this secret. iron-proxy will only
   inject the real value on requests to these hosts.
+- `http_methods` and `paths` optionally narrow each declared `hosts` rule for
+  `type = "http"`. Methods are normalized to uppercase and must be one of
+  `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or
+  `*`; every path must begin with `/` and may use globs. Multiple paths apply
+  to the same host rule.
 
 Use `optional_secrets` for credentials the tool can run without.
 
@@ -119,16 +129,40 @@ Do not call `load_dotenv()` in `client.py`. Server-side tools should use
 `secret("KEY")`; standalone CLIs may load local `.env` files in their CLI
 wrapper.
 
-## Verify
+## Write the CLI
 
-After deploy:
+The sandbox shim installer only exposes tools with `[project.scripts]`. Keep
+the CLI thin: parse command-line arguments, call the client, and print JSON or
+plain text that an agent can read.
 
-```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS http://localhost:8000/health/tools | jq
+```python
+import json
+import typer
+
+from .client import _client
+
+app = typer.Typer()
+
+
+@app.command()
+def query(sql: str) -> None:
+    print(json.dumps(_client().query(sql)))
 ```
 
-Check that the tool appears and that missing-secret warnings match what you
-expect. If a tool is missing, inspect the configured repo/ref in repo-cache,
-`TOOL_DIRS`, the tool directory name, and
-`[tool.centaur] module = "client.py"`.
+
+## Verify
+
+After deploy, verify from a fresh sandbox:
+
+```bash
+kubectl exec -n centaur-system <agent-sandbox-pod> -- centaur-tools list
+kubectl exec -n centaur-system <agent-sandbox-pod> -- warehouse --help
+kubectl exec -n centaur-system <agent-sandbox-pod> -- warehouse query "select 1"
+```
+
+Check that the tool appears, the CLI help is useful, and a real invocation
+works through iron-proxy when credentials are needed. If a tool is missing,
+inspect the configured repo/ref in repo-cache, `TOOL_DIRS`, the tool directory
+name, `[tool.centaur] module = "client.py"`, and the `[project.scripts]` entry.
+For workflow-only use, also run a small workflow that exercises
+`ctx.call_tool(...)`, which uses the generated `centaur-tools call` bridge.

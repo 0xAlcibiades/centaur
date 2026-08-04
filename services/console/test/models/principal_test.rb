@@ -13,7 +13,213 @@ class PrincipalTest < ActiveSupport::TestCase
   test "namespace defaults to 'default'" do
     principal = Principal.new(default_attrs)
     assert_equal "default", principal.namespace
+    assert_equal Principal::UNKNOWN_KIND, principal.kind
     assert principal.valid?
+  end
+
+  test "identity fields are stored only in columns and synthesized for compatibility" do
+    principal = Principal.create!(default_attrs(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_channel_id: "D0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "ada@example.com",
+      labels: { "team" => "platform" }
+    ))
+
+    principal.reload
+    assert_equal "slack_dm", principal.kind
+    assert_equal "U0123456789", principal.slack_user_id
+    assert_equal "D0123456789", principal.slack_channel_id
+    assert_equal "T0123456789", principal.slack_team_id
+    assert_equal "ada@example.com", principal.slack_email
+    assert_equal(
+      { "team" => "platform", Principal::SANDBOX_REPO_CACHE_LABEL => "all" },
+      principal.labels
+    )
+    assert_equal(
+      {
+        "team" => "platform",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all",
+        "kind" => "slack_dm",
+        "slack_user_id" => "U0123456789",
+        "slack_channel_id" => "D0123456789",
+        "slack_team_id" => "T0123456789",
+        "slack_email" => "ada@example.com"
+      },
+      principal.labels_with_sandbox_capabilities
+    )
+  end
+
+  test "legacy identity labels are promoted into columns" do
+    principal = Principal.create!(default_attrs(
+      labels: {
+        "kind" => "slack_dm",
+        "slack_user_id" => "U0123456789",
+        "slack_team_id" => "T0123456789",
+        "slack_email" => "ada@example.com"
+      }
+    ))
+
+    principal.reload
+    assert_equal "slack_dm", principal.kind
+    assert_equal "U0123456789", principal.slack_user_id
+    assert_equal "T0123456789", principal.slack_team_id
+    assert_equal "ada@example.com", principal.slack_email
+    assert_empty principal.labels.slice(*PrincipalIdentityLabels.labels_for(principal.kind))
+  end
+
+  test "first-class identity fields must agree with compatibility labels" do
+    principal = Principal.new(default_attrs(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      labels: {
+        "kind" => "slack_channel",
+        "slack_user_id" => "U9876543210"
+      }
+    ))
+
+    assert_not principal.valid?
+    assert_includes principal.errors[:kind], "does not agree with labels.kind"
+    assert_includes principal.errors[:slack_user_id], "does not agree with labels.slack_user_id"
+  end
+
+  test "console user identity is stored only in columns and synthesized for compatibility" do
+    user = users(:acme_admin)
+    principal = Principal.create!(default_attrs(
+      kind: "console_user",
+      console_user_id: user.id,
+      console_user_email: user.email,
+      labels: { "managed-by" => "centaur" }
+    ))
+
+    principal.reload
+    assert_equal user.id, principal.console_user_id
+    assert_equal user.email, principal.console_user_email
+    assert_empty principal.labels.slice("console-user-id", "email")
+    assert_equal user.oid, principal.labels_with_sandbox_capabilities["console-user-id"]
+    assert_equal user.email, principal.labels_with_sandbox_capabilities["email"]
+  end
+
+  test "legacy console user identity labels are promoted only for console users" do
+    user = users(:acme_admin)
+    console_user = Principal.create!(default_attrs(
+      labels: {
+        "kind" => "console_user",
+        "console-user-id" => user.oid,
+        "email" => user.email
+      }
+    ))
+    ordinary_user = Principal.create!(default_attrs(
+      labels: { "kind" => "user", "email" => user.email }
+    ))
+
+    assert_equal user.id, console_user.reload.console_user_id
+    assert_equal user.email, console_user.console_user_email
+    assert_empty console_user.labels.slice("console-user-id", "email")
+    assert_nil ordinary_user.reload.console_user_id
+    assert_nil ordinary_user.console_user_email
+    assert_equal user.email, ordinary_user.labels["email"]
+  end
+
+  test "blank legacy Slack identity labels clear columns" do
+    principal = Principal.create!(default_attrs(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_channel_id: "D0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "ada@example.com"
+    ))
+
+    principal.update!(labels: {
+      "kind" => "slack_dm",
+      "slack_user_id" => "",
+      "slack_channel_id" => "  ",
+      "slack_team_id" => nil,
+      "slack_email" => "\t"
+    })
+
+    principal.reload
+    assert_nil principal.slack_user_id
+    assert_nil principal.slack_channel_id
+    assert_nil principal.slack_team_id
+    assert_nil principal.slack_email
+  end
+
+  test "kind accepts only known values" do
+    Principal::KINDS.each do |kind|
+      assert Principal.new(default_attrs(kind: kind)).valid?, "expected #{kind.inspect} to be valid"
+    end
+
+    %w[service future_platform].each do |kind|
+      principal = Principal.new(default_attrs(kind: kind))
+      assert_not principal.valid?
+      assert_includes principal.errors[:kind], "must be one of #{Principal::KINDS.join(", ")}"
+    end
+
+    principal = Principal.new(default_attrs(kind: "  "))
+    assert_not principal.valid?
+    assert_includes principal.errors[:kind], "can't be blank"
+  end
+
+  test "Slack identity fields must use canonical formats" do
+    {
+      slack_user_id: %w[U0123456789 W0123456789 USLACK],
+      slack_channel_id: %w[C0123456789 D0123456789 G0123456789],
+      slack_team_id: %w[T0123456789 E0123456789],
+      slack_email: %w[ada@example.com]
+    }.each do |field, values|
+      values.each do |value|
+        assert Principal.new(default_attrs(field => value)).valid?, "expected #{field}=#{value.inspect} to be valid"
+      end
+    end
+
+    {
+      slack_user_id: " U0123456789 ",
+      slack_channel_id: "C123",
+      slack_team_id: "t0123456789",
+      slack_email: "not-an-email"
+    }.each do |field, value|
+      principal = Principal.new(default_attrs(field => value))
+      assert_not principal.valid?
+      assert_predicate principal.errors[field], :any?
+    end
+  end
+
+  test "console user principals permit missing user references but require valid email" do
+    user = users(:acme_admin)
+    principal = Principal.new(default_attrs(
+      kind: "console_user",
+      console_user_id: user.id,
+      console_user_email: user.email
+    ))
+    assert principal.valid?
+
+    principal.console_user_id = nil
+    assert principal.valid?
+
+    principal.console_user_email = "not-an-email"
+    assert_not principal.valid?
+    assert_predicate principal.errors[:console_user_email], :any?
+  end
+
+  test "unchanged malformed migrated Slack identities do not block unrelated saves" do
+    principal = principals(:acme_user_alice)
+    principal.update_columns(
+      slack_user_id: "U12345",
+      slack_channel_id: "D123",
+      slack_team_id: "TACME",
+      slack_email: "pending"
+    )
+
+    assert principal.reload.update!(name: "Renamed legacy principal")
+
+    principal.slack_user_id = "U67890"
+    assert_not principal.valid?
+    assert_includes principal.errors[:slack_user_id], "is not a valid Slack user ID"
+
+    principal.slack_user_id = nil
+    assert principal.save!
   end
 
   test "is valid with only a name" do
@@ -45,9 +251,112 @@ class PrincipalTest < ActiveSupport::TestCase
     assert other.valid?
   end
 
-  test "labels defaults to empty hash" do
+  test "labels include sandbox repo-cache projection by default" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-labels"))
-    assert_equal({}, principal.reload.labels)
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.reload.labels)
+  end
+
+  test "sandbox access defaults to enabled" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-sandbox-access"))
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_predicate principal, :sandbox_observability_enabled
+    assert_predicate principal, :sandbox_api_server_enabled
+  end
+
+  test "new principals with no roles receive configured defaults from their namespace" do
+    Role.update_all(assign_by_default: false)
+    [ roles(:acme_infra), roles(:acme_admin_role), roles(:globex_infra) ].each do |role|
+      role.update!(assign_by_default: true)
+    end
+
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "U-default-roles"))
+
+    assert_equal [ roles(:acme_infra), roles(:acme_admin_role) ].sort_by(&:id), principal.roles.order(:id)
+  end
+
+  test "preassigned roles suppress configured defaults" do
+    roles(:acme_infra).update!(assign_by_default: true)
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "U-explicit-role"))
+    principal.roles = [ roles(:acme_admin_role) ]
+
+    principal.save!
+
+    assert_equal [ roles(:acme_admin_role) ], principal.reload.roles
+  end
+
+  test "configured defaults are not applied to existing roleless principals" do
+    principal = principals(:acme_user_bob)
+    principal.principal_roles.destroy_all
+    roles(:acme_infra).update!(assign_by_default: true)
+
+    principal.update!(name: "Still roleless")
+
+    assert_empty principal.reload.roles
+  end
+
+  test "default sandbox repo-cache overwrites explicit label assignment" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-explicit-repo-cache-label"))
+
+    principal.apply_default_sandbox_capabilities!
+    principal.assign_attributes(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" })
+    principal.save!
+
+    assert_equal "all", principal.reload.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache stores canonical enum value" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-setting"))
+
+    principal.update!(sandbox_repo_cache: "public")
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+  end
+
+  test "sandbox repo-cache enum survives labels assigned in the same update" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-label-order"))
+
+    principal.update!(sandbox_repo_cache: "public", labels: { "team" => "platform" })
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal "platform", principal.labels["team"]
+    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+  end
+
+  test "sandbox repo-cache overwrites label with canonical value" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-label"))
+
+    principal.update!(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "public" })
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache param takes precedence over conflicting label" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-param-wins"))
+
+    principal.update!(
+      sandbox_repo_cache: "public",
+      labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" }
+    )
+    principal.reload
+
+    assert_equal "public", principal.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "public" }, principal.labels)
+  end
+
+  test "sandbox repo-cache rejects invalid enum values" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-invalid"))
+    principal.sandbox_repo_cache = "pub"
+
+    assert_not principal.valid?
+    assert_includes principal.errors[:sandbox_repo_cache], "is not included in the list"
   end
 
   test "labels accepts arbitrary string map" do
@@ -56,7 +365,174 @@ class PrincipalTest < ActiveSupport::TestCase
       foreign_id: "C-labels",
       labels: { "env" => "prod", "team" => "platform" }
     ))
-    assert_equal({ "env" => "prod", "team" => "platform" }, principal.reload.labels)
+    assert_equal(
+      {
+        "env" => "prod",
+        "team" => "platform",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
+  end
+
+  test "effective Slack permissions merge direct and role rows deterministically" do
+    principal = principals(:acme_channel)
+    role = roles(:acme_infra)
+    SlackChannelPermission.create!(
+      principal: principal,
+      channel_id: "C0123456789",
+      upload_enabled: true
+    )
+    SlackChannelPermission.create!(
+      role: role,
+      channel_id: "C0123456789",
+      download_enabled: true
+    )
+    SlackChannelPermission.create!(
+      role: role,
+      channel_id: "G9876543210",
+      history_enabled: true
+    )
+
+    assert_equal(
+      [
+        {
+          "channel_id" => "C0123456789",
+          "upload_enabled" => true,
+          "download_enabled" => true,
+          "history_enabled" => false
+        },
+        {
+          "channel_id" => "G9876543210",
+          "upload_enabled" => false,
+          "download_enabled" => false,
+          "history_enabled" => true
+        }
+      ],
+      principal.effective_slack_channel_permissions_payload
+    )
+    channel_ids = principal.slack_channel_ids_by_permission
+    assert_equal [ "C0123456789" ], channel_ids.fetch(:upload)
+    assert_equal [ "C0123456789" ], channel_ids.fetch(:download)
+    assert_equal [ "G9876543210" ], principal.slack_history_channel_ids
+  end
+
+  test "unsaved principals do not load role-owned Slack permissions" do
+    roles(:acme_infra).slack_channel_permissions.create!(
+      channel_id: "G9876543210",
+      history_enabled: true
+    )
+    principal = Principal.new
+    principal.slack_channel_permissions.build(
+      channel_id: "C0123456789",
+      upload_enabled: true
+    )
+
+    assert_equal [ "C0123456789" ],
+                 principal.effective_slack_channel_permissions_payload.pluck("channel_id")
+  end
+
+  test "api server JWT derives all Slack claims from one effective payload" do
+    principal = principals(:acme_channel)
+    calls = 0
+    payload = [
+      {
+        "channel_id" => "C0123456789",
+        "upload_enabled" => true,
+        "download_enabled" => true,
+        "history_enabled" => false
+      }
+    ]
+    original = principal.method(:effective_slack_channel_permissions_payload)
+    principal.define_singleton_method(:effective_slack_channel_permissions_payload) do
+      calls += 1
+      payload
+    end
+
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      assert_not_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+    assert_equal 1, calls
+  ensure
+    principal&.define_singleton_method(:effective_slack_channel_permissions_payload, original) if original
+  end
+
+  test "api server JWT includes inherited role Slack permissions" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      roles(:acme_infra).slack_channel_permissions.create!(
+        channel_id: "C0123456789",
+        upload_enabled: true,
+        history_enabled: true
+      )
+
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal [ "C0123456789" ], claims.dig("slack", "upload_channels")
+      assert_equal [ "C0123456789" ], claims.dig("slack", "history_channels")
+    end
+  end
+
+  test "api server JWT does not infer permissions from Slack channel identity" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      principal.update!(slack_channel_id: "C0123456789")
+
+      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+  end
+
+  test "clearing slack channel permissions revokes slack access" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = Principal.create!(
+        default_attrs(
+          namespace: "acme",
+          foreign_id: "C-clear-slack-permissions"
+        )
+      )
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        upload_enabled: true,
+        download_enabled: true,
+        history_enabled: true
+      )
+      assert_not_nil ApiServer::Jwt.encode_for_principal(principal)
+
+      SlackChannelPermission.replace_for!(principal, [])
+
+      assert_empty principal.slack_channel_permissions.reload
+      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+    end
+  end
+
+  test "api server JWT is deterministic inside the rotation window" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = principals(:acme_channel)
+      SlackChannelPermission.create!(
+        principal: principal,
+        channel_id: "C0123456789",
+        upload_enabled: true
+      )
+
+      window = ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
+      boundary = 1_700_000_100 + ApiServer::Jwt.rotation_offset(principal)
+
+      first = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + 23)
+      )
+      second = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + window - 1)
+      )
+      third = ApiServer::Jwt.encode_for_principal(
+        principal,
+        now: Time.zone.at(boundary + window)
+      )
+
+      assert_equal first, second
+      refute_equal first, third
+    end
   end
 
   test "namespace is immutable after creation" do
@@ -76,13 +552,33 @@ class PrincipalTest < ActiveSupport::TestCase
   test "labels remain mutable after creation" do
     principal = principals(:acme_channel)
     principal.update!(labels: { "changed" => "yes" })
-    assert_equal({ "changed" => "yes" }, principal.reload.labels)
+    assert_equal(
+      {
+        "changed" => "yes",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
   end
 
   test "name is editable after creation" do
     principal = principals(:acme_channel)
     principal.update!(name: "Acme Slack channel")
     assert_equal "Acme Slack channel", principal.reload.name
+  end
+
+  test "identity field changes invalidate the sync config cache" do
+    principal = Principal.create!(default_attrs)
+    previous_version = principal.sync_config_cache_version
+
+    principal.update!(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "a@example.com"
+    )
+
+    assert_equal previous_version + 1, principal.reload.sync_config_cache_version
   end
 
   test "declares prn as its oid prefix" do
@@ -109,129 +605,7 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "unassigned", proxy.status
   end
 
-  # --- effective config / grant resolution --------------------------------
-
-  def principal_with_grants(*grantables)
-    principal = principals(:globex_user)
-    grantables.each do |g|
-      key = Grant::GRANTABLE_ASSOCIATIONS.find { |a| g.is_a?(a.to_s.camelize.constantize) }
-      Grant.create!(principal: principal, key => g, created_by: users(:globex_admin))
-    end
-    principal
-  end
-
-  test "sync_secrets delivers a brokered token inline and omits it until minted" do
-    cred = BrokerCredential.create!(namespace: "default", foreign_id: "sync-#{SecureRandom.hex(4)}",
-                                    token_endpoint: "https://idp.example/token", client_id: "cid",
-                                    created_by: users(:globex_admin), refresh_token: "seed")
-
-    secret = StaticSecret.new(namespace: "default", foreign_id: "brokered-#{SecureRandom.hex(4)}",
-                              inject_config: { "header" => "Authorization" }, created_by: users(:globex_admin))
-    secret.build_source(source_type: "token_broker", config: { "credential_id" => cred.oid })
-    secret.rules.build(host: "api.example.com", position: 0)
-    secret.save!
-
-    principal = principal_with_grants(secret)
-
-    # Bootstrapping (no token yet) -> the secret is omitted from sync entirely.
-    assert_empty principal.sync_secrets
-
-    # Once control mints a token, it is delivered inline like a control_plane value.
-    cred.update!(access_token: "live-token", expires_at: 1.hour.from_now, last_refresh: Time.current)
-    secrets = principal.sync_secrets
-    assert_equal 1, secrets.length
-    assert_equal({ "type" => "control_plane", "value" => "live-token" }, secrets.first["source"])
-
-    # ...and redacted in the operator inspection view (no special-casing needed).
-    assert_equal "[redacted]", principal.effective_config.dig("secrets", 0, "source", "value")
-  end
-
-  test "sync_transforms emits a gcp_auth transform per granted GcpAuthSecret" do
-    transforms = principal_with_grants(gcp_auth_secrets(:acme_bigquery)).sync_transforms
-    assert_equal 1, transforms.length
-    assert_equal "gcp_auth", transforms.first["name"]
-    assert_equal({ "type" => "workload_identity" }, transforms.first.dig("config", "credentials_provider"))
-  end
-
-  test "sync_transforms emits an aws_auth transform per granted AwsAuthSecret" do
-    transforms = principal_with_grants(aws_auth_secrets(:acme_cloudwatch_aws)).sync_transforms
-    aws = transforms.find { |t| t["name"] == "aws_auth" }
-    refute_nil aws
-    assert_equal({ "type" => "env", "var" => "AWS_ACCESS_KEY_ID" }, aws.dig("config", "access_key_id"))
-    assert_equal({ "type" => "env", "var" => "AWS_SECRET_ACCESS_KEY" }, aws.dig("config", "secret_access_key"))
-    assert_equal %w[logs monitoring], aws.dig("config", "allowed_services")
-    assert_equal 1, aws.dig("config", "rules").length
-  end
-
-  test "sync_transforms bundles all granted oauth tokens into one transform" do
-    transforms = principal_with_grants(oauth_token_secrets(:acme_gmail_oauth)).sync_transforms
-    oauth = transforms.find { |t| t["name"] == "oauth_token" }
-    refute_nil oauth
-    tokens = oauth.dig("config", "tokens")
-    assert_equal 1, tokens.length
-    assert_equal "refresh_token", tokens.first["grant"]
-  end
-
-  test "sync_transforms is empty without transform grants" do
-    assert_empty principals(:globex_user).sync_transforms
-  end
-
-  test "sync_postgres emits a DSN entry per granted PgDsnSecret with foreign_id" do
-    entries = principal_with_grants(pg_dsn_secrets(:acme_analytics_pg)).sync_postgres
-    assert_equal 1, entries.length
-    assert_equal pg_dsn_secrets(:acme_analytics_pg).foreign_id, entries.first["foreign_id"]
-    assert_equal({ "type" => "env", "var" => "PG_ANALYTICS_DSN" }, entries.first["dsn"])
-  end
-
-  test "sync_postgres resolves value_from settings against the principal" do
-    principal = principals(:globex_user)
-    principal.update!(labels: { "slack_channel_id" => "C999" })
-    pg = pg_dsn_secrets(:acme_analytics_pg)
-    pg.update!(settings: [
-      {
-        "name" => "centaur.slack_channel_id",
-        "value_from" => { "principal_label" => "slack_channel_id" }
-      },
-      { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } }
-    ])
-    Grant.create!(principal: principal, pg_dsn_secret: pg, created_by: users(:globex_admin))
-
-    entry = principal.sync_postgres.fetch(0)
-    assert_equal(
-      [
-        { "name" => "centaur.slack_channel_id", "value" => "C999" },
-        { "name" => "centaur.principal", "value" => principal.foreign_id }
-      ],
-      entry["settings"]
-    )
-  end
-
-  test "sync_postgres emits only the highest-priority route for each database" do
-    principal = principals(:globex_user)
-    low = pg_dsn_secrets(:acme_analytics_pg)
-    high = PgDsnSecret.new(
-      namespace: low.namespace,
-      foreign_id: "pg-analytics-privileged",
-      name: "analytics privileged",
-      database: low.database,
-      role: "centaur_readonly",
-      created_by: users(:acme_admin)
-    )
-    high.build_dsn_source(source_type: "env", config: { "var" => "PG_PRIVILEGED_DSN" })
-    high.save!
-
-    Grant.create!(principal: principal, pg_dsn_secret: low, created_by: users(:acme_admin), priority: 0)
-    Grant.create!(principal: principal, pg_dsn_secret: high, created_by: users(:acme_admin), priority: 100)
-
-    entries = principal.sync_postgres
-    assert_equal 1, entries.length
-    assert_equal "pg-analytics-privileged", entries.first["foreign_id"]
-    assert_equal "PG_PRIVILEGED_DSN", entries.first.dig("dsn", "var")
-  end
-
-  test "sync_postgres is empty without pg_dsn grants" do
-    assert_empty principals(:globex_user).sync_postgres
-  end
+  # --- grant resolution ---------------------------------------------------
 
   test "granted_static_secrets includes secrets granted via an assigned role" do
     # acme_channel holds the acme_infra role, which is granted acme_prod_api_key.
@@ -284,168 +658,8 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal static_secrets(:acme_prod_api_key).id, ids.last
   end
 
-  # --- cross-type conflict resolution -------------------------------------
-
-  # Builds a static secret injecting `header` on `host`, granted directly to
-  # globex_user (priority 100).
-  def grant_direct_static(host:, header:)
-    secret = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
-                              inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
-                              created_by: users(:globex_admin))
-    secret.build_source(source_type: "control_plane", secret: "direct-token")
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(principal: principals(:globex_user), static_secret: secret, created_by: users(:globex_admin))
-    secret
-  end
-
-  # Builds a gcp_auth secret (writes Authorization) matching `host`, granted to
-  # globex_user through the globex_infra role (priority 0).
-  def grant_role_gcp(host:)
-    PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(role: roles(:globex_infra), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
-  end
-
-  def grant_direct_gcp(host:)
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(principal: principals(:globex_user), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
-  end
-
-  def grant_role_oauth(secret = nil)
-    PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    unless secret
-      secret = OauthTokenSecret.new(
-        namespace: "globex",
-        foreign_id: "oauth-#{SecureRandom.hex(4)}",
-        name: "gmail",
-        grant: "refresh_token",
-        token_endpoint: "https://oauth2.googleapis.com/token",
-        scopes: [ "https://www.googleapis.com/auth/gmail.readonly" ],
-        created_by: users(:globex_admin)
-      )
-      secret.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
-                           role: "refresh_token", role_kind: "credential_field")
-      secret.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
-                           role: "client_id", role_kind: "credential_field")
-      secret.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
-      secret.save!
-    end
-    Grant.create!(role: roles(:globex_infra), oauth_token_secret: secret, created_by: users(:globex_admin))
-    secret
-  end
-
-  test "a direct static secret suppresses a role-granted transform on the same host and header" do
-    grant_direct_static(host: "api.test.com", header: "Authorization")
-    grant_role_gcp(host: "api.test.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_empty principal.sync_transforms, "the lower-priority role gcp_auth should be withheld"
-  end
-
-  test "credentials writing different headers on the same host both serve" do
-    grant_direct_static(host: "api.test.com", header: "X-Api-Key")
-    grant_role_gcp(host: "api.test.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
-  end
-
-  test "credentials writing the same header on different hosts both serve" do
-    grant_direct_static(host: "api.test.com", header: "Authorization")
-    grant_role_gcp(host: "other.test.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
-  end
-
-  test "same-priority credentials writing the same header on the same host both serve" do
-    grant_direct_static(host: "api.test.com", header: "Authorization")
-    grant_direct_gcp(host: "api.test.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
-  end
-
-  test "a wildcard static secret suppresses a role-granted transform on a matching exact host" do
-    grant_direct_static(host: "*.test.com", header: "Authorization")
-    grant_role_gcp(host: "api.test.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_empty principal.sync_transforms, "the lower-priority role gcp_auth should be withheld"
-  end
-
-  test "a wildcard googleapis static secret suppresses oauth token entries on matching exact hosts" do
-    grant_direct_static(host: "*.googleapis.com", header: "Authorization")
-    grant_role_oauth
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_empty principal.sync_transforms, "the lower-priority google oauth_token should be withheld"
-  end
-
-  test "a higher-priority wildcard googleapis static secret suppresses all google auth transforms" do
-    grant_direct_static(host: "*.googleapis.com", header: "Authorization")
-    grant_role_gcp(host: "bigquery.googleapis.com")
-    grant_role_oauth
-    grant_role_gcp(host: "*.googleapis.com")
-    principal = principals(:globex_user)
-
-    assert_equal 1, principal.sync_secrets.length
-    assert_empty principal.sync_transforms, "lower-priority google auth transforms should be withheld"
-  end
-
-  test "equal-priority google auth transforms all serve without a stronger wildcard static secret" do
-    grant_role_gcp(host: "bigquery.googleapis.com")
-    grant_role_oauth
-    grant_role_gcp(host: "*.googleapis.com")
-    principal = principals(:globex_user)
-
-    transforms = principal.sync_transforms
-    assert_equal 2, transforms.count { |t| t["name"] == "gcp_auth" }
-    assert_equal 1, transforms.count { |t| t["name"] == "oauth_token" }
-    assert_equal 1, transforms.find { |t| t["name"] == "oauth_token" }.dig("config", "tokens").length
-  end
-
-  test "a promoted role transform suppresses a lower-priority direct static secret" do
-    grant_direct_static(host: "api.test.com", header: "Authorization")
-    gcp = grant_role_gcp(host: "api.test.com")
-    # Promote the role grant above the direct grant (priority 100): now the
-    # transform wins the conflict and the static secret is withheld.
-    Grant.find_by!(gcp_auth_secret: gcp).update!(priority: 900)
-    principal = principals(:globex_user)
-
-    assert_empty principal.sync_secrets, "the now-lower-priority direct static secret should be withheld"
-    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
-  end
-
-  test "effective_config redacts inline control_plane values by default but not when asked for live secrets" do
-    principal = principals(:acme_channel)
-    SecretSource.create!(source_type: "control_plane", secret: "s3cr3t",
-                         static_secret: static_secrets(:db_password_replace))
-
-    redacted = principal.effective_config.fetch("secrets").find { |s| s.dig("source", "type") == "control_plane" }
-    assert_equal "[redacted]", redacted.dig("source", "value")
-
-    live = principal.effective_config(redact_secrets: false)
-                    .fetch("secrets").find { |s| s.dig("source", "type") == "control_plane" }
-    assert_equal "s3cr3t", live.dig("source", "value")
+  def jwt_payload(token)
+    _header, payload, _signature = token.split(".")
+    JSON.parse(Base64.urlsafe_decode64(payload))
   end
 end

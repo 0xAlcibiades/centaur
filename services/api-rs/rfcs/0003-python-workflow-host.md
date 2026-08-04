@@ -267,13 +267,18 @@ api-rs handles agent turns through `SessionRuntime`.
 
 Rules:
 
-- honor explicit `thread_key`
-- otherwise derive `wf:<task_id>:agent:<step-or-message>`
+- for an unscoped workflow, honor an explicit `thread_key`
+- for an unscoped workflow without one, derive a server-owned task thread
+- for a workflow declaring `WORKFLOW_PRINCIPAL = True`, reject an explicit
+  `thread_key`, derive `wf:<task_id>:agent:<workflow_name>`, and bind the session
+  to the same exact Iron Control principal as the workflow-host sandbox
 - honor explicit `message_id`
 - otherwise derive a deterministic message id from task id and call site
 - pass through `metadata`, `delivery`, `harness`, `persona`, and prompt override
 - wait for terminal session result and return the same result shape existing
   workflows expect
+- honor `include_output_lines: false` for workflows that only need the terminal
+  `result_text`; the default remains `true` for compatibility
 
 ### `ctx.call_tool`
 

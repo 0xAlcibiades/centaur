@@ -34,8 +34,10 @@ These are broadly useful across most deployments and are good candidates to conf
 | `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
 | `gsuite` | Use Gmail, Calendar, Drive, Docs, Sheets, Slides, and Google Analytics | `GOOGLE_TOKEN_JSON` |
 | `websearch` | Free web search via Parallel and deep research | None; `PARALLEL_API_KEY` for `deep_research`; `ANTHROPIC_API_KEY` for search synthesis |
-| `company_context` | Search indexed company history across internal sources | None |
+| `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
+| `grafana` | Query dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Query product analytics, events, pageviews, breakdowns, and user agents | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
+| `amplitude` | Query product analytics — event segmentation, funnels, retention, user activity, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
 | `attio` | Work with CRM objects, records, lists, notes, tasks, calls, and meetings | `ATTIO_API_KEY` |
 | `pylon` | Read and manage support issues, accounts, contacts, teams, tags, and users | `PYLON_API_KEY` |
 
@@ -58,9 +60,11 @@ These are broadly useful across most deployments and are good candidates to conf
 
 | Tool | Use | API key / credential |
 |---|---|---|
+| `centaur-console` | Inspect the current sandbox's redacted permissions and capabilities | None |
 | `chart` | Render charts as PNG images for Slack or reports | None |
 | `demo` | Test tool hot-reload and basic tool plumbing | None |
 | `posthog` | Product analytics through HogQL, events, pageviews, and breakdowns | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
+| `amplitude` | Amplitude event segmentation, funnels, retention, user activity, realtime, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
 | `profslice` | Extract Firefox Profiler data for analysis | None |
 | `reth` | Reth execution timing and performance metrics | None |
 | `reth-log-analyzer` | Parse Reth logs and generate performance graphs | None |
@@ -71,8 +75,8 @@ These are broadly useful across most deployments and are good candidates to conf
 
 | Tool | Use | API key / credential |
 |---|---|---|
-| `airtable` | Bases, schemas, tables, records, views, and URL parsing | `AIRTABLE_API_KEY` |
-| `company_context` | Search indexed company history across internal sources | None |
+| `airtable` | Bases, schemas, tables, views, record reads, record writes, and URL parsing | `AIRTABLE_API_KEY` |
+| `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
 | `composio` | Execute tools from third-party services exposed through Composio | `COMPOSIO_API_KEY` |
 | `figma` | Extract Figma files, nodes, components, styles, and variables | `FIGMA_ACCESS_TOKEN` |
 | `granola` | Search and read Granola notes and transcripts | `GRANOLA_API_KEY` |
@@ -94,7 +98,6 @@ These are broadly useful across most deployments and are good candidates to conf
 | `googlenews` | Google News headlines, topics, and search | None |
 | `harmonic` | Startup discovery, company enrichment, people search, and saved searches | `HARMONIC_API_KEY` |
 | `invest_intake` | Normalize raw investment inputs into context packs | None |
-| `investmemos` | Search and read indexed investment memos | None |
 | `legistorm` | Congressional staff, offices, hearings, town halls, trips, and issue portfolios | `LEGISTORM_API_KEY`; optional: `LEGISTORM_ISSUES_ENDPOINT` |
 | `listennotes` | Podcast and episode search and metadata | `LISTENNOTES_KEY` |
 | `newsapi` | News headlines, article search, and source lists | `NEWSAPI_KEY` |
@@ -134,7 +137,7 @@ These tools ship in the base repo because many Centaur users need onchain or mar
 | `kalshi` | Prediction market events, markets, trades, and candlesticks | None |
 | `karma` | DAO delegate reputation, activity, scores, and governance analytics | None |
 | `messari` | Crypto asset prices, metrics, profiles, markets, news, and timeseries | `MESSARI_API_KEY` |
-| `mpp` | Paid market-data and web-search requests through Machine Payments Protocol | None |
+| `mpp` | Paid MPP requests | None |
 | `nansen` | Wallet labels, smart-money activity, token flows, holders, and PnL | `NANSEN_API_KEY` |
 | `polymarket` | Prediction market events, markets, prices, books, and trades | None |
 | `snapshot` | Offchain governance spaces, proposals, votes, and voting power | `SNAPSHOT_API_KEY` |

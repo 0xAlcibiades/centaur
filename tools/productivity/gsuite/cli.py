@@ -1,12 +1,35 @@
 """CLI for GSuite operations - Gmail, Calendar, Drive."""
 
+import json
 from pathlib import Path
 
 import typer
-from centaur_sdk import Table
 from rich.console import Console
+from rich.table import Table
 
 app = typer.Typer(name="gsuite", help="GSuite CLI for AI agents - Gmail, Calendar, Drive")
+
+
+@app.command("health")
+def health():
+    """Assert gsuite connectivity and auth with a safe read-only check."""
+    from .client import _client
+
+    client = _client()
+    try:
+        details = client.gmail_labels()
+        payload = {"ok": True, "tool": "gsuite", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "gsuite", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
 console = Console()
 
 # Sub-apps for each service
@@ -456,7 +479,17 @@ def calendar_rsvp_cmd(
 def drive_list(
     limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
     folder: str = typer.Option(None, "--folder", "-f", help="Folder ID to list"),
-    query: str = typer.Option(None, "--query", "-q", help="Search by name"),
+    query: str = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Search by name unless --full-text is set",
+    ),
+    full_text: bool = typer.Option(
+        False,
+        "--full-text",
+        help="Search file contents and metadata with Drive fullText contains",
+    ),
     file_type: str = typer.Option(None, "--type", "-t", help="Filter by MIME type"),
 ):
     """List files in Google Drive.
@@ -464,6 +497,7 @@ def drive_list(
     Examples:
         gsuite drive list
         gsuite drive list -q "report"
+        gsuite drive list -q "contract language" --full-text
         gsuite drive list --folder "1234abc" -n 20
         gsuite drive list --type "application/pdf"
     """
@@ -474,6 +508,7 @@ def drive_list(
         folder_id=folder,
         max_results=limit,
         file_type=file_type,
+        full_text=full_text,
     )
 
     if not results:

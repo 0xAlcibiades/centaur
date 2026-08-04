@@ -314,12 +314,19 @@ That recovery API should prefer durable bytes. A live Kubernetes attach pump can
 still exist underneath for low-latency reads, but it should be treated as an
 optimization rather than the durable source of truth.
 
-Input recovery is a higher-level problem. If the API crashes after accepting a
-write but before sending it to the sandbox, or after sending it but before
-persisting that fact, the sandbox layer alone cannot prove whether the workload
-observed the input. A future control-plane data model should persist intended
-input frames before writing them to `SandboxIo.stdin` if it needs retryable input
-delivery.
+Input recovery is a higher-level problem. The control plane persists each exact
+input frame batch in `session_input_deliveries` before writing it to
+`SandboxIo.stdin`. A delivery owner holds its generation, live lease, execution,
+sandbox resource UID, assignment epoch, actor boundary, and database row locks
+through the bounded flush and durable `session.input_flushed` event. Recovery
+replays an unresolved batch byte-for-byte.
+
+This is intentionally at-least-once delivery. If the API crashes after the
+sandbox observes a successful flush but before the database transaction commits,
+recovery cannot distinguish that case from a write that never arrived and sends
+the batch again. Eliminating that possible duplicate requires a receiver-side
+durable inbox and acknowledgement protocol in the harness; one-way stdin cannot
+provide exactly-once observation.
 
 ## Lifecycle State Machine
 

@@ -45,6 +45,8 @@ from api.workflow_engine import WorkflowContext
 
 WORKFLOW_NAME = "nightly_report"
 
+WORKFLOW_PRINCIPAL = True
+
 
 @dataclass
 class Input:
@@ -60,6 +62,25 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         text=f"Write a short report about {data['topic']}",
     )
     return {"channel": inp.channel, "report": result}
+```
+
+`WORKFLOW_PRINCIPAL` is optional. Use it when the workflow host calls tools
+directly with `ctx.call_tool(...)` and should have its own credential boundary.
+The API derives and registers the `workflow-nightly-report` principal from
+`WORKFLOW_NAME` and runs that workflow-host sandbox under it. Workflow code
+cannot choose another principal id, display name, or labels. Grant the required
+tool roles or secrets to the derived principal. `WORKFLOW_PRINCIPAL = True`
+requires `apiRs.workflowHostSandbox=true`, which renders
+`WORKFLOW_HOST_SANDBOX=true`; startup fails if workflow-host sandboxing is
+disabled.
+
+When pre-granting with `centaur-perms`, bind the canonical identity explicitly:
+
+```bash
+cargo run -p centaur-perms -- \
+  principals grant workflow-nightly-report \
+  --workflow-name nightly_report \
+  --tool slack
 ```
 
 ## Durable primitives
@@ -97,9 +118,8 @@ These primitives compose into larger automations:
 Create a run through the API:
 
 ```bash
-curl -s "$CENTAUR_API_URL/workflows/runs" \
+curl -s "$CENTAUR_API_URL/api/workflows/runs" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $WORKFLOW_API_KEY" \
   -d '{
     "workflow_name": "nightly_report",
     "input": {"channel": "ops", "topic": "open incidents"},
@@ -110,8 +130,7 @@ curl -s "$CENTAUR_API_URL/workflows/runs" \
 Inspect it:
 
 ```bash
-curl -s "$CENTAUR_API_URL/workflows/runs/$RUN_ID" \
-  -H "X-Api-Key: $WORKFLOW_API_KEY" | jq
+curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" | jq
 ```
 
 ## Schedule a workflow
@@ -125,7 +144,7 @@ WORKFLOW_NAME = "daily_market_digest"
 
 SCHEDULE = {
     "type": "cron",
-    "cron": "0 9 * * 1-5",
+    "cron": "0 9 * * MON-FRI",
     "timezone": "America/New_York",
     "input": {
         "channel": "markets",
@@ -140,11 +159,20 @@ Cron schedules use five fields:
 minute hour day-of-month month day-of-week
 ```
 
+:::warning[Day-of-week numbering is Quartz-style, not Unix crontab]
+The schedule engine parses cron expressions with the Rust
+[`cron` crate](https://github.com/zslayton/cron), which numbers days of week
+1–7 with **1 = Sunday** (`0` is rejected). A Unix-style `1-5` therefore fires
+Sunday–Thursday, not Monday–Friday. Always write day-of-week as names
+(`MON`, `MON-FRI`, `SAT,SUN`) — they mean the same thing in every dialect.
+:::
+
 Examples:
 
 | Cron | Meaning |
 |------|---------|
-| `0 9 * * 1-5` | 9:00 AM every weekday. |
+| `0 9 * * MON-FRI` | 9:00 AM every weekday. |
+| `0 9 * * 1-5` | 9:00 AM Sunday–Thursday (Quartz numbering — probably not what you meant). |
 | `*/15 * * * *` | Every 15 minutes. |
 | `30 6 * * *` | 6:30 AM every day. |
 | `0 0 1 * *` | Midnight on the first day of every month. |

@@ -1,4 +1,7 @@
-{{- if and .Values.ingress.enabled .Values.slackbotv2.enabled }}
+{{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $remoteMcpEnabled := and .Values.apiRs.enabled $console.enabled .Values.apiRs.mcpPublicUrl -}}
+{{- if and .Values.ingress.enabled (or .Values.slackbotv2.enabled .Values.linearbot.enabled .Values.githubbot.enabled $remoteMcpEnabled) }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -26,6 +29,72 @@ spec:
       {{- end }}
       http:
         paths:
+{{- if $remoteMcpEnabled }}
+          # Remote MCP uses api-rs as the protected resource and Console as
+          # the OAuth authorization server. Keep these paths ahead of the
+          # Slackbot catch-all so one public origin can serve the complete MCP
+          # authorization flow.
+          - path: /.well-known/oauth-protected-resource
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $apiRsName }}
+                port:
+                  number: {{ .Values.apiRs.port }}
+          - path: /.well-known/oauth-authorization-server
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.consoleName" . }}
+                port:
+                  number: {{ $console.service.httpPort }}
+          - path: /.well-known/openid-configuration
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "centaur.consoleName" . }}
+                port:
+                  number: {{ $console.service.httpPort }}
+          - path: /mcp/oauth
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.consoleName" . }}
+                port:
+                  number: {{ $console.service.httpPort }}
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $apiRsName }}
+                port:
+                  number: {{ .Values.apiRs.port }}
+{{- end }}
+{{- if .Values.linearbot.enabled }}
+          # Linear webhook deliveries route to the linearbot; everything else
+          # stays with slackbotv2 (the catch-all below). Funnel-style
+          # defaultBackend ingresses cannot route both — use httpRoutes or a
+          # second ingress there.
+          - path: /api/webhooks/linear
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "linearbot") }}
+                port:
+                  number: 3001
+{{- end }}
+{{- if .Values.githubbot.enabled }}
+          # GitHub webhook deliveries (issue/PR comments + review requests) route
+          # to the githubbot.
+          - path: /api/webhooks/github
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "githubbot") }}
+                port:
+                  number: 3001
+{{- end }}
+{{- if .Values.slackbotv2.enabled }}
           - path: /
             pathType: Prefix
             backend:
@@ -33,6 +102,7 @@ spec:
                 name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2") }}
                 port:
                   number: 3001
+{{- end }}
   {{- end }}
   {{- with .Values.ingress.tls }}
   tls:

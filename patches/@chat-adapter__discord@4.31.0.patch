@@ -3,7 +3,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -20,8 +20,8 @@ import { ButtonStyle, APIEmbed, ChannelType, APIMessage, InteractionType } from
-
+ 
  declare class DiscordFormatConverter extends BaseFormatConverter {
      /**
 -     * Convert @mentions to Discord format in plain text.

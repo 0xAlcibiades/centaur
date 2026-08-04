@@ -17,11 +17,17 @@ pub enum ApiError {
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
     MethodNotAllowed(String),
     #[error("{0}")]
     PayloadTooLarge(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Locked(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// Server-side misconfiguration or invariant failure. The message is
@@ -49,11 +55,19 @@ impl IntoResponse for ApiError {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Locked(_) => StatusCode::LOCKED,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
+            Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                | SessionRuntimeError::SandboxAssignmentChanged,
+            ) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND
             }
@@ -61,6 +75,9 @@ impl IntoResponse for ApiError {
                 ..
             })) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PersonaConflict {
+                ..
+            })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrincipalConflict {
                 ..
             })) => StatusCode::CONFLICT,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
@@ -102,6 +119,16 @@ impl IntoResponse for ApiError {
             body["existing_harness"] = json!(existing);
             body["requested_harness"] = json!(requested);
         }
+        if matches!(
+            &self,
+            Self::Runtime(
+                SessionRuntimeError::MetadataTraceBoundaryChanged
+                    | SessionRuntimeError::SandboxAssignmentChanged
+            )
+        ) {
+            body["code"] = json!("input_delivery_conflict");
+            body["retryable"] = json!(true);
+        }
         (status, Json(body)).into_response()
     }
 }
@@ -120,4 +147,34 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn principal_conflict_returns_http_conflict() {
+        let response = ApiError::Runtime(SessionRuntimeError::Store(
+            SessionStoreError::PrincipalConflict {
+                thread_key: "workflow:test".to_owned(),
+                existing: Some("prn_existing".to_owned()),
+                requested: Some("prn_requested".to_owned()),
+            },
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn delivery_fence_races_are_retryable_conflicts() {
+        for error in [
+            SessionRuntimeError::MetadataTraceBoundaryChanged,
+            SessionRuntimeError::SandboxAssignmentChanged,
+        ] {
+            let response = ApiError::Runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+    }
 }

@@ -3,20 +3,31 @@ set -euo pipefail
 
 NAMESPACE="centaur"
 FORCE=0
+# Keep the standalone script compatible with existing environment-backed
+# deployments. Callers that also render the chart should pass the chart's
+# ironProxy.secretSource explicitly.
+SECRET_SOURCE="env"
+SOURCE_AUTH_SECRET_NAME="centaur-iron-proxy-source-auth"
+SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY="OP_SERVICE_ACCOUNT_TOKEN"
+SOURCE_AUTH_CONNECT_TOKEN_KEY="OP_CONNECT_TOKEN"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/bootstrap-k8s-secrets.sh [--namespace NAMESPACE] [--force]
+Usage: scripts/bootstrap-k8s-secrets.sh [--namespace NAMESPACE] [--force] [--secret-source SOURCE]
 
 Creates the required local-dev Kubernetes infra Secrets consumed by the Helm chart.
-Requires OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN,
-SLACK_SIGNING_SECRET, and SLACKBOT_API_KEY in the shell environment.
+When creating centaur-infra-env from scratch or with --force, requires OP_VAULT,
+SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, and SLACKBOT_API_KEY. It also requires
+OP_SERVICE_ACCOUNT_TOKEN for env/onepassword sources or OP_CONNECT_TOKEN for
+onepassword-connect. Existing Secrets are only topped up with newly generated
+optional keys when absent.
 
-Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
+Optional 1Password Connect bootstrap (when ironProxy.secretSource is
 set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
                                creates Secret centaur-onepassword-connect-credentials
-  OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
+  OP_CONNECT_TOKEN             Connect API token; stored only in the dedicated
+                               proxy source-auth Secret for Connect mode
 
 Optional local-dev admin key:
   LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
@@ -29,10 +40,45 @@ Optional Lean tool credentials:
   LMNR_BASE_URL
 
 Optional repo-cache GitHub token:
-  GITHUB_TOKEN                 added to centaur-infra-env when present; the
-                               repo-cache DaemonSet reads it (repoCache.githubToken
-                               -> existingSecretName) to clone tool/overlay repos.
-                               Updated on every run when set, so it rotates.
+  GITHUB_TOKEN                 added to centaur-infra-env only when
+                               --secret-source=env. For 1Password sources,
+                               configure repoCache.githubToken.existingSecretName
+                               (or toolServer.githubToken.existingSecretName for
+                               direct clones) with a dedicated Kubernetes Secret.
+
+Secret source:
+  --secret-source SOURCE       env, onepassword, or onepassword-connect.
+                               Defaults to env for backward compatibility.
+  --source-auth-secret-name NAME
+                               dedicated Secret for the non-env proxy source
+                               credential (default centaur-iron-proxy-source-auth)
+  --source-auth-service-account-token-key KEY
+                               key to write for onepassword (default
+                               OP_SERVICE_ACCOUNT_TOKEN)
+  --source-auth-connect-token-key KEY
+                               key to write for onepassword-connect (default
+                               OP_CONNECT_TOKEN)
+
+Optional Linear bot bootstrap (consumed when linearbot.enabled=true):
+  LINEAR_ACCESS_TOKEN          actor=app OAuth token from the Linear agent
+                               install; required together with the webhook
+                               secret (partial config fails fast)
+  LINEARBOT_WEBHOOK_SECRET     signing secret from the linearbot webhook's
+                               settings page (distinct from the linear_webhook
+                               workflow's LINEAR_WEBHOOK_SECRET — separate
+                               Linear webhook, separate secret)
+  LINEARBOT_API_KEY            bearer the bot sends to api-rs; auto-generated
+                               when absent
+
+Optional GitHub ingress bootstrap (consumed when githubbot.enabled=true):
+  GITHUBBOT_TOKEN              personal access token for the bot's GitHub
+                               teammate account; required together with the
+                               webhook secret (partial config fails fast). Kept
+                               distinct from GITHUB_TOKEN (the repo-cache /
+                               sandbox tool token) so the bot acts as its own user.
+  GITHUBBOT_WEBHOOK_SECRET     signing secret from the GitHub repo/org webhook
+  GITHUBBOT_API_KEY            bearer the bot sends to api-rs; auto-generated
+                               when absent
 
 Optional Discord ingress bootstrap (consumed when discordbot.enabled=true):
   DISCORD_BOT_TOKEN            when set, seeds the discordbot keys; requires
@@ -45,7 +91,18 @@ Optional Discord ingress bootstrap (consumed when discordbot.enabled=true):
   DISCORDBOT_API_KEY           bearer the bot sends to api-rs; auto-generated
                                once when absent (never rotated in place)
 
-Optional iron-control bootstrap (consumed when ironControl.enabled=true):
+Optional Teams ingress bootstrap (consumed when teamsbot.enabled=true):
+  TEAMS_BOT_APP_ID             when set, seeds the teamsbot keys; requires
+                               TEAMS_BOT_APP_PASSWORD and
+                               TEAMS_BOT_APP_TENANT_ID (the script fails fast
+                               if either is missing). TEAMS_BOT_* values are
+                               overwritten on every run so they rotate.
+  TEAMS_BOT_APP_PASSWORD       Bot Framework app client secret
+  TEAMS_BOT_APP_TENANT_ID      Microsoft Entra tenant id for the Teams app
+  TEAMSBOT_API_KEY             bearer the bot sends to api-rs; auto-generated
+                               once when absent (never rotated in place)
+
+Console bootstrap:
   IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
                                bundled Postgres server with no database path, so
                                Rails resolves db names from its database.yml)
@@ -66,6 +123,22 @@ while [[ $# -gt 0 ]]; do
       FORCE=1
       shift
       ;;
+    --secret-source)
+      SECRET_SOURCE="${2:?--secret-source requires a value}"
+      shift 2
+      ;;
+    --source-auth-secret-name)
+      SOURCE_AUTH_SECRET_NAME="${2:?--source-auth-secret-name requires a value}"
+      shift 2
+      ;;
+    --source-auth-service-account-token-key)
+      SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY="${2:?--source-auth-service-account-token-key requires a value}"
+      shift 2
+      ;;
+    --source-auth-connect-token-key)
+      SOURCE_AUTH_CONNECT_TOKEN_KEY="${2:?--source-auth-connect-token-key requires a value}"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -77,6 +150,33 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$SECRET_SOURCE" in
+  env|onepassword|onepassword-connect) ;;
+  *)
+    echo "FATAL: --secret-source must be env, onepassword, or onepassword-connect (got: $SECRET_SOURCE)" >&2
+    exit 2
+    ;;
+esac
+
+for setting in \
+  SOURCE_AUTH_SECRET_NAME \
+  SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY \
+  SOURCE_AUTH_CONNECT_TOKEN_KEY; do
+  if [[ -z "${!setting}" ]]; then
+    echo "FATAL: $setting must not be empty" >&2
+    exit 2
+  fi
+done
+
+if [[ "$SECRET_SOURCE" != "env" ]]; then
+  case "$SOURCE_AUTH_SECRET_NAME" in
+    centaur-infra-env|centaur-firewall-ca|centaur-firewall-ca-key|centaur-onepassword-connect-credentials)
+      echo "FATAL: --source-auth-secret-name collides with another bootstrap Secret: $SOURCE_AUTH_SECRET_NAME" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 require_env() {
   local name="$1"
@@ -108,13 +208,76 @@ rand_hex() {
   openssl rand -hex 32 | tr -d '\n'
 }
 
+source_auth_token_env_name() {
+  case "$SECRET_SOURCE" in
+    onepassword) printf '%s\n' OP_SERVICE_ACCOUNT_TOKEN ;;
+    onepassword-connect) printf '%s\n' OP_CONNECT_TOKEN ;;
+    env) return 1 ;;
+  esac
+}
+
+source_auth_secret_key() {
+  case "$SECRET_SOURCE" in
+    onepassword) printf '%s\n' "$SOURCE_AUTH_SERVICE_ACCOUNT_TOKEN_KEY" ;;
+    onepassword-connect) printf '%s\n' "$SOURCE_AUTH_CONNECT_TOKEN_KEY" ;;
+    env) return 1 ;;
+  esac
+}
+
+# Render a one-key Secret through stdin so the source credential is never
+# included in a process argument or a command log. Patch an existing Secret's
+# `data` map rather than replacing it, so a bootstrap run cannot delete another
+# operator-managed key.
+apply_source_auth_secret() (
+  set -euo pipefail
+  local token_env_name token_key token_file
+  token_env_name="$(source_auth_token_env_name)"
+  token_key="$(source_auth_secret_key)"
+  require_env "$token_env_name"
+  umask 077
+  token_file="$(mktemp)"
+  trap 'rm -f "$token_file"' EXIT
+  printf '%s' "${!token_env_name}" > "$token_file"
+  if secret_exists "$SOURCE_AUTH_SECRET_NAME"; then
+    kubectl -n "$NAMESPACE" create secret generic "$SOURCE_AUTH_SECRET_NAME" \
+      --from-file="$token_key=$token_file" \
+      --dry-run=client -o yaml | \
+      awk '
+        /^data:$/ { found = 1; copy = 1 }
+        copy && /^[^[:space:]]/ && $0 != "data:" { copy = 0 }
+        copy { print }
+        END { if (!found) exit 1 }
+      ' | \
+      kubectl -n "$NAMESPACE" patch secret "$SOURCE_AUTH_SECRET_NAME" \
+        --type merge --patch-file /dev/stdin >/dev/null
+  else
+    kubectl -n "$NAMESPACE" create secret generic "$SOURCE_AUTH_SECRET_NAME" \
+      --from-file="$token_key=$token_file" >/dev/null
+  fi
+)
+
 require_cmd kubectl
 require_cmd openssl
-require_env OP_SERVICE_ACCOUNT_TOKEN
-require_env OP_VAULT
-require_env SLACK_BOT_TOKEN
-require_env SLACK_SIGNING_SECRET
-require_env SLACKBOT_API_KEY
+
+if [[ "$SECRET_SOURCE" != "env" && -n "${GITHUB_TOKEN:-}" ]]; then
+  echo "Not writing GITHUB_TOKEN to centaur-infra-env for --secret-source=$SECRET_SOURCE; configure the dedicated repo-cache or direct-clone token Secret instead." >&2
+fi
+
+# Linear config is optional but must be complete: a token without the webhook
+# secret (or vice versa) deploys a linearbot that boots and then rejects every
+# delivery, which reads as silence.
+if [[ -n "${LINEAR_ACCESS_TOKEN:-}" || -n "${LINEARBOT_WEBHOOK_SECRET:-}" ]]; then
+  require_env LINEAR_ACCESS_TOKEN
+  require_env LINEARBOT_WEBHOOK_SECRET
+fi
+
+# GitHub bot config is optional but must be complete: a PAT without the webhook
+# secret (or vice versa) deploys a githubbot that boots and then rejects every
+# delivery, which reads as silence.
+if [[ -n "${GITHUBBOT_TOKEN:-}" || -n "${GITHUBBOT_WEBHOOK_SECRET:-}" ]]; then
+  require_env GITHUBBOT_TOKEN
+  require_env GITHUBBOT_WEBHOOK_SECRET
+fi
 
 # Discord keys are optional as a group, but partial configuration would silently
 # seed empty values and crashloop the bot at deploy time instead of failing here.
@@ -123,12 +286,42 @@ if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
   require_env DISCORD_APPLICATION_ID
 fi
 
+# Teams keys are optional as a group, but partial configuration would silently
+# seed empty values and crashloop the bot at deploy time instead of failing here.
+if [[ -n "${TEAMS_BOT_APP_ID:-}${TEAMS_BOT_APP_PASSWORD:-}${TEAMS_BOT_APP_TENANT_ID:-}" ]]; then
+  require_env TEAMS_BOT_APP_ID
+  require_env TEAMS_BOT_APP_PASSWORD
+  require_env TEAMS_BOT_APP_TENANT_ID
+fi
+
+if [[ "$SECRET_SOURCE" != "env" ]]; then
+  require_env "$(source_auth_token_env_name)"
+fi
+
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+if [[ "$SECRET_SOURCE" != "env" ]]; then
+  delete_if_forced "$SOURCE_AUTH_SECRET_NAME"
+  apply_source_auth_secret
+  echo "Applied dedicated proxy source-auth Secret $SOURCE_AUTH_SECRET_NAME in namespace $NAMESPACE"
+fi
 
 delete_if_forced centaur-infra-env
 delete_if_forced centaur-firewall-ca
 delete_if_forced centaur-firewall-ca-key
 delete_if_forced centaur-onepassword-connect-credentials
+
+if ! secret_exists centaur-infra-env; then
+  require_env OP_VAULT
+  require_env SLACK_BOT_TOKEN
+  require_env SLACK_SIGNING_SECRET
+  require_env SLACKBOT_API_KEY
+  if [[ "$SECRET_SOURCE" == "onepassword-connect" ]]; then
+    require_env OP_CONNECT_TOKEN
+  else
+    require_env OP_SERVICE_ACCOUNT_TOKEN
+  fi
+fi
 
 secret_key_present() {
   local key="$1"
@@ -138,16 +331,26 @@ secret_key_present() {
   [[ -n "$value" ]]
 }
 
+remove_static_broker_key_if_present() {
+  local key="$1"
+  if secret_key_present "$key"; then
+    kubectl -n "$NAMESPACE" patch secret centaur-infra-env \
+      --type json \
+      --patch "[{\"op\":\"remove\",\"path\":\"/data/$key\"}]" >/dev/null
+    echo "Removed legacy $key from Secret centaur-infra-env"
+  fi
+}
+
+if secret_exists centaur-infra-env && [[ "$SECRET_SOURCE" != "env" ]]; then
+  remove_static_broker_key_if_present OP_SERVICE_ACCOUNT_TOKEN
+  remove_static_broker_key_if_present OP_CONNECT_TOKEN
+  remove_static_broker_key_if_present GITHUB_TOKEN
+fi
+
 if secret_exists centaur-infra-env; then
   patch_data=()
-  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+  if [[ "$SECRET_SOURCE" == "env" && -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
-  fi
-  # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
-  # support landed. Only generated when absent so we don't rotate it out from
-  # under cached iron-proxy access tokens on every script run.
-  if ! secret_key_present IRON_BROKER_TOKEN; then
-    patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
   fi
   if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
     patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
@@ -157,9 +360,10 @@ if secret_exists centaur-infra-env; then
       patch_data+=("\"$name\":\"$(printf '%s' "${!name}" | base64 | tr -d '\n')\"")
     fi
   done
-  # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
-  # rotated; harmless when repoCache is disabled.
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  # Environment-backed proxy deployments resolve the GitHub credential from the
+  # static Secret. 1Password modes must keep it in a dedicated repo-cache or
+  # direct-clone Secret instead of broadening the static proxy environment.
+  if [[ "$SECRET_SOURCE" == "env" && -n "${GITHUB_TOKEN:-}" ]]; then
     patch_data+=("\"GITHUB_TOKEN\":\"$(printf '%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')\"")
   fi
   # Discord ingress (discordbot) keys: added when DISCORD_BOT_TOKEN is in the env. DISCORD_* are
@@ -170,6 +374,17 @@ if secret_exists centaur-infra-env; then
     patch_data+=("\"DISCORD_APPLICATION_ID\":\"$(printf '%s' "$DISCORD_APPLICATION_ID" | base64 | tr -d '\n')\"")
     if ! secret_key_present DISCORDBOT_API_KEY; then
       patch_data+=("\"DISCORDBOT_API_KEY\":\"$(printf '%s' "${DISCORDBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
+  fi
+  # Teams ingress (teamsbot) keys: added when TEAMS_BOT_APP_ID is in the env.
+  # TEAMS_BOT_* are overwritten on each run; TEAMSBOT_API_KEY is generated once
+  # if absent.
+  if [[ -n "${TEAMS_BOT_APP_ID:-}" ]]; then
+    patch_data+=("\"TEAMS_BOT_APP_ID\":\"$(printf '%s' "$TEAMS_BOT_APP_ID" | base64 | tr -d '\n')\"")
+    patch_data+=("\"TEAMS_BOT_APP_PASSWORD\":\"$(printf '%s' "$TEAMS_BOT_APP_PASSWORD" | base64 | tr -d '\n')\"")
+    patch_data+=("\"TEAMS_BOT_APP_TENANT_ID\":\"$(printf '%s' "$TEAMS_BOT_APP_TENANT_ID" | base64 | tr -d '\n')\"")
+    if ! secret_key_present TEAMSBOT_API_KEY; then
+      patch_data+=("\"TEAMSBOT_API_KEY\":\"$(printf '%s' "${TEAMSBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
     fi
   fi
   # iron-control keys: top up only when absent so we never rotate them out from
@@ -210,6 +425,31 @@ if secret_exists centaur-infra-env; then
   if ! secret_key_present IRON_CONTROL_SECRET_KEY_BASE; then
     patch_data+=("\"IRON_CONTROL_SECRET_KEY_BASE\":\"$(printf '%s%s' "$(rand_hex)" "$(rand_hex)" | base64 | tr -d '\n')\"")
   fi
+  if ! secret_key_present CENTAUR_JWT_SIGNING_SECRET; then
+    patch_data+=("\"CENTAUR_JWT_SIGNING_SECRET\":\"$(printf '%s%s' "$(rand_hex)" "$(rand_hex)" | base64 | tr -d '\n')\"")
+  fi
+  # Linear bot credentials. Set whenever present so the OAuth token can be
+  # rotated; the api-rs bearer is generated once and kept stable.
+  if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
+    patch_data+=("\"LINEAR_ACCESS_TOKEN\":\"$(printf '%s' "$LINEAR_ACCESS_TOKEN" | base64 | tr -d '\n')\"")
+    patch_data+=("\"LINEARBOT_WEBHOOK_SECRET\":\"$(printf '%s' "$LINEARBOT_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
+    if [[ -n "${LINEARBOT_API_KEY:-}" ]]; then
+      patch_data+=("\"LINEARBOT_API_KEY\":\"$(printf '%s' "$LINEARBOT_API_KEY" | base64 | tr -d '\n')\"")
+    elif ! secret_key_present LINEARBOT_API_KEY; then
+      patch_data+=("\"LINEARBOT_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+    fi
+  fi
+  # GitHub bot credentials. The PAT + webhook secret are set whenever present so
+  # they can be rotated; the api-rs bearer is generated once and kept stable.
+  if [[ -n "${GITHUBBOT_TOKEN:-}" ]]; then
+    patch_data+=("\"GITHUBBOT_TOKEN\":\"$(printf '%s' "$GITHUBBOT_TOKEN" | base64 | tr -d '\n')\"")
+    patch_data+=("\"GITHUBBOT_WEBHOOK_SECRET\":\"$(printf '%s' "$GITHUBBOT_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
+    if [[ -n "${GITHUBBOT_API_KEY:-}" ]]; then
+      patch_data+=("\"GITHUBBOT_API_KEY\":\"$(printf '%s' "$GITHUBBOT_API_KEY" | base64 | tr -d '\n')\"")
+    elif ! secret_key_present GITHUBBOT_API_KEY; then
+      patch_data+=("\"GITHUBBOT_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+    fi
+  fi
   if [[ "${#patch_data[@]}" -gt 0 ]]; then
     patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
@@ -228,9 +468,7 @@ else
   secret_args=(
     -n "$NAMESPACE" create secret generic centaur-infra-env
     --from-literal=IRON_MANAGEMENT_API_KEY="$(rand_hex)"
-    --from-literal=IRON_BROKER_TOKEN="$(rand_hex)"
     --from-literal=SANDBOX_SIGNING_KEY="$(rand_hex)"
-    --from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
     --from-literal=OP_VAULT="$OP_VAULT"
     --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"
     --from-literal=SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET"
@@ -245,7 +483,11 @@ else
     --from-literal=IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY="$(rand_hex)"
     --from-literal=IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT="$(rand_hex)"
     --from-literal=IRON_CONTROL_SECRET_KEY_BASE="$(rand_hex)$(rand_hex)"
+    --from-literal=CENTAUR_JWT_SIGNING_SECRET="$(rand_hex)$(rand_hex)"
   )
+  if [[ "$SECRET_SOURCE" == "env" ]]; then
+    secret_args+=(--from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN")
+  fi
   if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
     secret_args+=(
       --from-literal=DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN"
@@ -254,7 +496,15 @@ else
       --from-literal=DISCORDBOT_API_KEY="${DISCORDBOT_API_KEY:-$(rand_hex)}"
     )
   fi
-  if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
+  if [[ -n "${TEAMS_BOT_APP_ID:-}" ]]; then
+    secret_args+=(
+      --from-literal=TEAMS_BOT_APP_ID="$TEAMS_BOT_APP_ID"
+      --from-literal=TEAMS_BOT_APP_PASSWORD="$TEAMS_BOT_APP_PASSWORD"
+      --from-literal=TEAMS_BOT_APP_TENANT_ID="$TEAMS_BOT_APP_TENANT_ID"
+      --from-literal=TEAMSBOT_API_KEY="${TEAMSBOT_API_KEY:-$(rand_hex)}"
+    )
+  fi
+  if [[ "$SECRET_SOURCE" == "env" && -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
   fi
   if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
@@ -265,8 +515,18 @@ else
       secret_args+=(--from-literal="$name=${!name}")
     fi
   done
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  if [[ "$SECRET_SOURCE" == "env" && -n "${GITHUB_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")
+  fi
+  if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=LINEAR_ACCESS_TOKEN="$LINEAR_ACCESS_TOKEN")
+    secret_args+=(--from-literal=LINEARBOT_WEBHOOK_SECRET="$LINEARBOT_WEBHOOK_SECRET")
+    secret_args+=(--from-literal=LINEARBOT_API_KEY="${LINEARBOT_API_KEY:-$(rand_hex)}")
+  fi
+  if [[ -n "${GITHUBBOT_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=GITHUBBOT_TOKEN="$GITHUBBOT_TOKEN")
+    secret_args+=(--from-literal=GITHUBBOT_WEBHOOK_SECRET="$GITHUBBOT_WEBHOOK_SECRET")
+    secret_args+=(--from-literal=GITHUBBOT_API_KEY="${GITHUBBOT_API_KEY:-$(rand_hex)}")
   fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"

@@ -29,6 +29,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_true() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Secret sources
 // ---------------------------------------------------------------------------
@@ -222,6 +226,44 @@ pub struct GcpAuthSecretInput {
 }
 
 // ---------------------------------------------------------------------------
+// GCP ID token secrets
+// ---------------------------------------------------------------------------
+
+/// Headers supported by iron-proxy's ``gcp_id_token`` transform.
+pub const GCP_ID_TOKEN_ALLOWED_HEADERS: &[&str] = &["authorization", "x-serverless-authorization"];
+
+/// Return the canonical lower-case header name when ``value`` is a supported
+/// ``gcp_id_token`` injection header.
+pub fn normalize_gcp_id_token_header(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    GCP_ID_TOKEN_ALLOWED_HEADERS
+        .contains(&normalized.as_str())
+        .then_some(normalized)
+}
+
+/// Request body for ``POST``/``PUT /api/v1/gcp_id_token_secrets``. iron-proxy
+/// mints a Google-signed OIDC ID token for ``audience`` from the service-account
+/// ``keyfile`` and injects it into ``Authorization`` by default, or
+/// ``X-Serverless-Authorization`` when ``header`` is set accordingly.
+// Not `Eq`: holds a `SecretSource` (arbitrary `Value` config).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GcpIdTokenSecretInput {
+    pub namespace: String,
+    pub foreign_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub audience: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub keyfile: SecretSource,
+    pub rules: Vec<RequestRule>,
+}
+
+// ---------------------------------------------------------------------------
 // AWS auth secrets
 // ---------------------------------------------------------------------------
 
@@ -302,6 +344,8 @@ pub struct PgDsnSettingValueFromInput {
     pub principal_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -411,8 +455,7 @@ pub struct BrokerCredentialRecord {
 // Principals and roles
 // ---------------------------------------------------------------------------
 
-/// Request body for ``POST``/``PUT /api/v1/principals`` and ``/roles`` — both
-/// take the same ``namespace``/``foreign_id``/``name``/``labels`` shape.
+/// Request body for ``POST``/``PUT /api/v1/roles``.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IdentityInput {
     pub namespace: String,
@@ -420,6 +463,29 @@ pub struct IdentityInput {
     pub name: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+/// Request body for ``POST``/``PUT /api/v1/principals``.
+///
+/// Principal identity is stored in first-class iron-control fields. Labels are
+/// reserved for extensible metadata and must not carry copies of these values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PrincipalInput {
+    pub namespace: String,
+    pub foreign_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_team_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_email: Option<String>,
 }
 
 /// A principal as returned by iron-control. Unknown fields are ignored, so this
@@ -432,6 +498,19 @@ pub struct Principal {
     pub name: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub sandbox_observability_enabled: bool,
+    #[serde(default = "default_true")]
+    pub sandbox_api_server_enabled: bool,
+}
+
+/// Request body for creating/updating one Slack permission row on a principal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SlackChannelPermissionInput {
+    pub channel_id: String,
+    pub upload_enabled: bool,
+    pub download_enabled: bool,
+    pub history_enabled: bool,
 }
 
 /// A principal's effective config — the same secrets/postgres the principal's
@@ -501,6 +580,7 @@ pub const SECRET_TYPES: &[(&str, &str, &str)] = &[
     ("static", "static_secrets", "ssr_"),
     ("oauth_token", "oauth_token_secrets", "ots_"),
     ("gcp_auth", "gcp_auth_secrets", "gas_"),
+    ("gcp_id_token", "gcp_id_token_secrets", "gid_"),
     ("pg_dsn", "pg_dsn_secrets", "pgs_"),
     ("hmac", "hmac_secrets", "hms_"),
     ("aws_auth", "aws_auth_secrets", "aas_"),
@@ -522,6 +602,7 @@ pub enum Grantee {
 pub enum GrantSecret {
     Static(String),
     GcpAuth(String),
+    GcpIdToken(String),
     OAuthToken(String),
     PgDsn(String),
     Hmac(String),
@@ -534,6 +615,7 @@ impl GrantSecret {
         match self {
             Self::Static(id)
             | Self::GcpAuth(id)
+            | Self::GcpIdToken(id)
             | Self::OAuthToken(id)
             | Self::PgDsn(id)
             | Self::Hmac(id)
@@ -552,6 +634,7 @@ impl GrantSecret {
             "static" => Self::Static(id),
             "oauth_token" => Self::OAuthToken(id),
             "gcp_auth" => Self::GcpAuth(id),
+            "gcp_id_token" => Self::GcpIdToken(id),
             "pg_dsn" => Self::PgDsn(id),
             "hmac" => Self::Hmac(id),
             "aws_auth" => Self::AwsAuth(id),
@@ -577,6 +660,8 @@ pub struct Grant {
     #[serde(default)]
     pub gcp_auth_secret_id: Option<String>,
     #[serde(default)]
+    pub gcp_id_token_secret_id: Option<String>,
+    #[serde(default)]
     pub pg_dsn_secret_id: Option<String>,
     #[serde(default)]
     pub hmac_secret_id: Option<String>,
@@ -591,6 +676,7 @@ impl Grant {
             .as_deref()
             .or(self.oauth_token_secret_id.as_deref())
             .or(self.gcp_auth_secret_id.as_deref())
+            .or(self.gcp_id_token_secret_id.as_deref())
             .or(self.pg_dsn_secret_id.as_deref())
             .or(self.hmac_secret_id.as_deref())
             .or(self.aws_auth_secret_id.as_deref())
@@ -606,6 +692,8 @@ impl Grant {
             Some(("oauth_token", "oauth_token_secrets", id))
         } else if let Some(id) = &self.gcp_auth_secret_id {
             Some(("gcp_auth", "gcp_auth_secrets", id))
+        } else if let Some(id) = &self.gcp_id_token_secret_id {
+            Some(("gcp_id_token", "gcp_id_token_secrets", id))
         } else if let Some(id) = &self.pg_dsn_secret_id {
             Some(("pg_dsn", "pg_dsn_secrets", id))
         } else if let Some(id) = &self.hmac_secret_id {
@@ -627,6 +715,8 @@ impl Grant {
 pub struct ProxyInput {
     pub name: String,
     pub principal_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A registered proxy. ``token`` (the plaintext ``iprx_`` bearer) is only
@@ -637,5 +727,42 @@ pub struct Proxy {
     pub name: String,
     pub principal_id: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub config_hash: Option<String>,
+    #[serde(default)]
     pub token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SlackChannelPermissionInput, normalize_gcp_id_token_header};
+
+    #[test]
+    fn normalizes_supported_gcp_id_token_headers() {
+        assert_eq!(
+            normalize_gcp_id_token_header("Authorization").as_deref(),
+            Some("authorization")
+        );
+        assert_eq!(
+            normalize_gcp_id_token_header(" X-Serverless-Authorization ").as_deref(),
+            Some("x-serverless-authorization")
+        );
+        assert_eq!(normalize_gcp_id_token_header("x-other"), None);
+    }
+
+    #[test]
+    fn slack_channel_permission_serializes_false_values() {
+        let value = serde_json::to_value(SlackChannelPermissionInput {
+            channel_id: "C0123456789".to_owned(),
+            upload_enabled: false,
+            download_enabled: true,
+            history_enabled: false,
+        })
+        .unwrap();
+
+        assert_eq!(value["upload_enabled"], false);
+        assert_eq!(value["download_enabled"], true);
+        assert_eq!(value["history_enabled"], false);
+    }
 }

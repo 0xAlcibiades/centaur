@@ -201,7 +201,7 @@ else:
 # config default stands) rather than written.
 effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
 if effort:
-    valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
     if effort not in valid:
         print(
             f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
@@ -277,6 +277,145 @@ else
     exit 1
 fi
 
+# A consented metadata-trace sidecar writes its loopback-only OTLP capability
+# here. The agent mount is read-only and this bounded wait deliberately keeps
+# Codex available when the sidecar is absent or unhealthy.
+configure_codex_metadata_trace() {
+    local address_file="${CENTAUR_CODEX_METADATA_TRACE_ADDRESS_FILE:-}"
+    [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "codex" ] || return 0
+
+    # The image may be reused after an earlier deployment injected OTEL state.
+    # Disable every inherited exporter before considering the narrow loopback
+    # capability, so an unavailable trace agent cannot fall back to a broad
+    # collector or export prompts through stale configuration.
+    while IFS='=' read -r name _; do
+        case "$name" in OTEL_*) unset "$name" ;; esac
+    done < <(env)
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
+from pathlib import Path
+import os
+import tomllib
+
+try:
+    import tomli_w
+except ModuleNotFoundError:
+    # The production image installs tomli-w. Keep local/minimal images usable
+    # with the TOML parser as the authority and a conservative writer fallback.
+    import json
+
+    class tomli_w:
+        @staticmethod
+        def dumps(value):
+            def scalar(item):
+                if isinstance(item, bool):
+                    return str(item).lower()
+                if isinstance(item, str):
+                    return json.dumps(item)
+                if isinstance(item, list):
+                    return "[" + ", ".join(scalar(entry) for entry in item) + "]"
+                return str(item)
+
+            lines = []
+            def write_table(table, path=()):
+                for key, item in table.items():
+                    if not isinstance(item, dict):
+                        lines.append(f"{key} = {scalar(item)}")
+                for key, item in table.items():
+                    if isinstance(item, dict):
+                        heading = ".".join((*path, key))
+                        lines.append(f"[{heading}]")
+                        write_table(item, (*path, key))
+            write_table(value)
+            return "\n".join(lines) + ("\n" if lines else "")
+
+path = Path(os.environ["CODEX_CONFIG_PATH"])
+config = tomllib.loads(path.read_text())
+config.pop("otel", None)
+config["otel"] = {
+    "exporter": "none",
+    "log_user_prompt": False,
+    "metrics_exporter": "none",
+    "trace_exporter": "none",
+}
+path.write_text(tomli_w.dumps(config))
+PYEOF
+    # Metadata-trace mode is the only supported Codex tracing path. This must
+    # remain disabled even when this execution has no consent, otherwise a
+    # baked or inherited exporter can observe prompts during a config rollout.
+    [ "${CENTAUR_SANDBOX_METADATA_TRACE_ENABLED:-false}" = "true" ] || return 0
+    [ -n "$address_file" ] || return 0
+
+    local wait_seconds="${CENTAUR_CODEX_METADATA_TRACE_WAIT_SECONDS:-5}"
+    local deadline=$(( $(date +%s) + wait_seconds ))
+    local endpoint=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -r "$address_file" ]; then
+            endpoint="$(tr -d '\r\n' < "$address_file")"
+            case "$endpoint" in
+                http://127.0.0.1:*|http://[::1]:*) break ;;
+                *) endpoint="" ;;
+            esac
+        fi
+        sleep 0.2
+    done
+    if [ -z "$endpoint" ]; then
+        echo "metadata trace sidecar unavailable; continuing without trace export" >&2
+        return 0
+    fi
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" CODEX_TRACE_ENDPOINT="$endpoint" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+import tomllib
+
+try:
+    import tomli_w
+except ModuleNotFoundError:
+    import json
+
+    class tomli_w:
+        @staticmethod
+        def dumps(value):
+            def scalar(item):
+                if isinstance(item, bool):
+                    return str(item).lower()
+                if isinstance(item, str):
+                    return json.dumps(item)
+                if isinstance(item, list):
+                    return "[" + ", ".join(scalar(entry) for entry in item) + "]"
+                return str(item)
+
+            lines = []
+            def write_table(table, path=()):
+                for key, item in table.items():
+                    if not isinstance(item, dict):
+                        lines.append(f"{key} = {scalar(item)}")
+                for key, item in table.items():
+                    if isinstance(item, dict):
+                        heading = ".".join((*path, key))
+                        lines.append(f"[{heading}]")
+                        write_table(item, (*path, key))
+            write_table(value)
+            return "\n".join(lines) + ("\n" if lines else "")
+
+path = Path(os.environ["CODEX_CONFIG_PATH"])
+# Codex 0.146 configures OTLP/HTTP at the signal endpoint, whereas the
+# capability is deliberately published as its base URL. Normalize both current
+# and already signal-scoped capabilities without a duplicate path.
+endpoint = os.environ["CODEX_TRACE_ENDPOINT"].rstrip("/")
+if not endpoint.endswith("/v1/traces"):
+    endpoint = f"{endpoint}/v1/traces"
+config = tomllib.loads(path.read_text())
+config.pop("otel", None)
+config["otel"] = {
+    "exporter": "none",
+    "log_user_prompt": False,
+    "metrics_exporter": "none",
+    "trace_exporter": {"otlp-http": {"endpoint": endpoint, "protocol": "binary"}},
+}
+path.write_text(tomli_w.dumps(config))
+PYEOF
+}
+
 # ── Claude Code settings ────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.claude"
 if [ -f "$HARNESS_CONFIG_DIR/claude/settings.json" ]; then
@@ -324,8 +463,8 @@ fi
 #   - access_token: Claude Code runs as a Claude.ai Pro or Max subscription
 #     user. We install a dummy ~/.claude/.credentials.json so the CLI emits
 #     OAuth-shaped requests, unset the API-key stub so it does not fall back
-#     to X-Api-Key, and let iron-token-broker mint a real Bearer at request
-#     time via the anthropic-claude brokered_token secret.
+#     to X-Api-Key, and let iron-proxy inject the current Bearer from the
+#     Console-managed anthropic-claude token_broker secret at request time.
 CLAUDE_CODE_AUTH_MODE="${CLAUDE_CODE_AUTH_MODE:-api_key}"
 case "$CLAUDE_CODE_AUTH_MODE" in
     api_key)
@@ -356,6 +495,26 @@ cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
 EOF
 
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
+repair_workspace_origin() {
+    local repo_path="$1"
+    local workspace_dir="$2"
+    local upstream_url
+    local workspace_origin
+
+    upstream_url="$(git -C "$repo_path" config --get remote.origin.url 2>/dev/null || true)"
+    if [ -z "$upstream_url" ]; then
+        echo "AGENT_REPO cache checkout has no origin: $repo_path" >&2
+        return 1
+    fi
+    workspace_origin="$(git -C "$workspace_dir" config --get remote.origin.url 2>/dev/null || true)"
+
+    if [ -z "$workspace_origin" ]; then
+        git -C "$workspace_dir" remote add origin "$upstream_url"
+    else
+        git -C "$workspace_dir" remote set-url origin "$upstream_url"
+    fi
+}
+
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"
 else
@@ -376,8 +535,12 @@ if [ -n "${AGENT_REPO:-}" ]; then
             git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
         fi
 
+        repair_workspace_origin "$REPO_PATH" "$WORKSPACE_DIR"
+
         BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
         git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
+    else
+        repair_workspace_origin "$REPO_PATH" "$WORKSPACE_DIR"
     fi
 else
     mkdir -p "$WORKSPACE_DIR"
@@ -390,34 +553,53 @@ mkdir -p "$HOME_DIR/uploads"
 WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \
     || echo "warning: failed to reload Centaur skills" >&2
 
+# ── Background: refresh repo-cache-backed tools/skills in running sandboxes ───
+case "${CENTAUR_TOOLS_AUTO_RELOAD:-true}" in
+    0|false|False|FALSE|no|No|NO|off|Off|OFF) _centaur_tools_auto_reload=0 ;;
+    *) _centaur_tools_auto_reload=1 ;;
+esac
+if [ "$_centaur_tools_auto_reload" = "1" ] \
+    && [ "${CENTAUR_SANDBOX_REPO_CACHE_ENABLED:-true}" != "false" ] \
+    && [ -n "${TOOL_DIRS:-}" ]; then
+    (
+        WORKSPACE_DIR="$WORKSPACE_DIR" repo-cache-watch \
+            || echo "warning: Centaur tool auto-reload watcher stopped" >&2
+    ) &
+fi
+unset _centaur_tools_auto_reload
+
 # ── Assemble system prompt from bind mounts ──────────────────────────────────
 # Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.
-# Org/persona overlays are mounted alongside the base prompt when present.
+# Prompt overlays from mounted repos are appended when present.
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
-if [ -f "$HOME_DIR/AGENTS_BASE.md" ]; then
-    cp "$HOME_DIR/AGENTS_BASE.md" "$TARGET_PROMPT"
-elif [ -f "$HOME_DIR/AGENTS.md" ]; then
-    cp "$HOME_DIR/AGENTS.md" "$TARGET_PROMPT"
+compose-system-prompt --home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT"
+
+if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
+    cat >> "$TARGET_PROMPT" <<'EOF'
+
+---
+
+[Observability access]
+This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
+EOF
 fi
 
-if [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
-    printf '\n\n---\n\n' >> "$TARGET_PROMPT"
-    cat "$HOME_DIR/AGENTS_OVERLAY.md" >> "$TARGET_PROMPT"
-# Repo-cache-era org prompt: with overlay images gone, point CENTAUR_OVERLAY_DIR
-# at the org repo's clone under the repos mount (e.g. ~/github/<owner>/<repo>)
-# and its SYSTEM_PROMPT.md is appended here, same contract the overlay-bootstrap
-# init container used to fulfil by staging $HOME/AGENTS_OVERLAY.md.
-elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
-    && [ -f "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" ] \
-    && [ -f "$TARGET_PROMPT" ]; then
-    printf '\n\n---\n\n' >> "$TARGET_PROMPT"
-    cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
+if [ "${CENTAUR_SANDBOX_API_SERVER_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
+    cat >> "$TARGET_PROMPT" <<'EOF'
+
+---
+
+[API server access]
+This sandbox does not have Centaur API server access. Do not use workflows or tool options that call the api-rs control plane, such as dispatching background agent sessions or downloading Centaur attachment handles.
+EOF
 fi
 
 # Persona prompt injection is done by the API when it writes AGENTS_BASE.md.
 
 # Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
 cd "$WORKSPACE_DIR"
+
+configure_codex_metadata_trace "$@"
 
 if [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "amp" ] && [ -f "$TARGET_PROMPT" ]; then
     rm -f "$WORKSPACE_DIR/AGENT.md"
