@@ -378,9 +378,9 @@ apiRs:
   workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
-  # Scheduled ETL workflow configuration. The chart renders these into api-rs
-  # env so workflow discovery sees the right schedules, then derives the
-  # workflow-host passthrough list from the same non-secret config.
+  # Scheduled workflow configuration. The chart renders these into api-rs env
+  # so workflow discovery sees the right schedules, then derives the workflow-
+  # host passthrough list from the same non-secret config.
   etl:
     slack:
       enabled: false
@@ -416,6 +416,25 @@ apiRs:
       intervalSeconds: 14400
       maxWindowSeconds: 21600
       batchSize: 50
+  # Classify idle conversation snapshots and optionally post a private daily
+  # Slack digest. Results and retry state are stored in user_experience_scans.
+  userExperienceDigest:
+    enabled: false
+    cron: "0 8 * * *"
+    timezone: America/Los_Angeles
+    model: gpt-5.4-nano
+    classifierVersion: v1
+    openaiBaseUrl: https://api.openai.com/v1
+    slackChannel: ""
+    idleMinutes: 60
+    batchSize: 100
+    maxMessages: 40
+    maxAttempts: 3
+    maxOutputTokens: 500
+    timeoutSeconds: 20
+    concurrency: 5
+    leaseMinutes: 30
+    includeDirectMessages: false
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days

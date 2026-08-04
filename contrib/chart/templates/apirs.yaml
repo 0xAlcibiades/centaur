@@ -98,8 +98,28 @@
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE" "value" (dig "companyContextDocuments" "batchSize" 50 $apiRsEtl))
 -}}
+{{- $apiRsUserExperience := .Values.apiRs.userExperienceDigest | default dict -}}
+{{- $apiRsUserExperienceEnv := list
+  (dict "name" "USER_EXPERIENCE_DIGEST_ENABLED" "value" (dig "enabled" false $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_CRON" "value" (dig "cron" "0 8 * * *" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_TIMEZONE" "value" (dig "timezone" "America/Los_Angeles" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_MODEL" "value" (dig "model" "gpt-5.4-nano" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_CLASSIFIER_VERSION" "value" (dig "classifierVersion" "v1" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_OPENAI_BASE_URL" "value" (dig "openaiBaseUrl" "https://api.openai.com/v1" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_SLACK_CHANNEL" "value" (dig "slackChannel" "" $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_IDLE_MINUTES" "value" (dig "idleMinutes" 60 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_BATCH_SIZE" "value" (dig "batchSize" 100 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_MAX_MESSAGES" "value" (dig "maxMessages" 40 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_MAX_ATTEMPTS" "value" (dig "maxAttempts" 3 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_MAX_OUTPUT_TOKENS" "value" (dig "maxOutputTokens" 500 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_TIMEOUT_SECONDS" "value" (dig "timeoutSeconds" 20 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_CONCURRENCY" "value" (dig "concurrency" 5 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_LEASE_MINUTES" "value" (dig "leaseMinutes" 30 $apiRsUserExperience))
+  (dict "name" "USER_EXPERIENCE_DIGEST_INCLUDE_DIRECT_MESSAGES" "value" (dig "includeDirectMessages" false $apiRsUserExperience))
+-}}
+{{- $apiRsWorkflowEnv := concat $apiRsEtlEnv $apiRsUserExperienceEnv -}}
 {{- $apiRsEtlPassthroughNames := list -}}
-{{- range $env := $apiRsEtlEnv -}}
+{{- range $env := $apiRsWorkflowEnv -}}
 {{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $env.name -}}
 {{- end -}}
 {{- with (get .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV") -}}
@@ -263,14 +283,14 @@ spec:
             - name: WORKFLOW_ALLOWED_NAMES
               value: {{ .Values.apiRs.workflowAllowedNames | quote }}
 {{- end }}
-{{- range $env := $apiRsEtlEnv }}
+{{- range $env := $apiRsWorkflowEnv }}
 {{- if not (hasKey $.Values.apiRs.extraEnv $env.name) }}
             - name: {{ $env.name }}
               value: {{ $env.value | toString | quote }}
 {{- end }}
 {{- end }}
-            # Forward the chart-rendered ETL workflow config into workflow-host
-            # sandboxes. Operators should set apiRs.etl.* values, not maintain
+            # Forward chart-rendered scheduled-workflow config into workflow-host
+            # sandboxes. Operators should use the chart values rather than maintain
             # SESSION_SANDBOX_PASSTHROUGH_ENV by hand.
             - name: SESSION_SANDBOX_PASSTHROUGH_ENV
               value: {{ join "," $apiRsEtlPassthroughNames | quote }}
