@@ -475,7 +475,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
-{{- end }}
 {{- if .Values.slackbotv2.enabled }}
             - name: SLACKBOT_API_KEY
               valueFrom:
