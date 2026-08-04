@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use centaur_iron_control::{
     BrokerCredentialInput, BrokerCredentialRecord, Grant, GrantSecret, Grantee, IdentityInput,
-    IronControlClient, IronControlError, Role, RoleSpec, SECRET_TYPES, grant_inputs_to_role,
-    managed_labels,
+    IronControlClient, IronControlError, PrincipalInput, Role, RoleSpec, SECRET_TYPES,
+    grant_inputs_to_role, managed_labels,
 };
 use centaur_iron_proxy::SourcePolicy;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -1258,7 +1258,7 @@ fn parse_kv(raw: &str, flag: &str) -> Result<(String, String)> {
 /// Ensure the principal exists, returning its OID. Existing principals are not
 /// changed except for an explicit workflow claim of the same untyped,
 /// Centaur-managed identity.
-fn resolve_grant_principal(cli: &Cli, args: &PrincipalGrantArgs) -> Result<IdentityInput> {
+fn resolve_grant_principal(cli: &Cli, args: &PrincipalGrantArgs) -> Result<PrincipalInput> {
     match args.workflow_name.as_deref() {
         Some(workflow_name) => {
             principal::resolve_workflow_principal(&args.principal, workflow_name, &cli.namespace)
@@ -1281,7 +1281,7 @@ fn resolve_grant_principal(cli: &Cli, args: &PrincipalGrantArgs) -> Result<Ident
 
 async fn ensure_principal(
     client: &IronControlClient,
-    identity: &IdentityInput,
+    identity: &PrincipalInput,
     require_exact_labels: bool,
 ) -> Result<String> {
     match client
@@ -1293,7 +1293,7 @@ async fn ensure_principal(
                 match labels_for_explicit_workflow_claim(&p.labels, &identity.labels)? {
                     None => return Ok(p.id),
                     Some(labels) => {
-                        let claimed = IdentityInput {
+                        let claimed = PrincipalInput {
                             labels,
                             ..identity.clone()
                         };
