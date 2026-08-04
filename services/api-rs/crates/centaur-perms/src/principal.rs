@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use centaur_iron_control::{IdentityInput, derive_principal, workflow_principal};
+use centaur_iron_control::{PrincipalInput, derive_principal, workflow_principal};
 use eyre::{Result, bail};
 
 /// Turn a `--principal` value (plus optional `--slack-user`) into the identity
@@ -17,17 +17,22 @@ pub fn resolve_principal(
     principal: &str,
     slack_user: Option<&str>,
     namespace: &str,
-) -> IdentityInput {
+) -> PrincipalInput {
     if principal.contains(':') {
         // The CLI has no resolved conversation name; the synthetic display name
         // is fine for operator-driven lookups.
-        derive_principal(principal, slack_user, None).to_identity_input(namespace)
+        derive_principal(principal, slack_user, None).to_principal_input(namespace)
     } else {
-        IdentityInput {
+        PrincipalInput {
             namespace: namespace.to_owned(),
             foreign_id: principal.to_owned(),
             name: principal.to_owned(),
             labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
+            kind: None,
+            slack_user_id: None,
+            slack_channel_id: None,
+            slack_team_id: None,
+            slack_email: None,
         }
     }
 }
@@ -37,8 +42,8 @@ pub fn resolve_workflow_principal(
     principal: &str,
     workflow_name: &str,
     namespace: &str,
-) -> Result<IdentityInput> {
-    let identity = workflow_principal(workflow_name).to_identity_input(namespace);
+) -> Result<PrincipalInput> {
+    let identity = workflow_principal(workflow_name).to_principal_input(namespace);
     if principal != identity.foreign_id {
         bail!(
             "workflow {workflow_name:?} requires principal {:?}, not {principal:?}",
@@ -104,7 +109,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id.name, "Workflow planetscale_daily_audit");
-        assert_eq!(id.labels.get("kind").map(String::as_str), Some("workflow"));
+        assert_eq!(id.kind.as_deref(), Some("workflow"));
+        assert!(!id.labels.contains_key("kind"));
         assert_eq!(
             id.labels.get("workflow_name").map(String::as_str),
             Some("planetscale_daily_audit")

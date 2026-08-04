@@ -351,7 +351,8 @@ impl WorkflowPrincipalRegistrar {
         validate_workflow_principal_foreign_ids(principals)?;
         let mut registered = BTreeMap::new();
         for workflow_name in principals {
-            let mut identity = workflow_principal(workflow_name).to_identity_input(&self.namespace);
+            let mut identity =
+                workflow_principal(workflow_name).to_principal_input(&self.namespace);
             let foreign_id = identity.foreign_id.clone();
             let labels = identity.labels.clone();
             let labels = match self
@@ -414,7 +415,7 @@ fn validate_workflow_principal_foreign_ids(
 #[cfg(test)]
 fn workflow_principal_labels(workflow_name: &str) -> BTreeMap<String, String> {
     workflow_principal(workflow_name)
-        .to_identity_input("default")
+        .to_principal_input("default")
         .labels
 }
 
@@ -5632,10 +5633,10 @@ mod tests {
     }
 
     #[test]
-    fn workflow_principal_labels_identify_workflow_kind() {
+    fn workflow_principal_labels_keep_extensible_metadata_only() {
         let labels = workflow_principal_labels("nightly_report");
 
-        assert_eq!(labels.get("kind").map(String::as_str), Some("workflow"));
+        assert!(!labels.contains_key("kind"));
         assert!(!labels.contains_key("purpose"));
         assert_eq!(
             labels.get("workflow_name").map(String::as_str),
@@ -5653,6 +5654,8 @@ mod tests {
             name: "Workflow nightly_report".to_owned(),
             labels: {
                 let mut labels = required.clone();
+                labels.insert("kind".to_owned(), "workflow".to_owned());
+                labels.insert("managed-by".to_owned(), "centaur".to_owned());
                 labels.insert("grant-owner".to_owned(), "operator".to_owned());
                 labels
             },
