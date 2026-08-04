@@ -2438,6 +2438,8 @@ mod tests {
             "http://console.local",
             "--iron-control-api-key",
             "iak_test",
+            "--kubernetes-firewall-manager-secret-source",
+            "env",
         ])
         .unwrap();
 
