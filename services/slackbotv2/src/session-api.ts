@@ -1462,6 +1462,38 @@ function apiHeaders(options: SlackbotV2Options, jsonBody = true): HeadersInit {
   }
 }
 
+export async function updateWorkflowToggle(
+  options: SlackbotV2Options,
+  input: {
+    enabled: boolean
+    metadata: JsonObject
+    updatedBy: string
+    workflowName: string
+  }
+): Promise<JsonObject> {
+  const fetchFn = options.fetch ?? fetch
+  const path = `/api/workflows/${encodeURIComponent(input.workflowName)}/enabled`
+  const response = await fetchWithTimeout(
+    fetchFn,
+    new URL(path, ensureTrailingSlash(options.apiUrl)).toString(),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify({
+        enabled: input.enabled,
+        updated_by: input.updatedBy,
+        metadata: input.metadata
+      })
+    },
+    sessionApiTimeoutMs(options),
+    'update workflow toggle'
+  )
+  await ensureApiOk(response, 'update workflow toggle')
+  const payload: unknown = await response.json()
+  if (!isJsonObject(payload)) throw new Error('update workflow toggle returned invalid JSON')
+  return payload
+}
+
 async function toSessionMessage(
   options: SlackbotV2Options,
   message: SlackbotV2ApiMessage,

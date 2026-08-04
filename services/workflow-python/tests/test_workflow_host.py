@@ -31,6 +31,11 @@ def load_workflow_host():
 class FakePool:
     def __init__(self) -> None:
         self.closed = False
+        self.rows = {}
+
+    async def fetchrow(self, query, workflow_name):
+        assert "workflow_toggles" in query
+        return self.rows.get(workflow_name)
 
     async def close(self) -> None:
         self.closed = True
@@ -80,6 +85,21 @@ class RequestRpc(FakeRpc):
 
 
 class WorkflowHostTests(unittest.TestCase):
+    def test_workflow_enabled_defaults_true_and_reads_durable_toggle(self) -> None:
+        host = load_workflow_host()
+        pool = FakePool()
+        ctx = host.WorkflowContext(
+            FakeRpc(),
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="market-label-audit",
+            pool=pool,
+        )
+
+        self.assertTrue(asyncio.run(ctx.workflow_enabled("market-label-audit")))
+        pool.rows["market-label-audit"] = {"enabled": False}
+        self.assertFalse(asyncio.run(ctx.workflow_enabled("market-label-audit")))
+
     def test_rpc_rejects_oversized_outbound_message(self) -> None:
         host = load_workflow_host()
         host.WORKFLOW_HOST_MAX_MESSAGE_BYTES = 64

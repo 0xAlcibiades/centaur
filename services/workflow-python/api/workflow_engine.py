@@ -188,6 +188,19 @@ class WorkflowContext:
             }
         )
 
+    async def workflow_enabled(self, workflow_name: str, *, default: bool = True) -> bool:
+        """Return the durable operator toggle for a workflow."""
+        name = workflow_name.strip()
+        if not name:
+            raise ValueError("workflow_name is required")
+        if self._pool is None:
+            return default
+        row = await self._pool.fetchrow(
+            "SELECT enabled FROM workflow_toggles WHERE workflow_name = $1",
+            name,
+        )
+        return default if row is None else bool(row["enabled"])
+
 
 def duration_seconds(value: dt.timedelta | int | float) -> float:
     if isinstance(value, dt.timedelta):
