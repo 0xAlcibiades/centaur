@@ -19,6 +19,7 @@ use kube::api::{ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Resource};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep};
+use uuid::Uuid;
 
 use crate::{
     API_SERVER_ENABLED_LABEL, AUXILIARY_GENERATION_ANNOTATION, AUXILIARY_GENERATION_LABEL,
@@ -29,6 +30,9 @@ use crate::{
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
+const WORKFLOW_TASK_ID_LABEL: &str = "centaur.workflow_task_id";
+const WORKFLOW_TASK_ID_ANNOTATION: &str = "centaur.ai/workflow-task-id";
+const WORKFLOW_TASK_ID_ANNOTATION_PATCH_ATTEMPTS: usize = 3;
 const FIREWALL_CA_MOUNT_PATH: &str = "/firewall-certs";
 pub(crate) const FIREWALL_CA_CERT_PATH: &str = "/firewall-certs/ca-cert.pem";
 const PROXY_MANAGEMENT_PORT: u16 = 9092;
@@ -738,6 +742,8 @@ impl AgentSandboxBackend {
         );
         self.patch_iron_control_principal_annotation(id, &generation, principal_id)
             .await?;
+        self.patch_proxy_workflow_task_id_annotation(id, &generation, labels)
+            .await?;
         self.wait_for_proxy_principal_applied(
             id,
             &generation,
@@ -781,6 +787,8 @@ impl AgentSandboxBackend {
                 .as_ref()
                 .and_then(|annotations| annotations.get(crate::IRON_CONTROL_PRINCIPAL_ANNOTATION));
             if assigned_principal.map(String::as_str) == Some(principal_id) && labels.is_empty() {
+                self.patch_proxy_workflow_task_id_annotation(id, &generation, labels)
+                    .await?;
                 return Ok(());
             }
 
@@ -792,6 +800,8 @@ impl AgentSandboxBackend {
                 .assign_proxy_principal(&proxy_id, principal_id, labels)
                 .await
                 .map_err(|err| SandboxError::backend_source("iron-control assign proxy", err))?;
+            self.patch_proxy_workflow_task_id_annotation(id, &generation, labels)
+                .await?;
             self.wait_for_proxy_principal_applied(
                 id,
                 &generation,
@@ -810,6 +820,8 @@ impl AgentSandboxBackend {
         self.recreate_iron_proxy_resources_for_principal(id, principal_id, labels)
             .await?;
         self.patch_iron_control_principal_annotation(id, &generation, principal_id)
+            .await?;
+        self.patch_proxy_workflow_task_id_annotation(id, &generation, labels)
             .await?;
         Ok(())
     }
@@ -1244,6 +1256,76 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("patch sandbox iron-control principal", err))
     }
 
+    async fn patch_proxy_workflow_task_id_annotation(
+        &self,
+        id: &SandboxId,
+        generation: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> SandboxResult<()> {
+        let workflow_task_id = workflow_task_id_from_proxy_labels(labels);
+        for attempt in 0..WORKFLOW_TASK_ID_ANNOTATION_PATCH_ATTEMPTS {
+            let params = ListParams::default().labels(&format!(
+                "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={},{AUXILIARY_GENERATION_LABEL}={generation}",
+                id.as_str(),
+            ));
+            let pods = self.pods().list(&params).await.map_err(|err| {
+                map_kube_error("list iron-proxy pods for workflow task patch", err)
+            })?;
+            let mut found_current_generation = false;
+            let mut retry = false;
+
+            for pod in pods.items {
+                let Some(name) = pod.metadata.name.as_deref() else {
+                    continue;
+                };
+                if auxiliary_delete_params(&pod.metadata, generation)?.is_none() {
+                    continue;
+                }
+                found_current_generation = true;
+                let Some(patch) = workflow_task_id_annotation_patch(
+                    &pod.metadata,
+                    generation,
+                    workflow_task_id.as_deref(),
+                )?
+                else {
+                    continue;
+                };
+                match self
+                    .pods()
+                    .patch(name, &PatchParams::default(), &patch)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err)
+                        if (is_conflict(&err) || is_not_found(&err))
+                            && attempt + 1 < WORKFLOW_TASK_ID_ANNOTATION_PATCH_ATTEMPTS =>
+                    {
+                        retry = true;
+                        break;
+                    }
+                    Err(err) => {
+                        return Err(map_kube_error(
+                            "patch iron-proxy workflow task annotation",
+                            err,
+                        ));
+                    }
+                }
+            }
+            if retry {
+                continue;
+            }
+            if !found_current_generation {
+                return Err(SandboxError::NotReady(format!(
+                    "iron-proxy pod for sandbox {} generation {} disappeared before workflow task annotation could be reconciled",
+                    id.as_str(),
+                    generation,
+                )));
+            }
+            return Ok(());
+        }
+        unreachable!("workflow task annotation patch returns or retries within the bounded loop")
+    }
+
     fn services(&self) -> Api<Service> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
@@ -1566,7 +1648,7 @@ fn build_iron_proxy_pod_with_generation(
     sync: &ProxySyncEnv,
     generation: &str,
 ) -> Pod {
-    let annotations = BTreeMap::from([
+    let mut annotations = BTreeMap::from([
         (
             IRON_CONTROL_PROXY_ID_ANNOTATION.to_owned(),
             sync.proxy_id.clone(),
@@ -1580,6 +1662,9 @@ fn build_iron_proxy_pod_with_generation(
             generation.to_owned(),
         ),
     ]);
+    if let Some(workflow_task_id) = workflow_task_id_from_proxy_labels(&resolved.labels) {
+        annotations.insert(WORKFLOW_TASK_ID_ANNOTATION.to_owned(), workflow_task_id);
+    }
     Pod {
         metadata: object_meta_with_annotations(
             resolved.proxy_pod_name.clone(),
@@ -1600,6 +1685,52 @@ fn build_iron_proxy_pod_with_generation(
         }),
         ..Default::default()
     }
+}
+
+fn workflow_task_id_from_proxy_labels(labels: &BTreeMap<String, String>) -> Option<String> {
+    labels
+        .get(WORKFLOW_TASK_ID_LABEL)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(|task_id| task_id.to_string())
+}
+
+fn workflow_task_id_annotation_patch(
+    metadata: &ObjectMeta,
+    generation: &str,
+    workflow_task_id: Option<&str>,
+) -> SandboxResult<Option<Patch<Value>>> {
+    let Some(params) = auxiliary_delete_params(metadata, generation)? else {
+        return Ok(None);
+    };
+    let existing = metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(WORKFLOW_TASK_ID_ANNOTATION))
+        .map(String::as_str);
+    if existing == workflow_task_id {
+        return Ok(None);
+    }
+    let preconditions = params
+        .preconditions
+        .expect("generation-checked proxy pod always carries preconditions");
+    let uid = preconditions
+        .uid
+        .expect("generation-checked proxy pod always carries a UID");
+    let resource_version = preconditions
+        .resource_version
+        .expect("generation-checked proxy pod always carries a resourceVersion");
+    Ok(Some(Patch::Merge(json!({
+        "metadata": {
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "annotations": {
+                WORKFLOW_TASK_ID_ANNOTATION: workflow_task_id,
+            },
+        },
+    }))))
 }
 
 fn iron_proxy_container(
@@ -2955,6 +3086,120 @@ mod tests {
                 .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn iron_proxy_pod_carries_only_valid_workflow_task_id_annotation() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let mut resolved = resolved();
+        resolved.labels = BTreeMap::from([
+            (
+                WORKFLOW_TASK_ID_LABEL.to_owned(),
+                "018F0054-9A67-7C17-9D26-89C2F0DC45B7".to_owned(),
+            ),
+            ("centaur.untrusted".to_owned(), "must-not-copy".to_owned()),
+        ]);
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
+        let annotations = pod.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations
+                .get(WORKFLOW_TASK_ID_ANNOTATION)
+                .map(String::as_str),
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45b7")
+        );
+        assert!(!annotations.contains_key("centaur.untrusted"));
+
+        resolved.labels.insert(
+            WORKFLOW_TASK_ID_LABEL.to_owned(),
+            "not-a-workflow-task-id".to_owned(),
+        );
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
+        assert!(
+            pod.metadata
+                .annotations
+                .as_ref()
+                .is_none_or(|annotations| !annotations.contains_key(WORKFLOW_TASK_ID_ANNOTATION))
+        );
+    }
+
+    #[test]
+    fn workflow_task_id_annotation_patch_is_generation_fenced_and_clears_stale_values() {
+        let metadata = ObjectMeta {
+            annotations: Some(BTreeMap::from([
+                (
+                    AUXILIARY_GENERATION_ANNOTATION.to_owned(),
+                    "current-generation".to_owned(),
+                ),
+                (
+                    WORKFLOW_TASK_ID_ANNOTATION.to_owned(),
+                    "018f0054-9a67-7c17-9d26-89c2f0dc45b7".to_owned(),
+                ),
+            ])),
+            uid: Some("proxy-uid".to_owned()),
+            resource_version: Some("42".to_owned()),
+            ..Default::default()
+        };
+
+        let clear_patch = workflow_task_id_annotation_patch(&metadata, "current-generation", None)
+            .unwrap()
+            .unwrap();
+        let clear_value = match clear_patch {
+            Patch::Merge(value) => value,
+            _ => unreachable!("workflow annotation uses a merge patch"),
+        };
+        assert_eq!(clear_value["metadata"]["uid"], "proxy-uid");
+        assert_eq!(clear_value["metadata"]["resourceVersion"], "42");
+        assert!(clear_value["metadata"]["annotations"][WORKFLOW_TASK_ID_ANNOTATION].is_null());
+
+        let set_patch = workflow_task_id_annotation_patch(
+            &metadata,
+            "current-generation",
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45b8"),
+        )
+        .unwrap()
+        .unwrap();
+        let set_value = match set_patch {
+            Patch::Merge(value) => value,
+            _ => unreachable!("workflow annotation uses a merge patch"),
+        };
+        assert_eq!(
+            set_value["metadata"]["annotations"][WORKFLOW_TASK_ID_ANNOTATION],
+            "018f0054-9a67-7c17-9d26-89c2f0dc45b8"
+        );
+        assert!(
+            workflow_task_id_annotation_patch(
+                &metadata,
+                "current-generation",
+                Some("018f0054-9a67-7c17-9d26-89c2f0dc45b7"),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let mut annotation_absent = metadata.clone();
+        annotation_absent
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(WORKFLOW_TASK_ID_ANNOTATION);
+        assert!(
+            workflow_task_id_annotation_patch(&annotation_absent, "current-generation", None,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            workflow_task_id_annotation_patch(&metadata, "old-generation", None)
+                .unwrap()
+                .is_none()
         );
     }
 

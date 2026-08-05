@@ -2834,7 +2834,7 @@ async fn run_centaur_workflow(
     workflow_clients: WorkflowQueueClients,
 ) -> absurd::Result<WorkflowResult> {
     let mut cleanup_guard =
-        WorkflowSandboxCleanupGuard::new(session_runtime.clone(), ctx.run_id().to_owned());
+        WorkflowSandboxCleanupGuard::new(session_runtime.clone(), ctx.task_id().to_owned());
     let result = run_centaur_workflow_inner(
         input,
         ctx,
@@ -2960,6 +2960,8 @@ async fn run_centaur_workflow_inner(
                                 session_metadata,
                                 message_metadata,
                                 execution_metadata,
+                                workflow_task_id: task_id,
+                                workflow_run_id: run_id,
                                 execution_idempotency_key: format!(
                                     "absurd-workflow-agent-turn:{client_message_id}"
                                 ),
@@ -3049,14 +3051,14 @@ async fn run_centaur_workflow_inner(
 
 struct WorkflowSandboxCleanupGuard {
     session_runtime: Option<SessionRuntime>,
-    workflow_run_id: String,
+    workflow_task_id: String,
 }
 
 impl WorkflowSandboxCleanupGuard {
-    fn new(session_runtime: SessionRuntime, workflow_run_id: String) -> Self {
+    fn new(session_runtime: SessionRuntime, workflow_task_id: String) -> Self {
         Self {
             session_runtime: Some(session_runtime),
-            workflow_run_id,
+            workflow_task_id,
         }
     }
 
@@ -3069,11 +3071,11 @@ impl WorkflowSandboxCleanupGuard {
             return;
         };
         if let Err(error) = session_runtime
-            .stop_workflow_owned_sandboxes(&self.workflow_run_id, reason)
+            .stop_workflow_owned_sandboxes_for_task(&self.workflow_task_id, reason)
             .await
         {
             warn!(
-                workflow_run_id = %self.workflow_run_id,
+                workflow_task_id = %self.workflow_task_id,
                 reason,
                 %error,
                 "failed to clean up workflow-owned sandboxes"
@@ -3089,14 +3091,17 @@ impl Drop for WorkflowSandboxCleanupGuard {
         let Some(session_runtime) = self.session_runtime.take() else {
             return;
         };
-        let workflow_run_id = self.workflow_run_id.clone();
+        let workflow_task_id = self.workflow_task_id.clone();
         tokio::spawn(async move {
             if let Err(error) = session_runtime
-                .stop_workflow_owned_sandboxes(&workflow_run_id, "workflow_cancelled_or_dropped")
+                .stop_workflow_owned_sandboxes_for_task(
+                    &workflow_task_id,
+                    "workflow_cancelled_or_dropped",
+                )
                 .await
             {
                 warn!(
-                    workflow_run_id,
+                    workflow_task_id,
                     %error,
                     "failed to clean up dropped workflow-owned sandboxes"
                 );
@@ -3927,6 +3932,8 @@ async fn run_python_agent_turn(
             session_metadata,
             message_metadata,
             execution_metadata,
+            workflow_task_id: ctx.task_id().to_owned(),
+            workflow_run_id: ctx.run_id().to_owned(),
             execution_idempotency_key,
             iron_control_principal: workflow_agent_principal.map(ToOwned::to_owned),
             workflow_owned_thread,
@@ -4383,6 +4390,8 @@ struct AgentTurnRequest {
     session_metadata: Value,
     message_metadata: Value,
     execution_metadata: Value,
+    workflow_task_id: String,
+    workflow_run_id: String,
     execution_idempotency_key: String,
     iron_control_principal: Option<String>,
     workflow_owned_thread: bool,
@@ -4439,6 +4448,8 @@ async fn run_agent_session_turn(
         session_metadata,
         message_metadata,
         execution_metadata,
+        workflow_task_id,
+        workflow_run_id,
         execution_idempotency_key,
         iron_control_principal,
         workflow_owned_thread,
@@ -4449,10 +4460,6 @@ async fn run_agent_session_turn(
         reasoning,
     } = turn;
     let thread_key = ThreadKey::parse(thread_key)?;
-    let mut session_metadata = session_metadata;
-    if workflow_owned_thread {
-        object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
-    }
     if let Some(principal_id) = iron_control_principal.as_deref() {
         session_runtime
             .create_or_get_session_bound_to_principal(
@@ -4487,7 +4494,7 @@ async fn run_agent_session_turn(
         )
         .await?;
     let execution = session_runtime
-        .execute_session(
+        .execute_workflow_session(
             &thread_key,
             ExecuteSessionInput {
                 idempotency_key: Some(execution_idempotency_key),
@@ -4501,6 +4508,9 @@ async fn run_agent_session_turn(
                 idle_timeout_ms: Some(idle_timeout_ms),
                 max_duration_ms: Some(max_duration_ms),
             },
+            &workflow_task_id,
+            &workflow_run_id,
+            workflow_owned_thread,
         )
         .await?;
 
