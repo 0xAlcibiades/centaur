@@ -380,6 +380,11 @@
       "type": "object",
       "properties": {
         "mcpPublicUrl": { "type": "string" },
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseServiceTierEnabled": { "type": "boolean" },
         "autorotate": {
           "type": "object",
           "properties": {
