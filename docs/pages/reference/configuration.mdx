@@ -260,6 +260,10 @@ Linear ETL workflows:
 
 User experience digest workflow:
 
+The migration records existing thread snapshots as baselines, so classification
+is forward-looking from rollout. Historical threads are not classified unless
+they receive a new message after the baseline is established.
+
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `USER_EXPERIENCE_DIGEST_ENABLED`, `USER_EXPERIENCE_DIGEST_CRON`, `USER_EXPERIENCE_DIGEST_TIMEZONE` | `apiRs.userExperienceDigest.enabled`, `.cron`, `.timezone`. | Enables and schedules the daily classifier. |

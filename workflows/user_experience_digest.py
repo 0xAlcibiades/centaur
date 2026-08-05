@@ -207,8 +207,13 @@ async def _discover_candidates(
               SELECT 1 FROM user_experience_scans existing
               WHERE existing.thread_key = s.thread_key
                 AND existing.last_message_id = latest.message_id
-                AND existing.classifier_version = $3
-                AND existing.model = $4
+                AND (
+                    existing.status = 'baseline'
+                    OR (
+                        existing.classifier_version = $3
+                        AND existing.model = $4
+                    )
+                )
           )
         ORDER BY latest.created_at, latest.message_id
         LIMIT $5

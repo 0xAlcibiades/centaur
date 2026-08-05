@@ -26,7 +26,7 @@ create table if not exists user_experience_scans (
     constraint user_experience_scans_snapshot_unique
         unique (thread_key, last_message_id, classifier_version, model),
     constraint user_experience_scans_status_check
-        check (status in ('pending', 'running', 'completed', 'failed', 'superseded')),
+        check (status in ('baseline', 'pending', 'running', 'completed', 'failed', 'superseded')),
     constraint user_experience_scans_label_check
         check (label is null or label in ('good', 'mixed', 'bad', 'unknown')),
     constraint user_experience_scans_confidence_check
@@ -56,6 +56,47 @@ create table if not exists user_experience_scans (
     constraint user_experience_scans_error_len
         check (octet_length(last_error) <= 4000)
 );
+
+-- Establish a durable rollout baseline in the same table as scan results. These
+-- rows prevent the first scheduled run from classifying retained history. A
+-- thread becomes eligible only after its latest message changes.
+insert into user_experience_scans (
+    scan_id,
+    thread_key,
+    last_message_id,
+    last_message_created_at,
+    classifier_version,
+    model,
+    status,
+    eligible_after
+)
+select
+    'uxs_baseline_' || md5(s.thread_key || chr(31) || latest.message_id),
+    s.thread_key,
+    latest.message_id,
+    latest.created_at,
+    'baseline',
+    'baseline',
+    'baseline',
+    latest.created_at
+from sessions s
+join lateral (
+    select m.message_id, m.created_at
+    from session_messages m
+    where m.thread_key = s.thread_key
+    order by m.created_at desc, m.message_id desc
+    limit 1
+) latest on true
+where coalesce(s.metadata ->> 'platform', '') in (
+    'slack', 'discord', 'linear', 'github', 'msteams'
+)
+  and exists (
+      select 1
+      from session_messages user_message
+      where user_message.thread_key = s.thread_key
+        and user_message.role = 'user'
+  )
+on conflict do nothing;
 
 create index if not exists user_experience_scans_claim_idx
     on user_experience_scans (status, eligible_after, created_at)
