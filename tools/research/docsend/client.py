@@ -168,6 +168,23 @@ def _normalize_docsend_url(url: str) -> str:
     return normalized
 
 
+def _encode_session_url(url: str) -> str:
+    """Encode a URL using characters accepted by Browserbase metadata."""
+    encoded = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    return f"b64{encoded}"
+
+
+def _decode_session_url(value: str) -> str:
+    """Decode a URL stored in Browserbase session metadata."""
+    if not value.startswith("b64"):
+        raise ValueError("Invalid DocSend URL in resumable session metadata")
+    try:
+        url = base64.urlsafe_b64decode(value[3:] + "===").decode()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Invalid DocSend URL in resumable session metadata") from exc
+    return _normalize_docsend_url(url)
+
+
 def _normalize_verification_url(url: str) -> str:
     normalized = _normalize_docsend_url(url)
     parsed = urlparse(normalized)
@@ -223,7 +240,7 @@ def _format_browserbase_error(error: Exception, api_key: str) -> str:
 
 
 async def _create_browserbase_session(api_key: str, url: str, session_timeout: int) -> dict:
-    metadata = {"tool": "docsend", "docsend_url": url}
+    metadata = {"tool": "docsend", "docsend_url": _encode_session_url(url)}
     if len(json.dumps(metadata, separators=(",", ":"))) >= 512:
         raise ValueError("DocSend URL is too long for a resumable Browserbase session")
     async with AsyncBrowserbase(api_key=api_key) as browserbase:
@@ -334,7 +351,7 @@ async def _load_docsend_session(
             "invalid_resume_session",
         )
     try:
-        url = _normalize_docsend_url(str(metadata["docsend_url"]))
+        url = _decode_session_url(str(metadata["docsend_url"]))
     except ValueError as exc:
         raise _SessionUnavailable(str(exc), "invalid_resume_session") from exc
     except KeyError as exc:
