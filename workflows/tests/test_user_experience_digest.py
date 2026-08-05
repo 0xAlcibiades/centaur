@@ -206,6 +206,8 @@ def test_discovery_uses_scan_rows_as_snapshot_checkpoints():
     assert "user_experience_scans existing" in pool.fetch_query
     assert "existing.status = 'baseline'" in pool.fetch_query
     assert "metadata ->> 'platform'" in pool.fetch_query
+    assert '"is_mention": true' in pool.fetch_query
+    assert "'discord'" not in pool.fetch_query
     assert "D[^:]*:" in pool.fetch_query
     assert pool.fetch_args == (60, False, "v1", "small-model", 100)
     assert "ON CONFLICT (thread_key, last_message_id" in pool.execute_calls[0][0]

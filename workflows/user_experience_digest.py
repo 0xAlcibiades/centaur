@@ -189,13 +189,15 @@ async def _discover_candidates(
             LIMIT 1
         ) latest ON TRUE
         WHERE latest.created_at <= NOW() - ($1::bigint * INTERVAL '1 minute')
-          AND COALESCE(s.metadata ->> 'platform', '') IN (
-              'slack', 'discord', 'linear', 'github', 'msteams'
-          )
+          AND COALESCE(s.metadata ->> 'platform', '') = 'slack'
           AND EXISTS (
               SELECT 1 FROM session_messages user_message
               WHERE user_message.thread_key = s.thread_key
                 AND user_message.role = 'user'
+                AND user_message.metadata @> '{
+                    "platform": "slack",
+                    "is_mention": true
+                }'::jsonb
           )
           AND NOT EXISTS (
               SELECT 1 FROM session_executions active

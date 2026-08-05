@@ -87,14 +87,16 @@ join lateral (
     order by m.created_at desc, m.message_id desc
     limit 1
 ) latest on true
-where coalesce(s.metadata ->> 'platform', '') in (
-    'slack', 'discord', 'linear', 'github', 'msteams'
-)
+where coalesce(s.metadata ->> 'platform', '') = 'slack'
   and exists (
       select 1
       from session_messages user_message
       where user_message.thread_key = s.thread_key
         and user_message.role = 'user'
+        and user_message.metadata @> '{
+            "platform": "slack",
+            "is_mention": true
+        }'::jsonb
   )
 on conflict do nothing;
 

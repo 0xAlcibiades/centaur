@@ -260,9 +260,10 @@ Linear ETL workflows:
 
 User experience digest workflow:
 
-The migration records existing thread snapshots as baselines, so classification
-is forward-looking from rollout. Historical threads are not classified unless
-they receive a new message after the baseline is established.
+The migration records existing Slack thread snapshots as baselines, so
+classification is forward-looking from rollout. Only threads containing a
+persisted bot mention are eligible. Historical threads are not classified
+unless they receive a new mentioned message after the baseline is established.
 
 | Env var | Set from | Controls |
 | --- | --- | --- |

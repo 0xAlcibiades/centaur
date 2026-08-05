@@ -417,9 +417,10 @@ apiRs:
       maxWindowSeconds: 21600
       batchSize: 50
   # Classify idle conversation snapshots and optionally post a private daily
-  # Slack digest. Results and retry state are stored in user_experience_scans.
-  # Existing snapshots are baselined by the migration and are not classified
-  # until their thread receives a new message.
+  # Slack digest. Only Slack threads with a persisted bot mention are eligible.
+  # Results and retry state are stored in user_experience_scans. Existing
+  # snapshots are baselined by the migration and are not classified until the
+  # bot is mentioned again in their thread.
   userExperienceDigest:
     enabled: false
     cron: "0 8 * * *"
