@@ -59,7 +59,35 @@ if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     export CENTAUR_PERSISTENT_STATE=1
 fi
 
+PORTABLE_SOURCE_DIR="${CENTAUR_PORTABLE_SOURCE_DIR:-$STATE_DIR/portable-sources}"
+if [ -L "$PORTABLE_SOURCE_DIR" ]; then
+    echo "CENTAUR_PORTABLE_SOURCE_DIR must not be a symlink" >&2
+    exit 1
+fi
+mkdir -p "$PORTABLE_SOURCE_DIR"
+export CENTAUR_PORTABLE_SOURCE_DIR="$PORTABLE_SOURCE_DIR"
+
+validate_config_dir() {
+    local config_dir="$1"
+    local state_dir="$2"
+    [ -L "$config_dir" ] || return 0
+    if [ "${CENTAUR_PERSISTENT_STATE:-0}" != "1" ] \
+        || [ "$(/usr/bin/readlink -f "$config_dir")" != "$(/usr/bin/readlink -f "$state_dir")" ]; then
+        echo "runtime config directories must not use untrusted symlinks" >&2
+        exit 1
+    fi
+}
+
+validate_config_dir "$HOME_DIR/.codex" "$STATE_DIR/codex"
+validate_config_dir "$HOME_DIR/.claude" "$STATE_DIR/claude"
+unset -f validate_config_dir
+
 mkdir -p "$HOME_DIR/.config/amp"
+
+if [ -e "$HOME_DIR/.codex/AGENTS.override.md" ] || [ -L "$HOME_DIR/.codex/AGENTS.override.md" ]; then
+    echo "persisted Codex AGENTS.override.md is not permitted" >&2
+    exit 1
+fi
 
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────
 cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
@@ -125,6 +153,7 @@ fi
 #     inject the brokered Bearer + chatgpt-account-id headers.
 CODEX_AUTH_MODE="${CODEX_AUTH_MODE:-api_key}"
 mkdir -p "$HOME_DIR/.codex"
+CODEX_CONFIG_DIR="$(cd -P "$HOME_DIR/.codex" && pwd)"
 if [ "$CODEX_AUTH_MODE" = "access_token" ] && [ -f /etc/centaur/codex-auth.default.json ]; then
     cp /etc/centaur/codex-auth.default.json "$HOME_DIR/.codex/auth.json"
     chmod 600 "$HOME_DIR/.codex/auth.json"
@@ -138,10 +167,11 @@ fi
 
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
-    cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
-    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
+    cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$CODEX_CONFIG_DIR/config.toml"
+    CODEX_CONFIG_PATH="$CODEX_CONFIG_DIR/config.toml" python3 - <<'PYEOF'
 from pathlib import Path
 import os
+import subprocess
 import sys
 
 path = Path(os.environ["CODEX_CONFIG_PATH"])
@@ -194,33 +224,6 @@ else:
         rewritten.append(f"{name} = false")
     lines = lines[: features_start + 1] + rewritten + lines[features_end:]
 
-# Optional deploy-time override of the codex reasoning effort. Lets a deployment
-# (e.g. an org overlay via sandbox.extraEnv) set the default without forking the
-# baked-in config.toml. Named after codex's own config key (model_reasoning_effort)
-# and validated against its ReasoningEffort enum; an unknown value is ignored (the
-# config default stands) rather than written.
-effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
-if effort:
-    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-    if effort not in valid:
-        print(
-            f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
-            f"expected one of {sorted(valid)}",
-            file=sys.stderr,
-        )
-    else:
-        # model_reasoning_effort is a top-level key, before the first [table].
-        first_table = next(
-            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
-        )
-        override = f'model_reasoning_effort = "{effort}"'
-        for i in range(first_table):
-            if lines[i].split("=", 1)[0].strip() == "model_reasoning_effort":
-                lines[i] = override
-                break
-        else:
-            lines.insert(first_table, override)
-
 text = "\n".join(lines).rstrip() + "\n"
 
 # CODEX_BEDROCK_REGION: when codex's built-in `amazon-bedrock` provider is enabled
@@ -243,6 +246,74 @@ if bedrock_region:
         config.setdefault("model_providers", {}).setdefault(
             "amazon-bedrock", {}
         ).setdefault("aws", {})["region"] = bedrock_region
+        text = tomli_w.dumps(config)
+
+# CENTAUR_CODEX_PROFILE_PATH points at a repository-mounted profile. Apply it
+# after platform-owned deployment patches and before the operator overlay: the
+# profile can carry portable agent defaults, but cannot change credentials,
+# providers, sandbox policy, or other platform authority. Unlike the optional
+# operator overlay, a configured portable profile fails closed so a deployment
+# cannot silently run with unexpected agent behavior.
+profile_path = (os.environ.get("CENTAUR_CODEX_PROFILE_PATH") or "").strip()
+if profile_path:
+    profile_sha256 = (os.environ.get("CENTAUR_CODEX_PROFILE_SHA256") or "").strip()
+    if not profile_sha256:
+        print("CENTAUR_CODEX_PROFILE_SHA256 is required with CENTAUR_CODEX_PROFILE_PATH", file=sys.stderr)
+        raise SystemExit(1)
+    profile_snapshot = str(
+        Path(os.environ["CENTAUR_PORTABLE_SOURCE_DIR"]) / "codex-profile.toml"
+    )
+    snapshot = subprocess.run(
+        [
+            "/usr/local/bin/snapshot-portable-source",
+            "--source",
+            profile_path,
+            "--destination",
+            profile_snapshot,
+            "--expected-sha256",
+            profile_sha256,
+            "--label",
+            "portable Codex profile",
+        ],
+        check=False,
+    )
+    if snapshot.returncode:
+        raise SystemExit(snapshot.returncode)
+    profile_path = profile_snapshot
+    path.write_text(text)
+    result = subprocess.run(
+        [
+            "/usr/local/bin/codex-profile-merge",
+            "--config",
+            str(path),
+            "--profile",
+            profile_path,
+            "--merge-only",
+        ],
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(result.returncode)
+    text = path.read_text()
+
+# CODEX_MODEL_REASONING_EFFORT is a deployment default, not repository policy.
+# It deliberately follows the portable profile and precedes the unrestricted
+# operator overlay, which owns the final explicit deployment override.
+effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
+if effort:
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    if effort not in valid:
+        print(
+            f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
+            f"expected one of {sorted(valid)}",
+            file=sys.stderr,
+        )
+    else:
+        import tomllib
+        import tomli_w
+
+        config = tomllib.loads(text)
+        config["model_reasoning_effort"] = effort
         text = tomli_w.dumps(config)
 
 # CODEX_CONFIG_OVERLAY: deep-merge an operator-supplied TOML fragment over the
@@ -271,6 +342,20 @@ if overlay_raw:
         text = tomli_w.dumps(merged)
 
 path.write_text(text)
+if profile_path:
+    result = subprocess.run(
+        [
+            "/usr/local/bin/codex-profile-merge",
+            "--config",
+            str(path),
+            "--profile",
+            profile_path,
+            "--attestation-only",
+        ],
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(result.returncode)
 PYEOF
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
@@ -291,7 +376,7 @@ configure_codex_metadata_trace() {
     while IFS='=' read -r name _; do
         case "$name" in OTEL_*) unset "$name" ;; esac
     done < <(env)
-    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
+    CODEX_CONFIG_PATH="$CODEX_CONFIG_DIR/config.toml" python3 - <<'PYEOF'
 from pathlib import Path
 import os
 import tomllib
@@ -362,7 +447,7 @@ PYEOF
         echo "metadata trace sidecar unavailable; continuing without trace export" >&2
         return 0
     fi
-    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" CODEX_TRACE_ENDPOINT="$endpoint" python3 - <<'PYEOF'
+    CODEX_CONFIG_PATH="$CODEX_CONFIG_DIR/config.toml" CODEX_TRACE_ENDPOINT="$endpoint" python3 - <<'PYEOF'
 import os
 from pathlib import Path
 import tomllib
@@ -569,41 +654,50 @@ fi
 unset _centaur_tools_auto_reload
 
 # ── Assemble system prompt from bind mounts ──────────────────────────────────
-# Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.
-# Prompt overlays from mounted repos are appended when present.
-TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
-compose-system-prompt --home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT"
-
-if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
-    cat >> "$TARGET_PROMPT" <<'EOF'
-
----
-
-[Observability access]
-This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
-EOF
+# Codex and Claude discover repository instructions themselves. Compose only
+# platform instructions in their user-level config directories so startup never
+# overwrites a target repository's policy, including uncommitted guidance.
+CODEX_PROMPT_DIR="$CODEX_CONFIG_DIR"
+CLAUDE_PROMPT_DIR="$(cd -P "$HOME_DIR/.claude" && pwd)"
+TARGET_PROMPT="$CODEX_PROMPT_DIR/AGENTS.md"
+CLAUDE_PROMPT="$CLAUDE_PROMPT_DIR/CLAUDE.md"
+COMPOSE_PROMPT_ARGS=(--home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT")
+if [ -n "${CENTAUR_AGENT_INSTRUCTIONS_PATH:-}" ]; then
+    INSTRUCTIONS_SNAPSHOT="$CENTAUR_PORTABLE_SOURCE_DIR/agent-instructions.md"
+    /usr/local/bin/snapshot-portable-source \
+        --source "$CENTAUR_AGENT_INSTRUCTIONS_PATH" \
+        --destination "$INSTRUCTIONS_SNAPSHOT" \
+        --expected-sha256 "${CENTAUR_AGENT_INSTRUCTIONS_SHA256:-}" \
+        --label "portable agent instructions"
+    COMPOSE_PROMPT_ARGS+=(--agent-instructions-path "$INSTRUCTIONS_SNAPSHOT")
 fi
+if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ]; then
+    COMPOSE_PROMPT_ARGS+=(--without-observability)
+fi
+if [ "${CENTAUR_SANDBOX_API_SERVER_ENABLED:-true}" = "false" ]; then
+    COMPOSE_PROMPT_ARGS+=(--without-api-server)
+fi
+/usr/local/bin/compose-system-prompt "${COMPOSE_PROMPT_ARGS[@]}"
+COMPOSE_PROMPT_ARGS[3]="$CLAUDE_PROMPT"
+/usr/local/bin/compose-system-prompt "${COMPOSE_PROMPT_ARGS[@]}"
+unset COMPOSE_PROMPT_ARGS
 
-if [ "${CENTAUR_SANDBOX_API_SERVER_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
-    cat >> "$TARGET_PROMPT" <<'EOF'
-
----
-
-[API server access]
-This sandbox does not have Centaur API server access. Do not use workflows or tool options that call the api-rs control plane, such as dispatching background agent sessions or downloading Centaur attachment handles.
-EOF
+if [ -n "${CENTAUR_AGENT_INSTRUCTIONS_PATH:-}" ]; then
+    INSTRUCTIONS_SHA256="$(/usr/bin/sha256sum "$INSTRUCTIONS_SNAPSHOT" | /usr/bin/cut -d ' ' -f 1)"
+    printf 'CENTAUR_AGENT_INSTRUCTIONS_APPLIED {"instructions_sha256":"%s"}\n' "$INSTRUCTIONS_SHA256"
+    unset INSTRUCTIONS_SHA256 INSTRUCTIONS_SNAPSHOT
 fi
 
 # Persona prompt injection is done by the API when it writes AGENTS_BASE.md.
 
-# Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
+# Switch to workspace so Codex discovers target-repository AGENTS.md naturally.
 cd "$WORKSPACE_DIR"
 
 configure_codex_metadata_trace "$@"
 
 if [ "${1:-}" = "harness-server" ] && [ "${2:-}" = "amp" ] && [ -f "$TARGET_PROMPT" ]; then
     rm -f "$WORKSPACE_DIR/AGENT.md"
-    ln -s "$(basename "$TARGET_PROMPT")" "$WORKSPACE_DIR/AGENT.md"
+    ln -s "$TARGET_PROMPT" "$WORKSPACE_DIR/AGENT.md"
 fi
 
 # Codex reads its auth file when the app server starts. Complete this before

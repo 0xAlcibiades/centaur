@@ -21,6 +21,11 @@ from repository `AGENTS.md` files, which guide contributors editing this repo.
 - `entrypoint.sh` must be deterministic and safe to rerun against persistent
   state. Preserve permissions, symlink targets, prompt composition order, and
   configured overlay precedence.
+- A mounted portable Codex profile may tune only agent behavior. Keep runtime
+  authority (providers, credentials, permissions, sandboxing, and deployment
+  policy) in the platform-owned configuration. Compose platform instructions
+  under Codex's global config and never rewrite target-repository `AGENTS.md`;
+  Codex discovers repository policy itself.
 - Tool discovery comes from ordered `TOOL_DIRS` entries and each tool's
   `[project.scripts]`. Keep `centaur-tools` catalog, direct CLI execution, and
   workflow compatibility behavior aligned.
