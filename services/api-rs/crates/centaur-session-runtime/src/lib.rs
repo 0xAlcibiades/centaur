@@ -1592,6 +1592,8 @@ impl SessionRuntime {
             }
             session = self.store.get_session(thread_key).await?;
         }
+        let proxy_labels =
+            proxy_labels_for_execution(&session.proxy_labels, &claim.execution.metadata);
         let sandbox_id = self
             .ensure_session_sandbox(EnsureSessionSandboxRequest {
                 thread_key,
@@ -1600,7 +1602,7 @@ impl SessionRuntime {
                 existing_sandbox_id: session.sandbox_id.as_deref(),
                 existing_sandbox_capabilities: session.sandbox_capabilities.as_ref(),
                 iron_control_principal: session.iron_control_principal.as_deref(),
-                proxy_labels: &session.proxy_labels,
+                proxy_labels: &proxy_labels,
                 desired_capabilities: &capabilities,
                 execution_metadata: Some(&claim.execution.metadata),
                 execution_id,
@@ -3026,14 +3028,14 @@ impl SessionRuntime {
         Ok(report)
     }
 
-    pub async fn stop_workflow_owned_sandboxes(
+    pub async fn stop_workflow_owned_sandboxes_for_task(
         &self,
-        workflow_run_id: &str,
+        workflow_task_id: &str,
         reason: &str,
     ) -> Result<WorkflowSandboxCleanupReport, SessionRuntimeError> {
         let sandboxes = self
             .store
-            .list_workflow_owned_sandboxes(workflow_run_id)
+            .list_workflow_owned_sandboxes_by_task(workflow_task_id)
             .await?;
         let mut report = WorkflowSandboxCleanupReport::default();
 
@@ -3094,7 +3096,7 @@ impl SessionRuntime {
                     warn!(
                         thread_key = %thread_key,
                         sandbox_id,
-                        workflow_run_id,
+                        workflow_task_id,
                         reason,
                         %error,
                         "failed to stop workflow-owned sandbox"
@@ -3112,7 +3114,7 @@ impl SessionRuntime {
                             json!({
                                 "thread_key": thread_key.as_str(),
                                 "sandbox_id": sandbox_id,
-                                "workflow_run_id": workflow_run_id,
+                                "workflow_task_id": workflow_task_id,
                                 "reason": reason,
                                 "error": error,
                             }),
@@ -3122,7 +3124,7 @@ impl SessionRuntime {
                         warn!(
                             thread_key = %thread_key,
                             sandbox_id,
-                            workflow_run_id,
+                            workflow_task_id,
                             %event_error,
                             "failed to append workflow sandbox stop failure event"
                         );
@@ -3145,7 +3147,7 @@ impl SessionRuntime {
                 warn!(
                     thread_key = %thread_key,
                     sandbox_id,
-                    workflow_run_id,
+                    workflow_task_id,
                     %error,
                     "failed to mark workflow-owned warm sandbox failed"
                 );
@@ -3169,7 +3171,7 @@ impl SessionRuntime {
                     json!({
                         "thread_key": thread_key.as_str(),
                         "sandbox_id": sandbox_id,
-                        "workflow_run_id": workflow_run_id,
+                        "workflow_task_id": workflow_task_id,
                         "reason": reason,
                         "missing": missing,
                         "cleared": cleared,
@@ -3180,7 +3182,7 @@ impl SessionRuntime {
                 warn!(
                     thread_key = %thread_key,
                     sandbox_id,
-                    workflow_run_id,
+                    workflow_task_id,
                     %error,
                     "failed to append workflow sandbox cleanup event"
                 );
@@ -3195,6 +3197,44 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        self.execute_session_inner(thread_key, input, None, None, None)
+            .await
+    }
+
+    /// Execute a workflow turn with server-owned Absurd identifiers and its
+    /// workflow-owned-thread decision.
+    ///
+    /// Both identifiers are normalized before becoming durable execution
+    /// metadata, so workflow ownership and proxy correlation cannot be supplied
+    /// through the generic execute API.
+    pub async fn execute_workflow_session(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        workflow_task_id: &str,
+        workflow_run_id: &str,
+        workflow_owned_thread: bool,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        let workflow_task_id = normalize_workflow_task_id(workflow_task_id)?;
+        let workflow_run_id = normalize_workflow_run_id(workflow_run_id)?;
+        self.execute_session_inner(
+            thread_key,
+            input,
+            Some(workflow_task_id),
+            Some(workflow_run_id),
+            Some(workflow_owned_thread),
+        )
+        .await
+    }
+
+    async fn execute_session_inner(
+        &self,
+        thread_key: &ThreadKey,
+        input: ExecuteSessionInput,
+        workflow_task_id: Option<String>,
+        workflow_run_id: Option<String>,
+        workflow_owned_thread: Option<bool>,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
         let ExecuteSessionInput {
             idempotency_key,
             metadata,
@@ -3202,6 +3242,12 @@ impl SessionRuntime {
             idle_timeout_ms,
             max_duration_ms,
         } = input;
+        let metadata = execution_request_metadata(
+            metadata,
+            workflow_task_id.as_deref(),
+            workflow_run_id.as_deref(),
+            workflow_owned_thread,
+        );
         let input_line_count = input_lines.len();
         let idempotency_key_present = idempotency_key.is_some();
         let span = info_span!(
@@ -3242,11 +3288,11 @@ impl SessionRuntime {
                     thread_key,
                     &session.harness_type,
                     session.iron_control_principal.as_deref(),
-                    metadata.as_ref(),
+                    Some(&metadata),
                 )
                 .await?;
             let mut durable_metadata =
-                execution_metadata(metadata.clone(), idle_timeout_ms, max_duration_ms);
+                execution_metadata(Some(metadata.clone()), idle_timeout_ms, max_duration_ms);
             merge_json_object(
                 &mut durable_metadata,
                 metadata_trace_execution_boundary(&desired_capabilities),
@@ -3263,7 +3309,7 @@ impl SessionRuntime {
                 input_lines: durable_input_lines,
                 boundary_fingerprint: input_delivery_boundary_fingerprint(
                     thread_key,
-                    metadata.as_ref(),
+                    Some(&metadata),
                     &desired_capabilities,
                 ),
             };
@@ -3589,15 +3635,16 @@ impl SessionRuntime {
     ) -> Result<(), SessionRuntimeError> {
         let boundary = SessionRuntimeError::MetadataTraceBoundaryChanged;
         let session = self.store.get_session(thread_key).await?;
+        let metadata = execution_request_metadata(metadata, None, None, None);
         let capabilities = self
             .resolve_sandbox_capabilities(
                 thread_key,
                 &session.harness_type,
                 session.iron_control_principal.as_deref(),
-                metadata.as_ref(),
+                Some(&metadata),
             )
             .await?;
-        let mut successor_metadata = execution_metadata(metadata.clone(), None, None);
+        let mut successor_metadata = execution_metadata(Some(metadata), None, None);
         merge_json_object(
             &mut successor_metadata,
             metadata_trace_execution_boundary(&capabilities),
@@ -9829,6 +9876,85 @@ fn proxy_labels_from_session_metadata(
     labels
 }
 
+const WORKFLOW_TASK_ID_METADATA_KEY: &str = "workflow_task_id";
+const WORKFLOW_TASK_ID_PROXY_LABEL: &str = "centaur.workflow_task_id";
+const WORKFLOW_RUN_ID_METADATA_KEY: &str = "workflow_run_id";
+const WORKFLOW_OWNED_THREAD_METADATA_KEY: &str = "workflow_owned_thread";
+
+fn normalize_workflow_task_id(workflow_task_id: &str) -> Result<String, SessionRuntimeError> {
+    normalize_workflow_identifier(workflow_task_id, "workflow_task_id")
+}
+
+fn normalize_workflow_run_id(workflow_run_id: &str) -> Result<String, SessionRuntimeError> {
+    normalize_workflow_identifier(workflow_run_id, "workflow_run_id")
+}
+
+fn normalize_workflow_identifier(
+    workflow_identifier: &str,
+    identifier_name: &str,
+) -> Result<String, SessionRuntimeError> {
+    Uuid::parse_str(workflow_identifier.trim())
+        .map(|workflow_identifier| workflow_identifier.to_string())
+        .map_err(|_| {
+            SessionRuntimeError::BadRequest(format!(
+                "{identifier_name} must be a valid UUID generated by the workflow runtime"
+            ))
+        })
+}
+
+fn execution_request_metadata(
+    metadata: Option<Value>,
+    workflow_task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_owned_thread: Option<bool>,
+) -> Value {
+    let mut metadata = default_metadata(metadata);
+    let Some(object) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    object.remove(WORKFLOW_TASK_ID_METADATA_KEY);
+    object.remove(WORKFLOW_RUN_ID_METADATA_KEY);
+    object.remove(WORKFLOW_OWNED_THREAD_METADATA_KEY);
+    if let Some(workflow_task_id) = workflow_task_id {
+        object.insert(
+            WORKFLOW_TASK_ID_METADATA_KEY.to_owned(),
+            Value::String(workflow_task_id.to_owned()),
+        );
+    }
+    if let Some(workflow_run_id) = workflow_run_id {
+        object.insert(
+            WORKFLOW_RUN_ID_METADATA_KEY.to_owned(),
+            Value::String(workflow_run_id.to_owned()),
+        );
+    }
+    if let Some(workflow_owned_thread) = workflow_owned_thread {
+        object.insert(
+            WORKFLOW_OWNED_THREAD_METADATA_KEY.to_owned(),
+            Value::Bool(workflow_owned_thread),
+        );
+    }
+    metadata
+}
+
+fn proxy_labels_for_execution(
+    session_proxy_labels: &BTreeMap<String, String>,
+    execution_metadata: &Value,
+) -> BTreeMap<String, String> {
+    let mut labels = session_proxy_labels.clone();
+    // A legacy session may still have this label persisted. The current
+    // execution owns workflow correlation, so never allow a prior task to
+    // follow a reused sandbox.
+    labels.remove(WORKFLOW_TASK_ID_PROXY_LABEL);
+    if let Some(workflow_task_id) = execution_metadata
+        .get(WORKFLOW_TASK_ID_METADATA_KEY)
+        .and_then(Value::as_str)
+        .and_then(|workflow_task_id| normalize_workflow_task_id(workflow_task_id).ok())
+    {
+        labels.insert(WORKFLOW_TASK_ID_PROXY_LABEL.to_owned(), workflow_task_id);
+    }
+    labels
+}
+
 fn insert_metadata_string_label(
     labels: &mut BTreeMap<String, String>,
     label: &str,
@@ -12073,6 +12199,121 @@ mod tests {
             BTreeMap::from([
                 ("centaur.slack_team_id".to_owned(), "T123".to_owned()),
                 ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn generic_execution_metadata_strips_workflow_correlation_spoofing() {
+        let thread_key = ThreadKey::parse("wf:task:agent:workflow").unwrap();
+        let session_labels = proxy_labels_from_session_metadata(
+            &thread_key,
+            &json!({"workflow_task_id": "018f0054-9a67-7c17-9d26-89c2f0dc45b7"}),
+        );
+        assert!(!session_labels.contains_key(WORKFLOW_TASK_ID_PROXY_LABEL));
+
+        let metadata = execution_request_metadata(
+            Some(json!({
+                "workflow_task_id": "018f0054-9a67-7c17-9d26-89c2f0dc45b7",
+                "workflow_run_id": "018f0054-9a67-7c17-9d26-89c2f0dc45b7",
+                "workflow_owned_thread": true,
+                "source": "untrusted-client",
+            })),
+            None,
+            None,
+            None,
+        );
+        assert!(metadata.get(WORKFLOW_TASK_ID_METADATA_KEY).is_none());
+        assert!(metadata.get(WORKFLOW_RUN_ID_METADATA_KEY).is_none());
+        assert!(metadata.get(WORKFLOW_OWNED_THREAD_METADATA_KEY).is_none());
+        assert_eq!(metadata["source"], "untrusted-client");
+        assert!(
+            !proxy_labels_for_execution(&session_labels, &metadata)
+                .contains_key(WORKFLOW_TASK_ID_PROXY_LABEL)
+        );
+    }
+
+    #[test]
+    fn trusted_workflow_execution_metadata_normalizes_task_and_run_ids() {
+        let workflow_task_id =
+            normalize_workflow_task_id(" 018F0054-9A67-7C17-9D26-89C2F0DC45B7 ").unwrap();
+        let workflow_run_id =
+            normalize_workflow_run_id(" 018F0054-9A67-7C17-9D26-89C2F0DC45B8 ").unwrap();
+        let metadata = execution_request_metadata(
+            Some(json!({
+                "workflow_task_id": "spoofed-task",
+                "workflow_run_id": "spoofed-run",
+                "workflow_owned_thread": false,
+                "source": "absurd_workflow",
+            })),
+            Some(&workflow_task_id),
+            Some(&workflow_run_id),
+            Some(true),
+        );
+        assert_eq!(
+            metadata[WORKFLOW_TASK_ID_METADATA_KEY],
+            "018f0054-9a67-7c17-9d26-89c2f0dc45b7"
+        );
+        assert_eq!(
+            metadata[WORKFLOW_RUN_ID_METADATA_KEY],
+            "018f0054-9a67-7c17-9d26-89c2f0dc45b8"
+        );
+        assert_eq!(metadata[WORKFLOW_OWNED_THREAD_METADATA_KEY], true);
+        assert!(matches!(
+            normalize_workflow_task_id("not-a-workflow-task-id"),
+            Err(SessionRuntimeError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_workflow_run_id("not-a-workflow-run-id"),
+            Err(SessionRuntimeError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_task_proxy_label_is_stable_across_retries_and_replaces_legacy_task() {
+        let session_labels = BTreeMap::from([
+            ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
+            (
+                WORKFLOW_TASK_ID_PROXY_LABEL.to_owned(),
+                "018f0054-9a67-7c17-9d26-89c2f0dc45b7".to_owned(),
+            ),
+        ]);
+        let first = execution_request_metadata(
+            None,
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45b8"),
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45b9"),
+            Some(true),
+        );
+        let retry = execution_request_metadata(
+            None,
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45b8"),
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45ba"),
+            Some(true),
+        );
+        assert_eq!(
+            proxy_labels_for_execution(&session_labels, &first),
+            proxy_labels_for_execution(&session_labels, &retry)
+        );
+        assert_ne!(
+            first[WORKFLOW_RUN_ID_METADATA_KEY],
+            retry[WORKFLOW_RUN_ID_METADATA_KEY]
+        );
+
+        let different_task = execution_request_metadata(
+            None,
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45bb"),
+            Some("018f0054-9a67-7c17-9d26-89c2f0dc45bc"),
+            Some(true),
+        );
+
+        assert_eq!(
+            proxy_labels_for_execution(&session_labels, &different_task),
+            BTreeMap::from([
+                ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
+                (
+                    WORKFLOW_TASK_ID_PROXY_LABEL.to_owned(),
+                    "018f0054-9a67-7c17-9d26-89c2f0dc45bb".to_owned(),
+                ),
             ])
         );
     }
@@ -15399,7 +15640,8 @@ mod adoption_tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let workflow_task_id = uuid::Uuid::new_v4().to_string();
+        let workflow_run_id = uuid::Uuid::new_v4().to_string();
         let sandbox_id = format!("sbx-owned-{}", uuid::Uuid::new_v4());
         let thread_key =
             ThreadKey::parse(format!("test:wf-cleanup-{}", uuid::Uuid::new_v4())).unwrap();
@@ -15410,13 +15652,25 @@ mod adoption_tests {
                 None,
                 json!({
                     "source": "absurd_workflow",
-                    "workflow_run_id": workflow_run_id,
-                    "workflow_owned_thread": true,
+                    "workflow_task_id": "caller-controlled-session-task",
+                    "workflow_owned_thread": false,
                 }),
                 Default::default(),
             )
             .await
             .expect("create session");
+        store
+            .create_execution(
+                &thread_key,
+                None,
+                json!({
+                    "workflow_task_id": workflow_task_id.clone(),
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_owned_thread": true,
+                }),
+            )
+            .await
+            .expect("create workflow-owned execution");
         assign_sandbox_identity(&store, &thread_key, &sandbox_id, "uid-workflow").await;
         store
             .insert_ready_warm_sandbox(&sandbox_id, Some("uid-workflow"), "test-workload")
@@ -15440,7 +15694,7 @@ mod adoption_tests {
         backend.set_observed_resource_uid(&sandbox_id, "uid-workflow");
         let runtime = runtime_with(&store, backend.clone());
         let report = runtime
-            .stop_workflow_owned_sandboxes(&workflow_run_id, "test")
+            .stop_workflow_owned_sandboxes_for_task(&workflow_task_id, "test")
             .await
             .expect("cleanup workflow sandboxes");
 
@@ -15460,7 +15714,7 @@ mod adoption_tests {
         let all = events(&store, &thread_key).await;
         assert!(all.iter().any(|event| {
             event.event_type == "session.workflow_sandbox_stopped"
-                && event.payload["workflow_run_id"] == json!(workflow_run_id)
+                && event.payload["workflow_task_id"] == json!(workflow_task_id)
                 && event.payload["cleared"] == json!(true)
         }));
     }
@@ -15471,7 +15725,8 @@ mod adoption_tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let workflow_task_id = uuid::Uuid::new_v4().to_string();
+        let workflow_run_id = uuid::Uuid::new_v4().to_string();
         let sandbox_id = format!("sbx-workflow-aba-{}", uuid::Uuid::new_v4());
         let thread_key = ThreadKey::parse(format!("test:wf-aba-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -15481,20 +15736,32 @@ mod adoption_tests {
                 None,
                 json!({
                     "source": "absurd_workflow",
-                    "workflow_run_id": workflow_run_id,
-                    "workflow_owned_thread": true,
+                    "workflow_task_id": "caller-controlled-session-task",
+                    "workflow_owned_thread": false,
                 }),
                 Default::default(),
             )
             .await
             .expect("create session");
+        store
+            .create_execution(
+                &thread_key,
+                None,
+                json!({
+                    "workflow_task_id": workflow_task_id.clone(),
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_owned_thread": true,
+                }),
+            )
+            .await
+            .expect("create workflow-owned execution");
         assign_sandbox_identity(&store, &thread_key, &sandbox_id, "uid-old").await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         backend.set_observed_resource_uid(&sandbox_id, "uid-new");
         let runtime = runtime_with(&store, backend.clone());
         let report = runtime
-            .stop_workflow_owned_sandboxes(&workflow_run_id, "test")
+            .stop_workflow_owned_sandboxes_for_task(&workflow_task_id, "test")
             .await
             .expect("stale cleanup reports failure without clearing");
 
@@ -15513,7 +15780,8 @@ mod adoption_tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let workflow_task_id = uuid::Uuid::new_v4().to_string();
+        let workflow_run_id = uuid::Uuid::new_v4().to_string();
         let thread_key =
             ThreadKey::parse(format!("test:wf-explicit-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -15523,12 +15791,25 @@ mod adoption_tests {
                 None,
                 json!({
                     "source": "absurd_workflow",
-                    "workflow_run_id": workflow_run_id,
+                    "workflow_task_id": workflow_task_id.clone(),
+                    "workflow_owned_thread": true,
                 }),
                 Default::default(),
             )
             .await
             .expect("create session");
+        store
+            .create_execution(
+                &thread_key,
+                None,
+                json!({
+                    "workflow_task_id": workflow_task_id.clone(),
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_owned_thread": false,
+                }),
+            )
+            .await
+            .expect("create shared workflow execution");
         store
             .update_sandbox_id(&thread_key, Some("sbx-explicit"))
             .await
@@ -15537,7 +15818,7 @@ mod adoption_tests {
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let runtime = runtime_with(&store, backend.clone());
         let report = runtime
-            .stop_workflow_owned_sandboxes(&workflow_run_id, "test")
+            .stop_workflow_owned_sandboxes_for_task(&workflow_task_id, "test")
             .await
             .expect("cleanup workflow sandboxes");
 
@@ -15555,7 +15836,8 @@ mod adoption_tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let workflow_run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let workflow_task_id = uuid::Uuid::new_v4().to_string();
+        let workflow_run_id = uuid::Uuid::new_v4().to_string();
         let thread_key =
             ThreadKey::parse(format!("test:wf-missing-{}", uuid::Uuid::new_v4())).unwrap();
         store
@@ -15565,13 +15847,25 @@ mod adoption_tests {
                 None,
                 json!({
                     "source": "absurd_workflow",
-                    "workflow_run_id": workflow_run_id,
-                    "workflow_owned_thread": true,
+                    "workflow_task_id": "caller-controlled-session-task",
+                    "workflow_owned_thread": false,
                 }),
                 Default::default(),
             )
             .await
             .expect("create session");
+        store
+            .create_execution(
+                &thread_key,
+                None,
+                json!({
+                    "workflow_task_id": workflow_task_id.clone(),
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_owned_thread": true,
+                }),
+            )
+            .await
+            .expect("create workflow-owned execution");
         assign_sandbox_identity(&store, &thread_key, "sbx-missing", "uid-missing").await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
@@ -15580,7 +15874,7 @@ mod adoption_tests {
         backend.set_observed_status("sbx-missing", SandboxStatus::Gone);
         let runtime = runtime_with(&store, backend);
         let report = runtime
-            .stop_workflow_owned_sandboxes(&workflow_run_id, "test")
+            .stop_workflow_owned_sandboxes_for_task(&workflow_task_id, "test")
             .await
             .expect("cleanup workflow sandboxes");
 

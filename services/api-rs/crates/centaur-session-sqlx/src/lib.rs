@@ -4301,9 +4301,9 @@ impl PgSessionStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    pub async fn list_workflow_owned_sandboxes(
+    pub async fn list_workflow_owned_sandboxes_by_task(
         &self,
-        workflow_run_id: &str,
+        workflow_task_id: &str,
     ) -> Result<Vec<WorkflowOwnedSandbox>, SessionStoreError> {
         let rows = sqlx::query_as::<_, WorkflowOwnedSandboxRow>(
             r#"
@@ -4313,12 +4313,17 @@ impl PgSessionStore {
                    sandbox_assignment_epoch as assignment_epoch
             from sessions
             where sandbox_id is not null
-              and metadata->>'workflow_owned_thread' = 'true'
-              and metadata->>'workflow_run_id' = $1
+              and exists (
+                  select 1
+                  from session_executions
+                  where session_executions.thread_key = sessions.thread_key
+                    and session_executions.metadata->>'workflow_task_id' = $1
+                    and session_executions.metadata->>'workflow_owned_thread' = 'true'
+              )
             order by thread_key
             "#,
         )
-        .bind(workflow_run_id)
+        .bind(workflow_task_id)
         .fetch_all(&self.pool)
         .await?;
 
