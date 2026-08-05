@@ -8,13 +8,8 @@ create table if not exists user_experience_scans (
     classifier_version text not null,
     model text not null,
     status text not null default 'pending',
-    problem_detected boolean,
-    experience text,
-    severity text,
-    user_emotion text,
-    agent_contribution text,
+    label text,
     confidence double precision,
-    failure_modes text[] not null default '{}',
     evidence_message_ids text[] not null default '{}',
     summary text,
     result jsonb not null default '{}'::jsonb,
@@ -32,35 +27,19 @@ create table if not exists user_experience_scans (
         unique (thread_key, last_message_id, classifier_version, model),
     constraint user_experience_scans_status_check
         check (status in ('pending', 'running', 'completed', 'failed', 'superseded')),
-    constraint user_experience_scans_experience_check
-        check (experience is null or experience in ('good', 'mixed', 'bad', 'unknown')),
-    constraint user_experience_scans_severity_check
-        check (severity is null or severity in ('none', 'low', 'medium', 'high', 'critical')),
-    constraint user_experience_scans_user_emotion_check
-        check (user_emotion is null or user_emotion in ('neutral', 'disappointed', 'frustrated', 'angry', 'unknown')),
-    constraint user_experience_scans_agent_contribution_check
-        check (agent_contribution is null or agent_contribution in ('none', 'possible', 'likely', 'unknown')),
+    constraint user_experience_scans_label_check
+        check (label is null or label in ('good', 'mixed', 'bad', 'unknown')),
     constraint user_experience_scans_confidence_check
         check (confidence is null or (confidence >= 0 and confidence <= 1)),
     constraint user_experience_scans_completed_result_check
         check (
             status <> 'completed'
             or (
-                problem_detected is not null
-                and experience is not null
-                and severity is not null
-                and user_emotion is not null
-                and agent_contribution is not null
+                label is not null
                 and confidence is not null
                 and summary is not null
                 and completed_at is not null
             )
-        ),
-    constraint user_experience_scans_problem_severity_check
-        check (
-            problem_detected is null
-            or (problem_detected and severity in ('low', 'medium', 'high', 'critical'))
-            or (not problem_detected and severity = 'none')
         ),
     constraint user_experience_scans_attempt_count_check
         check (attempt_count >= 0),
@@ -87,8 +66,8 @@ create index if not exists user_experience_scans_running_lease_idx
     where status = 'running';
 
 create index if not exists user_experience_scans_problem_completed_idx
-    on user_experience_scans (completed_at desc, severity)
-    where status = 'completed' and problem_detected = true;
+    on user_experience_scans (completed_at desc, label)
+    where status = 'completed' and label in ('mixed', 'bad');
 
 create index if not exists user_experience_scans_thread_created_idx
     on user_experience_scans (thread_key, created_at desc);

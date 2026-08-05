@@ -39,39 +39,14 @@ SLACK_THREAD_KEY_RE = re.compile(
     r"^slack:(?:(?P<team>[^:]+):)?(?P<channel>[CDG][^:]*):(?P<thread_ts>[^:]+)$"
 )
 
-EXPERIENCES = {"good", "mixed", "bad", "unknown"}
-SEVERITIES = {"none", "low", "medium", "high", "critical"}
-USER_EMOTIONS = {"neutral", "disappointed", "frustrated", "angry", "unknown"}
-AGENT_CONTRIBUTIONS = {"none", "possible", "likely", "unknown"}
-FAILURE_MODES = {
-    "wrong_answer",
-    "ignored_instruction",
-    "repeated_failure",
-    "tool_failure",
-    "no_response",
-    "slow_response",
-    "poor_tone",
-    "other",
-}
+LABELS = {"good", "mixed", "bad", "unknown"}
 
 CLASSIFIER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "problem_detected": {"type": "boolean"},
-        "experience": {"type": "string", "enum": sorted(EXPERIENCES)},
-        "severity": {"type": "string", "enum": sorted(SEVERITIES)},
-        "user_emotion": {"type": "string", "enum": sorted(USER_EMOTIONS)},
-        "agent_contribution": {
-            "type": "string",
-            "enum": sorted(AGENT_CONTRIBUTIONS),
-        },
+        "label": {"type": "string", "enum": sorted(LABELS)},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "failure_modes": {
-            "type": "array",
-            "items": {"type": "string", "enum": sorted(FAILURE_MODES)},
-            "uniqueItems": True,
-        },
         "evidence_message_ids": {
             "type": "array",
             "items": {"type": "string"},
@@ -81,27 +56,27 @@ CLASSIFIER_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string", "maxLength": 1000},
     },
     "required": [
-        "problem_detected",
-        "experience",
-        "severity",
-        "user_emotion",
-        "agent_contribution",
+        "label",
         "confidence",
-        "failure_modes",
         "evidence_message_ids",
         "summary",
     ],
 }
 
-SYSTEM_PROMPT = """You classify whether a user had a poor experience with an AI agent.
-Judge the quality of the interaction, not merely negative emotion about an external
-problem. Treat repeated corrections, ignored instructions, wrong answers, failed
-tools, timeouts, missing responses, and unhelpful tone as evidence. Operational
-failure may establish a problem even without an explicit complaint. Do not call an
-interaction bad solely because the user describes an upsetting situation. Use
-unknown when the transcript is insufficient. Cite only provided message IDs, keep
-the summary factual and under two sentences, and do not quote secrets or personal
-data."""
+SYSTEM_PROMPT = """Classify the user's experience with an AI agent using one label:
+- good: no material agent-caused problem is evident.
+- mixed: the agent caused meaningful friction, but the interaction retained value
+  or substantially recovered.
+- bad: a clear, significant agent-caused or agent-amplified failure was unresolved.
+- unknown: the transcript is insufficient to judge.
+
+Judge the interaction, not merely negative emotion about an external problem.
+Repeated corrections, ignored instructions, wrong answers, failed tools, timeouts,
+missing responses, and unhelpful tone are evidence. Operational failure may make an
+experience mixed or bad without an explicit complaint. Do not use mixed or bad
+solely because the user describes an upsetting situation. Cite only provided
+message IDs, keep the summary factual and under two sentences, and do not quote
+secrets or personal data."""
 
 
 def _positive_int(value: int | str | None, default: int) -> int:
@@ -514,26 +489,13 @@ async def _classify(
 
 
 def _validate_result(result: dict[str, Any], message_ids: set[str]) -> dict[str, Any]:
-    if not isinstance(result.get("problem_detected"), bool):
-        raise TypeError("problem_detected must be a boolean")
-    if result.get("experience") not in EXPERIENCES:
-        raise ValueError("invalid experience")
-    if result.get("severity") not in SEVERITIES:
-        raise ValueError("invalid severity")
-    if result.get("user_emotion") not in USER_EMOTIONS:
-        raise ValueError("invalid user_emotion")
-    if result.get("agent_contribution") not in AGENT_CONTRIBUTIONS:
-        raise ValueError("invalid agent_contribution")
+    if result.get("label") not in LABELS:
+        raise ValueError("invalid label")
     confidence = result.get("confidence")
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         raise TypeError("confidence must be numeric")
     if not 0 <= float(confidence) <= 1:
         raise ValueError("confidence must be between zero and one")
-    failure_modes = result.get("failure_modes")
-    if not isinstance(failure_modes, list) or any(
-        mode not in FAILURE_MODES for mode in failure_modes
-    ):
-        raise ValueError("invalid failure_modes")
     evidence = result.get("evidence_message_ids")
     if not isinstance(evidence, list) or any(
         item not in message_ids for item in evidence
@@ -542,17 +504,6 @@ def _validate_result(result: dict[str, Any], message_ids: set[str]) -> dict[str,
     summary = result.get("summary")
     if not isinstance(summary, str) or len(summary) > 1000:
         raise ValueError("summary must be a string of at most 1000 characters")
-    if not result["problem_detected"] and result["severity"] != "none":
-        raise ValueError("non-problem results must use severity none")
-    if result["problem_detected"] and result["severity"] == "none":
-        raise ValueError("problem results must use a non-none severity")
-    if result["problem_detected"] and result["experience"] not in {"mixed", "bad"}:
-        raise ValueError("problem results must use mixed or bad experience")
-    if not result["problem_detected"] and result["experience"] not in {
-        "good",
-        "unknown",
-    }:
-        raise ValueError("non-problem results must use good or unknown experience")
     return result
 
 
@@ -561,29 +512,19 @@ async def _complete_scan(pool: Any, scan_id: str, result: dict[str, Any]) -> Non
         """
         UPDATE user_experience_scans
         SET status = 'completed',
-            problem_detected = $2,
-            experience = $3,
-            severity = $4,
-            user_emotion = $5,
-            agent_contribution = $6,
-            confidence = $7,
-            failure_modes = $8,
-            evidence_message_ids = $9,
-            summary = $10,
-            result = $11::jsonb,
+            label = $2,
+            confidence = $3,
+            evidence_message_ids = $4,
+            summary = $5,
+            result = $6::jsonb,
             last_error = '',
             completed_at = NOW(),
             updated_at = NOW()
         WHERE scan_id = $1 AND status = 'running'
         """,
         scan_id,
-        result["problem_detected"],
-        result["experience"],
-        result["severity"],
-        result["user_emotion"],
-        result["agent_contribution"],
+        result["label"],
         float(result["confidence"]),
-        list(dict.fromkeys(result["failure_modes"])),
         list(dict.fromkeys(result["evidence_message_ids"])),
         result["summary"],
         json.dumps(result, separators=(",", ":")),
@@ -667,8 +608,8 @@ async def _process_scans(
 async def _load_run_results(pool: Any, run_id: str) -> list[dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT thread_key, status, problem_detected, severity, confidence,
-               failure_modes, summary, model, created_at, completed_at
+        SELECT thread_key, status, label, confidence, summary, model, created_at,
+               completed_at
         FROM user_experience_scans
         WHERE workflow_run_id = $1
         ORDER BY completed_at NULLS LAST, created_at
@@ -689,7 +630,7 @@ def _thread_reference(thread_key: str) -> str:
 
 def _format_digest(rows: list[dict[str, Any]], model: str) -> str:
     completed = [row for row in rows if row["status"] == "completed"]
-    problems = [row for row in completed if row["problem_detected"]]
+    problems = [row for row in completed if row["label"] in {"mixed", "bad"}]
     failed = sum(row["status"] == "failed" for row in rows)
     superseded = sum(row["status"] == "superseded" for row in rows)
     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -708,28 +649,26 @@ def _format_digest(rows: list[dict[str, Any]], model: str) -> str:
         else:
             lines.append("No eligible thread snapshots were available in this run.")
         return "\n\n".join(lines)
-    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
     problems.sort(
         key=lambda row: (
-            severity_order.get(str(row["severity"]), 5),
+            0 if row["label"] == "bad" else 1,
             -float(row["confidence"] or 0),
         )
     )
-    counts = {
-        severity: sum(row["severity"] == severity for row in problems)
-        for severity in ("critical", "high", "medium", "low")
-    }
     lines.append(
-        "Severity: "
-        + " · ".join(f"{name} *{count}*" for name, count in counts.items() if count)
+        "Labels: "
+        + " · ".join(
+            f"{label} *{sum(row['label'] == label for row in problems)}*"
+            for label in ("bad", "mixed")
+            if any(row["label"] == label for row in problems)
+        )
     )
     lines.append("*Highest-priority threads*")
     for row in problems[:10]:
-        modes = ", ".join(row["failure_modes"] or []) or "uncategorized"
         summary = str(row["summary"] or "No summary supplied").replace("\n", " ")
         lines.append(
-            f"• *{str(row['severity']).upper()}* {_thread_reference(str(row['thread_key']))} "
-            f"— {summary} _({modes})_"
+            f"• *{str(row['label']).upper()}* {_thread_reference(str(row['thread_key']))} "
+            f"— {summary}"
         )
     if len(problems) > 10:
         lines.append(f"…and {len(problems) - 10} more problematic threads.")

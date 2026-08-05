@@ -40,13 +40,8 @@ digest = _load_module()
 
 def _result(**overrides):
     value = {
-        "problem_detected": True,
-        "experience": "bad",
-        "severity": "high",
-        "user_emotion": "frustrated",
-        "agent_contribution": "likely",
+        "label": "bad",
         "confidence": 0.92,
-        "failure_modes": ["repeated_failure"],
         "evidence_message_ids": ["message-1"],
         "summary": "The agent repeated an unsuccessful answer after a correction.",
     }
@@ -81,15 +76,15 @@ def test_validate_result_rejects_evidence_outside_transcript():
         raise AssertionError("expected invalid evidence to be rejected")
 
 
-def test_validate_result_requires_none_severity_for_non_problem():
-    value = _result(problem_detected=False, experience="good")
+def test_validate_result_rejects_unknown_label():
+    value = _result(label="frustrated")
 
     try:
         digest._validate_result(value, {"message-1"})
     except ValueError as error:
-        assert "severity none" in str(error)
+        assert "invalid label" in str(error)
     else:
-        raise AssertionError("expected inconsistent severity to be rejected")
+        raise AssertionError("expected invalid label to be rejected")
 
 
 def test_classify_uses_strict_schema_and_store_false():
@@ -121,11 +116,17 @@ def test_classify_uses_strict_schema_and_store_false():
 
     result = asyncio.run(run())
 
-    assert result["problem_detected"] is True
+    assert result["label"] == "bad"
     assert requests[0]["store"] is False
     assert requests[0]["model"] == "small-model"
     assert requests[0]["text"]["format"]["strict"] is True
     assert requests[0]["text"]["format"]["schema"] == digest.CLASSIFIER_SCHEMA
+    assert set(digest.CLASSIFIER_SCHEMA["properties"]) == {
+        "label",
+        "confidence",
+        "evidence_message_ids",
+        "summary",
+    }
 
 
 def test_claim_reclaims_expired_running_rows():
@@ -214,19 +215,15 @@ def test_format_digest_lists_problem_threads_without_raw_evidence():
         {
             "thread_key": "slack:T1:C123:123.456",
             "status": "completed",
-            "problem_detected": True,
-            "severity": "high",
+            "label": "bad",
             "confidence": 0.9,
-            "failure_modes": ["wrong_answer"],
             "summary": "The response remained incorrect after a correction.",
         },
         {
             "thread_key": "linear:ISSUE-1",
             "status": "completed",
-            "problem_detected": False,
-            "severity": "none",
+            "label": "good",
             "confidence": 0.8,
-            "failure_modes": [],
             "summary": "No problem detected.",
         },
     ]
@@ -235,7 +232,7 @@ def test_format_digest_lists_problem_threads_without_raw_evidence():
 
     assert "problems *1*" in report
     assert "https://slack.com/archives/C123/p123456" in report
-    assert "wrong_answer" in report
+    assert "*BAD*" in report
     assert "No problem detected" not in report
 
 
@@ -263,10 +260,8 @@ def test_handler_discovers_classifies_and_posts_report(monkeypatch):
             {
                 "thread_key": scan.thread_key,
                 "status": "completed",
-                "problem_detected": True,
-                "severity": "high",
+                "label": "bad",
                 "confidence": 0.9,
-                "failure_modes": ["wrong_answer"],
                 "summary": "The answer was wrong.",
             }
         ]
