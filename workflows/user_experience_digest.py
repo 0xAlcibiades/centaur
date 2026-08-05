@@ -208,11 +208,11 @@ async def _discover_candidates(
           AND NOT EXISTS (
               SELECT 1 FROM user_experience_scans existing
               WHERE existing.thread_key = s.thread_key
-                AND existing.last_message_id = latest.message_id
                 AND (
                     existing.status = 'baseline'
                     OR (
-                        existing.classifier_version = $3
+                        existing.last_message_id = latest.message_id
+                        AND existing.classifier_version = $3
                         AND existing.model = $4
                     )
                 )

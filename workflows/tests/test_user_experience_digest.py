@@ -205,6 +205,9 @@ def test_discovery_uses_scan_rows_as_snapshot_checkpoints():
     assert inserted == 1
     assert "user_experience_scans existing" in pool.fetch_query
     assert "existing.status = 'baseline'" in pool.fetch_query
+    assert pool.fetch_query.index(
+        "existing.status = 'baseline'"
+    ) < pool.fetch_query.index("existing.last_message_id = latest.message_id")
     assert "metadata ->> 'platform'" in pool.fetch_query
     assert '"is_mention": true' in pool.fetch_query
     assert "'discord'" not in pool.fetch_query

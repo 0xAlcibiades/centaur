@@ -57,9 +57,9 @@ create table if not exists user_experience_scans (
         check (octet_length(last_error) <= 4000)
 );
 
--- Establish a durable rollout baseline in the same table as scan results. These
--- rows prevent the first scheduled run from classifying retained history. A
--- thread becomes eligible only after its latest message changes.
+-- Establish a durable rollout boundary in the same table as scan results. A
+-- baseline row permanently excludes each Slack thread that exists when this
+-- migration runs; only threads created afterward can be classified.
 insert into user_experience_scans (
     scan_id,
     thread_key,
@@ -88,16 +88,6 @@ join lateral (
     limit 1
 ) latest on true
 where coalesce(s.metadata ->> 'platform', '') = 'slack'
-  and exists (
-      select 1
-      from session_messages user_message
-      where user_message.thread_key = s.thread_key
-        and user_message.role = 'user'
-        and user_message.metadata @> '{
-            "platform": "slack",
-            "is_mention": true
-        }'::jsonb
-  )
 on conflict do nothing;
 
 create index if not exists user_experience_scans_claim_idx
