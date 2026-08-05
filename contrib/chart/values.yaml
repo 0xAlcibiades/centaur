@@ -558,6 +558,8 @@ githubbot:
   # / draft status.
   autoMerge: true
   mergeMethod: squash
+  # Emit CI and review workflow events to api-rs.
+  workflowEvents: false
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
   # Optional review / issue-work methodology overrides. When set, the chart writes
