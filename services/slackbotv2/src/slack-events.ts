@@ -1,6 +1,6 @@
 import type { Logger, Message } from 'chat'
 import type { ExternalPromptingEntitlementInput } from './session-api'
-import { withSlackApiTimeout } from './session-api'
+import { slackTeamId, withSlackApiTimeout } from './session-api'
 import type { JsonValue, SlackbotV2Options } from './types'
 import { isJsonObject, stringValue } from './utils'
 
@@ -112,7 +112,7 @@ export function externalPromptingPolicyForSlackWebhook(
   if (!externalTeamId) return { kind: 'not_required' }
 
   const eventId = stringValue(payload.event_id)
-  const teamId = stringValue(payload.team_id)
+  const teamId = slackTeamId(event) ?? stringValue(payload.team_id)
   const channelId = stringValue(event.channel)
   const threadTs = stringValue(event.thread_ts) ?? stringValue(event.ts)
   if (!channelId || !threadTs) {

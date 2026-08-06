@@ -489,12 +489,14 @@ function isSlackMessageUrl(url: string): boolean {
   return SLACK_MESSAGE_URL_PATTERN.test(url)
 }
 
-function slackTeamId(raw: unknown): string | undefined {
+export function slackTeamId(raw: unknown): string | undefined {
   if (!isJsonObject(raw)) return undefined
   const team = raw.team
   if (typeof raw.team_id === 'string' && raw.team_id) return raw.team_id
   if (typeof team === 'string' && team) return team
   if (isJsonObject(team) && typeof team.id === 'string' && team.id) return team.id
+  if (typeof raw.user_team === 'string' && raw.user_team) return raw.user_team
+  if (typeof raw.source_team === 'string' && raw.source_team) return raw.source_team
   const user = raw.user
   if (isJsonObject(user) && typeof user.team_id === 'string' && user.team_id) {
     return user.team_id

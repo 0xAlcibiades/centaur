@@ -5,7 +5,7 @@ import {
   isAllowedSlackMessage,
   isAllowedSlackWebhookBody
 } from '../src/slack-events'
-import { isExternalPromptingEnabled } from '../src/session-api'
+import { isExternalPromptingEnabled, serializeMessage } from '../src/session-api'
 import type { SlackbotV2Options } from '../src/types'
 
 const logger: Logger = {
@@ -168,6 +168,33 @@ describe('Slack external prompting entitlements', () => {
       if (threadId && policy.kind === 'check') expect(policy.input.threadId).toBe(threadId)
     })
   }
+
+  it('uses the same external team for DM entitlement and session principals', async () => {
+    const rawBody = externalWebhook('D1')
+    const raw = JSON.parse(rawBody).event
+    const config = {
+      ...options(() => {
+        throw new Error('entitlement endpoint must not be called before signature verification')
+      }),
+      allowedExternalTeamIds: ['TEXTERNAL'],
+      externalPromptingEntitlementsEnabled: true
+    }
+    const policy = externalPromptingPolicyForSlackWebhook(rawBody, config)
+    const sessionMessage = await serializeMessage({
+      attachments: [],
+      author: { isBot: false, userId: 'UEXTERNAL' },
+      id: raw.ts,
+      metadata: { dateSent: new Date() },
+      raw,
+      text: 'hello',
+      threadId: 'slack:D1:1700000000.000001'
+    } as unknown as Message)
+
+    expect(policy.kind).toBe('check')
+    if (policy.kind === 'check') {
+      expect([policy.input.teamId, sessionMessage.teamId]).toEqual(['TEXTERNAL', 'TEXTERNAL'])
+    }
+  })
 
   it('sends session identity metadata to the entitlement endpoint', async () => {
     let request: { body: unknown; url: string } | undefined

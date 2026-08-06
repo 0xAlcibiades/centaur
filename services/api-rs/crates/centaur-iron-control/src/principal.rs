@@ -392,22 +392,22 @@ mod tests {
     }
 
     #[test]
-    fn metadata_team_id_is_folded_into_legacy_dm_user_key() {
+    fn external_dm_metadata_team_id_is_folded_into_the_session_principal_key() {
         let principal = derive_principal_with_slack_team(
             "slack:D9:ts",
-            Some("U07ABC"),
-            Some("T123"),
+            Some("U_EXTERNAL"),
+            Some("T_EXTERNAL"),
             Some("Ada Lovelace"),
         );
-        assert_eq!(principal.foreign_id, "slack-user-t123-u07abc");
+        assert_eq!(principal.foreign_id, "slack-user-t-external-u-external");
         assert_eq!(principal.name, "Slack DM @Ada Lovelace");
         assert_eq!(
             principal.labels.get("slack_team_id").map(String::as_str),
-            Some("T123")
+            Some("T_EXTERNAL")
         );
         assert_eq!(
             principal.labels.get("slack_user_id").map(String::as_str),
-            Some("U07ABC")
+            Some("U_EXTERNAL")
         );
     }
 
