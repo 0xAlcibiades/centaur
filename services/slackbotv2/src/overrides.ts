@@ -5,7 +5,7 @@
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
  *   --model <name> (or --model=<name>)           pick the model within that harness
- *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex)
+ *   -r <effort> (or -r=<effort>)                 per-turn reasoning effort (codex/nanocodex)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
  *
  * Flags are stripped from the text before it reaches the agent. The harness
@@ -116,10 +116,10 @@ const MODEL_FLAG_PATTERN = new RegExp(
   'i'
 )
 
-// Single dash by design: a short per-turn knob (`-rsn high`), so it can't reuse
+// Single dash by design: a short per-turn knob (`-r high`), so it can't reuse
 // the `--`-prefixed flagPattern() helper. Value-capturing like --model.
 const REASONING_FLAG_PATTERN = new RegExp(
-  String.raw`(?:^|\s)-rsn${MODEL_VALUE_SEPARATOR}([A-Za-z-]+)${FLAG_VALUE_BOUNDARY}`,
+  String.raw`(?:^|\s)-r${MODEL_VALUE_SEPARATOR}([A-Za-z-]+)${FLAG_VALUE_BOUNDARY}`,
   'i'
 )
 

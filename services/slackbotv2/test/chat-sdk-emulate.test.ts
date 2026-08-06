@@ -1264,7 +1264,7 @@ describe('slackbotv2', () => {
 
     const parent = await postUserMessage('Channel default override thread context.')
     const mention = await postUserMessage(
-      `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`,
+      `<@${BOT_USER_ID}> --codex --model gpt-5.4 -r low go`,
       parent.ts
     )
     const waits: Promise<unknown>[] = []
@@ -1279,7 +1279,7 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: mention.ts,
           thread_ts: parent.ts,
-          text: `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`
+          text: `<@${BOT_USER_ID}> --codex --model gpt-5.4 -r low go`
         }
       }),
       {},
@@ -1288,7 +1288,7 @@ describe('slackbotv2', () => {
     expect(response.status).toBe(200)
     await Promise.all(waits)
 
-    // Explicit --codex/--model/-rsn beat every field of the channel default.
+    // Explicit --codex/--model/-r beat every field of the channel default.
     expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
     expect(codexApi.executes).toHaveLength(1)
     const inputLine = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<

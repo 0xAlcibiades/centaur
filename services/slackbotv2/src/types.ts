@@ -292,7 +292,7 @@ export type ForwardSessionInput = {
   metadataModel?: string
   /** Effective model provider selected by sticky thread flags (--bedrock); codex only. */
   provider?: string
-  /** Per-turn reasoning effort parsed from the `-rsn` flag (Codex/Nanocodex). */
+  /** Per-turn reasoning effort parsed from the `-r` flag (Codex/Nanocodex). */
   reasoning?: string
   onEventId(eventId: number): void
   openStream: boolean

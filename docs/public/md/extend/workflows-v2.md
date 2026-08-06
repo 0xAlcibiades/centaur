@@ -124,7 +124,7 @@ session runtime.
 
 `ctx.agent_turn(...)` accepts optional `model`, `provider`, and `reasoning`
 kwargs. They ride the turn exactly like the Slack `--model` / `--bedrock` /
-`-rsn` flags: `model` selects the model within the harness, `reasoning` sets the
+`-r` flags: `model` selects the model within the harness, `reasoning` sets the
 codex reasoning effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`),
 and `provider` selects the codex model provider. `provider` and `reasoning` only
 affect the codex harness; claude and amp ignore them. `reasoning` also accepts

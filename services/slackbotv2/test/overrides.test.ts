@@ -166,34 +166,34 @@ describe('extractMessageOverrides', () => {
     })
   })
 
-  test('parses -rsn with space or equals', () => {
-    expect(extractMessageOverrides('-rsn high fix it')).toEqual({
+  test('parses -r with space or equals', () => {
+    expect(extractMessageOverrides('-r high fix it')).toEqual({
       cleanedText: 'fix it',
       harnessType: undefined,
       model: undefined,
       reasoning: 'high'
     })
-    expect(extractMessageOverrides('-rsn=medium fix it').reasoning).toBe('medium')
+    expect(extractMessageOverrides('-r=medium fix it').reasoning).toBe('medium')
   })
 
-  test('-rsn is case-insensitive and normalizes the effort value', () => {
-    expect(extractMessageOverrides('-rsn HIGH fix it').reasoning).toBe('high')
-    expect(extractMessageOverrides('-rsn Medium fix it').reasoning).toBe('medium')
+  test('-r is case-insensitive and normalizes the effort value', () => {
+    expect(extractMessageOverrides('-r HIGH fix it').reasoning).toBe('high')
+    expect(extractMessageOverrides('-r Medium fix it').reasoning).toBe('medium')
   })
 
-  test('-rsn accepts short aliases', () => {
-    expect(extractMessageOverrides('-rsn min fix it').reasoning).toBe('minimal')
-    expect(extractMessageOverrides('-rsn med fix it').reasoning).toBe('medium')
-    expect(extractMessageOverrides('-rsn hi fix it').reasoning).toBe('high')
-    expect(extractMessageOverrides('-rsn xhi fix it').reasoning).toBe('xhigh')
+  test('-r accepts short aliases', () => {
+    expect(extractMessageOverrides('-r min fix it').reasoning).toBe('minimal')
+    expect(extractMessageOverrides('-r med fix it').reasoning).toBe('medium')
+    expect(extractMessageOverrides('-r hi fix it').reasoning).toBe('high')
+    expect(extractMessageOverrides('-r xhi fix it').reasoning).toBe('xhigh')
   })
 
-  test('-rsn accepts the GPT-5.6 max effort', () => {
-    expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
+  test('-r accepts the GPT-5.6 max effort', () => {
+    expect(extractMessageOverrides('-r max fix it').reasoning).toBe('max')
   })
 
-  test('-rsn combines with a harness flag', () => {
-    expect(extractMessageOverrides('-rsn high --codex audit this')).toEqual({
+  test('-r combines with a harness flag', () => {
+    expect(extractMessageOverrides('-r high --codex audit this')).toEqual({
       cleanedText: 'audit this',
       harnessType: 'codex',
       model: undefined,
@@ -201,18 +201,27 @@ describe('extractMessageOverrides', () => {
     })
   })
 
-  test('-rsn with an unknown effort value is left untouched', () => {
-    expect(extractMessageOverrides('-rsn turbo fix it')).toEqual({
-      cleanedText: '-rsn turbo fix it',
+  test('-r with an unknown effort value is left untouched', () => {
+    expect(extractMessageOverrides('-r turbo fix it')).toEqual({
+      cleanedText: '-r turbo fix it',
       harnessType: undefined,
       model: undefined,
       reasoning: undefined
     })
   })
 
-  test('-rsn without a value is left untouched', () => {
-    expect(extractMessageOverrides('what does -rsn do?')).toEqual({
-      cleanedText: 'what does -rsn do?',
+  test('-r without a value is left untouched', () => {
+    expect(extractMessageOverrides('what does -r do?')).toEqual({
+      cleanedText: 'what does -r do?',
+      harnessType: undefined,
+      model: undefined,
+      reasoning: undefined
+    })
+  })
+
+  test('does not accept the old -rsn spelling', () => {
+    expect(extractMessageOverrides('-rsn high fix it')).toEqual({
+      cleanedText: '-rsn high fix it',
       harnessType: undefined,
       model: undefined,
       reasoning: undefined
@@ -247,7 +256,7 @@ describe('extractMessageOverrides', () => {
   })
 
   test('--meta combines with a reasoning override', () => {
-    expect(extractMessageOverrides('--meta -rsn high fix it')).toEqual({
+    expect(extractMessageOverrides('--meta -r high fix it')).toEqual({
       cleanedText: 'fix it',
       harnessType: 'codex',
       model: undefined,

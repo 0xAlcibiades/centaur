@@ -39,7 +39,7 @@ class SystemPromptTest(unittest.TestCase):
         self.assertIn("`--codex --model=gpt-5.2 investigate this`", prompt)
         self.assertIn("`--meta` selects Codex with the Meta provider", prompt)
         self.assertIn("`--bedrock` selects Codex with the Bedrock provider", prompt)
-        self.assertIn("`-rsn <effort>` sets Codex reasoning effort", prompt)
+        self.assertIn("`-r <effort>` sets Codex reasoning effort", prompt)
 
     def test_personal_oauth_app_connection_guidance_is_present(self) -> None:
         prompt = SYSTEM_PROMPT.read_text()

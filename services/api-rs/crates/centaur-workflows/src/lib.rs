@@ -3613,7 +3613,7 @@ async fn run_python_agent_turn(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("absurd-workflow-agent-turn:{client_message_id}"));
     // Optional per-turn harness knobs, mirroring the slackbot's `--model` /
-    // `--bedrock` / `-rsn` flags. `reasoning` accepts `reasoning_effort` and
+    // `--bedrock` / `-r` flags. `reasoning` accepts `reasoning_effort` and
     // `effort` aliases so Python callers can use whichever reads best.
     let model = first_str_arg(&args, &["model"]);
     let provider = first_str_arg(&args, &["provider"]);
@@ -3932,7 +3932,7 @@ struct AgentTurnRequest {
     max_duration_ms: u64,
     // Optional per-turn model / provider / reasoning-effort overrides. When set
     // they ride the execute input line exactly like the slackbot's per-turn
-    // `--model` / `--bedrock` / `-rsn` flags do (see slackbotv2's
+    // `--model` / `--bedrock` / `-r` flags do (see slackbotv2's
     // `toCodexInputLineWithStaged`), so the harness applies them to this turn;
     // when `None` the deployment/baked harness default stands. `provider` and
     // `reasoning` only affect the codex harness (claude/amp ignore them).

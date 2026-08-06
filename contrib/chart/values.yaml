@@ -502,7 +502,7 @@ slackbotv2:
   #     C0TRIAGE: { reasoning: low }
   channelDefaults: {}
   # Message overrides strategy for Slack message text. "flags" keeps the legacy
-  # deterministic --model/--claude/-rsn strategy. "llm" asks a small model for
+  # deterministic --model/--claude/-r strategy. "llm" asks a small model for
   # normalized overrides, allowing natural language requests such as
   # "use max effort and the sol model". In llm mode,
   # set OPENAI_API_KEY in the shared secret or provide
