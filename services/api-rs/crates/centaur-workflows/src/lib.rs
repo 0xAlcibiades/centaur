@@ -17,7 +17,7 @@ use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
-    SessionRuntime,
+    SessionRuntime, sanitize_session_diagnostic_text,
 };
 use centaur_session_sqlx::PgSessionStore;
 use chrono::{DateTime, Utc};
@@ -4497,6 +4497,9 @@ async fn run_agent_session_turn(
         .execute_workflow_session(
             &thread_key,
             ExecuteSessionInput {
+                // Keep the logical turn idempotent across scheduler retries.
+                // Replaying its durable terminal state is safer than creating
+                // duplicate PR, Slack, or database side effects.
                 idempotency_key: Some(execution_idempotency_key),
                 metadata: Some(execution_metadata),
                 input_lines: vec![agent_turn_input_line(
@@ -4548,10 +4551,7 @@ async fn run_agent_session_turn(
                     result_text,
                     output_lines,
                 };
-                return Err(WorkflowRuntimeError::Upstream(format!(
-                    "agent turn {} for thread {} ended with {}",
-                    result.execution_id, result.thread_key, result.status
-                )));
+                return Err(agent_turn_terminal_error(&result, &event.payload));
             }
             _ => {}
         }
@@ -4560,6 +4560,35 @@ async fn run_agent_session_turn(
     Err(WorkflowRuntimeError::Upstream(
         "session event stream ended before terminal execution event".to_owned(),
     ))
+}
+
+fn agent_turn_terminal_error(result: &AgentTurnResult, payload: &Value) -> WorkflowRuntimeError {
+    let mut message = format!(
+        "agent turn {} for thread {} ended with {}",
+        result.execution_id, result.thread_key, result.status
+    );
+    if let Some(detail) = terminal_failure_detail(payload) {
+        message.push_str(": ");
+        message.push_str(&detail);
+    }
+    WorkflowRuntimeError::Upstream(message)
+}
+
+fn terminal_failure_detail(payload: &Value) -> Option<String> {
+    let error_code = payload
+        .get("error_code")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "usageLimitExceeded")?;
+    let error = payload
+        .get("error")
+        .and_then(Value::as_str)
+        .map(sanitize_session_diagnostic_text)
+        .filter(|value| !value.is_empty());
+    Some(match error {
+        Some(error) if error.starts_with(error_code) => error.to_owned(),
+        Some(error) => format!("{error_code}: {error}"),
+        None => error_code.to_owned(),
+    })
 }
 
 fn terminal_result_text(payload: &Value, output_lines: &[String]) -> String {
@@ -5237,6 +5266,46 @@ mod tests {
             "persisted final report"
         );
         assert_eq!(terminal_result_text(&json!({}), &output_lines), "fallback");
+    }
+
+    #[test]
+    fn terminal_agent_error_keeps_only_the_sanitized_structured_detail() {
+        let result = AgentTurnResult {
+            thread_key: "wf:task:agent:axiom_daily_monitor".to_owned(),
+            execution_id: "exe_failed".to_owned(),
+            status: "session.execution_failed".to_owned(),
+            output_lines: Vec::new(),
+            result_text: String::new(),
+        };
+        let error = agent_turn_terminal_error(
+            &result,
+            &json!({
+                "error_code": "usageLimitExceeded",
+                "error": "Usage limit reached; reset at 20:00Z; Bearer sbx1.secret-value"
+            }),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("usageLimitExceeded: Usage limit reached; reset at 20:00Z"));
+        assert!(message.contains("[REDACTED_TOKEN]"));
+        assert!(!message.contains("sbx1.secret-value"));
+    }
+
+    #[test]
+    fn terminal_agent_error_does_not_publish_unknown_harness_errors() {
+        let result = AgentTurnResult {
+            thread_key: "wf:task:agent:axiom_daily_monitor".to_owned(),
+            execution_id: "exe_failed".to_owned(),
+            status: "session.execution_failed".to_owned(),
+            output_lines: Vec::new(),
+            result_text: String::new(),
+        };
+        let error = agent_turn_terminal_error(
+            &result,
+            &json!({"error_code": "unexpected", "error": "do not publish this"}),
+        );
+
+        assert!(!error.to_string().contains("do not publish this"));
     }
 
     #[tokio::test]

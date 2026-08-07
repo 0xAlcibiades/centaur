@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io,
     sync::Mutex,
@@ -5410,7 +5410,10 @@ impl SessionRuntime {
             thread_key,
             sandbox_id,
             execution_id,
-            TerminalOutput::Failed { error },
+            TerminalOutput::Failed {
+                error,
+                error_code: None,
+            },
         )
         .await
         {
@@ -6611,7 +6614,10 @@ async fn fail_detached_execution(
         thread_key,
         sandbox_id,
         execution_id,
-        TerminalOutput::Failed { error },
+        TerminalOutput::Failed {
+            error,
+            error_code: None,
+        },
     )
     .await
     {
@@ -6896,6 +6902,7 @@ async fn record_stdout_pump_failure(
             &execution.execution_id,
             TerminalOutput::Failed {
                 error: error.clone(),
+                error_code: None,
             },
         )
         .await?
@@ -7872,6 +7879,7 @@ enum TerminalOutput {
     },
     Failed {
         error: String,
+        error_code: Option<String>,
     },
 }
 
@@ -7911,19 +7919,18 @@ async fn record_terminal_output(
             },
             "cancelled",
         ),
-        TerminalOutput::Failed { error } => {
-            failure_class = Some(terminal_failure_class(&error));
-            (
-                OwnedTerminalEvent::Failed {
-                    payload: json!({
-                        "execution_id": execution_id,
-                        "thread_key": thread_key.as_str(),
-                        "error": error.as_str(),
-                    }),
-                    error,
-                },
-                "failed",
-            )
+        TerminalOutput::Failed { error, error_code } => {
+            let error = sanitize_session_diagnostic_text(&error);
+            failure_class = Some(terminal_failure_class(error_code.as_deref(), &error));
+            let mut payload = json!({
+                "execution_id": execution_id,
+                "thread_key": thread_key.as_str(),
+                "error": error,
+            });
+            if let (Some(error_code), Some(object)) = (error_code, payload.as_object_mut()) {
+                object.insert("error_code".to_owned(), json!(error_code));
+            }
+            (OwnedTerminalEvent::Failed { payload, error }, "failed")
         }
     };
     let Some((terminal_execution, _)) = ctx
@@ -8865,8 +8872,19 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     }
 }
 
-fn terminal_failure_class(error: &str) -> &'static str {
+fn terminal_failure_class(error_code: Option<&str>, error: &str) -> &'static str {
+    match error_code {
+        Some("usageLimitExceeded") => return "provider_quota",
+        Some("rateLimitExceeded" | "rate_limit_exceeded" | "rate_limited") => {
+            return "provider_rate_limit";
+        }
+        _ => {}
+    }
+
     let error = error.to_ascii_lowercase();
+    if error.contains("rate limit") || error.contains("rate_limit") {
+        return "provider_rate_limit";
+    }
     if error.contains("max_duration") || error.contains("timeout") || error.contains("timed out") {
         return "timeout";
     }
@@ -8925,9 +8943,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
     if matches!(method, Some("error" | "turn/failed"))
         || matches!(event_type, Some("error" | "turn.failed" | "run.failed"))
     {
-        return Some(TerminalOutput::Failed {
-            error: terminal_error_text(value),
-        });
+        return Some(terminal_failure_output(value));
     }
 
     if method == Some("turn/completed") {
@@ -8950,9 +8966,7 @@ fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<Termi
         Some("turn.done") => Some(completed_terminal_output(value, "turn_done")),
         Some("result") => {
             if result_is_failure(value) {
-                Some(TerminalOutput::Failed {
-                    error: terminal_error_text(value),
-                })
+                Some(terminal_failure_output(value))
             } else {
                 Some(completed_terminal_output(value, "result"))
             }
@@ -8975,6 +8989,9 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
                 reason: "turn_interrupted",
             }
         }
+        Some("failed" | "failure" | "error") if prior_final_answer_text.trim().is_empty() => {
+            terminal_failure_output(value)
+        }
         Some(_status) if !prior_final_answer_text.trim().is_empty() => {
             completed_terminal_output_with_fallback(
                 value,
@@ -8984,6 +9001,7 @@ fn completed_turn_terminal_output(value: &Value, prior_final_answer_text: &str) 
         }
         Some(status) => TerminalOutput::Failed {
             error: format!("turn completed with status {status} before final answer"),
+            error_code: None,
         },
     }
 }
@@ -9144,18 +9162,63 @@ fn result_is_failure(value: &Value) -> bool {
     )
 }
 
-fn terminal_error_text(value: &Value) -> String {
-    for key in ["error", "message", "result", "text"] {
-        if let Some(text) = value.get(key).and_then(Value::as_str)
-            && !text.trim().is_empty()
-        {
-            return text.trim().to_owned();
+fn terminal_failure_output(value: &Value) -> TerminalOutput {
+    let error = value
+        .pointer("/params/turn/error")
+        .or_else(|| value.pointer("/params/error"))
+        .or_else(|| value.get("error"));
+    let error_code = error.and_then(terminal_error_code);
+    let (error_code, error_text) = match error_code.as_deref() {
+        Some("usageLimitExceeded") => (
+            error_code,
+            error
+                .and_then(usage_limit_error_message)
+                .unwrap_or_else(|| "provider usage limit exceeded".to_owned()),
+        ),
+        Some("rateLimitExceeded" | "rate_limit_exceeded" | "rate_limited") => {
+            (error_code, "provider rate limit exceeded".to_owned())
         }
+        _ => (None, "terminal harness output reported failure".to_owned()),
+    };
+    TerminalOutput::Failed {
+        error: error_text,
+        error_code,
     }
-    terminal_payload_text(value)
-        .trim()
-        .to_owned()
-        .if_empty("terminal harness output reported failure")
+}
+
+fn terminal_error_code(value: &Value) -> Option<String> {
+    ["codexErrorInfo", "code", "type"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn terminal_error_message(value: &Value) -> Option<String> {
+    ["message", "additionalDetails", "details", "text"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn usage_limit_error_message(value: &Value) -> Option<String> {
+    let message = terminal_error_message(value)?;
+    let mut reset_at = message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | ':' | '+' | '.'));
+    let reset_at = reset_at.find_map(|candidate| OffsetDateTime::parse(candidate, &Rfc3339).ok());
+    let reset_at = reset_at?.format(&Rfc3339).ok()?;
+    Some(format!(
+        "provider usage limit exceeded; resets at {reset_at}"
+    ))
 }
 
 fn terminal_payload_text(value: &Value) -> String {
@@ -9187,20 +9250,6 @@ fn terminal_payload_text(value: &Value) -> String {
             String::new()
         }
         _ => String::new(),
-    }
-}
-
-trait StringExt {
-    fn if_empty(self, fallback: &str) -> String;
-}
-
-impl StringExt for String {
-    fn if_empty(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.to_owned()
-        } else {
-            self
-        }
     }
 }
 
@@ -9543,6 +9592,28 @@ fn redact_sensitive_text(input: &str) -> String {
     let bearer_redacted = redact_bearer_tokens(input);
     let env_redacted = redact_sensitive_env_assignments(&bearer_redacted);
     redact_prefixed_tokens(&env_redacted)
+}
+
+/// Produces a one-line diagnostic suitable for durable terminal events and
+/// workflow status. Harness output is untrusted, so preserve only a bounded,
+/// redacted summary rather than forwarding a raw protocol frame.
+pub fn sanitize_session_diagnostic_text(input: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
+
+    let normalized = redact_sensitive_text(input)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
 }
 
 fn redact_bearer_tokens(input: &str) -> String {
@@ -10702,7 +10773,8 @@ mod tests {
         assert_eq!(
             terminal_output(&terminal, ""),
             Some(TerminalOutput::Failed {
-                error: "terminal harness output reported failure".to_owned()
+                error: "terminal harness output reported failure".to_owned(),
+                error_code: None,
             })
         );
     }
@@ -10827,9 +10899,98 @@ mod tests {
         assert_eq!(
             terminal_output(&event, ""),
             Some(TerminalOutput::Failed {
-                error: "sandbox exited".to_owned()
+                error: "terminal harness output reported failure".to_owned(),
+                error_code: None,
             })
         );
+    }
+
+    #[test]
+    fn codex_error_terminal_preserves_structured_quota_detail() {
+        let event = json!({
+            "method": "error",
+            "params": {
+                "turn": {
+                    "error": {
+                        "codexErrorInfo": "usageLimitExceeded",
+                        "message": "Usage limit reached; resets at 2026-08-07T20:00:00Z"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            terminal_output(&event, ""),
+            Some(TerminalOutput::Failed {
+                error: "provider usage limit exceeded; resets at 2026-08-07T20:00:00Z".to_owned(),
+                error_code: Some("usageLimitExceeded".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn failed_codex_turn_completed_preserves_structured_quota_detail() {
+        let event = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": "failed",
+                    "error": {
+                        "codexErrorInfo": "usageLimitExceeded",
+                        "message": "Usage limit reached; resets at 2026-08-07T20:00:00Z"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            terminal_output(&event, ""),
+            Some(TerminalOutput::Failed {
+                error: "provider usage limit exceeded; resets at 2026-08-07T20:00:00Z".to_owned(),
+                error_code: Some("usageLimitExceeded".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_harness_errors_do_not_become_terminal_diagnostics() {
+        let event = json!({
+            "method": "error",
+            "params": {
+                "turn": {
+                    "error": {
+                        "code": "unexpected",
+                        "message": "postgres://user:super-secret@db.internal/centaur"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            terminal_output(&event, ""),
+            Some(TerminalOutput::Failed {
+                error: "terminal harness output reported failure".to_owned(),
+                error_code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn session_diagnostic_text_is_redacted_single_line_and_bounded() {
+        let diagnostic = format!(
+            "usageLimitExceeded\nBearer sbx1.very-secret.token\n{}",
+            "x".repeat(2_000)
+        );
+
+        let safe = sanitize_session_diagnostic_text(&diagnostic);
+
+        assert!(
+            safe.starts_with("usageLimitExceeded Bearer [REDACTED_TOKEN]"),
+            "{safe}"
+        );
+        assert!(!safe.contains("sbx1.very-secret.token"));
+        assert!(!safe.contains('\n'));
+        assert!(safe.chars().count() <= 1_025);
     }
 
     #[test]
@@ -10870,15 +11031,27 @@ mod tests {
     #[test]
     fn terminal_failure_class_is_low_cardinality() {
         assert_eq!(
-            terminal_failure_class("sandbox stdout closed before terminal output"),
+            terminal_failure_class(None, "sandbox stdout closed before terminal output"),
             "sandbox_io"
         );
         assert_eq!(
-            terminal_failure_class("execution orphaned by control plane restart"),
+            terminal_failure_class(None, "execution orphaned by control plane restart"),
             "orphaned"
         );
         assert_eq!(
-            terminal_failure_class("turn failed: model error"),
+            terminal_failure_class(Some("usageLimitExceeded"), "provider usage limit exceeded"),
+            "provider_quota"
+        );
+        assert_eq!(
+            terminal_failure_class(Some("rateLimitExceeded"), "provider rate limit exceeded"),
+            "provider_rate_limit"
+        );
+        assert_eq!(
+            terminal_failure_class(None, "usage limit reached"),
+            "harness"
+        );
+        assert_eq!(
+            terminal_failure_class(None, "turn failed: model error"),
             "harness"
         );
     }
