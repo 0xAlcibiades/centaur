@@ -1118,9 +1118,11 @@ impl AgentSandboxBackend {
         Ok(wait_for_proxy_ack(
             &client,
             &endpoint,
-            principal_id,
-            config_hash,
-            strict_config_hash,
+            ProxyAckExpectation {
+                principal_id,
+                config_hash,
+                strict_config_hash,
+            },
             PROXY_ACK_TIMEOUT,
             PROXY_ACK_PROBE_WINDOW,
             PROXY_ACK_POLL_INTERVAL,
@@ -1516,6 +1518,12 @@ enum ProxyAck {
     TimedOut,
 }
 
+struct ProxyAckExpectation<'a> {
+    principal_id: &'a str,
+    config_hash: Option<&'a str>,
+    strict_config_hash: bool,
+}
+
 fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
     PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(elapsed)
 }
@@ -1543,9 +1551,7 @@ fn requires_strict_autorotate_proxy_ack(labels: &BTreeMap<String, String>) -> bo
 async fn wait_for_proxy_ack(
     client: &reqwest::Client,
     endpoint: &ProxyManagementEndpoint,
-    principal_id: &str,
-    config_hash: Option<&str>,
-    strict_config_hash: bool,
+    expectation: ProxyAckExpectation<'_>,
     ack_timeout: Duration,
     probe_window: Duration,
     poll_interval: Duration,
@@ -1578,12 +1584,15 @@ async fn wait_for_proxy_ack(
             management_confirmed = true;
             if let Ok(status) = response.json::<ProxyManagedStatus>().await
                 && status.synced_once
-                && status.principal_id == principal_id
-                && if strict_config_hash {
-                    config_hash.is_some() && status.config_hash.as_deref() == config_hash
+                && status.principal_id == expectation.principal_id
+                && if expectation.strict_config_hash {
+                    expectation.config_hash.is_some()
+                        && status.config_hash.as_deref() == expectation.config_hash
                 } else {
                     status.config_hash.as_deref().is_none_or(|applied_hash| {
-                        config_hash.is_none_or(|hash| applied_hash == hash)
+                        expectation
+                            .config_hash
+                            .is_none_or(|hash| applied_hash == hash)
                     })
                 }
             {
@@ -4086,9 +4095,11 @@ mod tests {
         let ack = wait_for_proxy_ack(
             &barrier_client(),
             &endpoint,
-            "prin_claimed",
-            None,
-            false,
+            ProxyAckExpectation {
+                principal_id: "prin_claimed",
+                config_hash: None,
+                strict_config_hash: false,
+            },
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(10),
@@ -4114,9 +4125,11 @@ mod tests {
         let ack = wait_for_proxy_ack(
             &barrier_client(),
             &endpoint,
-            "prin_claimed",
-            None,
-            false,
+            ProxyAckExpectation {
+                principal_id: "prin_claimed",
+                config_hash: None,
+                strict_config_hash: false,
+            },
             Duration::from_millis(400),
             Duration::from_millis(200),
             Duration::from_millis(25),
@@ -4138,9 +4151,11 @@ mod tests {
         let ack = wait_for_proxy_ack(
             &barrier_client(),
             &endpoint,
-            "prin_claimed",
-            Some("sha256:expected"),
-            false,
+            ProxyAckExpectation {
+                principal_id: "prin_claimed",
+                config_hash: Some("sha256:expected"),
+                strict_config_hash: false,
+            },
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_millis(10),
@@ -4166,9 +4181,11 @@ mod tests {
         let ack = wait_for_proxy_ack(
             &barrier_client(),
             &endpoint,
-            "prin_claimed",
-            None,
-            false,
+            ProxyAckExpectation {
+                principal_id: "prin_claimed",
+                config_hash: None,
+                strict_config_hash: false,
+            },
             Duration::from_secs(2),
             Duration::from_millis(300),
             Duration::from_millis(50),
