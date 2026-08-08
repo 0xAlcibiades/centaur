@@ -269,6 +269,10 @@ spec:
             - name: WORKFLOW_ALLOWED_NAMES
               value: {{ .Values.apiRs.workflowAllowedNames | quote }}
 {{- end }}
+{{- if and .Values.apiRs.workflowHostResources (not (hasKey .Values.apiRs.extraEnv "WORKFLOW_HOST_RESOURCES")) }}
+            - name: WORKFLOW_HOST_RESOURCES
+              value: {{ toJson .Values.apiRs.workflowHostResources | quote }}
+{{- end }}
 {{- range $env := $apiRsEtlEnv }}
 {{- if not (hasKey $.Values.apiRs.extraEnv $env.name) }}
             - name: {{ $env.name }}
@@ -332,6 +336,10 @@ spec:
               value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
+{{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}
+            - name: SESSION_SANDBOX_RESOURCES
+              value: {{ toJson .Values.sandbox.resources | quote }}
+{{- end }}
 {{- if .Values.global.imagePullSecrets }}
             - name: SESSION_SANDBOX_IMAGE_PULL_SECRETS
               value: "{{- range $index, $secret := .Values.global.imagePullSecrets }}{{- if $index }},{{ end -}}{{ $secret.name }}{{- end }}"
@@ -368,6 +376,10 @@ spec:
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
               value: {{ join "," .Values.ironProxy.upstreamDenyCidrs | quote }}
+{{- if and .Values.ironProxy.resources (not (hasKey .Values.apiRs.extraEnv "KUBERNETES_IRON_PROXY_RESOURCES")) }}
+            - name: KUBERNETES_IRON_PROXY_RESOURCES
+              value: {{ toJson .Values.ironProxy.resources | quote }}
+{{- end }}
             - name: KUBERNETES_FIREWALL_CA_SECRET_NAME
               value: {{ include "centaur.trustedCaSecretName" . | quote }}
             - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME

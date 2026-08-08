@@ -2,16 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
-use centaur_sandbox_core::{SandboxError, SandboxId, SandboxResult, SandboxSpec};
+use centaur_sandbox_core::{
+    ResourceRequirements, SandboxError, SandboxId, SandboxResult, SandboxSpec,
+};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
-    EnvVar as K8sEnvVar, HTTPGetAction, Pod, PodSpec, Probe, SecretEnvSource, SecretVolumeSource,
+    EnvVar as K8sEnvVar, HTTPGetAction, Pod, PodSpec, Probe, ResourceClaim as K8sResourceClaim,
+    ResourceRequirements as K8sResourceRequirements, SecretEnvSource, SecretVolumeSource,
     SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
@@ -87,6 +91,7 @@ pub struct IronProxyConfig {
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
     pub control_plane_pod_labels: BTreeMap<String, String>,
+    pub resources: Option<ResourceRequirements>,
 }
 
 impl IronProxyConfig {
@@ -115,6 +120,7 @@ impl IronProxyConfig {
                 "app.kubernetes.io/component".to_owned(),
                 "console".to_owned(),
             )]),
+            resources: None,
         }
     }
 }
@@ -1300,6 +1306,7 @@ fn iron_proxy_container(
         image_pull_policy: iron_proxy.image_pull_policy.clone(),
         env: Some(iron_proxy_env_vars(iron_proxy, resolved, sync)),
         env_from: iron_proxy_env_from(iron_proxy),
+        resources: iron_proxy.resources.as_ref().and_then(container_resources),
         ports: Some(container_ports(resolved)),
         readiness_probe: Some(health_probe(Some(5), Some(30))),
         liveness_probe: Some(health_probe(None, None)),
@@ -1326,6 +1333,35 @@ fn iron_proxy_container(
         // IRON_CONTROL_PLANE_URL set, runs iron-proxy with no local config.
         ..Default::default()
     }
+}
+
+fn container_resources(resources: &ResourceRequirements) -> Option<K8sResourceRequirements> {
+    (!resources.is_empty()).then(|| K8sResourceRequirements {
+        claims: (!resources.claims.is_empty()).then(|| {
+            resources
+                .claims
+                .iter()
+                .map(|claim| K8sResourceClaim {
+                    name: claim.name.clone(),
+                    request: claim.request.clone(),
+                })
+                .collect()
+        }),
+        limits: (!resources.limits.is_empty()).then(|| {
+            resources
+                .limits
+                .iter()
+                .map(|(name, quantity)| (name.clone(), Quantity(quantity.clone())))
+                .collect()
+        }),
+        requests: (!resources.requests.is_empty()).then(|| {
+            resources
+                .requests
+                .iter()
+                .map(|(name, quantity)| (name.clone(), Quantity(quantity.clone())))
+                .collect()
+        }),
+    })
 }
 
 fn iron_proxy_env_vars(
@@ -2254,6 +2290,79 @@ mod tests {
         let restricted_labels = iron_proxy_labels(&id, false, false);
         assert!(!restricted_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
         assert!(!restricted_labels.contains_key(API_SERVER_ENABLED_LABEL));
+    }
+
+    #[test]
+    fn iron_proxy_pod_carries_configured_resources() {
+        let id = SandboxId::new("asbx-test");
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy.resources = Some(
+            ResourceRequirements::new()
+                .request("cpu", "50m")
+                .request("memory", "128Mi")
+                .request("ephemeral-storage", "1Gi")
+                .limit("memory", "256Mi")
+                .limit("example.com/gpu", "1"),
+        );
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let pod = build_iron_proxy_pod(
+            &id,
+            &iron_proxy,
+            &resolved(),
+            &sync,
+            &BTreeMap::new(),
+            &[],
+            None,
+        );
+
+        let resources = pod.spec.as_ref().unwrap().containers[0]
+            .resources
+            .as_ref()
+            .unwrap();
+        let requests = resources.requests.as_ref().unwrap();
+        assert_eq!(requests.get("cpu"), Some(&Quantity("50m".to_owned())));
+        assert_eq!(requests.get("memory"), Some(&Quantity("128Mi".to_owned())));
+        assert_eq!(
+            requests.get("ephemeral-storage"),
+            Some(&Quantity("1Gi".to_owned()))
+        );
+        let limits = resources.limits.as_ref().unwrap();
+        assert_eq!(limits.get("memory"), Some(&Quantity("256Mi".to_owned())));
+        assert_eq!(
+            limits.get("example.com/gpu"),
+            Some(&Quantity("1".to_owned()))
+        );
+        assert!(!limits.contains_key("cpu"));
+    }
+
+    #[test]
+    fn iron_proxy_pod_omits_resources_when_unset() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+            config_hash: None,
+        };
+
+        let pod = build_iron_proxy_pod(
+            &id,
+            &iron_proxy,
+            &resolved(),
+            &sync,
+            &BTreeMap::new(),
+            &[],
+            None,
+        );
+
+        assert!(pod.spec.as_ref().unwrap().containers[0].resources.is_none());
     }
 
     #[test]

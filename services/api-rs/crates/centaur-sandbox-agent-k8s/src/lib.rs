@@ -904,14 +904,7 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
 
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     let resources = spec.resources.as_ref()?;
-    let mut limits = serde_json::Map::new();
-    if let Some(cpu_millis) = resources.cpu_millis {
-        limits.insert("cpu".to_owned(), json!(format!("{cpu_millis}m")));
-    }
-    if let Some(memory_bytes) = resources.memory_bytes {
-        limits.insert("memory".to_owned(), json!(format!("{memory_bytes}")));
-    }
-    (!limits.is_empty()).then(|| json!({ "limits": limits }))
+    (!resources.is_empty()).then(|| json!(resources))
 }
 
 fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
@@ -982,8 +975,11 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 
 #[cfg(test)]
 mod tests {
-    use centaur_sandbox_core::{RepoCacheAccess, ResourceLimits, SandboxCapabilities, SandboxSpec};
+    use centaur_sandbox_core::{
+        RepoCacheAccess, ResourceRequirements, SandboxCapabilities, SandboxSpec,
+    };
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     use super::*;
 
@@ -998,9 +994,13 @@ mod tests {
                 "/workspace",
             ))
             .resources(
-                ResourceLimits::new()
-                    .cpu_millis(500)
-                    .memory_bytes(512 * 1024 * 1024),
+                ResourceRequirements::new()
+                    .request("cpu", "250m")
+                    .request("memory", "256Mi")
+                    .request("ephemeral-storage", "1Gi")
+                    .limit("cpu", "500m")
+                    .limit("memory", "512Mi")
+                    .limit("example.com/gpu", "1"),
             );
         let config = AgentSandboxConfig::new("centaur")
             .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
@@ -1025,7 +1025,78 @@ mod tests {
         assert_eq!(container.image.as_deref(), Some("centaur-agent:latest"));
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
-        assert!(container.resources.as_ref().unwrap().limits.is_some());
+        let resources = container.resources.as_ref().unwrap();
+        let quantity = |value: &str| IntOrString::String(value.to_owned());
+        assert_eq!(
+            resources.requests.as_ref().unwrap().get("cpu"),
+            Some(&quantity("250m"))
+        );
+        assert_eq!(
+            resources.requests.as_ref().unwrap().get("memory"),
+            Some(&quantity("256Mi"))
+        );
+        assert_eq!(
+            resources
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("ephemeral-storage"),
+            Some(&quantity("1Gi"))
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("cpu"),
+            Some(&quantity("500m"))
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("memory"),
+            Some(&quantity("512Mi"))
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("example.com/gpu"),
+            Some(&quantity("1"))
+        );
+    }
+
+    #[test]
+    fn renders_partial_sandbox_resources() {
+        let spec = SandboxSpec::new("centaur-agent:latest").resources(
+            ResourceRequirements::new()
+                .request("memory", "4Gi")
+                .limit("memory", "4Gi"),
+        );
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        let resources = sandbox.spec.pod_template.spec.containers[0]
+            .resources
+            .as_ref()
+            .unwrap();
+        let memory = IntOrString::String("4Gi".to_owned());
+        assert_eq!(
+            resources.requests.as_ref().unwrap().get("memory"),
+            Some(&memory)
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("memory"),
+            Some(&memory)
+        );
+        assert!(!resources.requests.as_ref().unwrap().contains_key("cpu"));
+        assert!(!resources.limits.as_ref().unwrap().contains_key("cpu"));
+    }
+
+    #[test]
+    fn omits_resources_when_unset() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(
+            sandbox.spec.pod_template.spec.containers[0]
+                .resources
+                .is_none()
+        );
     }
 
     #[test]
