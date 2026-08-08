@@ -501,7 +501,9 @@ impl SandboxBackend for AgentSandboxBackend {
         // routing its model-proxy egress.
         let capability_labels = sandbox
             .as_ref()
-            .map(|sandbox| sandbox_capability_labels(sandbox, &self.config.container_name))
+            .map(|sandbox| {
+                sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
+            })
             .unwrap_or_default();
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
@@ -543,23 +545,37 @@ fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Val
 
 /// Re-derive the capability labels `build_agent_sandbox` would apply for this
 /// sandbox's recorded capabilities, reading them back from the durable env
-/// vars `apply_sandbox_capabilities` stamped on the container at create time
-/// (the same source `resolve_iron_proxy_for_resume` uses for its
-/// NetworkPolicy scoping). Used to reassert the labels on resume, since a pod
-/// recreated after external deletion (janitor, node pressure, manual reap)
-/// only inherits whatever the Sandbox's `podTemplate` currently carries.
+/// vars `apply_sandbox_capabilities` stamped on the container at create time.
+/// Missing or invalid env values use the same fail-closed CR-label fallback as
+/// `resolve_iron_proxy_for_resume`. Used to reassert the labels on resume,
+/// since a pod recreated after external deletion (janitor, node pressure,
+/// manual reap) only inherits whatever the Sandbox's `podTemplate` currently
+/// carries.
 fn sandbox_capability_labels(
     sandbox: &crd::Sandbox,
     container_name: &str,
+    sandbox_id: &str,
 ) -> BTreeMap<&'static str, bool> {
     let mut labels = BTreeMap::new();
     labels.insert(
         OBSERVABILITY_ENABLED_LABEL,
-        iron_proxy::sandbox_observability_enabled(sandbox, container_name).unwrap_or(true),
+        iron_proxy::resolve_resume_capability(
+            iron_proxy::sandbox_observability_enabled(sandbox, container_name),
+            sandbox.metadata.labels.as_ref(),
+            OBSERVABILITY_ENABLED_LABEL,
+            "observability",
+            sandbox_id,
+        ),
     );
     labels.insert(
         API_SERVER_ENABLED_LABEL,
-        iron_proxy::sandbox_api_server_enabled(sandbox, container_name).unwrap_or(true),
+        iron_proxy::resolve_resume_capability(
+            iron_proxy::sandbox_api_server_enabled(sandbox, container_name),
+            sandbox.metadata.labels.as_ref(),
+            API_SERVER_ENABLED_LABEL,
+            "api_server",
+            sandbox_id,
+        ),
     );
     labels
 }
@@ -1118,7 +1134,7 @@ mod tests {
             labels.remove(API_SERVER_ENABLED_LABEL);
         }
 
-        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME);
+        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&true));
         assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&true));
 
@@ -1143,21 +1159,17 @@ mod tests {
 
     #[test]
     fn resume_patch_clears_labels_for_restricted_capabilities() {
-        // Mirrors what `apply_sandbox_capabilities` (centaur-session-runtime)
-        // stamps onto the spec env alongside `.capabilities(..)`, since that's
-        // the durable record `sandbox_capability_labels` reads back on resume.
-        let spec = SandboxSpec::new("centaur-agent:latest")
-            .capabilities(SandboxCapabilities {
-                repo_cache: RepoCacheAccess::All,
-                observability_enabled: false,
-                api_server_enabled: false,
-            })
-            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "false")
-            .env("CENTAUR_SANDBOX_API_SERVER_ENABLED", "false");
+        // Exercise the fail-closed fallback for callers that set the backend
+        // capabilities without duplicating them into the container env.
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache: RepoCacheAccess::All,
+            observability_enabled: false,
+            api_server_enabled: false,
+        });
         let config = AgentSandboxConfig::new("centaur");
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
-        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME);
+        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&false));
         assert_eq!(labels.get(API_SERVER_ENABLED_LABEL), Some(&false));
 
