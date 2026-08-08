@@ -336,6 +336,21 @@ spec:
             - name: SESSION_SANDBOX_IMAGE_PULL_SECRETS
               value: "{{- range $index, $secret := .Values.global.imagePullSecrets }}{{- if $index }},{{ end -}}{{ $secret.name }}{{- end }}"
 {{- end }}
+            # Node steering for sandbox + iron-proxy pods. Passed to the control
+            # plane rather than templated onto a pod: api-rs creates those pods
+            # at runtime, so nothing this chart renders can reach them.
+{{- if and .Values.sandbox.nodeSelector (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_NODE_SELECTOR")) }}
+            - name: SESSION_SANDBOX_NODE_SELECTOR
+              value: {{ toJson .Values.sandbox.nodeSelector | quote }}
+{{- end }}
+{{- if and .Values.sandbox.tolerations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_TOLERATIONS")) }}
+            - name: SESSION_SANDBOX_TOLERATIONS
+              value: {{ toJson .Values.sandbox.tolerations | quote }}
+{{- end }}
+{{- if and .Values.sandbox.runtimeClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RUNTIME_CLASS_NAME")) }}
+            - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
+              value: {{ .Values.sandbox.runtimeClassName | quote }}
+{{- end }}
             # Sandboxes call back into this control plane via the in-cluster Service.
             - name: SESSION_SANDBOX_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
