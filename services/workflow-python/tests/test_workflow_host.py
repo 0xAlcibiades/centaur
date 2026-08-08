@@ -313,6 +313,18 @@ class WorkflowHostTests(unittest.TestCase):
             },
         )
 
+    def test_agent_turn_rejects_principal_oid(self) -> None:
+        host = load_workflow_host()
+        ctx = host.WorkflowContext(
+            RequestRpc(),
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        with self.assertRaisesRegex(ValueError, "foreign id, not a prn_ id"):
+            asyncio.run(ctx.agent_turn("do the thing", principal="prn_123"))
+
     def test_start_workflow_enqueues_durable_child_with_idempotency_key(self) -> None:
         host = load_workflow_host()
         rpc = RequestRpc()
@@ -542,6 +554,28 @@ class WorkflowHostTests(unittest.TestCase):
                 return_value={"principal_workflow": workflow},
             ),
             self.assertRaisesRegex(ValueError, "empty WORKFLOW_PRINCIPAL"),
+        ):
+            host.discovery_payload()
+
+    def test_workflow_principal_oid_fails_discovery(self) -> None:
+        host = load_workflow_host()
+        workflow = host.RegisteredWorkflow(
+            workflow_name="principal_workflow",
+            source_path="workflows/principal_workflow.py",
+            handler=lambda inp, ctx: None,
+            input_cls=None,
+            webhooks=None,
+            schedule=None,
+            principal="prn_123",
+        )
+
+        with (
+            patch.object(
+                host,
+                "discover_workflows",
+                return_value={"principal_workflow": workflow},
+            ),
+            self.assertRaisesRegex(ValueError, "foreign id, not a prn_ id"),
         ):
             host.discovery_payload()
 

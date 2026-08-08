@@ -11,7 +11,9 @@ use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
     SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
 };
-use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
+use centaur_iron_control::{
+    IronControlClient, IronControlError, Principal, PrincipalInput, slugify,
+};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
@@ -321,15 +323,39 @@ impl WorkflowPrincipalRegistrar {
                         })
                         .await?
                 }
-                WorkflowPrincipalDeclaration::Existing(principal) => {
-                    self.client
-                        .get_principal(&self.namespace, principal)
+                WorkflowPrincipalDeclaration::ForeignId(principal) => {
+                    self.resolve_or_create_principal(workflow_name, principal)
                         .await?
                 }
             };
             registered.insert(workflow_name.clone(), record.id);
         }
         Ok(registered)
+    }
+
+    async fn resolve_or_create_principal(
+        &self,
+        workflow_name: &str,
+        foreign_id: &str,
+    ) -> Result<Principal, WorkflowRuntimeError> {
+        match self.client.get_principal(&self.namespace, foreign_id).await {
+            Ok(principal) => Ok(principal),
+            Err(IronControlError::Status { status: 404, .. }) => Ok(self
+                .client
+                .upsert_principal(&PrincipalInput {
+                    namespace: self.namespace.clone(),
+                    foreign_id: foreign_id.to_owned(),
+                    name: format!("Workflow {workflow_name}"),
+                    labels: workflow_principal_labels(workflow_name),
+                    kind: Some("workflow".to_owned()),
+                    slack_user_id: None,
+                    slack_channel_id: None,
+                    slack_team_id: None,
+                    slack_email: None,
+                })
+                .await?),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -625,10 +651,12 @@ impl WorkflowRuntime {
         let task_session_runtime = session_runtime.clone();
         let task_workflow_host_sandbox = workflow_host_sandbox.clone();
         let task_workflow_clients = workflow_clients.clone();
+        let task_workflow_principal_registrar = workflow_principal_registrar.clone();
         client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = task_session_runtime.clone();
             let workflow_host_sandbox = task_workflow_host_sandbox.clone();
             let workflow_clients = task_workflow_clients.clone();
+            let workflow_principal_registrar = task_workflow_principal_registrar.clone();
             async move {
                 run_centaur_workflow(
                     input,
@@ -636,6 +664,7 @@ impl WorkflowRuntime {
                     session_runtime,
                     workflow_host_sandbox,
                     workflow_clients,
+                    workflow_principal_registrar,
                 )
                 .await
             }
@@ -643,10 +672,12 @@ impl WorkflowRuntime {
         let slack_live_session_runtime = session_runtime.clone();
         let slack_live_workflow_host_sandbox = workflow_host_sandbox.clone();
         let slack_live_workflow_clients = workflow_clients.clone();
+        let slack_live_workflow_principal_registrar = workflow_principal_registrar.clone();
         slack_live_client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = slack_live_session_runtime.clone();
             let workflow_host_sandbox = slack_live_workflow_host_sandbox.clone();
             let workflow_clients = slack_live_workflow_clients.clone();
+            let workflow_principal_registrar = slack_live_workflow_principal_registrar.clone();
             async move {
                 run_centaur_workflow(
                     input,
@@ -654,6 +685,7 @@ impl WorkflowRuntime {
                     session_runtime,
                     workflow_host_sandbox,
                     workflow_clients,
+                    workflow_principal_registrar,
                 )
                 .await
             }
@@ -661,10 +693,12 @@ impl WorkflowRuntime {
         let etl_session_runtime = session_runtime.clone();
         let etl_workflow_host_sandbox = workflow_host_sandbox.clone();
         let etl_workflow_clients = workflow_clients.clone();
+        let etl_workflow_principal_registrar = workflow_principal_registrar.clone();
         etl_client.register_task(WORKFLOW_TASK, move |input: WorkflowTaskInput, ctx| {
             let session_runtime = etl_session_runtime.clone();
             let workflow_host_sandbox = etl_workflow_host_sandbox.clone();
             let workflow_clients = etl_workflow_clients.clone();
+            let workflow_principal_registrar = etl_workflow_principal_registrar.clone();
             async move {
                 run_centaur_workflow(
                     input,
@@ -672,6 +706,7 @@ impl WorkflowRuntime {
                     session_runtime,
                     workflow_host_sandbox,
                     workflow_clients,
+                    workflow_principal_registrar,
                 )
                 .await
             }
@@ -679,12 +714,15 @@ impl WorkflowRuntime {
         let etl_backfill_session_runtime = session_runtime.clone();
         let etl_backfill_workflow_host_sandbox = workflow_host_sandbox.clone();
         let etl_backfill_workflow_clients = workflow_clients.clone();
+        let etl_backfill_workflow_principal_registrar = workflow_principal_registrar.clone();
         etl_backfill_client.register_task(
             WORKFLOW_TASK,
             move |input: WorkflowTaskInput, ctx| {
                 let session_runtime = etl_backfill_session_runtime.clone();
                 let workflow_host_sandbox = etl_backfill_workflow_host_sandbox.clone();
                 let workflow_clients = etl_backfill_workflow_clients.clone();
+                let workflow_principal_registrar =
+                    etl_backfill_workflow_principal_registrar.clone();
                 async move {
                     run_centaur_workflow(
                         input,
@@ -692,6 +730,7 @@ impl WorkflowRuntime {
                         session_runtime,
                         workflow_host_sandbox,
                         workflow_clients,
+                        workflow_principal_registrar,
                     )
                     .await
                 }
@@ -1681,7 +1720,7 @@ enum PythonWorkflowPrincipal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkflowPrincipalDeclaration {
     Derived,
-    Existing(String),
+    ForeignId(String),
 }
 
 impl PythonWorkflowPrincipal {
@@ -1693,15 +1732,11 @@ impl PythonWorkflowPrincipal {
             Self::Enabled(true) => Ok(Some(WorkflowPrincipalDeclaration::Derived)),
             Self::Enabled(false) => Ok(None),
             Self::Existing(principal) => {
-                let principal = principal.trim();
-                if principal.is_empty() {
-                    return Err(WorkflowRuntimeError::BadRequest(format!(
-                        "workflow {workflow_name} declares an empty WORKFLOW_PRINCIPAL"
-                    )));
-                }
-                Ok(Some(WorkflowPrincipalDeclaration::Existing(
-                    principal.to_owned(),
-                )))
+                let principal = validate_python_principal_foreign_id(
+                    &principal,
+                    &format!("workflow {workflow_name} WORKFLOW_PRINCIPAL"),
+                )?;
+                Ok(Some(WorkflowPrincipalDeclaration::ForeignId(principal)))
             }
         }
     }
@@ -2613,6 +2648,7 @@ async fn run_centaur_workflow(
     session_runtime: SessionRuntime,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_clients: WorkflowQueueClients,
+    workflow_principal_registrar: Option<WorkflowPrincipalRegistrar>,
 ) -> absurd::Result<WorkflowResult> {
     let mut cleanup_guard =
         WorkflowSandboxCleanupGuard::new(session_runtime.clone(), ctx.run_id().to_owned());
@@ -2622,6 +2658,7 @@ async fn run_centaur_workflow(
         session_runtime,
         workflow_host_sandbox,
         workflow_clients,
+        workflow_principal_registrar,
     )
     .await;
     if let Some(reason) = workflow_cleanup_reason(&result) {
@@ -2647,6 +2684,7 @@ async fn run_centaur_workflow_inner(
     session_runtime: SessionRuntime,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_clients: WorkflowQueueClients,
+    workflow_principal_registrar: Option<WorkflowPrincipalRegistrar>,
 ) -> absurd::Result<WorkflowResult> {
     let _heartbeat_guard = start_workflow_task_heartbeat(ctx.clone())
         .await
@@ -2809,6 +2847,7 @@ async fn run_centaur_workflow_inner(
                 session_runtime,
                 workflow_host_sandbox,
                 workflow_clients,
+                workflow_principal_registrar,
             )
             .await
             .map_err(absurd_error)?;
@@ -2887,6 +2926,7 @@ async fn run_python_workflow_host(
     session_runtime: SessionRuntime,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_clients: WorkflowQueueClients,
+    workflow_principal_registrar: Option<WorkflowPrincipalRegistrar>,
 ) -> Result<Value, WorkflowRuntimeError> {
     if let Some(sandbox) = workflow_host_sandbox {
         return run_python_workflow_host_in_sandbox(
@@ -2895,10 +2935,18 @@ async fn run_python_workflow_host(
             session_runtime,
             sandbox,
             workflow_clients,
+            workflow_principal_registrar,
         )
         .await;
     }
-    run_python_workflow_host_local(input, ctx, session_runtime, workflow_clients).await
+    run_python_workflow_host_local(
+        input,
+        ctx,
+        session_runtime,
+        workflow_clients,
+        workflow_principal_registrar,
+    )
+    .await
 }
 
 async fn start_workflow_task_heartbeat(
@@ -2921,11 +2969,13 @@ async fn run_python_workflow_host_local(
     ctx: TaskContext,
     session_runtime: SessionRuntime,
     workflow_clients: WorkflowQueueClients,
+    workflow_principal_registrar: Option<WorkflowPrincipalRegistrar>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let workflow_context = PythonWorkflowHostContext {
         session_runtime,
         workflow_clients,
         principal: None,
+        principal_registrar: workflow_principal_registrar,
     };
     let host_path = python_workflow_host_path();
     let mut command = Command::new(
@@ -3055,6 +3105,7 @@ async fn run_python_workflow_host_in_sandbox(
     session_runtime: SessionRuntime,
     sandbox: WorkflowHostSandboxRuntime,
     workflow_clients: WorkflowQueueClients,
+    workflow_principal_registrar: Option<WorkflowPrincipalRegistrar>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let (mut spec, workflow_principal) = sandbox.spec_for_workflow(&input.workflow_name)?;
     spec = spec
@@ -3087,6 +3138,7 @@ async fn run_python_workflow_host_in_sandbox(
             session_runtime,
             workflow_clients,
             principal: workflow_principal,
+            principal_registrar: workflow_principal_registrar,
         },
         &mut stdin,
         io.stdout,
@@ -3108,6 +3160,7 @@ struct PythonWorkflowHostContext {
     session_runtime: SessionRuntime,
     workflow_clients: WorkflowQueueClients,
     principal: Option<String>,
+    principal_registrar: Option<WorkflowPrincipalRegistrar>,
 }
 
 async fn run_python_workflow_host_protocol<W, R>(
@@ -3411,6 +3464,7 @@ async fn handle_python_context_request(
                 args,
                 &request_id,
                 workflow_context.principal.as_deref(),
+                workflow_context.principal_registrar.as_ref(),
             )
             .await
             {
@@ -3571,6 +3625,7 @@ async fn run_python_agent_turn(
     args: Value,
     request_id: &str,
     workflow_principal: Option<&str>,
+    workflow_principal_registrar: Option<&WorkflowPrincipalRegistrar>,
 ) -> Result<Value, WorkflowRuntimeError> {
     let text = args
         .get("text")
@@ -3662,7 +3717,13 @@ async fn run_python_agent_turn(
     let model = first_str_arg(&args, &["model"]);
     let provider = first_str_arg(&args, &["provider"]);
     let reasoning = first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]);
-    let agent_principal = agent_principal(&args, workflow_principal)?;
+    let agent_principal = resolve_python_agent_principal(
+        &args,
+        workflow_principal,
+        workflow_principal_registrar,
+        &input.workflow_name,
+    )
+    .await?;
     // Record the model on the execution like the slackbot does, so Console
     // readers can show what a workflow-dispatched turn ran on.
     if let Some(model) = model.as_deref() {
@@ -3693,6 +3754,29 @@ async fn run_python_agent_turn(
     serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
 }
 
+async fn resolve_python_agent_principal(
+    args: &Value,
+    workflow_principal: Option<&str>,
+    workflow_principal_registrar: Option<&WorkflowPrincipalRegistrar>,
+    workflow_name: &str,
+) -> Result<Option<String>, WorkflowRuntimeError> {
+    Ok(
+        match (
+            explicit_agent_principal(args)?,
+            workflow_principal_registrar,
+        ) {
+            (Some(foreign_id), Some(registrar)) => Some(
+                registrar
+                    .resolve_or_create_principal(workflow_name, &foreign_id)
+                    .await?
+                    .id,
+            ),
+            (Some(foreign_id), None) => Some(foreign_id),
+            (None, _) => workflow_principal.map(ToOwned::to_owned),
+        },
+    )
+}
+
 /// Returns the first arg key that holds a non-empty (trimmed) string, owned.
 fn first_str_arg(args: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
@@ -3710,26 +3794,33 @@ fn explicit_agent_principal(args: &Value) -> Result<Option<String>, WorkflowRunt
         if value.is_null() {
             continue;
         }
-        let principal = value.as_str().map(str::trim).ok_or_else(|| {
+        let principal = value.as_str().ok_or_else(|| {
             WorkflowRuntimeError::BadRequest(
-                "ctx.agent_turn principal must be a non-empty string".to_owned(),
+                "ctx.agent_turn principal must be a principal foreign id".to_owned(),
             )
         })?;
-        if principal.is_empty() {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "ctx.agent_turn principal must be a non-empty string".to_owned(),
-            ));
-        }
-        return Ok(Some(principal.to_owned()));
+        return validate_python_principal_foreign_id(principal, "ctx.agent_turn principal")
+            .map(Some);
     }
     Ok(None)
 }
 
-fn agent_principal(
-    args: &Value,
-    workflow_principal: Option<&str>,
-) -> Result<Option<String>, WorkflowRuntimeError> {
-    Ok(explicit_agent_principal(args)?.or_else(|| workflow_principal.map(ToOwned::to_owned)))
+fn validate_python_principal_foreign_id(
+    principal: &str,
+    field: &str,
+) -> Result<String, WorkflowRuntimeError> {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "{field} must be a non-empty principal foreign id"
+        )));
+    }
+    if principal.starts_with("prn_") {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "{field} must use a principal foreign id, not a prn_ id"
+        )));
+    }
+    Ok(principal.to_owned())
 }
 
 fn parse_agent_harness(args: &Value) -> Result<Option<HarnessType>, WorkflowRuntimeError> {
@@ -4247,6 +4338,8 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn python_event_names_are_collision_free() {
@@ -4617,31 +4710,57 @@ mod tests {
 
         assert_eq!(
             metadata.principals.get("nightly_report"),
-            Some(&WorkflowPrincipalDeclaration::Existing(
+            Some(&WorkflowPrincipalDeclaration::ForeignId(
                 "shared-automation".to_owned()
             ))
         );
     }
 
     #[test]
-    fn agent_turn_inherits_or_overrides_the_workflow_principal() {
+    fn discovery_metadata_rejects_a_principal_oid() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [{
+                "workflow_name": "nightly_report",
+                "source_path": "workflows/nightly_report.py",
+                "principal": "prn_123",
+            }],
+        }))
+        .unwrap();
+
+        let error = metadata_from_discovery_payload(payload).unwrap_err();
+
+        assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        assert!(error.to_string().contains("foreign id, not a prn_ id"));
+    }
+
+    #[test]
+    fn agent_turn_accepts_only_explicit_foreign_ids() {
+        assert_eq!(explicit_agent_principal(&json!({})).unwrap(), None);
         assert_eq!(
-            agent_principal(&json!({}), Some("workflow-default")).unwrap(),
-            Some("workflow-default".to_owned())
+            explicit_agent_principal(&json!({"principal": null})).unwrap(),
+            None
         );
         assert_eq!(
-            agent_principal(&json!({"principal": null}), Some("workflow-default")).unwrap(),
-            Some("workflow-default".to_owned())
-        );
-        assert_eq!(
-            agent_principal(
-                &json!({"principal": "agent-specific"}),
-                Some("workflow-default")
-            )
-            .unwrap(),
+            explicit_agent_principal(&json!({"principal": "agent-specific"})).unwrap(),
             Some("agent-specific".to_owned())
         );
-        assert!(agent_principal(&json!({"principal": "  "}), None).is_err());
+        assert!(explicit_agent_principal(&json!({"principal": "  "})).is_err());
+        assert!(explicit_agent_principal(&json!({"principal": "prn_123"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_turn_without_override_inherits_resolved_workflow_principal() {
+        assert_eq!(
+            resolve_python_agent_principal(
+                &json!({"principal": null}),
+                Some("prn_workflow"),
+                None,
+                "nightly_report",
+            )
+            .await
+            .unwrap(),
+            Some("prn_workflow".to_owned())
+        );
     }
 
     #[test]
@@ -4666,6 +4785,152 @@ mod tests {
             labels.get("workflow_name").map(String::as_str),
             Some("nightly_report")
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_principal_foreign_id_resolves_existing_principal_to_oid() {
+        let (base_url, requests, server) = spawn_workflow_principal_stub(true).await;
+        let registrar = WorkflowPrincipalRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+        );
+
+        let resolved = registrar
+            .resolve_workflow_principals(&BTreeMap::from([(
+                "nightly_report".to_owned(),
+                WorkflowPrincipalDeclaration::ForeignId("report-publisher".to_owned()),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.get("nightly_report").map(String::as_str),
+            Some("prn_report")
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/lookup/default/report-publisher"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workflow_principal_foreign_id_creates_missing_principal_and_returns_oid() {
+        let (base_url, requests, server) = spawn_workflow_principal_stub(false).await;
+        let registrar = WorkflowPrincipalRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+        );
+
+        let resolved = registrar
+            .resolve_workflow_principals(&BTreeMap::from([(
+                "nightly_report".to_owned(),
+                WorkflowPrincipalDeclaration::ForeignId("report-publisher".to_owned()),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.get("nightly_report").map(String::as_str),
+            Some("prn_report")
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            [
+                "GET /api/v1/principals/lookup/default/report-publisher",
+                "PUT /api/v1/principals/report-publisher",
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_turn_foreign_id_creates_missing_principal_and_returns_oid() {
+        let (base_url, requests, server) = spawn_workflow_principal_stub(false).await;
+        let registrar = WorkflowPrincipalRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+        );
+
+        let resolved = resolve_python_agent_principal(
+            &json!({"principal": "report-publisher"}),
+            Some("prn_workflow"),
+            Some(&registrar),
+            "nightly_report",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("prn_report"));
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            [
+                "GET /api/v1/principals/lookup/default/report-publisher",
+                "PUT /api/v1/principals/report-publisher",
+            ]
+        );
+        server.abort();
+    }
+
+    async fn spawn_workflow_principal_stub(
+        principal_exists: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let request_line = request.lines().next().unwrap_or_default();
+                seen.lock().unwrap().push(
+                    request_line
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+
+                let (status, body) = if request_line
+                    .starts_with("GET /api/v1/principals/lookup/default/report-publisher ")
+                {
+                    if principal_exists {
+                        ("200 OK", workflow_principal_body())
+                    } else {
+                        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+                    }
+                } else if request_line.starts_with("PUT /api/v1/principals/report-publisher ") {
+                    ("200 OK", workflow_principal_body())
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":"unexpected"}"#.to_owned(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn workflow_principal_body() -> String {
+        r#"{"data":{"id":"prn_report","namespace":"default","foreign_id":"report-publisher","name":"Report Publisher","labels":{}}}"#.to_owned()
     }
 
     #[test]
