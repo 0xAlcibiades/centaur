@@ -366,11 +366,6 @@ def normalize_principal(workflow: RegisteredWorkflow) -> bool | str | None:
             raise ValueError(
                 f"workflow {workflow.workflow_name!r} declares an empty WORKFLOW_PRINCIPAL"
             )
-        if principal.startswith("prn_"):
-            raise ValueError(
-                f"workflow {workflow.workflow_name!r} WORKFLOW_PRINCIPAL must use "
-                "a principal foreign id, not a prn_ id"
-            )
         return principal
     return None
 
