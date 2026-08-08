@@ -1760,7 +1760,7 @@ fn pg_from_sandbox_env(
     pg_from_sandbox_dsn(dsn, listen, port)
 }
 
-fn sandbox_observability_enabled(
+pub(crate) fn sandbox_observability_enabled(
     sandbox: &crate::crd::Sandbox,
     container_name: &str,
 ) -> Option<bool> {
@@ -1772,7 +1772,10 @@ fn sandbox_observability_enabled(
     .and_then(|value| value.parse().ok())
 }
 
-fn sandbox_api_server_enabled(sandbox: &crate::crd::Sandbox, container_name: &str) -> Option<bool> {
+pub(crate) fn sandbox_api_server_enabled(
+    sandbox: &crate::crd::Sandbox,
+    container_name: &str,
+) -> Option<bool> {
     sandbox_env_value(
         sandbox,
         "CENTAUR_SANDBOX_API_SERVER_ENABLED",
@@ -1784,7 +1787,7 @@ fn sandbox_api_server_enabled(sandbox: &crate::crd::Sandbox, container_name: &st
 /// Prefer a present, parseable capability env. When env is missing/invalid,
 /// fall back to the sandbox CR label (`"true"` => enabled; absent => disabled).
 /// Never default missing state to enabled (fail closed).
-fn resolve_resume_capability(
+pub(crate) fn resolve_resume_capability(
     env_enabled: Option<bool>,
     labels: Option<&BTreeMap<String, String>>,
     label_key: &str,
