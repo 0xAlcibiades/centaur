@@ -1413,8 +1413,37 @@ impl SessionRuntime {
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
+            let existing_principal_id = match self.store.get_session(thread_key).await {
+                Ok(session) => session.iron_control_principal,
+                Err(SessionStoreError::NotFound { .. }) => None,
+                Err(error) => return Err(error.into()),
+            };
             let registered_principal = if let Some(principal) = iron_control_principal {
-                self.iron_control.get_principal(principal).await?
+                let principal = self.iron_control.get_principal(principal).await?;
+                ensure_session_principal_matches(
+                    thread_key,
+                    existing_principal_id.as_deref(),
+                    &principal.id,
+                )?;
+                principal
+            } else if let Some(existing_principal_id) = existing_principal_id.as_deref() {
+                let existing_principal = self.iron_control.get_principal(existing_principal_id).await?;
+                let expected_foreign_id = self
+                    .iron_control
+                    .foreign_id_for_session(thread_key.as_str(), Some(&session_metadata));
+                if existing_principal.foreign_id.as_deref() != Some(expected_foreign_id.as_str()) {
+                    return Err(session_principal_conflict_error(thread_key));
+                }
+                let principal = self
+                    .iron_control
+                    .register_session(thread_key.as_str(), Some(&session_metadata))
+                    .await?;
+                ensure_session_principal_matches(
+                    thread_key,
+                    Some(existing_principal_id),
+                    &principal.id,
+                )?;
+                principal
             } else {
                 self.iron_control
                     .register_session(thread_key.as_str(), Some(&session_metadata))
@@ -1462,13 +1491,12 @@ impl SessionRuntime {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if iron_control_principal.is_some()
-                && let Some(existing) = session.iron_control_principal.as_deref()
-                && existing != registered_principal.id
-            {
-                return Err(SessionRuntimeError::BadRequest(format!(
-                    "session {thread_key} is already bound to a different Iron Control principal"
-                )));
+            if let Some(existing) = session.iron_control_principal.as_deref() {
+                ensure_session_principal_matches(
+                    thread_key,
+                    Some(existing),
+                    &registered_principal.id,
+                )?;
             }
             if let Some(context) = self.resolve_stored_persona(
                 session.persona_id.as_deref(),
@@ -5589,6 +5617,23 @@ fn sandbox_capabilities_from_principal(
     }
 }
 
+fn ensure_session_principal_matches(
+    thread_key: &ThreadKey,
+    existing_principal: Option<&str>,
+    requested_principal: &str,
+) -> Result<(), SessionRuntimeError> {
+    if existing_principal.is_some_and(|existing| existing != requested_principal) {
+        return Err(session_principal_conflict_error(thread_key));
+    }
+    Ok(())
+}
+
+fn session_principal_conflict_error(thread_key: &ThreadKey) -> SessionRuntimeError {
+    SessionRuntimeError::BadRequest(format!(
+        "session {thread_key} is already bound to a different Iron Control principal"
+    ))
+}
+
 fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSandboxCapabilities) {
     spec.capabilities = BackendSandboxCapabilities {
         repo_cache: match capabilities.repo_cache {
@@ -8438,8 +8483,9 @@ mod adoption_tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    use centaur_iron_control::{IronControlClient, SessionRegistrar};
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
 
@@ -8820,6 +8866,164 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    async fn spawn_principal_stub() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                seen.lock().unwrap().push(format!("{method} {path}"));
+
+                let (status_line, body) = match (method, path) {
+                    (
+                        "GET",
+                        "/api/v1/principals/lookup/default/report-publisher"
+                        | "/api/v1/principals/prn_explicit",
+                    ) => (
+                        "200 OK",
+                        r#"{"data":{"id":"prn_explicit","namespace":"default","foreign_id":"report-publisher","name":"Report Publisher","labels":{}}}"#,
+                    ),
+                    _ => ("500 Internal Server Error", r#"{"error":"unexpected"}"#),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_principal_cannot_be_rebound_when_later_create_omits_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_principal_stub().await;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        )
+        .with_iron_control(SessionRegistrar::new(
+            IronControlClient::new(base_url, "test-key"),
+            "default",
+        ));
+        let thread_key = ThreadKey::parse(format!(
+            "wf:{}:agent:principal-test",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"source": "absurd_workflow"})),
+                HarnessConflictPolicy::Reject,
+                Some("report-publisher"),
+            )
+            .await
+            .expect("bind explicit principal");
+
+        let error = runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"source": "absurd_workflow"})),
+                HarnessConflictPolicy::Reject,
+                None,
+            )
+            .await
+            .expect_err("omitting the principal must not rebind the session");
+
+        assert!(matches!(error, SessionRuntimeError::BadRequest(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("different Iron Control principal")
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("get session")
+                .iron_control_principal
+                .as_deref(),
+            Some("prn_explicit")
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "a rejected rebind must not mutate Iron Control"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_principal_requires_iron_control() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let thread_key = ThreadKey::parse(format!(
+            "wf:{}:agent:principal-test",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let error = runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({"source": "absurd_workflow"})),
+                HarnessConflictPolicy::Reject,
+                Some("report-publisher"),
+            )
+            .await
+            .expect_err("explicit principal must require Iron Control");
+
+        assert!(matches!(error, SessionRuntimeError::BadRequest(_)));
+        assert!(error.to_string().contains("requires Iron Control"));
+        assert!(matches!(
+            store.get_session(&thread_key).await,
+            Err(SessionStoreError::NotFound { .. })
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

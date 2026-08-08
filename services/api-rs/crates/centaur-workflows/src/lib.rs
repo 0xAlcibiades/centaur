@@ -3703,20 +3703,26 @@ fn first_str_arg(args: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn explicit_agent_principal(args: &Value) -> Result<Option<String>, WorkflowRuntimeError> {
-    let Some(value) = args.get("principal").or_else(|| args.get("principal_id")) else {
-        return Ok(None);
-    };
-    let principal = value.as_str().map(str::trim).ok_or_else(|| {
-        WorkflowRuntimeError::BadRequest(
-            "ctx.agent_turn principal must be a non-empty string".to_owned(),
-        )
-    })?;
-    if principal.is_empty() {
-        return Err(WorkflowRuntimeError::BadRequest(
-            "ctx.agent_turn principal must be a non-empty string".to_owned(),
-        ));
+    for key in ["principal", "principal_id"] {
+        let Some(value) = args.get(key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let principal = value.as_str().map(str::trim).ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.agent_turn principal must be a non-empty string".to_owned(),
+            )
+        })?;
+        if principal.is_empty() {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "ctx.agent_turn principal must be a non-empty string".to_owned(),
+            ));
+        }
+        return Ok(Some(principal.to_owned()));
     }
-    Ok(Some(principal.to_owned()))
+    Ok(None)
 }
 
 fn agent_principal(
@@ -4621,6 +4627,10 @@ mod tests {
     fn agent_turn_inherits_or_overrides_the_workflow_principal() {
         assert_eq!(
             agent_principal(&json!({}), Some("workflow-default")).unwrap(),
+            Some("workflow-default".to_owned())
+        );
+        assert_eq!(
+            agent_principal(&json!({"principal": null}), Some("workflow-default")).unwrap(),
             Some("workflow-default".to_owned())
         );
         assert_eq!(

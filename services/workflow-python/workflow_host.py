@@ -360,8 +360,13 @@ def normalize_principal(workflow: RegisteredWorkflow) -> bool | str | None:
     raw = workflow.principal
     if isinstance(raw, bool):
         return raw or None
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
+    if isinstance(raw, str):
+        principal = raw.strip()
+        if not principal:
+            raise ValueError(
+                f"workflow {workflow.workflow_name!r} declares an empty WORKFLOW_PRINCIPAL"
+            )
+        return principal
     return None
 
 

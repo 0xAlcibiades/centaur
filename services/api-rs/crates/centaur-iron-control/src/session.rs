@@ -78,15 +78,7 @@ impl SessionRegistrar {
         thread_key: &str,
         metadata: Option<&Value>,
     ) -> Result<Principal> {
-        let metadata = SessionPrincipalMetadata::from_session_metadata(metadata);
-        let principal = derive_principal_with_slack_team(
-            thread_key,
-            metadata.actor_user_id,
-            metadata.slack_team_id,
-            metadata.conversation_name,
-        );
-        let mut input = principal.to_principal_input(&self.namespace);
-        apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
+        let mut input = self.principal_input_for_session(thread_key, metadata);
         let existing = match self
             .client
             .get_principal(&self.namespace, &input.foreign_id)
@@ -119,6 +111,30 @@ impl SessionRegistrar {
                 .await?;
         }
         Ok(record)
+    }
+
+    /// Return the stable foreign id that `register_session` would use without
+    /// reading or mutating Iron Control.
+    pub fn foreign_id_for_session(&self, thread_key: &str, metadata: Option<&Value>) -> String {
+        self.principal_input_for_session(thread_key, metadata)
+            .foreign_id
+    }
+
+    fn principal_input_for_session(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> crate::models::PrincipalInput {
+        let metadata = SessionPrincipalMetadata::from_session_metadata(metadata);
+        let principal = derive_principal_with_slack_team(
+            thread_key,
+            metadata.actor_user_id,
+            metadata.slack_team_id,
+            metadata.conversation_name,
+        );
+        let mut input = principal.to_principal_input(&self.namespace);
+        apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
+        input
     }
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
