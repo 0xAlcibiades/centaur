@@ -69,6 +69,29 @@ pub enum SecretInput {
     AwsAuth(AwsAuthSecretInput),
 }
 
+impl SecretInput {
+    fn with_registrar_ownership(mut self, role_foreign_id: &str) -> Self {
+        let labels = match &mut self {
+            Self::Static(input) => &mut input.labels,
+            Self::OAuthToken(input) => &mut input.labels,
+            Self::GcpAuth(input) => &mut input.labels,
+            Self::GcpIdToken(input) => &mut input.labels,
+            Self::PgDsn(input) => &mut input.labels,
+            Self::Hmac(input) => &mut input.labels,
+            Self::AwsAuth(input) => &mut input.labels,
+        };
+        labels.insert(
+            REGISTRAR_LABEL_KEY.to_owned(),
+            REGISTRAR_LABEL_VALUE.to_owned(),
+        );
+        labels.insert(
+            REGISTRAR_ROLE_LABEL_KEY.to_owned(),
+            role_foreign_id.to_owned(),
+        );
+        self
+    }
+}
+
 /// A fragment transform iron-control cannot represent, or a malformed entry.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TranslateError {
@@ -102,11 +125,12 @@ pub fn gcp_auth_scopes_or_default(scopes: Vec<String>) -> Vec<String> {
     }
 }
 
-/// Reconcile Centaur-owned grants on ``role`` to the fragment's secrets. The
-/// shared infra role is not exclusive: grants backed by a secret without the
-/// Centaur management label are never removed. A mode transition revokes only
-/// stale Centaur grants before a proxy can sync it. Foreign-id upserts keep
-/// desired secret resources stable across reruns.
+/// Reconcile the registrar-owned grants on ``role`` to the fragment's secrets.
+/// The shared infra role is not exclusive: resources created here are marked
+/// with the registrar and role that own them, so mode transitions preserve
+/// operator and tool grants. A narrow exact-ID bridge retires already-deployed
+/// Codex resources that predate those labels. Foreign-id upserts keep desired
+/// resources stable across reruns.
 /// Returns the role's iron-control OID so callers can assign it to principals
 /// without a follow-up lookup.
 pub async fn register_role(
@@ -116,7 +140,10 @@ pub async fn register_role(
     fragment: &ProxyFragment,
     policy: &SourcePolicy,
 ) -> Result<String, RegisterError> {
-    let inputs = secret_inputs_from_fragment(namespace, &role.foreign_id, fragment, policy)?;
+    let inputs = secret_inputs_from_fragment(namespace, &role.foreign_id, fragment, policy)?
+        .into_iter()
+        .map(|input| input.with_registrar_ownership(&role.foreign_id))
+        .collect();
     let role_record = client
         .upsert_role(&IdentityInput {
             namespace: namespace.to_owned(),
@@ -125,18 +152,19 @@ pub async fn register_role(
             labels: managed_labels(),
         })
         .await?;
-    reconcile_inputs_to_role(client, &role_record.id, inputs).await?;
+    reconcile_inputs_to_role(client, &role_record.id, &role.foreign_id, inputs).await?;
     Ok(role_record.id)
 }
 
-/// Materialize desired secrets, revoke stale Centaur-owned grants, then grant
+/// Materialize desired secrets, revoke stale registrar-owned grants, then grant
 /// the desired set. Revocation happens before new grants so a partial
 /// transition fails closed rather than allowing a proxy to use a stale
-/// credential. The role can also carry grants owned by another registrar;
-/// those survive reconciliation.
+/// credential. The role can also carry Centaur-managed operator and tool
+/// grants; they survive unless they carry this registrar's role label.
 async fn reconcile_inputs_to_role(
     client: &IronControlClient,
     role_oid: &str,
+    role_foreign_id: &str,
     inputs: Vec<SecretInput>,
 ) -> Result<Vec<String>, IronControlError> {
     let existing = client.list_role_grants(role_oid).await?;
@@ -146,7 +174,9 @@ async fn reconcile_inputs_to_role(
         .map(|secret| secret.oid().to_owned())
         .collect::<BTreeSet<_>>();
 
-    for grant_id in registrar_owned_stale_grant_ids(client, &existing, &desired).await? {
+    for grant_id in
+        registrar_owned_stale_grant_ids(client, &existing, &desired, role_foreign_id).await?
+    {
         client.delete_grant(&grant_id).await?;
     }
 
@@ -231,6 +261,7 @@ async fn registrar_owned_stale_grant_ids(
     client: &IronControlClient,
     existing: &[crate::models::Grant],
     desired: &BTreeSet<String>,
+    role_foreign_id: &str,
 ) -> Result<Vec<String>, IronControlError> {
     let mut registrar_owned_secret_ids = BTreeSet::new();
     for grant in existing {
@@ -244,7 +275,7 @@ async fn registrar_owned_stale_grant_ids(
             continue;
         };
         match client.get_secret(collection, oid).await {
-            Ok(secret) if is_centaur_managed(&secret.labels) => {
+            Ok(secret) if is_register_role_owned_resource(&secret, role_foreign_id) => {
                 registrar_owned_secret_ids.insert(secret_id.to_owned());
             }
             Ok(_) | Err(IronControlError::Status { status: 404, .. }) => {}
@@ -256,6 +287,44 @@ async fn registrar_owned_stale_grant_ids(
         desired,
         &registrar_owned_secret_ids,
     ))
+}
+
+const REGISTRAR_LABEL_KEY: &str = "centaur-registrar";
+const REGISTRAR_LABEL_VALUE: &str = "api-rs";
+const REGISTRAR_ROLE_LABEL_KEY: &str = "centaur-registrar-role";
+
+fn is_register_role_owned_resource(
+    secret: &crate::models::SecretRecord,
+    role_foreign_id: &str,
+) -> bool {
+    (secret.labels.get(REGISTRAR_LABEL_KEY).map(String::as_str) == Some(REGISTRAR_LABEL_VALUE)
+        && secret
+            .labels
+            .get(REGISTRAR_ROLE_LABEL_KEY)
+            .map(String::as_str)
+            == Some(role_foreign_id))
+        || is_legacy_codex_mode_resource(secret, role_foreign_id)
+}
+
+// Versions deployed before registrar labels used these exact stable Codex
+// resource IDs. This bridge is deliberately limited to the shared infra role;
+// all newly upserted resources carry registrar ownership metadata instead.
+const LEGACY_CODEX_MODE_FOREIGN_IDS: &[&str] = &[
+    "infra-openai-api-key-authorization",
+    "infra-openai-codex",
+    "infra-openai-codex-account-id",
+];
+
+fn is_legacy_codex_mode_resource(
+    secret: &crate::models::SecretRecord,
+    role_foreign_id: &str,
+) -> bool {
+    role_foreign_id == "infra"
+        && is_centaur_managed(&secret.labels)
+        && secret
+            .foreign_id
+            .as_deref()
+            .is_some_and(|foreign_id| LEGACY_CODEX_MODE_FOREIGN_IDS.contains(&foreign_id))
 }
 
 fn is_centaur_managed(labels: &BTreeMap<String, String>) -> bool {
@@ -1079,30 +1148,70 @@ mod tests {
         SourcePolicy::env()
     }
 
+    fn secret_record(
+        foreign_id: &str,
+        labels: BTreeMap<String, String>,
+    ) -> crate::models::SecretRecord {
+        crate::models::SecretRecord {
+            id: "ssr_secret".to_owned(),
+            namespace: "default".to_owned(),
+            foreign_id: Some(foreign_id.to_owned()),
+            name: None,
+            labels,
+        }
+    }
+
+    fn registrar_labels(role_foreign_id: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                REGISTRAR_LABEL_KEY.to_owned(),
+                REGISTRAR_LABEL_VALUE.to_owned(),
+            ),
+            (
+                REGISTRAR_ROLE_LABEL_KEY.to_owned(),
+                role_foreign_id.to_owned(),
+            ),
+        ])
+    }
+
     #[test]
-    fn autorotate_transition_and_repeated_reconcile_only_touch_registrar_owned_grants() {
+    fn autorotate_transition_retires_only_registrar_owned_codex_grants() {
         let existing = vec![
             static_grant("grt_bearer", "ssr_openai_codex_bearer"),
             static_grant("grt_account", "ssr_openai_codex_account"),
             static_grant("grt_github", "ssr_github_token"),
+            static_grant("grt_axiom", "ssr_axiom_token"),
+            static_grant("grt_pg", "pgs_workflow_database"),
+            static_grant("grt_tool", "ssr_tool_secret"),
             static_grant("grt_operator", "ssr_operator_owned"),
         ];
-        let desired = BTreeSet::from(["ssr_github_token".to_owned()]);
+        let desired = BTreeSet::new();
         let registrar_owned = BTreeSet::from([
             "ssr_openai_codex_bearer".to_owned(),
             "ssr_openai_codex_account".to_owned(),
-            "ssr_github_token".to_owned(),
         ]);
 
         assert_eq!(
             managed_stale_grant_ids(&existing, &desired, &registrar_owned),
             vec!["grt_bearer".to_owned(), "grt_account".to_owned()]
         );
+    }
 
-        // A subsequent reconciler sees the first replica's desired state and
-        // leaves both retained and externally owned grants untouched.
+    #[test]
+    fn repeated_reconcile_is_idempotent_after_another_replica_revokes_stale_grants() {
+        let desired = BTreeSet::new();
+        let registrar_owned = BTreeSet::from([
+            "ssr_openai_codex_bearer".to_owned(),
+            "ssr_openai_codex_account".to_owned(),
+        ]);
+
+        // A second replica can list after the first has deleted the two legacy
+        // grants; unrelated Centaur-managed and operator grants still survive.
         let after_first_reconcile = vec![
             static_grant("grt_github", "ssr_github_token"),
+            static_grant("grt_axiom", "ssr_axiom_token"),
+            static_grant("grt_pg", "pgs_workflow_database"),
+            static_grant("grt_tool", "ssr_tool_secret"),
             static_grant("grt_operator", "ssr_operator_owned"),
         ];
         assert!(
@@ -1111,13 +1220,71 @@ mod tests {
     }
 
     #[test]
-    fn centaur_management_label_is_the_shared_role_ownership_fence() {
-        assert!(is_centaur_managed(&managed_labels()));
-        assert!(!is_centaur_managed(&BTreeMap::new()));
-        assert!(!is_centaur_managed(&BTreeMap::from([(
-            MANAGED_LABEL_KEY.to_owned(),
-            "another-registrar".to_owned(),
-        )])));
+    fn ownership_metadata_is_specific_to_this_registrar_and_role() {
+        let owned = secret_record("infra-claude-api-key", registrar_labels("infra"));
+        assert!(is_register_role_owned_resource(&owned, "infra"));
+        assert!(!is_register_role_owned_resource(&owned, "tool-github"));
+
+        for foreign_id in [
+            "infra-github-token",
+            "infra-axiom-token",
+            "workflow-database",
+        ] {
+            assert!(!is_register_role_owned_resource(
+                &secret_record(foreign_id, managed_labels()),
+                "infra"
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_codex_bridge_is_limited_to_the_shared_infra_role() {
+        for foreign_id in LEGACY_CODEX_MODE_FOREIGN_IDS {
+            let secret = secret_record(foreign_id, managed_labels());
+            assert!(is_register_role_owned_resource(&secret, "infra"));
+            assert!(!is_register_role_owned_resource(&secret, "tool-codex"));
+        }
+        assert!(!is_register_role_owned_resource(
+            &secret_record("infra-github-token", managed_labels()),
+            "infra"
+        ));
+    }
+
+    #[test]
+    fn registering_a_role_relabels_desired_resources_for_future_mode_transitions() {
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - replace:
+            proxy_value: ANTHROPIC_API_KEY
+            match_headers: ["X-Api-Key"]
+          labels:
+            centaur-tool: claude
+          rules: [{ host: api.anthropic.com }]
+"#,
+        )
+        .unwrap();
+        let inputs = secret_inputs_from_fragment("default", "infra", &fragment, &env_policy())
+            .unwrap()
+            .into_iter()
+            .map(|input| input.with_registrar_ownership("infra"))
+            .collect::<Vec<_>>();
+        let SecretInput::Static(input) = &inputs[0] else {
+            panic!("expected a static secret");
+        };
+
+        assert_eq!(input.labels.get("centaur-tool"), Some(&"claude".to_owned()));
+        assert_eq!(
+            input.labels.get(REGISTRAR_LABEL_KEY),
+            Some(&REGISTRAR_LABEL_VALUE.to_owned())
+        );
+        assert_eq!(
+            input.labels.get(REGISTRAR_ROLE_LABEL_KEY),
+            Some(&"infra".to_owned())
+        );
     }
 
     #[test]
