@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
-use crate::models::{Principal, SlackChannelPermissionInput};
+use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
     derive_principal_with_slack_team, is_direct_message, slack_conversation_id,
 };
@@ -139,6 +139,30 @@ impl SessionRegistrar {
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
         self.client.get_principal(&self.namespace, principal).await
+    }
+
+    /// Resolve a basic principal by foreign id and create it when missing.
+    /// Existing principal metadata is left unchanged.
+    pub async fn resolve_or_create_principal(
+        &self,
+        foreign_id: &str,
+        name: &str,
+        labels: BTreeMap<String, String>,
+        kind: Option<&str>,
+    ) -> Result<Principal> {
+        self.client
+            .get_or_create_principal(&PrincipalInput {
+                namespace: self.namespace.clone(),
+                foreign_id: foreign_id.to_owned(),
+                name: name.to_owned(),
+                labels,
+                kind: kind.map(ToOwned::to_owned),
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
+            })
+            .await
     }
 }
 
@@ -425,6 +449,34 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn resolve_or_create_principal_only_creates_when_missing() {
+        for principal_exists in [true, false] {
+            let (base_url, requests, server) = spawn_iron_control_stub(principal_exists).await;
+            let registrar =
+                SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+
+            let principal = registrar
+                .resolve_or_create_principal(
+                    "report-publisher",
+                    "Workflow nightly_report",
+                    BTreeMap::new(),
+                    Some("workflow"),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(principal.id, "prn_report");
+            let mut expected =
+                vec!["GET /api/v1/principals/lookup/default/report-publisher".to_owned()];
+            if !principal_exists {
+                expected.push("PUT /api/v1/principals/report-publisher".to_owned());
+            }
+            assert_eq!(*requests.lock().unwrap(), expected);
+            server.abort();
+        }
+    }
+
     #[test]
     fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
         assert_eq!(
@@ -492,8 +544,14 @@ mod tests {
                     {
                         ("200 OK", user_principal_body())
                     }
+                    ("GET", "/api/v1/principals/lookup/default/report-publisher")
+                        if principal_exists =>
+                    {
+                        ("200 OK", workflow_principal_body())
+                    }
                     ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
-                    | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123") => {
+                    | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
+                    | ("GET", "/api/v1/principals/lookup/default/report-publisher") => {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
                     }
                     ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
@@ -501,6 +559,9 @@ mod tests {
                     }
                     ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
                         ("200 OK", user_principal_body())
+                    }
+                    ("PUT", "/api/v1/principals/report-publisher") => {
+                        ("200 OK", workflow_principal_body())
                     }
                     (
                         "POST",
@@ -532,5 +593,9 @@ mod tests {
 
     fn user_principal_body() -> String {
         r#"{"data":{"id":"prn_user","namespace":"default","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+    }
+
+    fn workflow_principal_body() -> String {
+        r#"{"data":{"id":"prn_report","namespace":"default","foreign_id":"report-publisher","name":"Workflow nightly_report","labels":{}}}"#.to_owned()
     }
 }

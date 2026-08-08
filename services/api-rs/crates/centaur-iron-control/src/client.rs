@@ -62,6 +62,20 @@ impl IronControlClient {
         .await
     }
 
+    /// Resolve a principal by ``foreign_id``, creating it from ``input`` when
+    /// no matching principal exists. Existing principals are returned without
+    /// updating their metadata.
+    pub async fn get_or_create_principal(&self, input: &PrincipalInput) -> Result<Principal> {
+        match self
+            .get_principal(&input.namespace, &input.foreign_id)
+            .await
+        {
+            Ok(principal) => Ok(principal),
+            Err(IronControlError::Status { status: 404, .. }) => self.upsert_principal(input).await,
+            Err(error) => Err(error),
+        }
+    }
+
     /// Upsert a role by ``foreign_id``.
     pub async fn upsert_role(&self, input: &IdentityInput) -> Result<Role> {
         self.write(Method::PUT, &upsert_path("roles", &input.foreign_id), input)

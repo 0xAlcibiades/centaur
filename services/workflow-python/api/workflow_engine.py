@@ -126,7 +126,6 @@ class WorkflowContext:
         args = {**self._agent_defaults, **kwargs}
         if text is not None:
             args.setdefault("text", text)
-        normalize_agent_principal(args)
         return await self._rpc.request({"type": "ctx.agent_turn", "args": args})
 
     async def run_agent(self, *args: Any, text: str | None = None, **kwargs: Any) -> Any:
@@ -174,19 +173,3 @@ def duration_seconds(value: dt.timedelta | int | float) -> float:
     if isinstance(value, dt.timedelta):
         return max(value.total_seconds(), 0.0)
     return max(float(value), 0.0)
-
-
-def normalize_agent_principal(args: dict[str, Any]) -> None:
-    for key in ("principal", "principal_id"):
-        if key not in args or args[key] is None:
-            continue
-        principal = args[key]
-        if not isinstance(principal, str) or not principal.strip():
-            raise ValueError("ctx.agent_turn principal must be a non-empty foreign id")
-        principal = principal.strip()
-        if principal.startswith("prn_"):
-            raise ValueError(
-                "ctx.agent_turn principal must use a foreign id, not a prn_ id"
-            )
-        args[key] = principal
-        return

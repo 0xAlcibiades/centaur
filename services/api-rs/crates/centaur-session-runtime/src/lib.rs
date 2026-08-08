@@ -104,6 +104,16 @@ pub trait SessionPrincipalRegistrar: Send + Sync {
     ) -> Result<Principal, IronControlError>;
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError>;
+
+    fn foreign_id_for_session(&self, thread_key: &str, metadata: Option<&Value>) -> String;
+
+    async fn resolve_or_create_principal(
+        &self,
+        foreign_id: &str,
+        name: &str,
+        labels: BTreeMap<String, String>,
+        kind: Option<&str>,
+    ) -> Result<Principal, IronControlError>;
 }
 
 #[async_trait::async_trait]
@@ -118,6 +128,20 @@ impl SessionPrincipalRegistrar for SessionRegistrar {
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
         SessionRegistrar::get_principal(self, principal).await
+    }
+
+    fn foreign_id_for_session(&self, thread_key: &str, metadata: Option<&Value>) -> String {
+        SessionRegistrar::foreign_id_for_session(self, thread_key, metadata)
+    }
+
+    async fn resolve_or_create_principal(
+        &self,
+        foreign_id: &str,
+        name: &str,
+        labels: BTreeMap<String, String>,
+        kind: Option<&str>,
+    ) -> Result<Principal, IronControlError> {
+        SessionRegistrar::resolve_or_create_principal(self, foreign_id, name, labels, kind).await
     }
 }
 
@@ -1376,6 +1400,22 @@ impl SessionRuntime {
         .await
     }
 
+    /// Resolve an Iron Control principal by foreign id, creating it when it is
+    /// missing, and return its canonical OID.
+    pub async fn resolve_or_create_principal(
+        &self,
+        foreign_id: &str,
+        name: &str,
+        labels: BTreeMap<String, String>,
+        kind: Option<&str>,
+    ) -> Result<String, SessionRuntimeError> {
+        Ok(self
+            .iron_control
+            .resolve_or_create_principal(foreign_id, name, labels, kind)
+            .await?
+            .id)
+    }
+
     /// Create or load a session and optionally bind it to an existing Iron
     /// Control principal instead of deriving one from the thread key.
     pub async fn create_or_get_session_with_principal(
@@ -1427,7 +1467,10 @@ impl SessionRuntime {
                 )?;
                 principal
             } else if let Some(existing_principal_id) = existing_principal_id.as_deref() {
-                let existing_principal = self.iron_control.get_principal(existing_principal_id).await?;
+                let existing_principal = self
+                    .iron_control
+                    .get_principal(existing_principal_id)
+                    .await?;
                 let expected_foreign_id = self
                     .iron_control
                     .foreign_id_for_session(thread_key.as_str(), Some(&session_metadata));
@@ -8510,6 +8553,20 @@ mod adoption_tests {
         async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
             Ok(test_principal(principal))
         }
+
+        fn foreign_id_for_session(&self, _thread_key: &str, _metadata: Option<&Value>) -> String {
+            "test".to_owned()
+        }
+
+        async fn resolve_or_create_principal(
+            &self,
+            _foreign_id: &str,
+            _name: &str,
+            _labels: BTreeMap<String, String>,
+            _kind: Option<&str>,
+        ) -> Result<Principal, IronControlError> {
+            Ok(test_principal("prn_test"))
+        }
     }
 
     fn test_principal(id: &str) -> Principal {
@@ -8926,14 +8983,14 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let (base_url, requests, server) = spawn_principal_stub().await;
-        let runtime = runtime_with(
-            &store,
-            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-        )
-        .with_iron_control(SessionRegistrar::new(
-            IronControlClient::new(base_url, "test-key"),
-            "default",
-        ));
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("mock"),
+            ),
+            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default"),
+        );
         let thread_key = ThreadKey::parse(format!(
             "wf:{}:agent:principal-test",
             uuid::Uuid::new_v4().simple()
@@ -8988,42 +9045,6 @@ mod adoption_tests {
             "a rejected rebind must not mutate Iron Control"
         );
         server.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicit_principal_requires_iron_control() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let _serial = TEST_LOCK.lock().await;
-        let runtime = runtime_with(
-            &store,
-            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-        );
-        let thread_key = ThreadKey::parse(format!(
-            "wf:{}:agent:principal-test",
-            uuid::Uuid::new_v4().simple()
-        ))
-        .unwrap();
-
-        let error = runtime
-            .create_or_get_session_with_principal(
-                &thread_key,
-                &HarnessType::Codex,
-                None,
-                Some(json!({"source": "absurd_workflow"})),
-                HarnessConflictPolicy::Reject,
-                Some("report-publisher"),
-            )
-            .await
-            .expect_err("explicit principal must require Iron Control");
-
-        assert!(matches!(error, SessionRuntimeError::BadRequest(_)));
-        assert!(error.to_string().contains("requires Iron Control"));
-        assert!(matches!(
-            store.get_session(&thread_key).await,
-            Err(SessionStoreError::NotFound { .. })
-        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -313,18 +313,6 @@ class WorkflowHostTests(unittest.TestCase):
             },
         )
 
-    def test_agent_turn_rejects_principal_oid(self) -> None:
-        host = load_workflow_host()
-        ctx = host.WorkflowContext(
-            RequestRpc(),
-            run_id="run-123",
-            task_id="task-456",
-            workflow_name="sample",
-        )
-
-        with self.assertRaisesRegex(ValueError, "foreign id, not a prn_ id"):
-            asyncio.run(ctx.agent_turn("do the thing", principal="prn_123"))
-
     def test_start_workflow_enqueues_durable_child_with_idempotency_key(self) -> None:
         host = load_workflow_host()
         rpc = RequestRpc()
