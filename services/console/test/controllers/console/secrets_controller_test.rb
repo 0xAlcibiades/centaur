@@ -80,6 +80,49 @@ module Console
       assert_response :unprocessable_entity
     end
 
+    test "POST create resolves the GitHub token profile" do
+      assert_difference -> { StaticSecret.count } => 1,
+                        -> { RequestRule.count } => 2 do
+        post console_static_secrets_url, params: {
+          secret: { namespace: "acme", name: "GitHub token", foreign_id: "github-token" },
+          static: { kind: "github_token", mode: "inject" },
+          source: { source_type: "env", reference: "GITHUB_TOKEN" }
+        }
+      end
+
+      secret = StaticSecret.find_by!(namespace: "acme", foreign_id: "github-token")
+      assert_equal "github_token", secret.kind
+      assert_nil secret.inject_config
+      assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, secret.replace_config
+      assert_equal %w[api.github.com github.com], secret.rules.map(&:host)
+    end
+
+    test "PATCH preserves a GitHub token profile through the form representation" do
+      secret = StaticSecret.create!(
+        namespace: "acme",
+        name: "GitHub token",
+        kind: "github_token",
+        replace_config: CredentialProfiles::GithubToken::REPLACE_CONFIG,
+        rules: CredentialProfiles::GithubToken::RULE_ATTRIBUTES.map { |attrs| RequestRule.new(attrs) }
+      )
+
+      patch console_static_secret_url(secret.oid), params: {
+        secret: { namespace: "acme", name: "renamed GitHub token" },
+        static: {
+          kind: "github_token", mode: "replace", proxy_value: "GITHUB_TOKEN",
+          match_headers: "Authorization"
+        },
+        rules: {
+          "0" => { host: "api.github.com" },
+          "1" => { host: "github.com" }
+        }
+      }
+
+      assert_redirected_to console_secret_path("static", secret.oid)
+      assert_equal "renamed GitHub token", secret.reload.name
+      assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, secret.replace_config
+    end
+
     test "POST create with an invalid nested rule is rejected without writing" do
       assert_no_difference [ "StaticSecret.count", "RequestRule.count" ] do
         post console_static_secrets_url, params: {
@@ -216,6 +259,24 @@ module Console
           { "name" => "centaur.slack_channel_id", "value_from" => { "principal_label" => "slack_channel_id" } },
           { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } },
           { "name" => "app.tenant", "value" => "centaur" }
+        ],
+        secret.settings
+      )
+    end
+
+    test "POST create captures proxy label settings via the kind select" do
+      post console_pg_dsn_secrets_url, params: {
+        secret: { namespace: "acme", foreign_id: "ui-proxy-label", database: "proxylabeldb" },
+        settings: {
+          "0" => { name: "centaur.slack_user_id", kind: "proxy_label", value: "centaur.slack_user_id" }
+        },
+        source: { source_type: "env", reference: "PROXY_LABEL_DSN" }
+      }
+      secret = PgDsnSecret.find_by!(namespace: "acme", foreign_id: "ui-proxy-label")
+      assert_redirected_to console_secret_path("pg_dsn", secret.oid)
+      assert_equal(
+        [
+          { "name" => "centaur.slack_user_id", "value_from" => { "proxy_label" => "centaur.slack_user_id" } }
         ],
         secret.settings
       )

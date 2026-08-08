@@ -53,8 +53,8 @@ The script exports recent `sessions`, `session_messages`,
 `session.output.line` events (capped by `THINKING_EVENT_LIMIT_PER_THREAD`,
 default 200 per thread), and referenced `slack_sync_users` rows with the source
 connection forced read-only, then imports them into the local `ai_v2` database
-used by the Console dev container. The Threads surface is read-only: it does
-not render a composer and rejects POSTs server-side.
+used by the Console dev container. The Console never writes directly to those
+session tables; starting and continuing accessible chats goes through api-rs.
 
 Threads extras beyond the Slack surface:
 
@@ -96,7 +96,10 @@ The operator console always supports email and password sign-in. To add Google o
 | `CENTAUR_CONSOLE_GOOGLE_CLIENT_SECRET`   | for Google | Google OAuth client secret for console login.                                                |
 | `CENTAUR_CONSOLE_SLACK_CLIENT_ID`        | for Slack | Slack OpenID Connect client ID for console login.                                            |
 | `CENTAUR_CONSOLE_SLACK_CLIENT_SECRET`    | for Slack | Slack OpenID Connect client secret for console login.                                        |
-| `CENTAUR_CONSOLE_BOOTSTRAP_ADMINS`       | no       | Comma- or whitespace-separated email allowlist. Matching users become active admins on first SSO login. Other SSO users become active non-admin operators and land on the console directly -- the deployment's network boundary is the access control, there is no approval queue. |
+| `CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS`      | recommended for public exposure | Comma- or whitespace-separated domain allowlist for SSO users, for example `acme.com example.org`. Empty allows any IdP-authenticated email. |
+| `CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED` | no       | Set to `false` to disable email and password sign-in. Defaults to enabled.                    |
+| `CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED` | no | Set to `true` to let every authenticated Console user browse public Slack channel conversations. Requires the Slack ETL channel catalog; access fails closed when it is unavailable. Private channels and DMs remain owner-only. Defaults to disabled. |
+| `CENTAUR_CONSOLE_BOOTSTRAP_ADMINS`       | no       | Comma- or whitespace-separated email allowlist. Matching users become active admins on first SSO login. Other accepted SSO users become active non-admin operators and land on the console directly. |
 
 Register these callback URLs with the provider:
 

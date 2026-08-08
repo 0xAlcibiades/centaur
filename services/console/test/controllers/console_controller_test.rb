@@ -117,15 +117,6 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
     assert_select "td", text: "CLOUD_RUN_SA_KEYFILE"
   end
 
-  test "pg_dsn detail page lists configured session settings" do
-    secret = pg_dsn_secrets(:acme_analytics_pg)
-    secret.update!(settings: [ { "name" => "app.tenant", "value" => "centaur" } ])
-    get console_secret_url("pg_dsn", secret.oid)
-    assert_response :ok
-    assert_select "dt", text: "Session settings"
-    assert_select "dd", text: "app.tenant = centaur"
-  end
-
   test "secret detail page 404s for an unknown kind or id" do
     get console_secret_url("bogus", "ssr_whatever")
     assert_response :not_found
@@ -149,6 +140,32 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
     assert_select "a[href=?]", console_new_principal_path, text: "Add Principal"
   end
 
+  test "principal pages render first-class identity fields as labels" do
+    principal = principals(:acme_channel)
+    principal.update!(
+      kind: "slack_dm",
+      slack_user_id: "U0123456789",
+      slack_channel_id: "D0123456789",
+      slack_team_id: "T0123456789",
+      slack_email: "member@example.com"
+    )
+    expected_labels = {
+      "kind" => "slack_dm",
+      "slack_user_id" => "U0123456789",
+      "slack_channel_id" => "D0123456789",
+      "slack_team_id" => "T0123456789",
+      "slack_email" => "member@example.com"
+    }
+
+    [ console_principals_url, console_principal_url(principal.oid) ].each do |url|
+      get url
+      assert_response :ok
+      expected_labels.each do |key, value|
+        assert_select ".label-chip", text: "#{key}=#{value}"
+      end
+    end
+  end
+
   test "principal detail page offers delete" do
     principal = principals(:acme_channel)
     get console_principal_url(principal.oid)
@@ -157,6 +174,52 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
       assert_select "input[name=_method][value=delete]"
       assert_select "button[type=submit]", "Delete"
     end
+  end
+
+  test "principal detail page renders DM permissions as API-managed rows" do
+    principal = principals(:acme_user_bob)
+    principal.update!(name: "Bob")
+    SlackChannelPermission.create!(
+      principal: principal,
+      channel_id: "D0123456789",
+      upload_enabled: true,
+      download_enabled: false,
+      history_enabled: true
+    )
+
+    get console_principal_url(principal.oid)
+    assert_response :ok
+
+    assert_select "td", text: /DM Bob/
+    assert_select "td", text: "API-managed"
+  end
+
+  test "principal detail page resolves direct and inherited Slack channel names from the catalog" do
+    principal = principals(:acme_channel)
+    principal.slack_channel_permissions.create!(
+      channel_id: "C0123456789",
+      upload_enabled: true
+    )
+    roles(:acme_infra).slack_channel_permissions.create!(
+      channel_id: "G9876543210",
+      history_enabled: true
+    )
+    catalog = SlackChannelCatalog::Result.new(
+      channels: [
+        SlackChannelCatalog::Channel.new(id: "C0123456789", name: "general", private: false),
+        SlackChannelCatalog::Channel.new(id: "G9876543210", name: "private", private: true)
+      ],
+      error: nil,
+      configured: true
+    )
+
+    with_slack_channel_catalog(catalog) { get console_principal_url(principal.oid) }
+    assert_response :ok
+
+    assert_select "td", text: /#general/
+    assert_select "h3", text: "Inherited From Roles"
+    assert_select "td", text: /#private/
+    assert_select "input[type=checkbox][disabled]", minimum: 3
   end
 
   test "credentials table combines id, shows status, and links to detail" do
@@ -308,5 +371,16 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
       assert_select "input[name=_method][value=delete]", count: 1
       assert_select "button", text: "Sign out"
     end
+  end
+
+  private
+
+  def with_slack_channel_catalog(catalog)
+    singleton = SlackChannelCatalog.singleton_class
+    original = singleton.instance_method(:fetch)
+    singleton.define_method(:fetch) { catalog }
+    yield
+  ensure
+    singleton.define_method(:fetch, original)
   end
 end

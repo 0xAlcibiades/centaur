@@ -1,10 +1,11 @@
-require "json"
-require "net/http"
-require "uri"
-
 module SlackDm
   class SyncCredential
-    REQUIRED_SCOPES = %w[im:read im:history mpim:read mpim:history].freeze
+    DM_REQUIRED_SCOPES = %w[im:read im:history].freeze
+    MPIM_REQUIRED_SCOPES = %w[mpim:read mpim:history].freeze
+    PRIVATE_CHANNEL_REQUIRED_SCOPES = %w[groups:read groups:history].freeze
+    REQUIRED_SCOPES = (
+      DM_REQUIRED_SCOPES + MPIM_REQUIRED_SCOPES + PRIVATE_CHANNEL_REQUIRED_SCOPES
+    ).freeze
 
     AUTH_TEST_ENDPOINT = "https://slack.com/api/auth.test"
     CONVERSATIONS_LIST_ENDPOINT = "https://slack.com/api/conversations.list"
@@ -22,7 +23,16 @@ module SlackDm
       end
 
       def required_scopes_granted?(scopes)
-        (REQUIRED_SCOPES - Array(scopes)).empty?
+        supported_conversation_types(scopes).any?
+      end
+
+      def supported_conversation_types(scopes)
+        granted = Array(scopes)
+        types = []
+        types << "im" if (DM_REQUIRED_SCOPES - granted).empty?
+        types << "mpim" if (MPIM_REQUIRED_SCOPES - granted).empty?
+        types << "private_channel" if (PRIVATE_CHANNEL_REQUIRED_SCOPES - granted).empty?
+        types
       end
     end
 
@@ -111,9 +121,12 @@ module SlackDm
     end
 
     def list_conversations
+      types = self.class.supported_conversation_types(@credential.scopes)
+      raise SlackApiError, "Slack credential has no supported conversation scopes" if types.empty?
+
       each_page(
         CONVERSATIONS_LIST_ENDPOINT,
-        { "types" => "im,mpim", "exclude_archived" => "false", "limit" => list_page_size },
+        { "types" => types.join(","), "exclude_archived" => "false", "limit" => list_page_size },
         max_pages: list_max_pages
       ).flat_map { |page| Array(page["channels"]) }
     end
@@ -122,7 +135,7 @@ module SlackDm
       batch[:conversations] << {
         home_team_id: home_team_id,
         conversation_id: conversation.fetch("id"),
-        conversation_type: conversation["is_mpim"] ? "mpim" : "im",
+        conversation_type: conversation_type(conversation),
         is_archived: conversation["is_archived"] == true,
         is_ext_shared: conversation["is_ext_shared"] == true,
         raw_payload: conversation
@@ -151,14 +164,30 @@ module SlackDm
         return members.uniq
       end
 
+      complete = true
       pages = each_page(
         CONVERSATIONS_MEMBERS_ENDPOINT,
         { "channel" => conversation.fetch("id"), "limit" => members_page_size },
         max_pages: members_max_pages
-      )
+      ) do |_page, truncated|
+        complete = false if truncated
+      end
+      unless complete
+        raise SlackApiError,
+              "Slack membership pagination truncated for #{conversation.fetch('id')}"
+      end
+
       members = pages.flat_map { |page| Array(page["members"]) }.compact
       members << @credential.provider_subject if @credential.provider_subject.present?
       members.uniq
+    end
+
+    def conversation_type(conversation)
+      return "mpim" if conversation["is_mpim"]
+      return "im" if conversation["is_im"]
+      return "private_channel" if conversation["is_private"]
+
+      raise SlackApiError, "Unsupported Slack conversation #{conversation['id']}"
     end
 
     def sync_history(conversation, home_team_id, checkpoint, batch)
@@ -293,21 +322,15 @@ module SlackDm
         )
       end
 
-      uri = URI.parse(endpoint)
-      uri.query = URI.encode_www_form(params) if params.any?
-      request = Net::HTTP::Get.new(uri)
-      request["Authorization"] = "Bearer #{@credential.access_token}"
-      request["Accept"] = "application/json"
+      response = HttpClient.new(open_timeout: slack_timeout, read_timeout: slack_timeout).get(
+        endpoint,
+        params: params,
+        headers: { "Authorization" => "Bearer #{@credential.access_token}" }
+      )
+      raise SlackApiError, "Slack API rate limited" if response.status == 429
 
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = uri.scheme == "https"
-      http.open_timeout = slack_timeout
-      http.read_timeout = slack_timeout
-      response = http.request(request)
-      raise SlackApiError, "Slack API rate limited" if response.code.to_i == 429
-
-      parsed = JSON.parse(response.body.to_s)
-      raise SlackApiError, "Slack API returned HTTP #{response.code}" unless response.code.to_i.between?(200, 299)
+      parsed = response.json
+      raise SlackApiError, "Slack API returned HTTP #{response.status}" unless response.success?
       raise SlackApiError, "Slack API returned #{parsed['error']}" unless parsed["ok"] == true
 
       parsed

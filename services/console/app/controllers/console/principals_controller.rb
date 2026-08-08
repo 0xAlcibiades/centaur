@@ -6,6 +6,7 @@ module Console
   class PrincipalsController < ApplicationController
     include KvRowParams
     include SecretKinds
+    include Console::SlackChannelPermissionManagement
 
     layout "console"
 
@@ -19,6 +20,7 @@ module Console
     def create
       @principal = Principal.new(created_by: current_user)
       assign_form(@principal)
+      @principal.apply_default_sandbox_capabilities!
       if @principal.save
         redirect_to console_principal_path(@principal.oid), notice: "Principal created."
       else
@@ -41,6 +43,14 @@ module Console
       redirect_to console_principal_path(@principal.oid), notice: "Updated sandbox access."
     rescue ActiveRecord::RecordInvalid => e
       redirect_to console_principal_path(@principal.oid), alert: e.record.errors.full_messages.to_sentence
+    end
+
+    def update_slack_channel_permissions
+      update_slack_channel_permissions_from_form(
+        @principal,
+        console_principal_path(@principal.oid),
+        preserve_api_managed_direct_messages: true
+      )
     end
 
     def assign_role

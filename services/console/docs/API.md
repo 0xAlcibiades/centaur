@@ -1,6 +1,6 @@
 # iron-control API
 
-`iron-control` exposes a JSON API under `/api/v1`. Every resource endpoint requires API key authentication. The single exception is `POST /api/v1/proxy/sync`, which `iron-proxy` instances call with a proxy bearer token.
+`iron-control` exposes a JSON API under `/api/v1`. Resource endpoints require API key authentication. `POST /api/v1/proxy/sync` uses proxy bearer authentication, and sandbox read endpoints use the sandbox entitlement JWT injected by `iron-proxy`.
 
 - [Authentication](#authentication)
 - [Conventions](#conventions)
@@ -58,7 +58,7 @@ A missing or invalid token returns `401`:
 - **Namespaced list filtering** (static secrets, GCP auth secrets, GCP ID token secrets, OAuth token secrets, principals, roles) requires a `namespace` query parameter and accepts an optional `labels[key]=value` filter that matches by JSONB containment (all supplied pairs must be present). Label values must be scalars.
 - **Object IDs** are prefixed by type: `ssr_` (static secret), `gas_` (GCP auth secret), `gid_` (GCP ID token secret), `ots_` (OAuth token secret), `prn_` (principal), `role_` (role), `grant_` (grant), `ak_` (API key), `prx_` (proxy).
 - **`namespace`** defaults to `"default"` when omitted on create. Once set, `namespace` and `foreign_id` are immutable.
-- **`namespace` and `foreign_id`** must be URL-safe: only `A-Z a-z 0-9 - . _ ~`. `foreign_id` is optional and, when set, must be unique within its namespace. A `foreign_id` may not start with the resource's opaque-id prefix (e.g. `ssr_`), so it can never be mistaken for an OID.
+- **`namespace` and `foreign_id`** must be URL-safe: only `A-Z a-z 0-9 - . _ ~`. `foreign_id` is optional and, when set, must be globally unique within its resource type. A `foreign_id` may not start with the resource's opaque-id prefix (e.g. `ssr_`), so it can never be mistaken for an OID.
 
 ### Upsert (`PUT` / `PATCH`)
 
@@ -67,7 +67,7 @@ For the resources with a `foreign_id` (static secrets, GCP auth secrets, GCP ID 
 - **`:id` is an OID** (it starts with the resource's prefix, e.g. `ssr_…`): updates that record. `404` if it does not exist — an OID is server-assigned, so it can't be created at a chosen value.
 - **`:id` is anything else**: it is treated as a `foreign_id` within the body `namespace` (default `"default"`). The record is **updated if it exists, created if it does not**. Creation responds `201`; update responds `200`.
 
-This makes provisioning idempotent: `PUT /api/v1/roles/infra` with `{"data":{"namespace":"acme", …}}` converges the `acme/infra` role whether or not it already exists, in one call. On the foreign-id form the namespace and foreign_id come from the URL/body, so omitting `foreign_id` from the body does not clear it.
+This makes provisioning idempotent: `PUT /api/v1/roles/acme-infra` with `{"data":{"namespace":"acme", …}}` converges the `acme/acme-infra` role whether or not it already exists, in one call. On the foreign-id form the namespace and foreign_id come from the URL/body, so omitting `foreign_id` from the body does not clear it.
 - **`labels`** is an arbitrary string-keyed object (defaults to `{}`).
 - **Timestamps** are ISO 8601 UTC.
 
@@ -178,7 +178,7 @@ A static secret injects or replaces a fixed credential value on matching request
 | Field            | In requests | Notes |
 | ---------------- | ----------- | ----- |
 | `namespace`      | optional    | Defaults to `"default"`. Immutable after create. |
-| `foreign_id`     | optional    | Unique per namespace. Immutable after create. |
+| `foreign_id`     | optional    | Globally unique within this resource type. Immutable after create. |
 | `name`           | optional    | |
 | `description`    | optional    | |
 | `labels`         | optional    | Object; defaults to `{}`. |
@@ -277,7 +277,7 @@ A GCP auth secret mints short-lived GCP OAuth2 access tokens and injects them as
 | Field                  | In requests | Notes |
 | ---------------------- | ----------- | ----- |
 | `namespace`            | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`           | optional    | Unique per namespace. Immutable. |
+| `foreign_id`           | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description`  | optional    | |
 | `labels`               | optional    | |
 | `scopes`               | required    | Non-empty array of non-empty strings (GCP OAuth scopes). |
@@ -361,7 +361,7 @@ A GCP ID token secret mints Google-signed OIDC ID tokens for an audience and inj
 | Field                 | In requests | Notes |
 | --------------------- | ----------- | ----- |
 | `namespace`           | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`          | optional    | Unique per namespace. Immutable. |
+| `foreign_id`          | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description` | optional    | |
 | `labels`              | optional    | Object; defaults to `{}`. |
 | `audience`            | required    | ID token `aud` claim. For Cloud Run, use the service URL or configured custom audience. |
@@ -434,7 +434,7 @@ Each granted AWS auth secret is delivered to `iron-proxy` as its own `aws_auth` 
 | Field               | In requests | Notes |
 | ------------------- | ----------- | ----- |
 | `namespace`         | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`        | optional    | Unique per namespace. Immutable. |
+| `foreign_id`        | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description` | optional  | |
 | `labels`            | optional    | Object; defaults to `{}`. |
 | `allowed_regions`   | optional    | Array of non-empty strings; defaults to `[]` (no region scoping). |
@@ -519,7 +519,7 @@ An OAuth token secret mints OAuth2 access tokens for a single grant and injects 
 | Field                    | In requests | Notes |
 | ------------------------ | ----------- | ----- |
 | `namespace`              | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`             | optional    | Unique per namespace. Immutable. |
+| `foreign_id`             | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description`    | optional    | |
 | `labels`                 | optional    | |
 | `grant`                  | required    | One of `refresh_token`, `client_credentials`, `password`, `jwt_bearer`. |
@@ -624,13 +624,13 @@ Listener and client knobs (bind address, client auth) are deliberately not model
 | Field         | In requests | Notes |
 | ------------- | ----------- | ----- |
 | `namespace`   | optional    | Defaults to `"default"`. Immutable after create. |
-| `foreign_id`  | required    | Unique per namespace. Immutable after create. |
+| `foreign_id`  | required    | Globally unique within this resource type. Immutable after create. |
 | `name`        | optional    | |
 | `description` | optional    | |
 | `labels`      | optional    | Object; defaults to `{}`. |
 | `database`    | required    | Database name clients connect to through the proxy. Must match the upstream DSN's database. If several granted secrets use the same database, grant priority selects the effective route. |
 | `role`        | optional    | Upstream `SET ROLE` applied to the session. |
-| `settings`    | optional    | Ordered array of session variables (GUCs) the proxy SETs at session start, before the `SET ROLE`, and pins so clients cannot override them. Each entry is `{ "name", "value" }` for a literal value, or `{ "name", "value_from" }` to resolve the value from the assigned proxy principal at sync time (see [principal-derived values](#principal-derived-setting-values)). Names must be a bare or dotted identifier; `role` and `session_authorization` are reserved. Replaced wholesale on update. |
+| `settings`    | optional    | Ordered array of session variables (GUCs) the proxy SETs at session start, before the `SET ROLE`, and pins so clients cannot override them. Each entry is `{ "name", "value" }` for a literal value, or `{ "name", "value_from" }` to resolve the value from the assigned proxy principal or proxy labels at sync time (see [derived setting values](#derived-setting-values)). Names must be a bare or dotted identifier; `role` and `session_authorization` are reserved. Replaced wholesale on update. |
 | `dsn`         | required    | A [secret source](#secret-sources) resolving to the connection string. Replaced wholesale on update. |
 
 ### Create
@@ -676,10 +676,10 @@ Returns `201` with the created resource. Response shape:
 
 The `dsn` in responses never includes a `control_plane` `secret` value.
 
-### Principal-derived setting values
+### Derived setting values
 
-A setting may take its value from the proxy's assigned principal instead of
-storing a literal, by replacing `value` with `value_from`:
+A setting may take its value from the proxy's assigned principal or proxy
+labels instead of storing a literal, by replacing `value` with `value_from`:
 
 ```json
 { "name": "centaur.slack_channel_id", "value_from": { "principal_label": "slack_channel_id" } }
@@ -689,11 +689,12 @@ storing a literal, by replacing `value` with `value_from`:
 
 | Key               | Resolves to |
 | ----------------- | ----------- |
-| `principal_label` | The named label on the assigned principal. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
-| `principal_field` | One of the principal's identity fields: `id` (the opaque `prn_...` id), `namespace`, `foreign_id`, or `name`. |
+| `principal_label` | The named label on the assigned principal. Reserved identity labels resolve through their authoritative columns. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
+| `principal_field` | One of the principal's fields: `id` (the opaque `prn_...` id), `namespace`, `foreign_id`, `name`, or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
+| `proxy_label`     | The named label on the proxy. A label the proxy does not carry resolves to an empty string, so RLS-style policies fail closed. |
 
 A setting has either `value` or `value_from`, never both; unknown
-`principal_field` names and blank `principal_label` keys are rejected at create
+`principal_field` names and blank label keys are rejected at create
 and update time. References are resolved only in the proxy sync and
 effective-config payloads; create, update, show, and list responses echo the
 stored reference.
@@ -719,7 +720,7 @@ Each granted HMAC secret is delivered to `iron-proxy` as its own `hmac_sign` tra
 | Field                       | In requests | Notes |
 | --------------------------- | ----------- | ----- |
 | `namespace`                 | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`                | optional    | Unique per namespace. Immutable. |
+| `foreign_id`                | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description`       | optional    | |
 | `labels`                    | optional    | Object; defaults to `{}`. |
 | `timestamp_format`          | required    | One of `unix_seconds`, `unix_millis`, `unix_nanos`, `rfc3339`. |
@@ -813,16 +814,16 @@ The token credentials it refreshes with are fields on the credential, resolved b
 | Field                          | In requests | Notes |
 | ------------------------------ | ----------- | ----- |
 | `namespace`                    | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id`                   | optional    | Unique per namespace. Immutable. |
+| `foreign_id`                   | optional    | Globally unique within this resource type. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `grant`                        | optional    | One of `refresh_token`, `password`, or `preqin`. Defaults to `refresh_token`. |
+| `grant`                        | optional    | One of `refresh_token`, `client_credentials`, `password`, or `preqin`. Defaults to `refresh_token`. |
 | `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin`, which uses the fixed `https://api.preqin.com/connect/token` endpoint. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token` and `password` credentials. Returned in responses. Not used for `preqin`. |
-| `client_secret`                | optional    | OAuth client secret. Write-only and encrypted at rest; omit for public clients. Never returned. |
+| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token`, `client_credentials`, and `password` credentials. Returned in responses. Not used for `preqin`. |
+| `client_secret`                | conditional | OAuth client secret. Required for `client_credentials`, optional for `refresh_token` and `password`, and not used for `preqin`. Write-only and encrypted at rest; omit for public clients. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
-| `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` credentials when the provider returns one. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
+| `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` credentials when the provider returns one. Not used by `client_credentials` credentials. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
 | `username`                     | conditional | Required for `password` credentials. Write-only and encrypted at rest. Never returned. |
 | `password`                     | conditional | Required for `password` credentials. Write-only and encrypted at rest. Never returned. |
 | `api_key`                      | conditional | Required for `preqin` credentials. Write-only and encrypted at rest. Never returned. |
@@ -851,6 +852,8 @@ Read-only fields are returned but never accepted in requests:
 The minted `access_token`, the `refresh_token`, `username`, `password`, `api_key`, the `client_secret`, and the `token_endpoint_headers` values are never returned in any response.
 
 Password-grant credentials first use the stored initial values with `grant_type=password`. If the token endpoint returns a `refresh_token`, iron-control stores it and uses `grant_type=refresh_token` on later scheduled refreshes. If that stored refresh token is rejected with an unrecoverable OAuth error, iron-control retries once with `grant_type=password`; retryable network, 5xx, rate-limit, and parse failures keep the existing backoff behavior and do not fall back to password.
+
+Client-credentials credentials use the stored `client_id` and encrypted `client_secret` with `grant_type=client_credentials` every time they mint an access token. Providers that return only `access_token`, `token_type`, and `expires_in` are supported; no `refresh_token` is required or stored.
 
 Credentials minted by the [OAuth consent flow](#oauth-consent-flow) are linked to an OAuth app and delegate their `client_id` and `client_secret` to it: rotating the app's secret applies to every credential it minted. Such a credential needs no `client_id`/`client_secret` of its own, and its `scopes` reflect exactly what the IdP granted.
 
@@ -922,6 +925,22 @@ Password-grant providers use the same endpoint with `grant: "password"`:
     "username": "user@example.com",
     "password": "account-password",
     "token_endpoint_headers": { "x-api-key": "api-key" }
+  }
+}
+```
+
+Client-credentials providers use the same endpoint with `grant: "client_credentials"`:
+
+```json
+{
+  "data": {
+    "namespace": "default",
+    "foreign_id": "bloomberg-dl",
+    "name": "Bloomberg DL",
+    "grant": "client_credentials",
+    "token_endpoint": "https://bsso.blpprofessional.com/ext/api/as/token.oauth2",
+    "client_id": "client-id",
+    "client_secret": "client-secret"
   }
 }
 ```
@@ -1062,6 +1081,53 @@ Returns `201`. The `client_secret` is never echoed back:
 | `PUT`/`PATCH` | `/api/v1/oauth_apps/:id` | [Upsert](#upsert-put--patch) by OID or slug. Omitted fields are preserved; `client_secret` is only changed when supplied. |
 | `DELETE` | `/api/v1/oauth_apps/:id` | Delete. Returns `204`; `404` if missing. Returns `409` while the app still has minted credentials (delete or unlink them first). |
 
+### Sandbox Start URLs
+
+`GET /api/v1/sandbox/oauth_apps`
+
+Returns enabled OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
+
+```json
+{
+  "data": [
+    {
+      "id": "oap_...",
+      "slug": "google",
+      "description": "Gmail",
+      "labels": {},
+      "provider": "google",
+      "allowed_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+      "start_url": "https://<iron-control>/oauth/google/start"
+    }
+  ]
+}
+```
+
+### Sandbox OAuth Credential Metadata
+
+`GET /api/v1/sandbox/permissions`
+
+The sandbox permissions response includes an `oauth_credentials` array with non-secret metadata for OAuth-flow credentials currently granted to the sandbox principal. Use it to confirm that a user completed consent for the expected app and personal email.
+
+```json
+{
+  "data": {
+    "oauth_credentials": [
+      {
+        "id": "bcr_...",
+        "oauth_app_id": "oap_...",
+        "slug": "google",
+        "provider": "google",
+        "provider_email": "person@example.com",
+        "provider_subject": "google-subject",
+        "status": "live",
+        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
+      }
+    ]
+  }
+}
+```
+
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).
@@ -1107,21 +1173,40 @@ A tampered, expired, or missing flow state or cookie renders an error page with 
 | Google   | `google`         |
 | Slack    | `slack`          |
 
-Slack OAuth apps should have token rotation enabled so the callback receives a refresh token for the broker refresh loop.
+Slack OAuth apps may use token rotation or long-lived tokens. When token rotation is enabled, the callback stores the returned refresh token and the broker refresh loop keeps the access token fresh. When Slack returns a long-lived token without a refresh token or expiry, the credential is stored without scheduling broker refresh.
 Slack OAuth apps should use normal Slack API scopes such as `channels:history`, not Sign in with Slack scopes such as `openid`, `email`, or `profile`.
 
 ## Principals
 
 A principal is an identity (an application, service, or proxy owner) that can be granted secrets.
 
+When a principal is created with no preassigned roles, the console assigns the
+system default roles configured for that principal's namespace. Defaults apply
+only during initial creation. Updating an existing roleless principal does not
+restore roles that an operator removed. The default configuration assigns the
+system-managed `default/infra` role.
+
 ### Attributes
 
 | Field        | In requests | Notes |
 | ------------ | ----------- | ----- |
 | `namespace`  | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id` | optional    | Unique per namespace. Immutable. |
+| `foreign_id` | optional    | Globally unique within this resource type. Immutable. |
 | `name`       | optional    | |
-| `labels`     | optional    | |
+| `kind`       | optional    | Defaults to `unknown`. See the known values below. |
+| `slack_user_id` | optional | First-class Slack user identity. |
+| `slack_channel_id` | optional | First-class Slack conversation identity. |
+| `slack_team_id` | optional | First-class Slack team or enterprise scope. |
+| `slack_email` | optional | First-class Slack email identity. |
+| `console_user_id` | optional | Database ID of the associated console user for a `console_user` principal. |
+| `console_user_email` | optional | Email identity for a `console_user` principal. |
+| `labels`     | optional    | Extensible metadata. Compatibility identity labels are still accepted and synthesized in responses during the transition. |
+| `slack_channel_permissions` | optional | Direct permissions owned by the principal. Full replacement when present on create or update. |
+| `effective_slack_channel_permissions` | response only | Direct permissions merged with permissions inherited from assigned roles. |
+
+Known kinds are `unknown`, `user`, `console_user`, `workflow`,
+`slack_channel`, `slack_dm`, `discord_channel`, `linear_issue`, `teams_user`,
+and `teams_conversation`. Use one of these values for the `kind` field.
 
 ### Operations
 
@@ -1140,7 +1225,9 @@ Returns `201`:
     "namespace": "default",
     "foreign_id": "api-service",
     "name": "API Service",
-    "labels": { "tier": "backend" },
+    "labels": { "tier": "backend", "kind": "unknown" },
+    "slack_channel_permissions": [],
+    "effective_slack_channel_permissions": [],
     "created_at": "2026-06-01T10:00:00Z",
     "updated_at": "2026-06-01T10:00:00Z"
   }
@@ -1149,13 +1236,24 @@ Returns `201`:
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
-| `GET`  | `/api/v1/principals?namespace=default` | List. |
+| `GET`  | `/api/v1/principals?namespace=default` | List. Accepts exact-match label filters, including the reserved identity labels. |
 | `GET`  | `/api/v1/principals/:id` | Fetch one by OID. To fetch by `foreign_id`, use the lookup route below. |
 | `GET`  | `/api/v1/principals/lookup/:namespace/:foreign_id` | Fetch by namespace + foreign id. `404` if missing. |
 | `GET`  | `/api/v1/principals/:id/effective_config` | [Effective config](#effective-config) the principal resolves to. `:id` is an OID. |
 | `GET`  | `/api/v1/principals/lookup/:namespace/:foreign_id/effective_config` | [Effective config](#effective-config) by namespace + foreign id. `404` if missing. |
 | `GET`  | `/api/v1/principals/:principal_id/grants` | [List the grants](#list-by-grantee) granted directly to the principal. |
-| `PUT`/`PATCH` | `/api/v1/principals/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. Only `name` and `labels` are mutable on an existing record; `namespace`/`foreign_id` apply only when creating. |
+| `POST` | `/api/v1/principals/:id/slack_channel_permissions` | Idempotently create or update one direct Slack channel permission. Omitted flags default to enabled on create and remain unchanged on update. |
+| `PUT`/`PATCH` | `/api/v1/principals/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. `name`, first-class identity fields, `labels`, and direct `slack_channel_permissions` are mutable on an existing record. `namespace` and `foreign_id` apply only when creating. |
+
+The first-class identity fields are authoritative. For compatibility, responses
+still synthesize `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`,
+and `slack_email` in `labels`. A `console_user` response also synthesizes
+`console-user-id` and `email`. Writes may send the compatibility labels, but if
+a request sends both forms, their values must agree or the API returns `422`.
+Sending a null, empty, or whitespace-only Slack identity label clears that
+value. A null or blank `kind` is rejected, as are unknown kind values and new
+or changed malformed nonblank Slack identities. Unchanged legacy values remain
+round-trip safe during the compatibility release.
 
 See [Role assignments](#role-assignments) for attaching roles to a principal.
 
@@ -1200,7 +1298,7 @@ The `secrets`, `transforms`, and `postgres` arrays are assembled exactly as in [
 
 ## Roles
 
-A role is a reusable bundle of [grants](#grants). Principals are assigned roles, and a principal's effective secrets are the union of its own direct grants and the grants of every role it holds. Use a role to apply a common set of secrets (for example, shared infrastructure credentials) to many principals without re-granting each one.
+A role is a reusable bundle of [grants](#grants) and Slack channel permissions. Principals are assigned roles, and a principal's effective access is the union of its own direct grants and Slack permissions plus those of every role it holds.
 
 Roles are namespaced. A principal may only be assigned roles in its own namespace.
 
@@ -1209,9 +1307,10 @@ Roles are namespaced. A principal may only be assigned roles in its own namespac
 | Field        | In requests | Notes |
 | ------------ | ----------- | ----- |
 | `namespace`  | optional    | Defaults to `"default"`. Immutable. |
-| `foreign_id` | optional    | Unique per namespace. Immutable. Handy for idempotent provisioning. |
+| `foreign_id` | optional    | Globally unique within this resource type. Immutable. Handy for idempotent provisioning. |
 | `name`       | optional    | |
 | `labels`     | optional    | |
+| `slack_channel_permissions` | optional | Full replacement when present on create or update. Each row accepts `channel_id` and the `upload_enabled`, `download_enabled`, and `history_enabled` flags. |
 
 ### Operations
 
@@ -1231,6 +1330,7 @@ Returns `201`:
     "foreign_id": "infra",
     "name": "Infra",
     "labels": { "kind": "shared" },
+    "slack_channel_permissions": [],
     "created_at": "2026-06-01T10:00:00Z",
     "updated_at": "2026-06-01T10:00:00Z"
   }
@@ -1243,7 +1343,8 @@ Returns `201`:
 | `GET`    | `/api/v1/roles/:id` | Fetch one. |
 | `GET`    | `/api/v1/roles/lookup/:namespace/:foreign_id` | Fetch by namespace + foreign id. `404` if missing. |
 | `GET`    | `/api/v1/roles/:role_id/grants` | [List the grants](#list-by-grantee) attached to the role. |
-| `PUT`/`PATCH` | `/api/v1/roles/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. Only `name` and `labels` are mutable on an existing record; `namespace`/`foreign_id` apply only when creating. |
+| `POST`   | `/api/v1/roles/:id/slack_channel_permissions` | Idempotently create or update one role-owned Slack channel permission without replacing other rows. Omitted flags default to enabled on create and remain unchanged on update. |
+| `PUT`/`PATCH` | `/api/v1/roles/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. `name`, `labels`, and `slack_channel_permissions` are mutable on an existing record; `namespace` and `foreign_id` apply only when creating. |
 | `DELETE` | `/api/v1/roles/:id` | Delete. Returns `204`. Cascades: the role's grants and its assignments are removed. |
 
 ### Role assignments
@@ -1382,7 +1483,17 @@ A proxy's `status` is `assigned` when it currently holds a principal and `unassi
 `POST /api/v1/proxies`
 
 ```json
-{ "data": { "name": "Edge Proxy - US", "principal_id": "prn_..." } }
+{
+  "data": {
+    "name": "Edge Proxy - US",
+    "principal_id": "prn_...",
+    "labels": {
+      "centaur.slack_user_id": "U0123456789",
+      "centaur.slack_team_id": "T0123456789",
+      "centaur.slack_channel_id": "C0123456789"
+    }
+  }
+}
 ```
 
 Returns `201`. The plaintext proxy `token` (`iprx_...`) is included **only** in this create response: save it immediately. The proxy uses it to authenticate to [proxy sync](#proxy-sync).
@@ -1394,6 +1505,11 @@ Returns `201`. The plaintext proxy `token` (`iprx_...`) is included **only** in 
     "name": "Edge Proxy - US",
     "principal_id": "prn_...",
     "status": "assigned",
+    "labels": {
+      "centaur.slack_user_id": "U0123456789",
+      "centaur.slack_team_id": "T0123456789",
+      "centaur.slack_channel_id": "C0123456789"
+    },
     "principal_assigned_at": "2026-06-01T10:00:00Z",
     "created_at": "2026-06-01T10:00:00Z",
     "updated_at": "2026-06-01T10:00:00Z"
@@ -1401,7 +1517,7 @@ Returns `201`. The plaintext proxy `token` (`iprx_...`) is included **only** in 
 }
 ```
 
-`name` is required. `principal_id` is optional: omit it to create an unassigned proxy (`status` is then `unassigned`, `principal_id` and `principal_assigned_at` are `null`). When supplied, a missing principal returns `404`.
+`name` is required. `principal_id` is optional: omit it to create an unassigned proxy (`status` is then `unassigned`, `principal_id` and `principal_assigned_at` are `null`). `labels` is optional and defaults to `{}`; keys and values must be strings. Labels initialized by Centaur's Slack API path use the `centaur.` prefix. When supplied, a missing principal returns `404`.
 
 ### Assign, swap, or clear the principal
 
@@ -1411,13 +1527,13 @@ Returns `201`. The plaintext proxy `token` (`iprx_...`) is included **only** in 
 { "data": { "principal_id": "prn_..." } }
 ```
 
-Assigns the principal when the proxy is unassigned, or swaps it when already assigned. The token is unchanged; the proxy picks up the new config on its next [sync](#proxy-sync). Send `"principal_id": null` to unassign. Omitting `principal_id` leaves the assignment unchanged; `name` may also be updated. A missing principal returns `404`. Returns `200` with the updated proxy.
+Assigns the principal when the proxy is unassigned, or swaps it when already assigned. The token is unchanged; the proxy picks up the new config on its next [sync](#proxy-sync). Send `"principal_id": null` to unassign. Omitting `principal_id` leaves the assignment unchanged; `name` and `labels` may also be updated. Omitting `labels` leaves labels unchanged, `"labels": null` clears labels, and an object replaces labels. A missing principal returns `404`. Returns `200` with the updated proxy.
 
 ### Other operations
 
 | Method   | Path | Notes |
 | -------- | ---- | ----- |
-| `GET`    | `/api/v1/proxies` | List. Optional `principal_id` filter; paginated. Tokens are never returned. |
+| `GET`    | `/api/v1/proxies` | List. Optional `principal_id` and `labels[k]=v` filters; paginated. Tokens are never returned. |
 | `GET`    | `/api/v1/proxies/:id` | Fetch one (no token). |
 | `DELETE` | `/api/v1/proxies/:id` | Deregister. Returns `204`. |
 

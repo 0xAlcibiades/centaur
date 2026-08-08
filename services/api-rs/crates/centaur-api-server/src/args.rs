@@ -16,8 +16,8 @@ use centaur_api_server::{
     discover_tool_proxy_fragment,
 };
 use centaur_iron_control::{
-    IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
-    register_role,
+    IdentityInput, IronControlClient, IronControlError, PrincipalInput, RegisterError, RoleSpec,
+    SessionRegistrar, register_role,
 };
 use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
@@ -33,7 +33,7 @@ use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
     PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
 };
-use centaur_workflows::WorkflowHostSandboxRuntime;
+use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{info, warn};
 
@@ -113,6 +113,10 @@ impl Args {
         Duration::from_secs(self.server.shutdown_execution_drain_timeout_secs)
     }
 
+    pub(crate) fn codex_nanocodex_rollout_percent(&self) -> u8 {
+        self.server.codex_nanocodex_rollout_percent
+    }
+
     pub(crate) fn execution_adoption_interval(&self) -> Option<Duration> {
         (self.server.execution_adoption_interval_secs > 0)
             .then(|| Duration::from_secs(self.server.execution_adoption_interval_secs))
@@ -123,6 +127,7 @@ pub(crate) struct IronControlRuntime {
     pub(crate) registrar: SessionRegistrar,
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
+    pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -460,6 +465,16 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// Percentage of sessions requesting Codex that are assigned to
+    /// Nanocodex. The assignment is deterministic by thread key and the
+    /// resolved harness is persisted on the session.
+    #[arg(
+        long = "session-codex-nanocodex-rollout-percent",
+        env = "SESSION_CODEX_NANOCODEX_ROLLOUT_PERCENT",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    codex_nanocodex_rollout_percent: u8,
     /// How long shutdown waits for in-flight executions to finish before
     /// releasing their stdout-owner leases for adoption by a peer. Keep
     /// below the pod's terminationGracePeriodSeconds (35s in the chart) so
@@ -673,32 +688,25 @@ impl SandboxArgs {
             return Ok(None);
         };
         let namespace = self.iron_control.namespace.clone();
-        let role_ids = if self.iron_control_sync_infra_secrets {
+        if self.iron_control_sync_infra_secrets {
             let policy = self.iron_proxy.source_policy();
             let roles = self.iron_proxy.roles_to_register()?;
-            let mut role_ids = Vec::with_capacity(roles.len());
             for (spec, fragment) in &roles {
-                role_ids.push(
-                    register_role_with_retry(&client, &namespace, spec, fragment, &policy).await?,
-                );
+                register_role_with_retry(&client, &namespace, spec, fragment, &policy).await?;
             }
-            role_ids
         } else {
             let spec = RoleSpec::infra();
-            vec![
-                client
-                    .upsert_role(&IdentityInput {
-                        namespace: namespace.clone(),
-                        foreign_id: spec.foreign_id,
-                        name: spec.name,
-                        labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
-                    })
-                    .await?
-                    .id,
-            ]
-        };
+            client
+                .upsert_role(&IdentityInput {
+                    namespace: namespace.clone(),
+                    foreign_id: spec.foreign_id,
+                    name: spec.name,
+                    labels: BTreeMap::from([("managed-by".to_owned(), "centaur".to_owned())]),
+                })
+                .await?;
+        }
         let bootstrap = client
-            .upsert_principal(&IdentityInput {
+            .upsert_principal(&PrincipalInput {
                 namespace: namespace.clone(),
                 foreign_id: "warm-pool-bootstrap".to_owned(),
                 name: "Warm pool bootstrap".to_owned(),
@@ -706,10 +714,15 @@ impl SandboxArgs {
                     ("managed-by".to_owned(), "centaur".to_owned()),
                     ("purpose".to_owned(), "warm-pool-bootstrap".to_owned()),
                 ]),
+                kind: None,
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
             })
             .await?;
         let workflow_host = client
-            .upsert_principal(&IdentityInput {
+            .upsert_principal(&PrincipalInput {
                 namespace: namespace.clone(),
                 foreign_id: "workflow-host".to_owned(),
                 name: "Workflow host".to_owned(),
@@ -717,15 +730,18 @@ impl SandboxArgs {
                     ("managed-by".to_owned(), "centaur".to_owned()),
                     ("purpose".to_owned(), "workflow-host".to_owned()),
                 ]),
+                kind: None,
+                slack_user_id: None,
+                slack_channel_id: None,
+                slack_team_id: None,
+                slack_email: None,
             })
             .await?;
-        for role_id in &role_ids {
-            client.assign_role(&workflow_host.id, role_id).await?;
-        }
         Ok(Some(IronControlRuntime {
-            registrar: SessionRegistrar::new(client, namespace, role_ids),
+            registrar: SessionRegistrar::new(client.clone(), namespace.clone()),
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
+            workflow_principal_registrar: WorkflowPrincipalRegistrar::new(client, namespace),
         }))
     }
 
@@ -1360,18 +1376,14 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
-        config.iron_proxy = args.iron_proxy.to_config()?;
-        if let Some(proxy) = config.iron_proxy.as_mut() {
-            // `to_config` only ships the harness fragment, so add infra and
-            // discovered tool fragments for any static proxy placeholder
-            // metadata the backend needs.
-            let mut fragments = vec![args.iron_proxy.infra_fragment()?];
-            if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
-                fragments.push(tool_fragment.fragment);
-            }
-            fragments.append(&mut proxy.fragments);
-            proxy.fragments = fragments;
+        let mut proxy = args.iron_proxy.to_config()?;
+        let mut fragments = vec![args.iron_proxy.infra_fragment()?];
+        if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
+            fragments.push(tool_fragment.fragment);
         }
+        fragments.append(&mut proxy.fragments);
+        proxy.fragments = fragments;
+        config.iron_proxy = Some(proxy);
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
         // The chart label policy handles sandbox OTLP egress; keep the
@@ -1380,7 +1392,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
-        if config.iron_proxy.is_some() && config.iron_control.is_none() {
+        if config.iron_control.is_none() {
             return Err(ServerError::UnsupportedConfig(
                 "iron-proxy requires iron-control: set IRON_CONTROL_URL and IRON_CONTROL_API_KEY"
                     .to_owned(),
@@ -1572,13 +1584,6 @@ fn repository_visibility(value: Option<&str>) -> String {
 #[derive(Debug, ClapArgs)]
 struct IronProxyArgs {
     #[arg(
-        long = "kubernetes-sandbox-iron-proxy-mode",
-        env = "KUBERNETES_SANDBOX_IRON_PROXY_MODE",
-        value_enum,
-        default_value = "auto"
-    )]
-    mode: IronProxyMode,
-    #[arg(
         long = "kubernetes-iron-proxy-image",
         env = "KUBERNETES_IRON_PROXY_IMAGE",
         default_value = "centaur-iron-proxy:latest"
@@ -1616,16 +1621,8 @@ struct IronProxyArgs {
 }
 
 impl IronProxyArgs {
-    fn to_config(&self) -> Result<Option<IronProxyConfig>, ServerError> {
-        let mode = self.mode;
-        let ca = self.ca.secrets(mode)?;
-        // The harness auth fragment (infra) is always present, so iron-proxy is
-        // enabled whenever a CA is available (or mode forces it).
-        if !mode.enabled(true, ca.is_some()) {
-            return Ok(None);
-        }
-        let (ca_cert_secret_name, ca_key_secret_name) =
-            ca.ok_or(ServerError::MissingIronProxyCaSecret)?;
+    fn to_config(&self) -> Result<IronProxyConfig, ServerError> {
+        let (ca_cert_secret_name, ca_key_secret_name) = self.ca.secrets()?;
 
         let harness_fragments = self.harness.fragments()?;
         let mut config =
@@ -1647,7 +1644,7 @@ impl IronProxyArgs {
         {
             config.api_pod_labels = labels.clone();
         }
-        Ok(Some(config))
+        Ok(config)
     }
 
     fn source_policy(&self) -> SourcePolicy {
@@ -1716,14 +1713,13 @@ struct IronProxyCaArgs {
 }
 
 impl IronProxyCaArgs {
-    fn secrets(&self, mode: IronProxyMode) -> Result<Option<(String, String)>, ServerError> {
+    fn secrets(&self) -> Result<(String, String), ServerError> {
         match (&self.cert_secret_name, &self.key_secret_name) {
-            (Some(cert), Some(key)) => Ok(Some((cert.clone(), key.clone()))),
-            (None, None) if mode == IronProxyMode::Enabled => Ok(Some((
+            (Some(cert), Some(key)) => Ok((cert.clone(), key.clone())),
+            (None, None) => Ok((
                 "centaur-firewall-ca".to_owned(),
                 "centaur-firewall-ca-key".to_owned(),
-            ))),
-            (None, None) => Ok(None),
+            )),
             _ => Err(ServerError::MissingIronProxyCaSecret),
         }
     }
@@ -1842,7 +1838,7 @@ impl IronProxyHarnessArgs {
             HarnessType::ClaudeCode,
             HarnessType::Amp,
         ] {
-            if engine == self.engine {
+            if harness_fragment_engine_name(&engine) == harness_fragment_engine_name(&self.engine) {
                 continue;
             }
             let auth_mode = harness_auth_mode_env(&engine).unwrap_or_else(|| "api_key".to_owned());
@@ -1867,23 +1863,6 @@ impl IronProxyHarnessArgs {
             fragments.push(fragment);
         }
         Ok(fragments)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum IronProxyMode {
-    Auto,
-    Enabled,
-    Disabled,
-}
-
-impl IronProxyMode {
-    fn enabled(self, has_fragments: bool, has_ca_config: bool) -> bool {
-        match self {
-            IronProxyMode::Auto => has_fragments || has_ca_config,
-            IronProxyMode::Enabled => true,
-            IronProxyMode::Disabled => false,
-        }
     }
 }
 
@@ -1924,6 +1903,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Codex => "codex",
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
+        HarnessType::Nanocodex => "codex",
     }
 }
 
@@ -1938,7 +1918,7 @@ fn merge_fragment(target: &mut ProxyFragment, source: ProxyFragment) {
 
 fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
     match engine {
-        HarnessType::Codex => env::var("CODEX_AUTH_MODE").ok(),
+        HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
     }
@@ -2140,8 +2120,6 @@ mod tests {
             "17",
             "--session-sandbox-k8s-context",
             "kind-test",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2150,6 +2128,33 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn parses_codex_nanocodex_rollout_percent() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-codex-nanocodex-rollout-percent",
+            "50",
+        ])
+        .unwrap();
+
+        assert_eq!(args.codex_nanocodex_rollout_percent(), 50);
+    }
+
+    #[test]
+    fn rejects_invalid_codex_nanocodex_rollout_percent() {
+        let result = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-codex-nanocodex-rollout-percent",
+            "101",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2233,8 +2238,6 @@ mod tests {
             "agent-k8s",
             "--kubernetes-namespace",
             "centaur-test",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2258,8 +2261,10 @@ mod tests {
             "github-access-token-read-packages, extra-secret ",
             "--session-sandbox-ready-timeout-secs",
             "42",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
         ])
         .unwrap();
 
@@ -2271,7 +2276,7 @@ mod tests {
             vec!["github-access-token-read-packages", "extra-secret"]
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
-        assert!(config.iron_proxy.is_none());
+        assert!(config.iron_proxy.is_some());
     }
 
     #[test]
@@ -2282,8 +2287,10 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-ref",
@@ -2323,8 +2330,10 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-runner-image",
@@ -2347,8 +2356,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-runner-image",
@@ -2376,8 +2383,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2395,8 +2400,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--tools-path",
@@ -2453,8 +2456,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--repos-pvc",
@@ -2490,8 +2491,6 @@ mod tests {
             "agent-k8s",
             "--session-sandbox-centaur-api-url",
             "http://centaur-api-rs:8080",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "disabled",
         ])
         .unwrap();
 
@@ -2780,8 +2779,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "enabled",
             "--kubernetes-firewall-ca-secret-name",
             "centaur-firewall-ca",
             "--kubernetes-firewall-ca-key-secret-name",
@@ -2828,8 +2825,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-sandbox-iron-proxy-mode",
-            "enabled",
             "--kubernetes-firewall-ca-secret-name",
             "centaur-firewall-ca",
             "--kubernetes-firewall-ca-key-secret-name",
@@ -2839,7 +2834,7 @@ mod tests {
         ])
         .unwrap();
 
-        let config = args.sandbox.iron_proxy.to_config().unwrap().unwrap();
+        let config = args.sandbox.iron_proxy.to_config().unwrap();
         assert_eq!(
             config.upstream_deny_cidrs,
             vec![
@@ -2923,6 +2918,21 @@ mod tests {
         assert_eq!(
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn nanocodex_reuses_the_codex_proxy_fragment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "access_token")]);
+
+        assert_eq!(
+            harness_fragment_engine_name(&HarnessType::Nanocodex),
+            harness_fragment_engine_name(&HarnessType::Codex)
+        );
+        assert_eq!(
+            harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
+            Some("access_token")
         );
     }
 }

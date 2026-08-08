@@ -1,10 +1,7 @@
-require "json"
-require "net/http"
-require "uri"
 require "cgi"
+require "uri"
 
 class CentaurApiClient
-  Response = Struct.new(:status, :body, keyword_init: true)
   Error = Class.new(StandardError)
 
   DEFAULT_TIMEOUT_SECONDS = 20
@@ -14,8 +11,7 @@ class CentaurApiClient
   def initialize(base_url: nil, api_key: nil, http: nil, timeout: DEFAULT_TIMEOUT_SECONDS)
     @base_url = (base_url.presence || ConsoleEnv["CENTAUR_API_URL"].presence || "http://localhost:8080").delete_suffix("/")
     @api_key = api_key.presence || ConsoleEnv["CENTAUR_API_KEY"].presence
-    @http = http || method(:net_http_request)
-    @timeout = timeout
+    @api = HttpClient.new(http: http, open_timeout: timeout, read_timeout: timeout)
   end
 
   def list_slack_archive_imports(limit: 100)
@@ -67,6 +63,14 @@ class CentaurApiClient
 
   def ingest_google_docs_sync_batch(payload)
     post("/api/admin/google/docs-sync/batch", payload)
+  end
+
+  def get_granola_sync_checkpoint(scope_id:)
+    get("/api/admin/granola/sync/checkpoint", scope_id: scope_id)
+  end
+
+  def ingest_granola_sync_batch(payload)
+    post("/api/admin/granola/sync/batch", payload)
   end
 
   def create_session(thread_key:, harness_type:, metadata: {}, persona_id: nil,
@@ -122,12 +126,11 @@ class CentaurApiClient
   end
 
   def request(method, path, payload = nil)
-    response = @http.call(
+    response = @api.request(
       method: method,
       url: URI.join("#{@base_url}/", path.delete_prefix("/")).to_s,
-      body: payload&.to_json,
-      headers: request_headers,
-      timeout: @timeout
+      json: payload,
+      headers: request_headers
     )
     parsed = parse_body(response.body)
     return parsed if response.status.between?(200, 299)
@@ -144,29 +147,9 @@ class CentaurApiClient
   end
 
   def parse_body(body)
-    return {} if body.blank?
-    JSON.parse(body)
+    HttpClient.decode_json_body(body)
   rescue JSON::ParserError
     { "raw" => body.to_s }
-  end
-
-  def net_http_request(method:, url:, body:, headers:, timeout:)
-    uri = URI.parse(url)
-    request_class = {
-      get: Net::HTTP::Get,
-      post: Net::HTTP::Post,
-      delete: Net::HTTP::Delete
-    }.fetch(method)
-    request = request_class.new(uri)
-    headers.each { |key, value| request[key] = value }
-    request.body = body if body
-
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = uri.scheme == "https"
-    http.open_timeout = timeout
-    http.read_timeout = timeout
-    res = http.request(request)
-    Response.new(status: res.code.to_i, body: res.body.to_s)
   end
 
   def escape_path(value)

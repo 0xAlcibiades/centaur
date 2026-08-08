@@ -344,6 +344,8 @@ pub struct PgDsnSettingValueFromInput {
     pub principal_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,8 +455,7 @@ pub struct BrokerCredentialRecord {
 // Principals and roles
 // ---------------------------------------------------------------------------
 
-/// Request body for ``POST``/``PUT /api/v1/principals`` and ``/roles`` — both
-/// take the same ``namespace``/``foreign_id``/``name``/``labels`` shape.
+/// Request body for ``POST``/``PUT /api/v1/roles``.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IdentityInput {
     pub namespace: String,
@@ -462,6 +463,29 @@ pub struct IdentityInput {
     pub name: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+/// Request body for ``POST``/``PUT /api/v1/principals``.
+///
+/// Principal identity is stored in first-class iron-control fields. Labels are
+/// reserved for extensible metadata and must not carry copies of these values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PrincipalInput {
+    pub namespace: String,
+    pub foreign_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_team_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack_email: Option<String>,
 }
 
 /// A principal as returned by iron-control. Unknown fields are ignored, so this
@@ -475,11 +499,18 @@ pub struct Principal {
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     #[serde(default = "default_true")]
-    pub sandbox_repo_cache_enabled: bool,
-    #[serde(default = "default_true")]
     pub sandbox_observability_enabled: bool,
     #[serde(default = "default_true")]
     pub sandbox_api_server_enabled: bool,
+}
+
+/// Request body for creating/updating one Slack permission row on a principal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SlackChannelPermissionInput {
+    pub channel_id: String,
+    pub upload_enabled: bool,
+    pub download_enabled: bool,
+    pub history_enabled: bool,
 }
 
 /// A principal's effective config — the same secrets/postgres the principal's
@@ -684,6 +715,8 @@ impl Grant {
 pub struct ProxyInput {
     pub name: String,
     pub principal_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A registered proxy. ``token`` (the plaintext ``iprx_`` bearer) is only
@@ -694,12 +727,16 @@ pub struct Proxy {
     pub name: String,
     pub principal_id: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub config_hash: Option<String>,
+    #[serde(default)]
     pub token: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_gcp_id_token_header;
+    use super::{SlackChannelPermissionInput, normalize_gcp_id_token_header};
 
     #[test]
     fn normalizes_supported_gcp_id_token_headers() {
@@ -712,5 +749,20 @@ mod tests {
             Some("x-serverless-authorization")
         );
         assert_eq!(normalize_gcp_id_token_header("x-other"), None);
+    }
+
+    #[test]
+    fn slack_channel_permission_serializes_false_values() {
+        let value = serde_json::to_value(SlackChannelPermissionInput {
+            channel_id: "C0123456789".to_owned(),
+            upload_enabled: false,
+            download_enabled: true,
+            history_enabled: false,
+        })
+        .unwrap();
+
+        assert_eq!(value["upload_enabled"], false);
+        assert_eq!(value["download_enabled"], true);
+        assert_eq!(value["history_enabled"], false);
     }
 }

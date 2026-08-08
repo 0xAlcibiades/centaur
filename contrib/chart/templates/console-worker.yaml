@@ -1,5 +1,4 @@
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
-{{- if and $console.enabled $console.worker.enabled }}
 {{- $secretEnv := include "centaur.secretEnvName" . }}
 {{- $prefix := .Values.secretManager.envPrefix }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") }}
@@ -164,6 +163,8 @@ spec:
 {{- if .Values.apiRs.enabled }}
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            # Console OAuth sync workers submit normalized provider data to the
+            # in-cluster API; credentials themselves never leave this pod.
             - name: CENTAUR_CONSOLE_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
 {{- end }}
@@ -214,5 +215,4 @@ spec:
         - protocol: TCP
           port: 443
     # DNS egress is provided by the namespace-wide allow-dns policy.
-{{- end }}
 {{- end }}

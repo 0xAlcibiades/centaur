@@ -1,10 +1,10 @@
 module Api
   class BaseController < ActionController::API
+    include ApiRequestSupport
+
     before_action :authenticate_api_key!
 
     rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
-    rescue_from ActionController::ParameterMissing, with: :render_bad_request
-    rescue_from ActionController::BadRequest, with: :render_bad_request
 
     attr_reader :current_api_key
 
@@ -17,29 +17,16 @@ module Api
     def authenticate_api_key!
       token = bearer_token
       @current_api_key = ApiKey.find_by_token(token) if token.present?
-      return if @current_api_key
+      unless current_api_key&.user&.active?
+        return render_error(status: :unauthorized, message: "invalid or missing API key")
+      end
+      return if current_api_key.user.admin?
 
-      render_error(status: :unauthorized, message: "invalid or missing API key")
-    end
-
-    def bearer_token
-      header = request.headers["Authorization"].to_s
-      return nil unless header.start_with?("Bearer ")
-      header.sub(/\ABearer\s+/, "").presence
-    end
-
-    def render_error(status:, message:, details: nil)
-      body = { error: { message: message } }
-      body[:error][:details] = details if details
-      render status: status, json: body
+      render_error(status: :forbidden, message: "API key owner is not an admin")
     end
 
     def render_not_found(e)
       render_error(status: :not_found, message: e.message)
-    end
-
-    def render_bad_request(e)
-      render_error(status: :bad_request, message: e.message)
     end
 
     def render_validation_error(record)
@@ -118,15 +105,28 @@ module Api
       end
     end
 
+    def with_sync_config_replacement_guard(record, attributes, **associations)
+      record.lock! unless record.new_record?
+      return record if !record.new_record? && SyncConfigReplacement.equivalent?(record, attributes, associations)
+
+      yield
+    end
+
     DEFAULT_PAGE_LIMIT = 50
     MAX_PAGE_LIMIT = 200
 
-    def paginated_label_search(scope)
+    def paginated_label_search(scope, label_filter: nil)
       namespace = params.require(:namespace)
 
       labels = label_filter_params
       filtered = scope.where(namespace: namespace)
-      filtered = filtered.where("labels @> ?", labels.to_json) if labels.any?
+      filtered = if label_filter
+        label_filter.call(filtered, labels)
+      elsif labels.any?
+        filtered.where("labels @> ?", labels.to_json)
+      else
+        filtered
+      end
 
       limit = pagination_limit
       page = pagination_page
