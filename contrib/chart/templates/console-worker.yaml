@@ -130,6 +130,17 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sCENTAUR_JWT_SIGNING_SECRET" $prefix }}
+{{- if eq .Values.sandbox.codexAuthMode "autorotate" }}
+            # Parent-lease reconciliation calls Autorotate from this trusted
+            # Console worker. api-rs and sandboxes never mount this token.
+            - name: CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_URL
+              value: {{ required "slackbotv2.autorotate.url is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.url | quote }}
+            - name: CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "slackbotv2.autorotate.credentialsSecretName is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ required "slackbotv2.autorotate.runtimeTokenKey is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.runtimeTokenKey | quote }}
+{{- end }}
 {{- if $console.publicUrl }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}

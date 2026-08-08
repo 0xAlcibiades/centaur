@@ -122,13 +122,14 @@ class MetadataTraceEntrypointTests(unittest.TestCase):
                 self.assertEqual("none", config["otel"]["exporter"])
                 self.assertFalse(config["otel"]["log_user_prompt"])
 
-    def test_codex_0146_keeps_both_existing_auth_modes_outside_trace_setup(self) -> None:
+    def test_codex_0146_keeps_chatgpt_auth_modes_outside_trace_setup(self) -> None:
         self.assertIn("ARG CODEX_VERSION=0.146.0", self.dockerfile)
         self.assertIn('codex --version | grep -F "${CODEX_VERSION}"', self.dockerfile)
         self.assertIn('CODEX_AUTH_MODE="${CODEX_AUTH_MODE:-api_key}"', self.script)
-        self.assertIn('if [ "$CODEX_AUTH_MODE" = "access_token" ]', self.script)
-        self.assertIn('if [ "$CODEX_AUTH_MODE" != "access_token" ]', self.script)
+        self.assertIn('[ "$CODEX_AUTH_MODE" = "access_token" ] || [ "$CODEX_AUTH_MODE" = "autorotate" ]', self.script)
+        self.assertIn('[ "$CODEX_AUTH_MODE" != "access_token" ] && [ "$CODEX_AUTH_MODE" != "autorotate" ]', self.script)
         self.assertIn('codex login --with-api-key', self.script)
+        self.assertNotIn("AUTOROTATE_PROXY_PARENT_TOKEN", self.script)
 
 
 if __name__ == "__main__":

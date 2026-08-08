@@ -147,14 +147,15 @@ fi
 #   - api_key (default): codex uses an OPENAI_API_KEY against api.openai.com.
 #     The entrypoint runs `codex login --with-api-key` below, which overwrites
 #     auth.json.
-#   - access_token: codex uses a ChatGPT-style access token against
+#   - access_token / autorotate: codex uses ChatGPT-shaped requests against
 #     chatgpt.com. The default auth.json (auth_mode: chatgpt) is always
-#     installed and the api-key login step is skipped so iron-proxy can
-#     inject the brokered Bearer + chatgpt-account-id headers.
+#     installed and the api-key login step is skipped. `access_token` receives
+#     shared broker headers; `autorotate` receives only Console's pinned proxy
+#     overlay. Neither mode puts a real token in the sandbox.
 CODEX_AUTH_MODE="${CODEX_AUTH_MODE:-api_key}"
 mkdir -p "$HOME_DIR/.codex"
 CODEX_CONFIG_DIR="$(cd -P "$HOME_DIR/.codex" && pwd)"
-if [ "$CODEX_AUTH_MODE" = "access_token" ] && [ -f /etc/centaur/codex-auth.default.json ]; then
+if { [ "$CODEX_AUTH_MODE" = "access_token" ] || [ "$CODEX_AUTH_MODE" = "autorotate" ]; } && [ -f /etc/centaur/codex-auth.default.json ]; then
     cp /etc/centaur/codex-auth.default.json "$HOME_DIR/.codex/auth.json"
     chmod 600 "$HOME_DIR/.codex/auth.json"
 elif [ ! -f "$HOME_DIR/.codex/auth.json" ] && [ -f /etc/centaur/codex-auth.default.json ]; then
@@ -702,9 +703,10 @@ fi
 
 # Codex reads its auth file when the app server starts. Complete this before
 # signaling readiness, otherwise warm pods can be claimed with no auth loaded.
-# Skipped under access_token mode — that path relies on the chatgpt auth.json
-# installed above plus iron-proxy injecting the real Bearer at request time.
-if [ "$CODEX_AUTH_MODE" != "access_token" ]; then
+# Skipped under access_token and autorotate modes — both use the ChatGPT
+# auth.json installed above. Iron-proxy injects the broker credential for
+# access_token or the Console-pinned overlay for autorotate at request time.
+if [ "$CODEX_AUTH_MODE" != "access_token" ] && [ "$CODEX_AUTH_MODE" != "autorotate" ]; then
     CODEX_KEY="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
     if [ -n "$CODEX_KEY" ]; then
         echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true

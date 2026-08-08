@@ -9,12 +9,21 @@ fn harness_auth_fragments_are_baked_in() {
         Some("OPENAI_API_KEY")
     );
 
-    // access_token carries the token-broker credential, not a replace
+    // access_token carries the legacy token-broker credential, not a replace
     // placeholder, so it contributes no sandbox placeholder env.
     let codex_access = harness_auth_fragment("codex", "access_token")
         .unwrap()
         .unwrap();
     assert!(placeholder_env(&[codex_access]).is_empty());
+
+    // Autorotate gets both ChatGPT headers from Console's pinned credential
+    // overlay. The shared infra role must therefore contribute neither a
+    // token-broker source nor a static account-id source.
+    let codex_autorotate = harness_auth_fragment("codex", "autorotate")
+        .unwrap()
+        .unwrap();
+    assert!(codex_autorotate.transforms.is_empty());
+    assert!(placeholder_env(&[codex_autorotate]).is_empty());
 
     let openrouter = harness_auth_fragment("openrouter", "api_key")
         .unwrap()
@@ -102,6 +111,32 @@ fn access_token_fragment_carries_no_broker_credentials_block() {
         .unwrap()
         .unwrap();
     assert!(!codex.top_level.contains_key("broker_credentials"));
+}
+
+#[test]
+fn codex_auth_modes_keep_legacy_and_autorotate_credential_sources_separate() {
+    let access_token = harness_auth_fragment("codex", "access_token")
+        .unwrap()
+        .unwrap();
+    let secrets = &access_token.transforms[0].config.secrets;
+    assert_eq!(secrets.len(), 2);
+    assert_eq!(
+        secrets[0].source.as_ref().unwrap()["type"].as_str(),
+        Some("token_broker")
+    );
+    assert_eq!(
+        secrets[0].source.as_ref().unwrap()["credential_id"].as_str(),
+        Some("openai-codex")
+    );
+    assert_eq!(
+        secrets[1].source.as_ref().unwrap()["placeholder"].as_str(),
+        Some("OPENAI_CODEX_ACCOUNT_ID")
+    );
+
+    let autorotate = harness_auth_fragment("codex", "autorotate")
+        .unwrap()
+        .unwrap();
+    assert!(autorotate.transforms.is_empty());
 }
 
 #[test]

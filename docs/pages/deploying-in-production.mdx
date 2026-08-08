@@ -229,7 +229,7 @@ token family is revoked, logging both sides out at random. Use a separate
 ChatGPT account for any non-Centaur Codex work.
 :::
 
-Codex supports two authentication modes. Set `sandbox.codexAuthMode` in Helm;
+Codex supports three authentication modes. Set `sandbox.codexAuthMode` in Helm;
 the chart renders `CODEX_AUTH_MODE` into api-rs before it registers the matching
 iron-proxy fragment, then propagates the same value to each sandbox:
 
@@ -237,6 +237,7 @@ iron-proxy fragment, then propagates the same value to each sandbox:
 |------|----------|------------------|
 | `api_key` (default) | `api.openai.com` | `OPENAI_API_KEY` |
 | `access_token` | `chatgpt.com` | Console broker credential `openai-codex`; static `OPENAI_CODEX_ACCOUNT_ID` |
+| `autorotate` | `chatgpt.com` | Console runtime access to the dedicated Autorotate Secret. Console pins one credential per sandbox and supplies both ChatGPT headers as that sandbox's proxy overlay; api-rs and sandboxes never receive the runtime token. |
 
 `access_token` mode routes Codex through a ChatGPT account rather than a raw
 API key. The Console broker credential holds the Codex OAuth client id and
@@ -358,7 +359,8 @@ tokens:
 kubectl --namespace centaur create secret generic centaur-autorotate \
   --from-literal=AUTOROTATE_OBSERVER_TOKEN='<observer token>' \
   --from-literal=AUTOROTATE_OPERATOR_TOKEN='<enrollment operator token>' \
-  --from-literal=AUTOROTATE_CONTROL_TOKEN='<maintenance control token>'
+  --from-literal=AUTOROTATE_CONTROL_TOKEN='<maintenance control token>' \
+  --from-literal=AUTOROTATE_PROXY_PARENT_TOKEN='<Console proxy-parent token>'
 ```
 
 Then enable the integration in the deployment values:
@@ -373,11 +375,23 @@ slackbotv2:
       - T0123456789
     operatorSlackUserIds:
       - T0123456789:U0123456789
+
+# Uses the same Autorotate Secret, but Helm mounts only its runtime token into
+# the trusted Console web and worker processes. api-rs sends no runtime token
+# and the sandbox receives only its credential overlay through iron-control.
+sandbox:
+  codexAuthMode: autorotate
 ```
 
 The workspace allowlist must match the signed Slack request. Obtain the workspace
 ID from Slack's `auth.test` response or the workspace administration page.
 `credentialsSecretName` must not name the shared Centaur infrastructure Secret.
+`runtimeTokenKey` defaults to `AUTOROTATE_PROXY_PARENT_TOKEN`, a dedicated
+proxy-parent bearer rather than the general runner API token, and is distinct
+from the observer, operator, and control tokens. In `autorotate` mode only the
+trusted Console web and worker processes mount it; a sandbox without a valid
+Console pin has no Codex authorization and cannot fall back to `access_token`
+credentials.
 
 Every member of an allowed workspace can run read-only `/autorotate` commands
 from any Slack conversation; a direct message is not required. Slackbot sends the

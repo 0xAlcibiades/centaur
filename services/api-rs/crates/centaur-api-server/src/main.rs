@@ -7,6 +7,7 @@ use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{TelemetryConfig, init_telemetry};
 use centaur_workflows::WorkflowRuntime;
 use clap::Parser;
+use std::env;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -104,8 +105,15 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         warm_pool_bootstrap_principal = Some(iron_control.warm_pool_bootstrap_principal);
         workflow_host_principal = Some(iron_control.workflow_host_principal);
         workflow_principal_registrar = Some(iron_control.workflow_principal_registrar);
+        if env::var("CODEX_AUTH_MODE")
+            .ok()
+            .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("autorotate"))
+        {
+            runtime = runtime.with_autorotate_runtime_pins(iron_control.client.clone());
+        }
         runtime = runtime.with_iron_control(iron_control.registrar);
     }
+    runtime.spawn_autorotate_runtime_pin_reconciler();
     // Trace revocation, expiry, and disabled-generation retirement are
     // durable session concerns. They must keep running in deployments that do
     // not configure the optional credential-control plane.

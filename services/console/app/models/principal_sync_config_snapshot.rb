@@ -51,7 +51,9 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
 
   def self.config_for_proxy(proxy, sandbox_entitlements_hosts: Proxy.sandbox_entitlements_hosts)
     config = rendered_principal_config_for_proxy(proxy)
-    with_sandbox_entitlements_secret_for_proxy(proxy, config, hosts: sandbox_entitlements_hosts)
+    config = with_sandbox_entitlements_secret_for_proxy(proxy, config, hosts: sandbox_entitlements_hosts)
+    # Pin-scoped runtime credentials must not enter cached principal snapshots.
+    Autorotate::ProxyOverlay.apply(proxy, config)
   end
 
   def self.sync_secrets_for(principal)

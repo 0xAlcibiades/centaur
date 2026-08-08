@@ -31,6 +31,7 @@ pub fn harness_auth_fragment(engine: &str, auth_mode: &str) -> Result<Option<Pro
     let yaml = match (engine, normalize_auth_mode(auth_mode).as_str()) {
         ("codex", "api_key") => CODEX_API_KEY_FRAGMENT,
         ("codex", "access_token") => CODEX_ACCESS_TOKEN_FRAGMENT,
+        ("codex", "autorotate") => CODEX_AUTOROTATE_FRAGMENT,
         ("openrouter", "api_key") => OPENROUTER_API_KEY_FRAGMENT,
         ("meta-ai", "api_key") => META_AI_API_KEY_FRAGMENT,
         ("claude-code", "api_key") => CLAUDE_CODE_API_KEY_FRAGMENT,
@@ -212,6 +213,15 @@ transforms:
           inject:
             header: chatgpt-account-id
           rules: [{ host: chatgpt.com }]
+"#;
+
+// Autorotate leases credentials per sandbox through Console. The dynamic
+// per-principal overlay is intentionally the only source of both ChatGPT
+// headers: registering a shared source here would let an unpinned sandbox use
+// a legacy account. An empty fragment still marks this auth mode as supported
+// while leaving a sandbox without a valid overlay unable to authenticate.
+const CODEX_AUTOROTATE_FRAGMENT: &str = r#"
+transforms: []
 "#;
 
 const CLAUDE_CODE_API_KEY_FRAGMENT: &str = r#"

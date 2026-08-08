@@ -18,10 +18,17 @@
   "CODEX_AUTH_MODE"
   "CLAUDE_CODE_AUTH_MODE"
   "KUBERNETES_IRON_PROXY_HARNESS_ENGINE"
+  "KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE"
 -}}
 {{- range $name := $ironProxyManagedEnv }}
 {{- if hasKey $.Values.apiRs.extraEnv $name }}
 {{- fail (printf "apiRs.extraEnv.%s is chart-managed; use the matching ironProxy, firewall, secretManager, apiRs.opVault, or sandbox value instead" $name) }}
+{{- end }}
+{{- if hasKey $.Values.sandbox.extraEnv "CODEX_AUTH_MODE" }}
+{{- fail "sandbox.extraEnv.CODEX_AUTH_MODE is chart-managed; use sandbox.codexAuthMode instead" }}
+{{- end }}
+{{- if and (eq $.Values.sandbox.codexAuthMode "autorotate") (not $.Values.apiRs.syncInfraSecrets) }}
+{{- fail "sandbox.codexAuthMode=autorotate requires apiRs.syncInfraSecrets=true to revoke legacy Codex grants" }}
 {{- end }}
 {{- end }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}

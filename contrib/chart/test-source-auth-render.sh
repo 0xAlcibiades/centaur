@@ -29,13 +29,45 @@ require_env_secret_key_count() {
   local key="$3"
   local expected="$4"
   local count
-  count="$(awk -v name="$name" -v key="key: $key" '
+  count="$(awk -v name="$name" -v key="$key" '
     $0 ~ "^[[:space:]]*- name: " name "$" { waiting = 1; next }
-    waiting && index($0, key) { count += 1; waiting = 0; next }
+    waiting && $1 == "key:" {
+      rendered_key = $2
+      gsub(/"/, "", rendered_key)
+      if (rendered_key == key) count += 1
+      waiting = 0
+      next
+    }
     waiting && $0 ~ "^[[:space:]]*- name:" { waiting = 0 }
     END { print count + 0 }
   ' "$file")"
   [[ "$count" == "$expected" ]] || fail "$(basename "$file") binds $name to $key $count times, expected $expected"
+}
+
+require_deployment_env_secret_key() {
+  local file="$1"
+  local deployment="$2"
+  local name="$3"
+  local key="$4"
+  local count
+  count="$(awk -v deployment="$deployment" -v name="$name" -v key="$key" '
+    $0 == "kind: Deployment" {
+      if (in_deployment && deployment_name == deployment) exit
+      in_deployment = 1; deployment_name = ""; waiting = 0; next
+    }
+    in_deployment && deployment_name == "" && $1 == "name:" { deployment_name = $2; next }
+    in_deployment && deployment_name == deployment && $0 ~ "^[[:space:]]*- name: " name "$" { waiting = 1; next }
+    waiting && $1 == "key:" {
+      rendered_key = $2
+      gsub(/"/, "", rendered_key)
+      if (rendered_key == key) count += 1
+      waiting = 0
+      next
+    }
+    waiting && $0 ~ "^[[:space:]]*- name:" { waiting = 0 }
+    END { print count + 0 }
+  ' "$file")"
+  [[ "$count" == "1" ]] || fail "$(basename "$file") does not bind $name to $key exactly once on $deployment"
 }
 
 require_resource_verb() {
@@ -106,6 +138,45 @@ render environment --set ironProxy.secretSource=env
 require_resource_verb "$test_dir/environment.yaml" persistentvolumeclaims patch
 if grep -Fq 'KUBERNETES_IRON_PROXY_SOURCE_AUTH_SECRET_' "$test_dir/environment.yaml"; then
   fail "environment source rendered a non-env source-auth reference"
+fi
+
+# Autorotate runtime credentials belong only to Console. api-rs receives the
+# mode and registers a headerless fragment; a sandbox never sees this token.
+render autorotate-runtime \
+  --set sandbox.codexAuthMode=autorotate \
+  --set console.enabled=true \
+  --set-string slackbotv2.autorotate.url=https://autorotate.example.test \
+  --set-string slackbotv2.autorotate.credentialsSecretName=centaur-autorotate
+require_env_value "$test_dir/autorotate-runtime.yaml" CODEX_AUTH_MODE autorotate
+require_deployment_env_secret_key \
+  "$test_dir/autorotate-runtime.yaml" \
+  autorotate-runtime-centaur-console \
+  CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_TOKEN \
+  AUTOROTATE_PROXY_PARENT_TOKEN
+require_deployment_env_secret_key \
+  "$test_dir/autorotate-runtime.yaml" \
+  autorotate-runtime-centaur-console-worker \
+  CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_TOKEN \
+  AUTOROTATE_PROXY_PARENT_TOKEN
+require_env_secret_key_count \
+  "$test_dir/autorotate-runtime.yaml" \
+  CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_TOKEN \
+  AUTOROTATE_PROXY_PARENT_TOKEN \
+  2
+if grep -Fq 'CENTAUR_CONSOLE_AUTOROTATE_OBSERVER_TOKEN' "$test_dir/autorotate-runtime.yaml"; then
+  fail "autorotate runtime rendering unexpectedly mounted the observer token"
+fi
+if grep -Fq 'AUTOROTATE_API_TOKEN' "$test_dir/autorotate-runtime.yaml"; then
+  fail "autorotate runtime rendering used the general runner API token"
+fi
+
+if helm template autorotate-runtime-missing-secret "$CHART" \
+  --set sandbox.codexAuthMode=autorotate \
+  --set console.enabled=true \
+  --set-string slackbotv2.autorotate.url=https://autorotate.example.test \
+  > "$test_dir/autorotate-runtime-missing-secret.yaml" \
+  2> "$test_dir/autorotate-runtime-missing-secret.err"; then
+  fail "autorotate mode rendered without a dedicated runtime Secret"
 fi
 
 # The trace-consent bearer must restart only the two workloads that consume it.
@@ -183,7 +254,8 @@ for managed_env in \
   KUBERNETES_OP_CONNECT_HOST \
   CODEX_AUTH_MODE \
   CLAUDE_CODE_AUTH_MODE \
-  KUBERNETES_IRON_PROXY_HARNESS_ENGINE; do
+  KUBERNETES_IRON_PROXY_HARNESS_ENGINE \
+  KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE; do
   if helm template "managed-env-override" "$CHART" \
     --set-string "apiRs.extraEnv.${managed_env}=override" \
     > "$test_dir/managed-env-override.yaml" \
@@ -191,5 +263,20 @@ for managed_env in \
     fail "apiRs.extraEnv unexpectedly overrode chart-managed $managed_env"
   fi
 done
+
+if helm template sandbox-auth-mode-override "$CHART" \
+  --set-string sandbox.extraEnv.CODEX_AUTH_MODE=access_token \
+  > "$test_dir/sandbox-auth-mode-override.yaml" \
+  2> "$test_dir/sandbox-auth-mode-override.err"; then
+  fail "sandbox.extraEnv unexpectedly overrode chart-managed CODEX_AUTH_MODE"
+fi
+
+if helm template autorotate-without-infra-sync "$CHART" \
+  --set sandbox.codexAuthMode=autorotate \
+  --set apiRs.syncInfraSecrets=false \
+  > "$test_dir/autorotate-without-infra-sync.yaml" \
+  2> "$test_dir/autorotate-without-infra-sync.err"; then
+  fail "autorotate mode rendered without infra-role reconciliation enabled"
+fi
 
 echo "iron-proxy source-auth chart render tests passed"

@@ -421,8 +421,9 @@ impl AgentSandboxBackend {
             generation,
             &resolved.principal_id,
             sync.config_hash.as_deref(),
+            &resolved.labels,
         )
-        .await;
+        .await?;
         Ok(())
     }
 
@@ -749,8 +750,9 @@ impl AgentSandboxBackend {
             &generation,
             principal_id,
             proxy.config_hash.as_deref(),
+            labels,
         )
-        .await;
+        .await?;
         Ok(())
     }
 
@@ -774,24 +776,13 @@ impl AgentSandboxBackend {
             .get(id.as_str())
             .await
             .map_err(|err| map_kube_error("get sandbox for proxy principal check", err))?;
-        let (sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
+        let (_sandbox, generation) = self.ensure_auxiliary_generation(id, sandbox).await?;
         let proxy_id = self.proxy_id_for_sandbox(id, &generation).await?;
         if let Some(proxy_id) = proxy_id
             && self
                 .has_usable_iron_proxy_resources(id, &generation)
                 .await?
         {
-            let assigned_principal = sandbox
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.get(crate::IRON_CONTROL_PRINCIPAL_ANNOTATION));
-            if assigned_principal.map(String::as_str) == Some(principal_id) && labels.is_empty() {
-                self.patch_proxy_workflow_task_id_annotation(id, &generation, labels)
-                    .await?;
-                return Ok(());
-            }
-
             let iron_control = self.config.iron_control.as_ref().ok_or_else(|| {
                 SandboxError::backend("iron-proxy requires iron-control to be configured")
             })?;
@@ -807,8 +798,9 @@ impl AgentSandboxBackend {
                 &generation,
                 principal_id,
                 proxy.config_hash.as_deref(),
+                labels,
             )
-            .await;
+            .await?;
             return Ok(());
         }
 
@@ -936,10 +928,19 @@ impl AgentSandboxBackend {
         generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
-    ) {
+        labels: &BTreeMap<String, String>,
+    ) -> SandboxResult<()> {
+        let strict = requires_strict_autorotate_proxy_ack(labels);
         let started = Instant::now();
         match self
-            .proxy_principal_ack(id, generation, principal_id, config_hash, "claim barrier")
+            .proxy_principal_ack(
+                id,
+                generation,
+                principal_id,
+                config_hash,
+                strict,
+                "claim barrier",
+            )
             .await
         {
             Ok(ProxyAck::Applied) => {
@@ -950,16 +951,29 @@ impl AgentSandboxBackend {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "iron-proxy acknowledged the claimed principal's config"
                 );
+                Ok(())
             }
             Ok(ProxyAck::ManagementUnavailable) => {
+                if strict {
+                    return Err(SandboxError::NotReady(
+                        "autorotate credential pin requires a proxy config acknowledgement"
+                            .to_owned(),
+                    ));
+                }
                 tracing::info!(
                     sandbox_id = id.as_str(),
                     "iron-proxy management API is unavailable (image without \
                      managed status support?); using the fixed reassign delay"
                 );
                 sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+                Ok(())
             }
             Ok(ProxyAck::TimedOut) => {
+                if strict {
+                    return Err(SandboxError::NotReady(
+                        "autorotate credential pin proxy acknowledgement timed out".to_owned(),
+                    ));
+                }
                 // The ack timeout already waited longer than the fixed
                 // fallback delay, so do not add another sleep here.
                 tracing::warn!(
@@ -969,8 +983,12 @@ impl AgentSandboxBackend {
                      config before the deadline; proceeding (managed proxies \
                      fail closed until synced)"
                 );
+                Ok(())
             }
             Err(error) => {
+                if strict {
+                    return Err(error);
+                }
                 tracing::warn!(
                     sandbox_id = id.as_str(),
                     %error,
@@ -978,6 +996,7 @@ impl AgentSandboxBackend {
                      claim barrier; using the fixed reassign delay"
                 );
                 sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+                Ok(())
             }
         }
     }
@@ -993,7 +1012,9 @@ impl AgentSandboxBackend {
         generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
-    ) {
+        labels: &BTreeMap<String, String>,
+    ) -> SandboxResult<()> {
+        let strict = requires_strict_autorotate_proxy_ack(labels);
         let started = Instant::now();
         match self
             .proxy_principal_ack(
@@ -1001,6 +1022,7 @@ impl AgentSandboxBackend {
                 generation,
                 principal_id,
                 config_hash,
+                strict,
                 "cold create barrier",
             )
             .await
@@ -1013,16 +1035,29 @@ impl AgentSandboxBackend {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "iron-proxy acknowledged the claimed principal's config"
                 );
+                Ok(())
             }
             Ok(ProxyAck::ManagementUnavailable) => {
+                if strict {
+                    return Err(SandboxError::NotReady(
+                        "autorotate credential pin requires a proxy config acknowledgement"
+                            .to_owned(),
+                    ));
+                }
                 tracing::info!(
                     sandbox_id = id.as_str(),
                     "iron-proxy management API is unavailable (image without \
                      managed status support?); using the fixed cold-create delay"
                 );
                 sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+                Ok(())
             }
             Ok(ProxyAck::TimedOut) => {
+                if strict {
+                    return Err(SandboxError::NotReady(
+                        "autorotate credential pin proxy acknowledgement timed out".to_owned(),
+                    ));
+                }
                 // The ack timeout already waited longer than the fixed
                 // fallback delay, so do not add another sleep here.
                 tracing::warn!(
@@ -1032,8 +1067,12 @@ impl AgentSandboxBackend {
                      config before the deadline; proceeding (managed proxies \
                      fail closed until synced)"
                 );
+                Ok(())
             }
             Err(error) => {
+                if strict {
+                    return Err(error);
+                }
                 tracing::warn!(
                     sandbox_id = id.as_str(),
                     %error,
@@ -1041,6 +1080,7 @@ impl AgentSandboxBackend {
                      cold create barrier; using the fixed cold-create delay"
                 );
                 sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+                Ok(())
             }
         }
     }
@@ -1051,6 +1091,7 @@ impl AgentSandboxBackend {
         generation: &str,
         principal_id: &str,
         config_hash: Option<&str>,
+        strict_config_hash: bool,
         barrier: &'static str,
     ) -> SandboxResult<ProxyAck> {
         let endpoint = match self.proxy_management_endpoint(id, generation).await {
@@ -1079,6 +1120,7 @@ impl AgentSandboxBackend {
             &endpoint,
             principal_id,
             config_hash,
+            strict_config_hash,
             PROXY_ACK_TIMEOUT,
             PROXY_ACK_PROBE_WINDOW,
             PROXY_ACK_POLL_INTERVAL,
@@ -1478,6 +1520,21 @@ fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
     PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(elapsed)
 }
 
+/// Only runtime-owned labels opt into strict acknowledgement. Ordinary proxy
+/// reassignment preserves its compatibility fallback; an Autorotate execution
+/// must prove the exact config hash before the harness can receive stdin.
+fn requires_strict_autorotate_proxy_ack(labels: &BTreeMap<String, String>) -> bool {
+    labels
+        .get("centaur.autorotate_pin_id")
+        .is_some_and(|value| !value.trim().is_empty())
+        && labels
+            .get("centaur.execution_id")
+            .is_some_and(|value| !value.trim().is_empty())
+        || labels
+            .get("centaur.autorotate_clear")
+            .is_some_and(|value| value == "true")
+}
+
 /// Poll the proxy's management API until it reports `principal_id`'s config
 /// applied. `probe_window` bounds how long an entirely-unresponsive
 /// management API is probed before concluding the image predates managed
@@ -1488,6 +1545,7 @@ async fn wait_for_proxy_ack(
     endpoint: &ProxyManagementEndpoint,
     principal_id: &str,
     config_hash: Option<&str>,
+    strict_config_hash: bool,
     ack_timeout: Duration,
     probe_window: Duration,
     poll_interval: Duration,
@@ -1521,10 +1579,13 @@ async fn wait_for_proxy_ack(
             if let Ok(status) = response.json::<ProxyManagedStatus>().await
                 && status.synced_once
                 && status.principal_id == principal_id
-                && status
-                    .config_hash
-                    .as_deref()
-                    .is_none_or(|applied_hash| config_hash.is_none_or(|hash| applied_hash == hash))
+                && if strict_config_hash {
+                    config_hash.is_some() && status.config_hash.as_deref() == config_hash
+                } else {
+                    status.config_hash.as_deref().is_none_or(|applied_hash| {
+                        config_hash.is_none_or(|hash| applied_hash == hash)
+                    })
+                }
             {
                 return ProxyAck::Applied;
             }
@@ -4027,6 +4088,7 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
+            false,
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(10),
@@ -4054,6 +4116,7 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
+            false,
             Duration::from_millis(400),
             Duration::from_millis(200),
             Duration::from_millis(25),
@@ -4077,6 +4140,7 @@ mod tests {
             &endpoint,
             "prin_claimed",
             Some("sha256:expected"),
+            false,
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_millis(10),
@@ -4104,6 +4168,7 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
+            false,
             Duration::from_secs(2),
             Duration::from_millis(300),
             Duration::from_millis(50),
@@ -4149,6 +4214,19 @@ mod tests {
             proxy_fallback_delay_remaining(Duration::from_secs(10)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn autorotate_pin_labels_require_strict_proxy_ack() {
+        assert!(!requires_strict_autorotate_proxy_ack(&BTreeMap::new()));
+        assert!(!requires_strict_autorotate_proxy_ack(&BTreeMap::from([(
+            "centaur.autorotate_pin_id".to_owned(),
+            "pin_1".to_owned(),
+        )])));
+        assert!(requires_strict_autorotate_proxy_ack(&BTreeMap::from([
+            ("centaur.autorotate_pin_id".to_owned(), "pin_1".to_owned()),
+            ("centaur.execution_id".to_owned(), "exe_1".to_owned()),
+        ])));
     }
 
     #[test]

@@ -161,6 +161,7 @@ impl Args {
 }
 
 pub(crate) struct IronControlRuntime {
+    pub(crate) client: IronControlClient,
     pub(crate) registrar: SessionRegistrar,
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
@@ -788,6 +789,7 @@ impl SandboxArgs {
     /// Build the iron-control registrar. The warm-pool bootstrap principal
     /// stays roleless until claim-time reassignment binds the session principal.
     async fn iron_control_runtime(&self) -> Result<Option<IronControlRuntime>, ServerError> {
+        self.validate_auth_mode_fence()?;
         let Some(client) = self.iron_control.client() else {
             return Ok(None);
         };
@@ -842,6 +844,7 @@ impl SandboxArgs {
             })
             .await?;
         Ok(Some(IronControlRuntime {
+            client: client.clone(),
             registrar: SessionRegistrar::new(client.clone(), namespace.clone()),
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
@@ -1067,9 +1070,10 @@ impl SandboxArgs {
         // credential the egress proxy injects — api-rs reads the same
         // CODEX_AUTH_MODE to register the iron-control fragment. Codex defaults
         // to api_key so the agent never silently falls back to the ChatGPT
-        // auth.json; CLAUDE_CODE_AUTH_MODE rides along when set.
-        let codex_auth_mode = clean_optional_value(env::var("CODEX_AUTH_MODE").ok().as_deref())
-            .unwrap_or_else(|| "api_key".to_owned());
+        // auth.json. `autorotate` deliberately has no shared proxy credential:
+        // Console applies its pinned per-sandbox overlay or Codex receives no
+        // auth at all. CLAUDE_CODE_AUTH_MODE rides along when set.
+        let codex_auth_mode = resolved_codex_auth_mode();
         envs.push(("CODEX_AUTH_MODE".to_owned(), codex_auth_mode.clone()));
         if let Some(mode) = clean_optional_value(env::var("CLAUDE_CODE_AUTH_MODE").ok().as_deref())
         {
@@ -1137,6 +1141,11 @@ impl SandboxArgs {
         // `apply_proxy_env` overrides the pinned proxy vars at create time and
         // merges NO_PROXY instead of replacing it.
         for (name, value) in self.sandbox_extra_env() {
+            if name == "CODEX_AUTH_MODE" && !auth_modes_match(&value, &codex_auth_mode) {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_EXTRA_ENV CODEX_AUTH_MODE must match CODEX_AUTH_MODE ({codex_auth_mode})"
+                )));
+            }
             if let Some((_, existing_value)) = envs
                 .iter_mut()
                 .find(|(existing_name, _)| existing_name == &name)
@@ -1148,6 +1157,28 @@ impl SandboxArgs {
         }
 
         Ok(envs)
+    }
+
+    fn validate_auth_mode_fence(&self) -> Result<(), ServerError> {
+        let codex_auth_mode = resolved_codex_auth_mode();
+        if auth_modes_match(&codex_auth_mode, "autorotate") && !self.iron_control_sync_infra_secrets
+        {
+            return Err(ServerError::UnsupportedConfig(
+                "CODEX_AUTH_MODE=autorotate requires IRON_CONTROL_SYNC_INFRA_SECRETS=true to revoke legacy Codex grants"
+                    .to_owned(),
+            ));
+        }
+        if let Some((_, value)) = self
+            .sandbox_extra_env()
+            .into_iter()
+            .find(|(name, _)| name == "CODEX_AUTH_MODE")
+            && !auth_modes_match(&value, &codex_auth_mode)
+        {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_EXTRA_ENV CODEX_AUTH_MODE must match CODEX_AUTH_MODE ({codex_auth_mode})"
+            )));
+        }
+        self.iron_proxy.harness.validate_auth_mode_fence()
     }
 
     /// `SESSION_SANDBOX_EXTRA_ENV` parsed as a JSON list of `{"name","value"}`
@@ -1491,6 +1522,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
     type Error = ServerError;
 
     fn try_from(args: &SandboxArgs) -> Result<Self, Self::Error> {
+        args.validate_auth_mode_fence()?;
         let mut config = AgentSandboxConfig::new(args.k8s_namespace.clone());
         config.image_pull_policy = args.agent_image_pull_policy.clone();
         config.image_pull_secrets = args
@@ -1978,11 +2010,20 @@ struct IronProxyHarnessArgs {
 }
 
 impl IronProxyHarnessArgs {
-    fn resolved_auth_mode(&self) -> String {
-        self.auth_mode
-            .clone()
-            .or_else(|| harness_auth_mode_env(&self.engine))
-            .unwrap_or_else(|| "api_key".to_owned())
+    fn resolved_auth_mode(&self) -> Result<String, ServerError> {
+        let canonical = harness_auth_mode_env(&self.engine).unwrap_or_else(|| "api_key".to_owned());
+        if let Some(override_mode) = clean_optional_value(self.auth_mode.as_deref())
+            && !auth_modes_match(&override_mode, &canonical)
+        {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE must match the canonical harness auth mode ({canonical})"
+            )));
+        }
+        Ok(canonical)
+    }
+
+    fn validate_auth_mode_fence(&self) -> Result<(), ServerError> {
+        self.resolved_auth_mode().map(|_| ())
     }
 
     /// The harness auth fragment — infra, baked in and selected by auth mode.
@@ -1990,7 +2031,7 @@ impl IronProxyHarnessArgs {
     /// Console-managed broker credential.
     fn fragment(&self) -> Result<ProxyFragment, ServerError> {
         let engine = harness_fragment_engine_name(&self.engine);
-        let auth_mode = self.resolved_auth_mode();
+        let auth_mode = self.resolved_auth_mode()?;
         harness_auth_fragment(engine, &auth_mode)?.ok_or_else(|| {
             ServerError::UnsupportedConfig(format!(
                 "no harness auth fragment for engine {engine} auth-mode {auth_mode}"
@@ -2090,11 +2131,24 @@ fn merge_fragment(target: &mut ProxyFragment, source: ProxyFragment) {
 
 fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
     match engine {
-        HarnessType::Codex => env::var("CODEX_AUTH_MODE").ok(),
-        HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
+        HarnessType::Codex => Some(resolved_codex_auth_mode()),
+        HarnessType::ClaudeCode => {
+            clean_optional_value(env::var("CLAUDE_CODE_AUTH_MODE").ok().as_deref())
+        }
         HarnessType::Amp => None,
         HarnessType::Nanocodex => Some("api_key".to_owned()),
     }
+}
+
+fn resolved_codex_auth_mode() -> String {
+    clean_optional_value(env::var("CODEX_AUTH_MODE").ok().as_deref())
+        .unwrap_or_else(|| "api_key".to_owned())
+}
+
+fn auth_modes_match(left: &str, right: &str) -> bool {
+    left.trim()
+        .replace('-', "_")
+        .eq_ignore_ascii_case(&right.trim().replace('-', "_"))
 }
 
 fn parse_host_port(value: &str) -> Option<u16> {
@@ -2858,7 +2912,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_autorotate_env_template_has_no_static_codex_credentials() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "autorotate")]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+        ])
+        .unwrap();
+
+        let env = args.sandbox.codex_app_server_env_template().unwrap();
+        assert!(
+            env.iter()
+                .any(|(name, value)| { name == "CODEX_AUTH_MODE" && value == "autorotate" })
+        );
+        assert!(
+            !env.iter()
+                .any(|(name, _)| name == "OPENAI_API_KEY" || name == "OPENAI_CODEX_ACCOUNT_ID")
+        );
+    }
+
+    #[test]
     fn codex_app_server_env_template_applies_extra_env_last() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "api_key")]);
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -2869,7 +2949,7 @@ mod tests {
             r#"[
                 {"name":"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT","value":"http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces"},
                 {"name":"OTEL_SERVICE_NAME","value":"codex"},
-                {"name":"CODEX_AUTH_MODE","value":"chatgpt"},
+                {"name":"CENTAUR_API_URL","value":"http://override.invalid"},
                 {"name":"NULL_VALUE"},
                 {"name":"  ","value":"skipped"},
                 {"name":"BAD=NAME","value":"skipped"}
@@ -2889,15 +2969,17 @@ mod tests {
             Some("http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces")
         );
         assert_eq!(value("OTEL_SERVICE_NAME"), Some("codex"));
-        // Operator extra env overrides template defaults.
-        assert_eq!(value("CODEX_AUTH_MODE"), Some("chatgpt"));
+        // Operator extra env overrides template defaults other than the
+        // canonical auth mode fence.
+        assert_eq!(value("CENTAUR_API_URL"), Some("http://override.invalid"));
+        assert_eq!(value("CODEX_AUTH_MODE"), Some("api_key"));
         // Null values become empty strings; invalid names are dropped.
         assert_eq!(value("NULL_VALUE"), Some(""));
         assert!(!env.iter().any(|(name, _)| name == "BAD=NAME"));
         // No duplicate entries for overridden names.
         assert_eq!(
             env.iter()
-                .filter(|(name, _)| name == "CODEX_AUTH_MODE")
+                .filter(|(name, _)| name == "CENTAUR_API_URL")
                 .count(),
             1
         );
@@ -3255,6 +3337,69 @@ mod tests {
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
         );
+    }
+
+    #[test]
+    fn codex_harness_auth_mode_rejects_conflicting_override() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "autorotate")]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-iron-proxy-harness-auth-mode",
+            "access_token",
+        ])
+        .unwrap();
+
+        let error = args.sandbox.iron_proxy.to_config().unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::UnsupportedConfig(message)
+                if message.contains("KUBERNETES_IRON_PROXY_HARNESS_AUTH_MODE")
+        ));
+    }
+
+    #[test]
+    fn sandbox_extra_auth_mode_rejects_conflicting_override() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "autorotate")]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"CODEX_AUTH_MODE","value":"access_token"}]"#,
+        ])
+        .unwrap();
+
+        let error = args.sandbox.codex_app_server_env_template().unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::UnsupportedConfig(message)
+                if message.contains("SESSION_SANDBOX_EXTRA_ENV CODEX_AUTH_MODE")
+        ));
+    }
+
+    #[test]
+    fn autorotate_requires_infra_secret_sync() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CODEX_AUTH_MODE", "autorotate")]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--iron-control-sync-infra-secrets",
+            "false",
+        ])
+        .unwrap();
+
+        let error = args.sandbox.validate_auth_mode_fence().unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::UnsupportedConfig(message)
+                if message.contains("IRON_CONTROL_SYNC_INFRA_SECRETS=true")
+        ));
     }
 
     #[test]

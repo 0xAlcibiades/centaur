@@ -214,6 +214,13 @@ Rails.application.routes.draw do
         collection { get "lookup/:slug", action: :lookup, as: :lookup }
       end
 
+      scope "autorotate/parent-lease", controller: :autorotate_parent_leases do
+        post "pins", action: :create_pin
+        post "pins/:id/heartbeat", action: :heartbeat_pin
+        post "pins/:id/quota-exhausted", action: :quota_exhausted_pin
+        delete "pins/:id", action: :release_pin
+      end
+
       # Called by iron-proxy instances (proxy bearer auth, not ApiKey auth).
       post "proxy/sync", to: "proxy_sync#create"
 

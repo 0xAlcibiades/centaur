@@ -17,6 +17,7 @@ mod util;
 pub use client::IronControlClient;
 pub use error::{IronControlError, Result};
 pub use models::{
+    AutorotateRuntimePin, AutorotateRuntimePinOperationRequest, AutorotateRuntimePinRequest,
     AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, EffectiveConfig,
     EffectivePgDsn, EffectiveReplace, EffectiveSecret, GCP_ID_TOKEN_ALLOWED_HEADERS,
     GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee, HmacSecretHeader,

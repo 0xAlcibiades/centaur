@@ -454,6 +454,89 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     refute_nil entry
   end
 
+  test "live renders paired ChatGPT headers from one bound pin without caching the token" do
+    lease = AutorotateParentLease.create!(consumer: "bojack", lease_id: "lease-1", fence: 7,
+                                          external_generation: 3, state: "active", expires_at: 30.minutes.from_now)
+    version = AutorotateCredentialVersion.create!(parent_lease: lease, access_token: "runtime-token",
+                                                  broker_lease_id: "lease-1", provider_account_id: "account-1", external_generation: 3,
+                                                  expires_at: 20.minutes.from_now)
+    pin = AutorotateExecutionPin.create!(parent_lease: lease, credential_version: version,
+                                         operation_id: "op-1", execution_id: "exe-1",
+                                         request_hash: Digest::SHA256.hexdigest('{"execution_id":"exe-1"}'), lease_id: "lease-1", fence: 7,
+                                         expires_at: 5.minutes.from_now)
+    @proxy.update!(labels: {
+      AutorotateExecutionPin::PROXY_PIN_LABEL => pin.oid,
+      AutorotateExecutionPin::PROXY_EXECUTION_LABEL => "exe-1"
+    })
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+
+    entries = json_body.fetch("secrets").select { |entry| entry.dig("source", "value").in?(%w[runtime-token account-1]) }
+    assert_equal [ "Authorization", "chatgpt-account-id" ], entries.map { |entry| entry.dig("inject", "header") }.sort
+    assert_equal [ "Bearer {{ .Value }}", "{{ .Value }}" ], entries.map { |entry| entry.dig("inject", "formatter") }.sort
+    assert entries.all? { |entry| entry.fetch("rules") == [ { "host" => "chatgpt.com" } ] }
+    assert_equal @proxy.id, pin.reload.proxy_id
+    snapshot = PrincipalSyncConfigSnapshot.find_by!(principal: @proxy.principal)
+    refute_includes snapshot.payload.to_json, "runtime-token"
+    refute_includes snapshot.payload.to_json, "account-1"
+
+    pin.release!
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+    refute json_body.fetch("secrets").any? { |entry| entry.dig("source", "value") == "runtime-token" }
+  end
+
+  test "a newer parent generation leaves an older pinned runtime overlay live" do
+    lease = AutorotateParentLease.create!(consumer: "bojack", lease_id: "lease-1", fence: 7,
+                                          external_generation: 3, state: "active", expires_at: 30.minutes.from_now)
+    version = AutorotateCredentialVersion.create!(parent_lease: lease, access_token: "runtime-token",
+                                                  broker_lease_id: "lease-1", provider_account_id: "account-1", external_generation: 3,
+                                                  expires_at: 20.minutes.from_now)
+    pin = AutorotateExecutionPin.create!(parent_lease: lease, credential_version: version,
+                                         operation_id: "op-1", execution_id: "exe-1",
+                                         request_hash: Digest::SHA256.hexdigest('{"execution_id":"exe-1"}'), lease_id: "lease-1", fence: 7,
+                                         expires_at: 5.minutes.from_now, proxy: @proxy)
+    @proxy.update!(labels: { AutorotateExecutionPin::PROXY_PIN_LABEL => pin.oid,
+                             AutorotateExecutionPin::PROXY_EXECUTION_LABEL => "exe-1" })
+    lease.update!(external_generation: 4)
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+
+    assert_response :ok
+    assert json_body.fetch("secrets").any? { |entry| entry.dig("source", "value") == "runtime-token" }
+  end
+
+  test "a bound pin loses its credential overlay when either trusted label changes" do
+    lease = AutorotateParentLease.create!(consumer: "bojack", lease_id: "lease-1", fence: 7,
+                                          external_generation: 3, state: "active", expires_at: 30.minutes.from_now)
+    version = AutorotateCredentialVersion.create!(parent_lease: lease, access_token: "runtime-token",
+                                                  broker_lease_id: "lease-1", provider_account_id: "account-1", external_generation: 3,
+                                                  expires_at: 20.minutes.from_now)
+    pin = AutorotateExecutionPin.create!(parent_lease: lease, credential_version: version,
+                                         operation_id: "op-1", execution_id: "exe-1",
+                                         request_hash: Digest::SHA256.hexdigest('{"execution_id":"exe-1"}'), lease_id: "lease-1", fence: 7,
+                                         expires_at: 5.minutes.from_now)
+    @proxy.update!(labels: { AutorotateExecutionPin::PROXY_PIN_LABEL => pin.oid,
+                             AutorotateExecutionPin::PROXY_EXECUTION_LABEL => pin.execution_id })
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+    assert json_body.fetch("secrets").any? { |entry| entry.dig("source", "value") == "runtime-token" }
+
+    @proxy.update!(labels: { AutorotateExecutionPin::PROXY_PIN_LABEL => pin.oid,
+                             AutorotateExecutionPin::PROXY_EXECUTION_LABEL => "other-execution" })
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+    refute json_body.fetch("secrets").any? { |entry| entry.dig("source", "value") == "runtime-token" }
+
+    @proxy.update!(labels: { AutorotateExecutionPin::PROXY_PIN_LABEL => "apn_other",
+                             AutorotateExecutionPin::PROXY_EXECUTION_LABEL => pin.execution_id })
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+    refute json_body.fetch("secrets").any? { |entry| entry.dig("source", "value") == "runtime-token" }
+  end
+
   def jwt_payload(token)
     _header, payload, _signature = token.split(".")
     JSON.parse(Base64.urlsafe_decode64(payload))

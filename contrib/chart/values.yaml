@@ -257,6 +257,9 @@ sandbox:
   #                  placeholder against api.openai.com / api.anthropic.com).
   #   access_token — codex uses a ChatGPT token against chatgpt.com / claude a
   #                  subscription token (proxy injects the brokered credential).
+  #   autorotate   — Codex gets a Console-pinned Autorotate lease. The shared
+  #                  proxy role has no Codex auth; an absent or invalid pin
+  #                  fails closed instead of using a static account.
   codexAuthMode: api_key
   claudeCodeAuthMode: api_key
   # The deployment's default harness: codex | amp | claudecode. Decides what
@@ -527,6 +530,10 @@ slackbotv2:
     observerTokenKey: AUTOROTATE_OBSERVER_TOKEN
     operatorTokenKey: AUTOROTATE_OPERATOR_TOKEN
     controlTokenKey: AUTOROTATE_CONTROL_TOKEN
+    # Used only by Console to acquire and renew per-sandbox runtime leases.
+    # It is distinct from the observer/operator/control command tokens and is
+    # never mounted into api-rs or a sandbox.
+    runtimeTokenKey: AUTOROTATE_PROXY_PARENT_TOKEN
     operatorSlackTeamIds: []
     # Required `TEAM_ID:USER_ID` principals for `/autorotate maintenance
     # drain|resume`. Slack Connect users are authorized in their signed actor

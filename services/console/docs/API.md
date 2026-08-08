@@ -1710,3 +1710,40 @@ Notes on the proxy-sync payload, which differs from the REST representation:
 - Each source is flattened: its `config` keys are merged up and tagged with `type` (the `source_type`). A `control_plane` source delivers its decrypted value inline as `value`.
 - Rules use `methods` here, versus `http_methods` in the REST API. Blank rule fields are omitted.
 - The top-level `rules`, `mcp`, and `ingest_token` fields the proxy also understands are intentionally omitted; iron-control has no models for them. Rules are carried per secret instead.
+
+### Autorotate runtime parent lease
+
+The internal API-key-authenticated runtime endpoints are intentionally separate
+from the observer endpoint and never return an access token. The runtime only
+mutates the parent lease through pin-scoped endpoints; there is no parent-level
+quota-exhaustion route and callers never supply a fence or generation.
+
+`POST /api/v1/autorotate/parent-lease/pins` accepts an `operation_id` and an
+`execution_id` and returns only `pin_id`, `version_id`, and `expires_at`. The
+same operation/request or execution is idempotent; reusing an operation id for
+a different request returns `409`. The runtime must put the returned pin id and
+the execution id in the server-owned proxy labels `centaur.autorotate_pin_id`
+and `centaur.execution_id`. On first sync Console binds that pin to the proxy;
+it cannot be rebound. A missing, stale, released, or mismatched pin omits both
+ChatGPT authentication headers from the proxy payload.
+
+`POST /api/v1/autorotate/parent-lease/pins/:id/heartbeat` accepts an
+`operation_id` and extends only that pin's existing credential version. It is
+idempotent and cannot extend past the parent expiry or the token safety margin.
+
+`POST /api/v1/autorotate/parent-lease/pins/:id/quota-exhausted` accepts only
+the pin operation id. Console first persists a draining transition and the
+source broker lease, fence, generation, account, and UUID refresh request id,
+then returns `204` without waiting on Autorotate. The periodic reconciler
+refreshes, exhausts, and replaces only that source lease through durable
+phases. Once the last pin drains it takes a second, separately idempotent
+authoritative refresh before exhausting; a broker finding that quota recovered
+causes a clean release and replacement instead. A replay after a replacement
+is a no-op; it cannot drain the healthy successor. If an exact broker replay
+arrives after its lease expires, Console retires only the expired, pin-drained
+source and acquires a new parent without claiming an exhaustion. Console never
+accepts a caller-supplied fence or generation.
+
+The pin overlay is rendered at proxy-sync time, never retained in a principal
+snapshot. It injects `Authorization: Bearer` and `chatgpt-account-id` together
+from the same immutable credential version, scoped only to `chatgpt.com`.

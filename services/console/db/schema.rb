@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_02_170149) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_07_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -24,6 +24,70 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_02_170149) do
     t.index ["deleted_at"], name: "index_api_keys_on_deleted_at"
     t.index ["token_hash"], name: "index_api_keys_on_token_hash", unique: true
     t.index ["user_id"], name: "index_api_keys_on_user_id"
+  end
+
+  create_table "autorotate_credential_versions", force: :cascade do |t|
+    t.text "access_token", null: false
+    t.bigint "autorotate_parent_lease_id", null: false
+    t.string "broker_lease_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.bigint "external_generation", null: false
+    t.string "provider_account_id", null: false
+    t.datetime "updated_at", null: false
+    t.index ["autorotate_parent_lease_id", "broker_lease_id", "external_generation"], name: "index_autorotate_versions_on_parent_lease_and_generation", unique: true
+    t.index ["autorotate_parent_lease_id"], name: "idx_on_autorotate_parent_lease_id_a954603a5f"
+  end
+
+  create_table "autorotate_execution_pins", force: :cascade do |t|
+    t.bigint "autorotate_credential_version_id", null: false
+    t.bigint "autorotate_parent_lease_id", null: false
+    t.datetime "created_at", null: false
+    t.string "execution_id", null: false
+    t.datetime "expires_at", null: false
+    t.bigint "fence", null: false
+    t.string "last_heartbeat_operation_id"
+    t.string "lease_id", null: false
+    t.string "operation_id", null: false
+    t.bigint "proxy_id"
+    t.string "quota_exhausted_operation_id"
+    t.datetime "released_at"
+    t.string "request_hash", null: false
+    t.string "state", default: "active", null: false
+    t.datetime "updated_at", null: false
+    t.index ["autorotate_credential_version_id", "state"], name: "index_autorotate_pins_on_version_and_state"
+    t.index ["autorotate_credential_version_id"], name: "idx_on_autorotate_credential_version_id_3b22302d17"
+    t.index ["autorotate_parent_lease_id"], name: "index_autorotate_execution_pins_on_autorotate_parent_lease_id"
+    t.index ["execution_id"], name: "index_autorotate_execution_pins_on_execution_id", unique: true
+    t.index ["last_heartbeat_operation_id"], name: "index_autorotate_pins_on_heartbeat_operation", unique: true, where: "(last_heartbeat_operation_id IS NOT NULL)"
+    t.index ["operation_id"], name: "index_autorotate_execution_pins_on_operation_id", unique: true
+    t.index ["proxy_id"], name: "index_autorotate_execution_pins_on_proxy_id"
+    t.index ["quota_exhausted_operation_id"], name: "index_autorotate_pins_on_quota_operation", unique: true, where: "(quota_exhausted_operation_id IS NOT NULL)"
+  end
+
+  create_table "autorotate_parent_leases", force: :cascade do |t|
+    t.string "consumer", null: false
+    t.datetime "created_at", null: false
+    t.bigint "drain_external_generation"
+    t.bigint "drain_fence"
+    t.string "drain_final_refresh_operation_id"
+    t.string "drain_lease_id"
+    t.string "drain_operation_id"
+    t.string "drain_phase"
+    t.text "drain_provider_account_id"
+    t.string "drain_refresh_operation_id"
+    t.datetime "expires_at"
+    t.bigint "external_generation"
+    t.bigint "fence"
+    t.string "lease_id"
+    t.string "operation_id"
+    t.string "pending_operation_id"
+    t.string "state", default: "released", null: false
+    t.datetime "updated_at", null: false
+    t.index ["consumer"], name: "index_autorotate_parent_leases_on_consumer", unique: true
+    t.index ["drain_final_refresh_operation_id"], name: "idx_on_drain_final_refresh_operation_id_fbcc86b864", unique: true, where: "(drain_final_refresh_operation_id IS NOT NULL)"
+    t.index ["drain_operation_id"], name: "index_autorotate_parent_leases_on_drain_operation_id", unique: true, where: "(drain_operation_id IS NOT NULL)"
+    t.index ["drain_refresh_operation_id"], name: "index_autorotate_parent_leases_on_drain_refresh_operation_id", unique: true, where: "(drain_refresh_operation_id IS NOT NULL)"
   end
 
   create_table "aws_auth_secrets", force: :cascade do |t|
@@ -492,6 +556,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_02_170149) do
   end
 
   add_foreign_key "api_keys", "users"
+  add_foreign_key "autorotate_credential_versions", "autorotate_parent_leases"
+  add_foreign_key "autorotate_execution_pins", "autorotate_credential_versions"
+  add_foreign_key "autorotate_execution_pins", "autorotate_parent_leases"
+  add_foreign_key "autorotate_execution_pins", "proxies"
   add_foreign_key "aws_auth_secrets", "users", column: "created_by_id"
   add_foreign_key "broker_credentials", "oauth_apps"
   add_foreign_key "broker_credentials", "users", column: "created_by_id"

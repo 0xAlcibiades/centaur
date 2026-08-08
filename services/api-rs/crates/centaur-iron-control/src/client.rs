@@ -6,13 +6,15 @@
 //! wraps the body in the ``{ "data": ... }`` envelope, sends, and unwraps the
 //! response ``data`` field.
 
-use reqwest::{Client as HttpClient, Method, Response};
+use reqwest::{Client as HttpClient, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::error::{IronControlError, Result};
 use crate::models::{
+    AutorotateRuntimePin, AutorotateRuntimePinOperationRequest, AutorotateRuntimePinRequest,
     AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope,
     EffectiveConfig, GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee,
     HmacSecretInput, IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal,
@@ -21,6 +23,7 @@ use crate::models::{
 };
 
 const API_PREFIX: &str = "/api/v1";
+const AUTOROTATE_PIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Admin client for iron-control, authenticated with an ``iak_`` API key.
 #[derive(Clone, Debug)]
@@ -33,7 +36,70 @@ pub struct IronControlClient {
 impl IronControlClient {
     /// Build a client with a fresh [`reqwest::Client`].
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::with_client(HttpClient::new(), base_url, api_key)
+        let http = HttpClient::builder()
+            .connect_timeout(AUTOROTATE_PIN_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| HttpClient::new());
+        Self::with_client(http, base_url, api_key)
+    }
+
+    // ----- Autorotate runtime pins ----------------------------------------
+
+    /// Idempotently pin one credential generation for a durable execution.
+    /// The Console-admin boundary returns only opaque correlation metadata.
+    pub async fn acquire_autorotate_runtime_pin(
+        &self,
+        request: &AutorotateRuntimePinRequest,
+    ) -> Result<AutorotateRuntimePin> {
+        self.pin_write(
+            Method::POST,
+            "/api/v1/autorotate/parent-lease/pins",
+            request,
+        )
+        .await
+    }
+
+    /// Renew a held runtime pin without changing its credential generation.
+    pub async fn heartbeat_autorotate_runtime_pin(
+        &self,
+        pin_id: &str,
+        request: &AutorotateRuntimePinOperationRequest,
+    ) -> Result<AutorotateRuntimePin> {
+        let path = format!(
+            "{API_PREFIX}/autorotate/parent-lease/pins/{}/heartbeat",
+            urlencoding::encode(pin_id)
+        );
+        self.pin_write(Method::POST, &path, request).await
+    }
+
+    /// Record quota evidence before Console starts draining the pinned account.
+    pub async fn report_autorotate_runtime_pin_quota_exhausted(
+        &self,
+        pin_id: &str,
+        request: &AutorotateRuntimePinOperationRequest,
+    ) -> Result<()> {
+        let path = format!(
+            "{API_PREFIX}/autorotate/parent-lease/pins/{}/quota-exhausted",
+            urlencoding::encode(pin_id)
+        );
+        self.pin_write_unit(Method::POST, &path, request).await
+    }
+
+    /// Release a pin. Repeating the same operation id is safe after a crash.
+    pub async fn release_autorotate_runtime_pin(
+        &self,
+        pin_id: &str,
+        request: &AutorotateRuntimePinOperationRequest,
+    ) -> Result<()> {
+        let path = format!(
+            "{API_PREFIX}/autorotate/parent-lease/pins/{}?operation_id={}",
+            urlencoding::encode(pin_id),
+            urlencoding::encode(&request.operation_id),
+        );
+        let resp = self.send_pin(Method::DELETE, &path, None::<&Value>).await?;
+        expect_pin_success(resp, Method::DELETE, &path)
+            .await
+            .map(|_| ())
     }
 
     /// Build a client reusing an existing [`reqwest::Client`] (connection pool,
@@ -439,6 +505,11 @@ impl IronControlClient {
     pub async fn delete_grant(&self, id: &str) -> Result<()> {
         let path = format!("{API_PREFIX}/grants/{}", urlencoding::encode(id));
         let resp = self.send(Method::DELETE, &path, None::<&Value>).await?;
+        // Each api-rs replica reconciles this role. A peer can revoke a stale
+        // grant after this replica listed it; absence is the successful state.
+        if delete_grant_is_success_or_absent(resp.status()) {
+            return Ok(());
+        }
         expect_success(resp, Method::DELETE, &path).await
     }
 
@@ -499,6 +570,28 @@ impl IronControlClient {
         decode_data(resp, method, path).await
     }
 
+    async fn pin_write<B: Serialize, R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        data: &B,
+    ) -> Result<R> {
+        let body = DataEnvelope::new(data);
+        let resp = self.send_pin(method.clone(), path, Some(&body)).await?;
+        decode_pin_data(resp, method, path).await
+    }
+
+    async fn pin_write_unit<B: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        data: &B,
+    ) -> Result<()> {
+        let body = DataEnvelope::new(data);
+        let resp = self.send_pin(method.clone(), path, Some(&body)).await?;
+        expect_pin_success(resp, method, path).await.map(|_| ())
+    }
+
     /// Like [`Self::write`] but discards the response body (assignment POSTs).
     async fn write_unit<B: Serialize>(&self, method: Method, path: &str, data: &B) -> Result<()> {
         let body = DataEnvelope::new(data);
@@ -528,6 +621,48 @@ impl IronControlClient {
                 source,
             })
     }
+
+    /// Pin calls are on the stdin/terminal critical path. Bound them without
+    /// changing the legacy admin-client transport semantics.
+    async fn send_pin<B: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<Response> {
+        let url = format!("{}{path}", self.base_url);
+        let mut request = self
+            .http
+            .request(method.clone(), url.as_str())
+            .bearer_auth(&self.api_key)
+            .timeout(AUTOROTATE_PIN_REQUEST_TIMEOUT);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| IronControlError::Transport {
+                path: path.to_owned(),
+                source,
+            })?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            // Do not consume or preserve Console's error body: it may contain
+            // provider diagnostics and must not reach runtime logs/events.
+            Err(IronControlError::Status {
+                method: method.to_string(),
+                path: path.to_owned(),
+                status: response.status().as_u16(),
+                body: "autorotate_pin_rejected".to_owned(),
+            })
+        }
+    }
+}
+
+fn delete_grant_is_success_or_absent(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::NOT_FOUND
 }
 
 fn proxy_assignment_payload(
@@ -538,9 +673,9 @@ fn proxy_assignment_payload(
         "principal_id".to_owned(),
         Value::String(principal_id.to_owned()),
     )]);
-    if !labels.is_empty() {
-        body.insert("labels".to_owned(), json!(labels));
-    }
+    // Assignment labels are a full desired set, including an explicit empty
+    // map that clears terminal execution pin labels from a reused proxy.
+    body.insert("labels".to_owned(), json!(labels));
     Value::Object(body)
 }
 
@@ -611,6 +746,34 @@ async fn decode_data<R: DeserializeOwned>(resp: Response, method: Method, path: 
                 source,
             })?;
     Ok(envelope.data)
+}
+
+async fn decode_pin_data<R: DeserializeOwned>(
+    resp: Response,
+    method: Method,
+    path: &str,
+) -> Result<R> {
+    let resp = expect_pin_success(resp, method, path).await?;
+    resp.json::<DataEnvelope<R>>()
+        .await
+        .map(|envelope| envelope.data)
+        .map_err(|source| IronControlError::Decode {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+async fn expect_pin_success(resp: Response, method: Method, path: &str) -> Result<Response> {
+    if resp.status().is_success() {
+        Ok(resp)
+    } else {
+        Err(IronControlError::Status {
+            method: method.to_string(),
+            path: path.to_owned(),
+            status: resp.status().as_u16(),
+            body: "autorotate_pin_rejected".to_owned(),
+        })
+    }
 }
 
 async fn expect_success(resp: Response, method: Method, path: &str) -> Result<()> {
@@ -841,6 +1004,13 @@ mod tests {
     }
 
     #[test]
+    fn delete_grant_treats_a_concurrent_not_found_as_success() {
+        assert!(delete_grant_is_success_or_absent(StatusCode::NO_CONTENT));
+        assert!(delete_grant_is_success_or_absent(StatusCode::NOT_FOUND));
+        assert!(!delete_grant_is_success_or_absent(StatusCode::CONFLICT));
+    }
+
+    #[test]
     fn proxy_token_only_present_when_returned() {
         let created: Proxy = serde_json::from_value(json!({
             "id": "prx_1",
@@ -891,10 +1061,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_assignment_payload_omits_empty_labels() {
+    fn proxy_assignment_payload_includes_empty_labels_to_clear_stale_state() {
         assert_eq!(
             proxy_assignment_payload("prn_1", &std::collections::BTreeMap::new()),
-            json!({ "principal_id": "prn_1" })
+            json!({ "principal_id": "prn_1", "labels": {} })
         );
     }
 
@@ -911,6 +1081,33 @@ mod tests {
                 "principal_id": "prn_1",
                 "labels": { "centaur.slack_user_id": "U1" }
             })
+        );
+    }
+
+    #[test]
+    fn autorotate_runtime_pin_paths_are_pin_scoped_and_escape_ids() {
+        let pin_id = "pin/a b";
+        assert_eq!(
+            format!(
+                "{API_PREFIX}/autorotate/parent-lease/pins/{}/heartbeat",
+                urlencoding::encode(pin_id)
+            ),
+            "/api/v1/autorotate/parent-lease/pins/pin%2Fa%20b/heartbeat"
+        );
+        assert_eq!(
+            format!(
+                "{API_PREFIX}/autorotate/parent-lease/pins/{}/quota-exhausted",
+                urlencoding::encode(pin_id)
+            ),
+            "/api/v1/autorotate/parent-lease/pins/pin%2Fa%20b/quota-exhausted"
+        );
+        assert_eq!(
+            format!(
+                "{API_PREFIX}/autorotate/parent-lease/pins/{}?operation_id={}",
+                urlencoding::encode(pin_id),
+                urlencoding::encode("op/release")
+            ),
+            "/api/v1/autorotate/parent-lease/pins/pin%2Fa%20b?operation_id=op%2Frelease"
         );
     }
 }

@@ -193,6 +193,18 @@ spec:
                   name: {{ .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
                   key: {{ .Values.slackbotv2.autorotate.observerTokenKey | quote }}
 {{- end }}
+{{- if eq .Values.sandbox.codexAuthMode "autorotate" }}
+            # Console is the only trusted Autorotate runtime client. It turns
+            # a per-sandbox pin into the proxy overlay; api-rs and sandboxes
+            # receive neither this token nor a direct Autorotate route.
+            - name: CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_URL
+              value: {{ required "slackbotv2.autorotate.url is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.url | quote }}
+            - name: CENTAUR_CONSOLE_AUTOROTATE_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "slackbotv2.autorotate.credentialsSecretName is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.credentialsSecretName | quote }}
+                  key: {{ required "slackbotv2.autorotate.runtimeTokenKey is required when sandbox.codexAuthMode is autorotate" .Values.slackbotv2.autorotate.runtimeTokenKey | quote }}
+{{- end }}
 {{- if $console.publicUrl }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}

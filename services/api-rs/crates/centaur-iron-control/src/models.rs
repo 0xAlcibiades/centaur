@@ -560,8 +560,9 @@ pub struct Role {
     pub labels: BTreeMap<String, String>,
 }
 
-/// A secret resource as returned by any of the ``*_secrets`` endpoints. Only
-/// the identity fields are captured; grants reference the secret by ``id``.
+/// A secret resource as returned by any of the ``*_secrets`` endpoints. Grants
+/// reference the secret by ``id``; labels identify resources Centaur owns when
+/// reconciling a shared role.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct SecretRecord {
     pub id: String,
@@ -570,6 +571,8 @@ pub struct SecretRecord {
     /// Human label. Optional because some secret types allow a null ``name``.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Every secret type as ``(type label, REST collection, OID prefix)``. Mirrors
@@ -732,6 +735,33 @@ pub struct Proxy {
     pub config_hash: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Autorotate runtime credential pins
+// ---------------------------------------------------------------------------
+
+/// Request for a credential pin owned by one durable execution. The endpoint
+/// is intentionally an admin/control-plane boundary: it never returns secret
+/// material to api-rs or the sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AutorotateRuntimePinRequest {
+    pub operation_id: String,
+    pub execution_id: String,
+}
+
+/// Opaque, non-secret identity of the credential selected for an execution.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct AutorotateRuntimePin {
+    pub pin_id: String,
+    pub version_id: String,
+    pub expires_at: String,
+}
+
+/// Request body shared by the heartbeat and quota-evidence endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AutorotateRuntimePinOperationRequest {
+    pub operation_id: String,
 }
 
 #[cfg(test)]

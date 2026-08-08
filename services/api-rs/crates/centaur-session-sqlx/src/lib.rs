@@ -227,6 +227,50 @@ pub struct ClaimedInputDelivery {
     pub execution: SessionExecution,
 }
 
+/// Durable, opaque credential selection for one logical execution. Secret
+/// material remains in Console and iron-proxy; this row is only a correlation
+/// and release-retry record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionCredentialPin {
+    pub execution_id: String,
+    pub acquire_operation_id: String,
+    pub release_operation_id: String,
+    pub state: ExecutionCredentialPinState,
+    pub pin_id: Option<String>,
+    pub credential_version: Option<String>,
+    pub expires_at: Option<OffsetDateTime>,
+    pub quota_evidence_operation_id: Option<String>,
+    pub quota_evidence_at: Option<OffsetDateTime>,
+    pub quota_reported_at: Option<OffsetDateTime>,
+    pub release_attempts: i32,
+    pub last_release_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCredentialPinState {
+    Acquiring,
+    Held,
+    Evidence,
+    ReleasePending,
+    Released,
+}
+
+impl FromStr for ExecutionCredentialPinState {
+    type Err = SessionStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "acquiring" => Ok(Self::Acquiring),
+            "held" => Ok(Self::Held),
+            "evidence" => Ok(Self::Evidence),
+            "release_pending" => Ok(Self::ReleasePending),
+            "released" => Ok(Self::Released),
+            _ => Err(SessionStoreError::InvalidPersistedValue(value.to_owned())),
+        }
+    }
+}
+
 /// Holds all durable fences through the bounded sandbox pipe flush.
 pub struct InputDeliveryFlushGuard {
     transaction: Transaction<'static, sqlx::Postgres>,
@@ -1247,6 +1291,244 @@ impl PgSessionStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Create the durable pin acquisition operation before contacting Console.
+    /// A retry receives the original operation id and can never select a new
+    /// credential generation for the same execution.
+    pub async fn prepare_execution_credential_pin(
+        &self,
+        execution_id: &str,
+    ) -> Result<ExecutionCredentialPin, SessionStoreError> {
+        let acquire_operation_id = prefixed_id("op");
+        let release_operation_id = prefixed_id("op");
+        sqlx::query(
+            r#"
+            insert into execution_credential_pins
+                (execution_id, acquire_operation_id, release_operation_id, state)
+            select $1, $2, $3, 'acquiring'
+            where exists (
+                select 1 from session_executions
+                where execution_id = $1 and status in ('queued', 'running')
+            )
+            on conflict (execution_id) do nothing
+            "#,
+        )
+        .bind(execution_id)
+        .bind(acquire_operation_id)
+        .bind(release_operation_id)
+        .execute(&self.pool)
+        .await?;
+        self.execution_credential_pin(execution_id)
+            .await?
+            .ok_or_else(|| {
+                SessionStoreError::InvalidPersistedValue(format!(
+                    "active execution {execution_id} is missing its credential pin"
+                ))
+            })
+    }
+
+    pub async fn execution_credential_pin(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExecutionCredentialPin>, SessionStoreError> {
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            "select execution_id, acquire_operation_id, release_operation_id, state, pin_id, credential_version, expires_at, quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error from execution_credential_pins where execution_id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    /// Records the first successful Console pin. Conditional predicates make a
+    /// conflicting later response fail closed instead of repinning execution.
+    pub async fn hold_execution_credential_pin(
+        &self,
+        execution_id: &str,
+        pin_id: &str,
+        credential_version: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<Option<ExecutionCredentialPin>, SessionStoreError> {
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            r#"
+            update execution_credential_pins
+            set state = 'held', pin_id = $2, credential_version = $3,
+                expires_at = $4,
+                held_at = coalesce(held_at, clock_timestamp()), updated_at = clock_timestamp()
+            where execution_id = $1 and state = 'acquiring'
+              and exists (select 1 from session_executions
+                          where execution_id = $1 and status in ('queued', 'running'))
+            returning execution_id, acquire_operation_id, release_operation_id, state, pin_id,
+                      credential_version, expires_at,
+                      quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error
+            "#,
+        )
+        .bind(execution_id)
+        .bind(pin_id)
+        .bind(credential_version)
+        .bind(expires_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    /// If Console replied after the execution terminal CAS, retain only the
+    /// opaque pin metadata and enqueue its release. This closes the external
+    /// acquire/terminal race without ever allowing a terminal execution to
+    /// resume on the newly acquired credential.
+    pub async fn enqueue_terminal_execution_credential_pin_release(
+        &self,
+        execution_id: &str,
+        pin_id: &str,
+        credential_version: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<Option<ExecutionCredentialPin>, SessionStoreError> {
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            r#"
+            update execution_credential_pins
+            set state = 'release_pending', pin_id = $2, credential_version = $3,
+                expires_at = $4, updated_at = clock_timestamp()
+            where execution_id = $1 and state = 'acquiring'
+              and exists (select 1 from session_executions
+                          where execution_id = $1 and status not in ('queued', 'running'))
+            returning execution_id, acquire_operation_id, release_operation_id, state, pin_id,
+                      credential_version, expires_at,
+                      quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error
+            "#,
+        )
+        .bind(execution_id)
+        .bind(pin_id)
+        .bind(credential_version)
+        .bind(expires_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    /// Persists quota evidence before any external draining report. Repeated
+    /// observations preserve the original operation id for idempotent replay.
+    pub async fn record_execution_credential_pin_quota_evidence(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExecutionCredentialPin>, SessionStoreError> {
+        let operation_id = prefixed_id("op");
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            r#"
+            update execution_credential_pins
+            set state = 'evidence', quota_evidence_operation_id = coalesce(quota_evidence_operation_id, $2),
+                quota_evidence_at = coalesce(quota_evidence_at, clock_timestamp()), updated_at = clock_timestamp()
+            where execution_id = $1 and state in ('held', 'evidence')
+            returning execution_id, acquire_operation_id, release_operation_id, state, pin_id,
+                      credential_version, expires_at,
+                      quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error
+            "#,
+        )
+        .bind(execution_id)
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub async fn renew_execution_credential_pin(
+        &self,
+        execution_id: &str,
+        pin_id: &str,
+        credential_version: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query(
+            "update execution_credential_pins set expires_at = $4, updated_at = clock_timestamp() where execution_id = $1 and pin_id = $2 and credential_version = $3 and state in ('held', 'evidence')",
+        )
+        .bind(execution_id)
+        .bind(pin_id)
+        .bind(credential_version)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn list_execution_credential_pin_releases(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ExecutionCredentialPin>, SessionStoreError> {
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            "select execution_id, acquire_operation_id, release_operation_id, state, pin_id, credential_version, expires_at, quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error from execution_credential_pins where state = 'release_pending' and (quota_evidence_at is null or quota_reported_at is not null) order by updated_at, execution_id limit $1",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
+    }
+
+    pub async fn list_execution_credential_pin_quota_reports(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ExecutionCredentialPin>, SessionStoreError> {
+        sqlx::query_as::<_, ExecutionCredentialPinRow>(
+            "select execution_id, acquire_operation_id, release_operation_id, state, pin_id, credential_version, expires_at, quota_evidence_operation_id, quota_evidence_at, quota_reported_at, release_attempts, last_release_error from execution_credential_pins where quota_evidence_at is not null and quota_reported_at is null order by quota_evidence_at, execution_id limit $1",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
+    }
+
+    pub async fn mark_execution_credential_pin_quota_reported(
+        &self,
+        execution_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query(
+            "update execution_credential_pins set quota_reported_at = clock_timestamp(), updated_at = clock_timestamp() where execution_id = $1 and quota_evidence_operation_id = $2 and quota_reported_at is null",
+        )
+        .bind(execution_id)
+        .bind(operation_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn mark_execution_credential_pin_released(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query(
+            "update execution_credential_pins set state = 'released', released_at = clock_timestamp(), last_release_error = null, updated_at = clock_timestamp() where execution_id = $1 and state = 'release_pending'",
+        )
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn record_execution_credential_pin_release_failure(
+        &self,
+        execution_id: &str,
+        error: &str,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query(
+            "update execution_credential_pins set release_attempts = release_attempts + 1, last_release_error = $2, updated_at = clock_timestamp() where execution_id = $1 and state = 'release_pending'",
+        )
+        .bind(execution_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
     }
 
     pub async fn lock_metadata_trace_input(
@@ -5441,6 +5723,43 @@ struct SessionInputDeliveryRow {
 }
 
 #[derive(Debug, FromRow)]
+struct ExecutionCredentialPinRow {
+    execution_id: String,
+    acquire_operation_id: String,
+    release_operation_id: String,
+    state: String,
+    pin_id: Option<String>,
+    credential_version: Option<String>,
+    expires_at: Option<OffsetDateTime>,
+    quota_evidence_operation_id: Option<String>,
+    quota_evidence_at: Option<OffsetDateTime>,
+    quota_reported_at: Option<OffsetDateTime>,
+    release_attempts: i32,
+    last_release_error: Option<String>,
+}
+
+impl TryFrom<ExecutionCredentialPinRow> for ExecutionCredentialPin {
+    type Error = SessionStoreError;
+
+    fn try_from(row: ExecutionCredentialPinRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            execution_id: row.execution_id,
+            acquire_operation_id: row.acquire_operation_id,
+            release_operation_id: row.release_operation_id,
+            state: parse_persisted(row.state)?,
+            pin_id: row.pin_id,
+            credential_version: row.credential_version,
+            expires_at: row.expires_at,
+            quota_evidence_operation_id: row.quota_evidence_operation_id,
+            quota_evidence_at: row.quota_evidence_at,
+            quota_reported_at: row.quota_reported_at,
+            release_attempts: row.release_attempts,
+            last_release_error: row.last_release_error,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
 struct PersistedPreparedMessageRow {
     message_id: String,
     role: String,
@@ -5917,6 +6236,258 @@ mod tests {
             conflict,
             Err(SessionStoreError::InputDeliveryIdempotencyConflict)
         ));
+    }
+
+    async fn credential_pin_execution(store: &PgSessionStore, suffix: &str) -> (ThreadKey, String) {
+        let thread_key =
+            ThreadKey::parse(format!("test:credential-pin-{suffix}-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .unwrap();
+        (thread_key, execution.execution.execution_id)
+    }
+
+    #[tokio::test]
+    async fn credential_pin_terminal_before_hold_enqueues_release_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (_thread_key, execution_id) =
+            credential_pin_execution(&store, "terminal-before-hold").await;
+        let pin_id = format!("pin-terminal-{}", Uuid::new_v4());
+        let version_id = format!("version-terminal-{}", Uuid::new_v4());
+        store
+            .prepare_execution_credential_pin(&execution_id)
+            .await
+            .unwrap();
+        store
+            .fail_execution_if_active(&execution_id, "terminal before pin response")
+            .await
+            .unwrap();
+        let pin = store
+            .enqueue_terminal_execution_credential_pin_release(
+                &execution_id,
+                &pin_id,
+                &version_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pin.state,
+            super::ExecutionCredentialPinState::ReleasePending
+        );
+        assert!(
+            store
+                .enqueue_terminal_execution_credential_pin_release(
+                    &execution_id,
+                    &pin_id,
+                    &version_id,
+                    OffsetDateTime::now_utc() + TimeDuration::hours(1),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .list_execution_credential_pin_releases(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.execution_id == execution_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_pin_quota_evidence_round_trips_reported_at() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (_thread_key, execution_id) = credential_pin_execution(&store, "quota-fence").await;
+        let pin_id = format!("pin-quota-{}", Uuid::new_v4());
+        let version_id = format!("version-quota-{}", Uuid::new_v4());
+        store
+            .prepare_execution_credential_pin(&execution_id)
+            .await
+            .unwrap();
+        store
+            .hold_execution_credential_pin(
+                &execution_id,
+                &pin_id,
+                &version_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = store
+            .record_execution_credential_pin_quota_evidence(&execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(evidence.quota_evidence_at.is_some());
+        assert!(evidence.quota_reported_at.is_none());
+        let operation = evidence.quota_evidence_operation_id.unwrap();
+        assert!(
+            store
+                .mark_execution_credential_pin_quota_reported(&execution_id, &operation)
+                .await
+                .unwrap()
+        );
+        let reread = store
+            .execution_credential_pin(&execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reread.quota_reported_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn credential_pin_release_selector_requires_quota_acknowledgement() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (_thread_key, execution_id) =
+            credential_pin_execution(&store, "quota-release-gate").await;
+        let pin_id = format!("pin-quota-release-gate-{}", Uuid::new_v4());
+        let version_id = format!("version-quota-release-gate-{}", Uuid::new_v4());
+        store
+            .prepare_execution_credential_pin(&execution_id)
+            .await
+            .unwrap();
+        let held = store
+            .hold_execution_credential_pin(
+                &execution_id,
+                &pin_id,
+                &version_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = store
+            .record_execution_credential_pin_quota_evidence(&execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .fail_execution_if_active(&execution_id, "quota terminal")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .execution_credential_pin(&execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            super::ExecutionCredentialPinState::ReleasePending
+        );
+        assert!(
+            !store
+                .list_execution_credential_pin_releases(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.execution_id == execution_id)
+        );
+        let operation = evidence.quota_evidence_operation_id.unwrap();
+        assert!(
+            store
+                .mark_execution_credential_pin_quota_reported(&execution_id, &operation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_execution_credential_pin_releases(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.execution_id == execution_id)
+        );
+        assert_eq!(held.pin_id.as_deref(), Some(pin_id.as_str()));
+        store
+            .fail_execution_if_active(&execution_id, "repeat terminal")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_execution_credential_pin_releases(100)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.execution_id == execution_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_pin_terminal_trigger_enqueues_held_pin_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (_thread_key, execution_id) =
+            credential_pin_execution(&store, "terminal-trigger").await;
+        let pin_id = format!("pin-terminal-trigger-{}", Uuid::new_v4());
+        let version_id = format!("version-terminal-trigger-{}", Uuid::new_v4());
+        store
+            .prepare_execution_credential_pin(&execution_id)
+            .await
+            .unwrap();
+        store
+            .hold_execution_credential_pin(
+                &execution_id,
+                &pin_id,
+                &version_id,
+                OffsetDateTime::now_utc() + TimeDuration::hours(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .fail_execution_if_active(&execution_id, "terminal trigger")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .execution_credential_pin(&execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            super::ExecutionCredentialPinState::ReleasePending
+        );
+        store
+            .fail_execution_if_active(&execution_id, "repeat terminal trigger")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_execution_credential_pin_releases(100)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.execution_id == execution_id)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

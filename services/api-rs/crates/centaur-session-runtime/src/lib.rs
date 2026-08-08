@@ -11,7 +11,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use centaur_iron_control::{SessionRegistrar, SlackTraceSubject};
+use centaur_iron_control::{
+    AutorotateRuntimePinOperationRequest, AutorotateRuntimePinRequest, IronControlClient,
+    SessionRegistrar, SlackTraceSubject,
+};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, SandboxBackend, SandboxCapabilities as BackendSandboxCapabilities,
     SandboxError, SandboxHandle, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
@@ -28,12 +31,12 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    AppendMessagesWithoutActiveExecution, ClaimedInputDelivery, InputDeliveryState,
-    MetadataTraceConfigIdentity, MetadataTraceConsent, MetadataTraceDrainTarget,
-    MetadataTraceReconcilerLease, OwnedTerminalEvent, PgSessionStore, PreparedInputDelivery,
-    PreparedSessionMessage, SandboxAssignmentIdentity, SandboxAssignmentReconciliationLock,
-    SandboxAssignmentSnapshot, SandboxCapacityCandidate, SessionEventListener, SessionStoreError,
-    default_metadata,
+    AppendMessagesWithoutActiveExecution, ClaimedInputDelivery, ExecutionCredentialPin,
+    ExecutionCredentialPinState, InputDeliveryState, MetadataTraceConfigIdentity,
+    MetadataTraceConsent, MetadataTraceDrainTarget, MetadataTraceReconcilerLease,
+    OwnedTerminalEvent, PgSessionStore, PreparedInputDelivery, PreparedSessionMessage,
+    SandboxAssignmentIdentity, SandboxAssignmentReconciliationLock, SandboxAssignmentSnapshot,
+    SandboxCapacityCandidate, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -100,6 +103,13 @@ const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const PUBLIC_REPO_CACHE_SUBPATH: &str = "public";
 const CENTAUR_SKILL_DIRS_ENV: &str = "CENTAUR_SKILL_DIRS";
 const CENTAUR_PUBLIC_SKILL_DIRS_ENV: &str = "CENTAUR_PUBLIC_SKILL_DIRS";
+const AUTOROTATE_PIN_LABEL: &str = "centaur.autorotate_pin_id";
+const AUTOROTATE_CREDENTIAL_VERSION_LABEL: &str = "centaur.autorotate_version_id";
+const AUTOROTATE_EXECUTION_LABEL: &str = "centaur.execution_id";
+const AUTOROTATE_CLEAR_LABEL: &str = "centaur.autorotate_clear";
+/// A recovery write must leave enough time for a failed heartbeat to be
+/// observed before Console can expire the proxy's pinned credential overlay.
+const AUTOROTATE_PIN_MINIMUM_REMAINING_LIFETIME: TimeDuration = TimeDuration::seconds(90);
 const SANDBOX_REPO_CACHE_LABEL: &str = "centaur.sandbox_repo_cache";
 const OBSERVABILITY_TOOL_BLOCKLIST: &str =
     "vlogs,vmetrics,grafana,centaur_investigator,centaur-investigator";
@@ -139,10 +149,16 @@ type SessionPipeOpenLock = SharedRegisteredLock<Mutex<()>>;
 type SessionOutputGate = SharedRegisteredLock<tokio::sync::RwLock<()>>;
 type ToolHostCallLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type SessionTitleThreadSet = Arc<DashSet<ThreadKey>>;
+type CredentialPinHeartbeatSet = Arc<DashSet<String>>;
 type StdoutOwnerRenewalRegistry = Arc<DashMap<String, Arc<StdoutOwnerRenewal>>>;
 type SessionTitleGenerator = Arc<
     dyn Fn(String) -> BoxFuture<'static, Result<String, SessionTitleGenerationError>> + Send + Sync,
 >;
+
+#[derive(Clone)]
+struct AutorotateRuntimePins {
+    client: IronControlClient,
+}
 
 struct StdoutOwnerRenewal {
     generation: Uuid,
@@ -201,6 +217,8 @@ pub struct SessionRuntime {
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
+    autorotate_runtime_pins: Option<AutorotateRuntimePins>,
+    credential_pin_heartbeats: CredentialPinHeartbeatSet,
     metadata_trace_config: Option<MetadataTraceConfigIdentity>,
     metadata_trace_reconciler_owner_id: String,
     warm_pool: Option<Arc<WarmPoolManager>>,
@@ -548,6 +566,8 @@ struct RuntimeContext {
     execution_spans: ExecutionSpanRegistry,
     stdout_owner_id: String,
     stdout_owner_renewals: StdoutOwnerRenewalRegistry,
+    autorotate_runtime_pins: Option<AutorotateRuntimePins>,
+    credential_pin_heartbeats: CredentialPinHeartbeatSet,
 }
 
 struct SandboxCapacityController {
@@ -1053,6 +1073,8 @@ impl SessionRuntime {
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
+            autorotate_runtime_pins: None,
+            credential_pin_heartbeats: Arc::new(DashSet::new()),
             metadata_trace_config: None,
             metadata_trace_reconciler_owner_id: Uuid::new_v4().to_string(),
             warm_pool: None,
@@ -1195,6 +1217,8 @@ impl SessionRuntime {
             execution_spans: self.execution_spans.clone(),
             stdout_owner_id: self.stdout_owner_id.clone(),
             stdout_owner_renewals: self.stdout_owner_renewals.clone(),
+            autorotate_runtime_pins: self.autorotate_runtime_pins.clone(),
+            credential_pin_heartbeats: self.credential_pin_heartbeats.clone(),
         }
     }
 
@@ -1592,8 +1616,20 @@ impl SessionRuntime {
             }
             session = self.store.get_session(thread_key).await?;
         }
-        let proxy_labels =
-            proxy_labels_for_execution(&session.proxy_labels, &claim.execution.metadata);
+        let credential_pin = if matches!(session.harness_type, HarnessType::Codex) {
+            self.ensure_execution_credential_pin(&claim.execution.execution_id)
+                .await?
+        } else {
+            None
+        };
+        if let Some(pin) = credential_pin.as_ref() {
+            spawn_autorotate_pin_heartbeat(self.context(), pin.clone());
+        }
+        let proxy_labels = proxy_labels_for_execution(
+            &session.proxy_labels,
+            &claim.execution.metadata,
+            credential_pin.as_ref(),
+        );
         let sandbox_id = self
             .ensure_session_sandbox(EnsureSessionSandboxRequest {
                 thread_key,
@@ -1623,6 +1659,263 @@ impl SessionRuntime {
             &boundary_fingerprint,
         )
         .await
+    }
+
+    /// Acquire (or recover) the one credential generation allowed to serve an
+    /// execution.  The durable operation id is created before the HTTP call,
+    /// so a crash can repeat the request without selecting a replacement.
+    async fn ensure_execution_credential_pin(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExecutionCredentialPin>, SessionRuntimeError> {
+        let Some(pins) = self.autorotate_runtime_pins.as_ref() else {
+            return Ok(None);
+        };
+        let pin = self
+            .store
+            .prepare_execution_credential_pin(execution_id)
+            .await?;
+        match pin.state {
+            ExecutionCredentialPinState::Held | ExecutionCredentialPinState::Evidence => self
+                .ensure_execution_credential_pin_is_deliverable(pin)
+                .await
+                .map(Some),
+            ExecutionCredentialPinState::Acquiring => {
+                let acquired = pins
+                    .client
+                    .acquire_autorotate_runtime_pin(&AutorotateRuntimePinRequest {
+                        operation_id: pin.acquire_operation_id.clone(),
+                        execution_id: execution_id.to_owned(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        SessionRuntimeError::BadRequest(format!(
+                            "autorotate credential pin acquisition failed: {error}"
+                        ))
+                    })?;
+                let expires_at =
+                    OffsetDateTime::parse(&acquired.expires_at, &Rfc3339).map_err(|_| {
+                        SessionRuntimeError::BadRequest(
+                            "autorotate credential pin returned an invalid expiry".to_owned(),
+                        )
+                    })?;
+                match self
+                    .store
+                    .hold_execution_credential_pin(
+                        execution_id,
+                        &acquired.pin_id,
+                        &acquired.version_id,
+                        expires_at,
+                    )
+                    .await?
+                {
+                    Some(held) => self
+                        .ensure_execution_credential_pin_is_deliverable(held)
+                        .await
+                        .map(Some),
+                    None => {
+                        if let Some(release_pending) = self
+                            .store
+                            .enqueue_terminal_execution_credential_pin_release(
+                                execution_id,
+                                &acquired.pin_id,
+                                &acquired.version_id,
+                                expires_at,
+                            )
+                            .await?
+                        {
+                            self.release_autorotate_runtime_pin(&release_pending).await;
+                            return Err(SessionRuntimeError::BadRequest(
+                                "execution terminalized while autorotate credential pin was acquiring"
+                                    .to_owned(),
+                            ));
+                        }
+                        let current = self.store.execution_credential_pin(execution_id).await?;
+                        match current {
+                            Some(current)
+                                if matches!(
+                                    current.state,
+                                    ExecutionCredentialPinState::Held
+                                        | ExecutionCredentialPinState::Evidence
+                                ) && current.pin_id.as_deref()
+                                    == Some(acquired.pin_id.as_str())
+                                    && current.credential_version.as_deref()
+                                        == Some(acquired.version_id.as_str()) =>
+                            {
+                                self.ensure_execution_credential_pin_is_deliverable(current)
+                                    .await
+                                    .map(Some)
+                            }
+                            _ => Err(SessionRuntimeError::BadRequest(
+                                "autorotate credential pin changed during execution".to_owned(),
+                            )),
+                        }
+                    }
+                }
+            }
+            ExecutionCredentialPinState::ReleasePending | ExecutionCredentialPinState::Released => {
+                Err(SessionRuntimeError::BadRequest(
+                    "terminal execution cannot acquire or switch an autorotate credential pin"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// A recovered delivery cannot wait for the normal heartbeat cadence when
+    /// its durable pin is close to expiry: Console could remove the overlay
+    /// between proxy acknowledgement and stdin flush. Renew before returning a
+    /// pin that permits input delivery, and reject any response that switches
+    /// the durable pin/version fence.
+    async fn ensure_execution_credential_pin_is_deliverable(
+        &self,
+        pin: ExecutionCredentialPin,
+    ) -> Result<ExecutionCredentialPin, SessionRuntimeError> {
+        if credential_pin_requires_synchronous_renewal(&pin, OffsetDateTime::now_utc())? {
+            self.renew_execution_credential_pin_now(pin).await
+        } else {
+            Ok(pin)
+        }
+    }
+
+    /// Retry the durable release outbox. It is deliberately safe to invoke
+    /// from foreground execution and terminal/recovery paths; Console sees a
+    /// stable release operation id on every attempt.
+    pub async fn drain_autorotate_runtime_pin_releases(&self) {
+        let Some(pins) = self.autorotate_runtime_pins.as_ref() else {
+            return;
+        };
+        if let Ok(reports) = self
+            .store
+            .list_execution_credential_pin_quota_reports(100)
+            .await
+        {
+            for pin in reports {
+                let (Some(pin_id), Some(operation_id)) = (
+                    pin.pin_id.as_deref(),
+                    pin.quota_evidence_operation_id.as_deref(),
+                ) else {
+                    continue;
+                };
+                if pins
+                    .client
+                    .report_autorotate_runtime_pin_quota_exhausted(
+                        pin_id,
+                        &AutorotateRuntimePinOperationRequest {
+                            operation_id: operation_id.to_owned(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+                {
+                    let _ = self
+                        .store
+                        .mark_execution_credential_pin_quota_reported(
+                            &pin.execution_id,
+                            operation_id,
+                        )
+                        .await;
+                }
+            }
+        }
+        let Ok(releases) = self.store.list_execution_credential_pin_releases(100).await else {
+            return;
+        };
+        for pin in releases {
+            self.release_autorotate_runtime_pin(&pin).await;
+        }
+    }
+
+    async fn release_autorotate_runtime_pin(&self, pin: &ExecutionCredentialPin) {
+        let Some(pins) = self.autorotate_runtime_pins.as_ref() else {
+            return;
+        };
+        let result = match pin.pin_id.as_deref() {
+            Some(pin_id) => pins
+                .client
+                .release_autorotate_runtime_pin(
+                    pin_id,
+                    &AutorotateRuntimePinOperationRequest {
+                        operation_id: pin.release_operation_id.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                let _ = self
+                    .store
+                    .mark_execution_credential_pin_released(&pin.execution_id)
+                    .await;
+            }
+            Err(error) => {
+                let _ = self
+                    .store
+                    .record_execution_credential_pin_release_failure(
+                        &pin.execution_id,
+                        credential_pin_release_error_class(&error),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn renew_execution_credential_pin_now(
+        &self,
+        mut pin: ExecutionCredentialPin,
+    ) -> Result<ExecutionCredentialPin, SessionRuntimeError> {
+        let Some(pins) = self.autorotate_runtime_pins.as_ref() else {
+            return Ok(pin);
+        };
+        let (Some(pin_id), Some(version)) =
+            (pin.pin_id.as_deref(), pin.credential_version.as_deref())
+        else {
+            return Err(SessionRuntimeError::BadRequest(
+                "autorotate credential pin is incomplete".to_owned(),
+            ));
+        };
+        let renewed = pins
+            .client
+            .heartbeat_autorotate_runtime_pin(
+                pin_id,
+                &AutorotateRuntimePinOperationRequest {
+                    operation_id: format!("op-{}", Uuid::new_v4().simple()),
+                },
+            )
+            .await
+            .map_err(|_| {
+                SessionRuntimeError::BadRequest(
+                    "autorotate credential pin renewal failed".to_owned(),
+                )
+            })?;
+        if renewed.pin_id != pin_id || renewed.version_id != version {
+            return Err(SessionRuntimeError::BadRequest(
+                "autorotate credential pin renewal attempted a credential switch".to_owned(),
+            ));
+        }
+        let expires_at = OffsetDateTime::parse(&renewed.expires_at, &Rfc3339).map_err(|_| {
+            SessionRuntimeError::BadRequest(
+                "autorotate credential pin renewal returned an invalid expiry".to_owned(),
+            )
+        })?;
+        if expires_at <= OffsetDateTime::now_utc() + AUTOROTATE_PIN_MINIMUM_REMAINING_LIFETIME {
+            return Err(SessionRuntimeError::BadRequest(
+                "autorotate credential pin renewal has insufficient lifetime".to_owned(),
+            ));
+        }
+        if !self
+            .store
+            .renew_execution_credential_pin(&pin.execution_id, pin_id, version, expires_at)
+            .await?
+        {
+            return Err(SessionRuntimeError::BadRequest(
+                "autorotate credential pin renewal lost its durable fence".to_owned(),
+            ));
+        }
+        pin.expires_at = Some(expires_at);
+        Ok(pin)
     }
 
     async fn finish_failed_input_delivery(
@@ -1778,6 +2071,29 @@ impl SessionRuntime {
     pub fn with_iron_control(mut self, registrar: SessionRegistrar) -> Self {
         self.iron_control = Some(registrar);
         self
+    }
+
+    /// Enable Console-managed, per-execution Autorotate credential pins. The
+    /// caller selects this only for `CODEX_AUTH_MODE=autorotate`; credentials
+    /// themselves never enter api-rs or the sandbox specification.
+    pub fn with_autorotate_runtime_pins(mut self, client: IronControlClient) -> Self {
+        self.autorotate_runtime_pins = Some(AutorotateRuntimePins { client });
+        self
+    }
+
+    /// Drive the durable external-release outbox independently of incoming
+    /// requests, including after restart when no further execution arrives.
+    pub fn spawn_autorotate_runtime_pin_reconciler(&self) {
+        if self.autorotate_runtime_pins.is_none() {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            loop {
+                runtime.drain_autorotate_runtime_pin_releases().await;
+                sleep(Duration::from_secs(30)).await;
+            }
+        });
     }
 
     pub async fn slack_trace_consent(
@@ -2589,6 +2905,7 @@ impl SessionRuntime {
             &thread_trace_parent_span_id(thread_key),
         );
         let result = async {
+            self.drain_autorotate_runtime_pin_releases().await;
             ensure_thread_trace_root_span(thread_key);
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -5181,6 +5498,40 @@ impl SessionRuntime {
             return Ok(OrphanAdoption::Deferred);
         }
 
+        // Recovered Codex executions must revalidate their original opaque
+        // credential pin before touching either recorded output or live IO.
+        // A missing/expired pin is never replaced during adoption.
+        if matches!(session.harness_type, HarnessType::Codex) {
+            match self.ensure_execution_credential_pin(execution_id).await {
+                Ok(Some(pin)) => match self.renew_execution_credential_pin_now(pin).await {
+                    Ok(pin) => spawn_autorotate_pin_heartbeat(self.context(), pin),
+                    Err(error) => {
+                        self.fail_orphaned_execution(
+                            thread_key,
+                            execution_id,
+                            sandbox_id,
+                            "autorotate credential pin could not be renewed",
+                        )
+                        .await;
+                        self.abandon_stdout_owner(execution_id).await;
+                        return Err(error);
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    self.fail_orphaned_execution(
+                        thread_key,
+                        execution_id,
+                        sandbox_id,
+                        "autorotate credential pin could not be recovered",
+                    )
+                    .await;
+                    self.abandon_stdout_owner(execution_id).await;
+                    return Err(error);
+                }
+            }
+        }
+
         let since = execution.started_at.unwrap_or(execution.created_at);
         spawn_remaining_max_duration_failure(self.context(), execution);
         let adoption_io_deadline = Instant::now() + EXECUTION_ADOPTION_IO_TIMEOUT;
@@ -5571,6 +5922,39 @@ impl SessionRuntime {
             }
         }
     }
+}
+
+fn credential_pin_release_error_class(error: &str) -> &'static str {
+    if error.contains("returned 401") || error.contains("returned 403") {
+        "authorization"
+    } else if error.contains("returned 404") {
+        "not_found"
+    } else if error.contains("returned 429") {
+        "rate_limited"
+    } else if error.contains("returned 5") {
+        "server"
+    } else if error.contains("request to") {
+        "transport"
+    } else {
+        "other"
+    }
+}
+
+fn credential_pin_requires_synchronous_renewal(
+    pin: &ExecutionCredentialPin,
+    now: OffsetDateTime,
+) -> Result<bool, SessionRuntimeError> {
+    if pin.pin_id.as_deref().is_none_or(str::is_empty)
+        || pin.credential_version.as_deref().is_none_or(str::is_empty)
+        || pin.expires_at.is_none_or(|expires_at| expires_at <= now)
+    {
+        return Err(SessionRuntimeError::BadRequest(
+            "autorotate credential pin is missing required opaque metadata".to_owned(),
+        ));
+    }
+    Ok(pin
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now + AUTOROTATE_PIN_MINIMUM_REMAINING_LIFETIME))
 }
 
 /// Outcome of one orphan-adoption attempt.
@@ -7920,6 +8304,9 @@ async fn record_terminal_output(
             "cancelled",
         ),
         TerminalOutput::Failed { error, error_code } => {
+            if error_code.as_deref() == Some("usageLimitExceeded") {
+                report_autorotate_quota_evidence(ctx, execution_id).await;
+            }
             let error = sanitize_session_diagnostic_text(&error);
             failure_class = Some(terminal_failure_class(error_code.as_deref(), &error));
             let mut payload = json!({
@@ -7944,6 +8331,8 @@ async fn record_terminal_output(
     else {
         return Ok(false);
     };
+    clear_terminal_autorotate_proxy_overlay(ctx, thread_key, sandbox_id).await;
+    release_terminal_autorotate_runtime_pin(ctx, execution_id).await;
     stop_terminal_stdout_owner_renewer(ctx, execution_id).await;
     ctx.execution_spans.lock().await.remove(execution_id);
     if let Err(error) = ctx
@@ -7979,6 +8368,200 @@ async fn record_terminal_output(
         );
     }
     Ok(true)
+}
+
+async fn clear_terminal_autorotate_proxy_overlay(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    sandbox_id: &str,
+) {
+    if ctx.autorotate_runtime_pins.is_none() {
+        return;
+    }
+    let Ok(session) = ctx.store.get_session(thread_key).await else {
+        return;
+    };
+    if !matches!(session.harness_type, HarnessType::Codex) {
+        return;
+    }
+    let Some(principal_id) = session.iron_control_principal.as_deref() else {
+        return;
+    };
+    let mut labels = proxy_labels_for_execution(&session.proxy_labels, &json!({}), None);
+    // Forces the backend's exact-hash acknowledgement path while proving that
+    // all pin/version/execution labels have been removed from the proxy.
+    labels.insert(AUTOROTATE_CLEAR_LABEL.to_owned(), "true".to_owned());
+    let id = SandboxId::new(sandbox_id);
+    if let Err(error) = ctx
+        .manager
+        .ensure_iron_control_proxy_resources(&id, principal_id, &labels)
+        .await
+    {
+        warn!(thread_key = %thread_key, sandbox_id, %error, "terminal autorotate proxy clear was not acknowledged; retiring sandbox");
+        let _ = ctx.manager.stop(&id).await;
+        ctx.sandbox_pipes.remove(sandbox_id);
+    }
+}
+
+/// Quota draining is never reported ahead of durable evidence. The stable
+/// evidence operation id makes a crash between the local write and Console
+/// call replay-safe and does not create a successor execution.
+async fn report_autorotate_quota_evidence(ctx: &RuntimeContext, execution_id: &str) {
+    let Some(pins) = ctx.autorotate_runtime_pins.as_ref() else {
+        return;
+    };
+    let Ok(Some(pin)) = ctx
+        .store
+        .record_execution_credential_pin_quota_evidence(execution_id)
+        .await
+    else {
+        return;
+    };
+    let (Some(pin_id), Some(operation_id)) = (
+        pin.pin_id.as_deref(),
+        pin.quota_evidence_operation_id.as_deref(),
+    ) else {
+        return;
+    };
+    match pins
+        .client
+        .report_autorotate_runtime_pin_quota_exhausted(
+            pin_id,
+            &AutorotateRuntimePinOperationRequest {
+                operation_id: operation_id.to_owned(),
+            },
+        )
+        .await
+    {
+        Ok(()) => {
+            let _ = ctx
+                .store
+                .mark_execution_credential_pin_quota_reported(execution_id, operation_id)
+                .await;
+        }
+        Err(error) => {
+            warn!(execution_id, %error, "failed to report durable autorotate quota evidence")
+        }
+    }
+}
+
+async fn release_terminal_autorotate_runtime_pin(ctx: &RuntimeContext, execution_id: &str) {
+    let Some(pins) = ctx.autorotate_runtime_pins.as_ref() else {
+        return;
+    };
+    let Ok(Some(pin)) = ctx.store.execution_credential_pin(execution_id).await else {
+        return;
+    };
+    if pin.state != ExecutionCredentialPinState::ReleasePending {
+        return;
+    }
+    if pin.quota_evidence_at.is_some() && pin.quota_reported_at.is_none() {
+        return;
+    }
+    let result = match pin.pin_id.as_deref() {
+        Some(pin_id) => pins
+            .client
+            .release_autorotate_runtime_pin(
+                pin_id,
+                &AutorotateRuntimePinOperationRequest {
+                    operation_id: pin.release_operation_id.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        None => Ok(()),
+    };
+    match result {
+        Ok(()) => {
+            let _ = ctx
+                .store
+                .mark_execution_credential_pin_released(execution_id)
+                .await;
+        }
+        Err(error) => {
+            let _ = ctx
+                .store
+                .record_execution_credential_pin_release_failure(
+                    execution_id,
+                    credential_pin_release_error_class(&error),
+                )
+                .await;
+        }
+    }
+}
+
+fn spawn_autorotate_pin_heartbeat(ctx: RuntimeContext, pin: ExecutionCredentialPin) {
+    let Some(pins) = ctx.autorotate_runtime_pins.clone() else {
+        return;
+    };
+    if !ctx
+        .credential_pin_heartbeats
+        .insert(pin.execution_id.clone())
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let execution_id = pin.execution_id.clone();
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            let Ok(Some(current)) = ctx.store.execution_credential_pin(&execution_id).await else {
+                break;
+            };
+            if !matches!(
+                current.state,
+                ExecutionCredentialPinState::Held | ExecutionCredentialPinState::Evidence
+            ) {
+                break;
+            }
+            let (Some(pin_id), Some(version)) = (
+                current.pin_id.as_deref(),
+                current.credential_version.as_deref(),
+            ) else {
+                break;
+            };
+            let response = pins
+                .client
+                .heartbeat_autorotate_runtime_pin(
+                    pin_id,
+                    &AutorotateRuntimePinOperationRequest {
+                        // Each successful heartbeat is a new monotonic lease
+                        // extension. Reusing acquisition's operation id would
+                        // be treated as an idempotent replay by Console and
+                        // silently let long executions expire.
+                        operation_id: format!("op-{}", Uuid::new_v4().simple()),
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) if response.pin_id == pin_id && response.version_id == version => {
+                    let Ok(expires_at) = OffsetDateTime::parse(&response.expires_at, &Rfc3339)
+                    else {
+                        break;
+                    };
+                    if ctx
+                        .store
+                        .renew_execution_credential_pin(&execution_id, pin_id, version, expires_at)
+                        .await
+                        .ok()
+                        != Some(true)
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    error!(
+                        execution_id,
+                        "autorotate heartbeat attempted to switch credential pin"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    warn!(execution_id, %error, "autorotate credential pin heartbeat failed");
+                }
+            }
+        }
+        ctx.credential_pin_heartbeats.remove(&execution_id);
+    });
 }
 
 fn spawn_max_duration_failure(
@@ -10010,8 +10593,20 @@ fn execution_request_metadata(
 fn proxy_labels_for_execution(
     session_proxy_labels: &BTreeMap<String, String>,
     execution_metadata: &Value,
+    credential_pin: Option<&ExecutionCredentialPin>,
 ) -> BTreeMap<String, String> {
     let mut labels = session_proxy_labels.clone();
+    // These are server-owned execution facts. Remove any historical or caller
+    // supplied value before inserting the durable pin below, so proxy policy
+    // can rely on them without accepting metadata spoofing.
+    for reserved in [
+        AUTOROTATE_PIN_LABEL,
+        AUTOROTATE_CREDENTIAL_VERSION_LABEL,
+        AUTOROTATE_EXECUTION_LABEL,
+        AUTOROTATE_CLEAR_LABEL,
+    ] {
+        labels.remove(reserved);
+    }
     // A legacy session may still have this label persisted. The current
     // execution owns workflow correlation, so never allow a prior task to
     // follow a reused sandbox.
@@ -10022,6 +10617,22 @@ fn proxy_labels_for_execution(
         .and_then(|workflow_task_id| normalize_workflow_task_id(workflow_task_id).ok())
     {
         labels.insert(WORKFLOW_TASK_ID_PROXY_LABEL.to_owned(), workflow_task_id);
+    }
+    if let Some(pin) = credential_pin {
+        let (Some(pin_id), Some(version)) =
+            (pin.pin_id.as_deref(), pin.credential_version.as_deref())
+        else {
+            return labels;
+        };
+        labels.insert(AUTOROTATE_PIN_LABEL.to_owned(), pin_id.to_owned());
+        labels.insert(
+            AUTOROTATE_CREDENTIAL_VERSION_LABEL.to_owned(),
+            version.to_owned(),
+        );
+        labels.insert(
+            AUTOROTATE_EXECUTION_LABEL.to_owned(),
+            pin.execution_id.clone(),
+        );
     }
     labels
 }
@@ -12401,9 +13012,74 @@ mod tests {
         assert!(metadata.get(WORKFLOW_OWNED_THREAD_METADATA_KEY).is_none());
         assert_eq!(metadata["source"], "untrusted-client");
         assert!(
-            !proxy_labels_for_execution(&session_labels, &metadata)
+            !proxy_labels_for_execution(&session_labels, &metadata, None)
                 .contains_key(WORKFLOW_TASK_ID_PROXY_LABEL)
         );
+    }
+
+    #[test]
+    fn execution_pin_labels_replace_spoofed_session_values() {
+        let session_labels = BTreeMap::from([
+            (AUTOROTATE_PIN_LABEL.to_owned(), "spoofed-pin".to_owned()),
+            (
+                AUTOROTATE_CREDENTIAL_VERSION_LABEL.to_owned(),
+                "spoofed-version".to_owned(),
+            ),
+            (
+                AUTOROTATE_EXECUTION_LABEL.to_owned(),
+                "spoofed-execution".to_owned(),
+            ),
+            ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
+        ]);
+        let pin = ExecutionCredentialPin {
+            execution_id: "exe-server-owned".to_owned(),
+            acquire_operation_id: "op-acquire".to_owned(),
+            release_operation_id: "op-release".to_owned(),
+            state: ExecutionCredentialPinState::Held,
+            pin_id: Some("pin-server-owned".to_owned()),
+            credential_version: Some("version-server-owned".to_owned()),
+            expires_at: Some(OffsetDateTime::now_utc()),
+            quota_evidence_operation_id: None,
+            quota_evidence_at: None,
+            quota_reported_at: None,
+            release_attempts: 0,
+            last_release_error: None,
+        };
+
+        let labels = proxy_labels_for_execution(&session_labels, &json!({}), Some(&pin));
+
+        assert_eq!(labels[AUTOROTATE_PIN_LABEL], "pin-server-owned");
+        assert_eq!(
+            labels[AUTOROTATE_CREDENTIAL_VERSION_LABEL],
+            "version-server-owned"
+        );
+        assert_eq!(labels[AUTOROTATE_EXECUTION_LABEL], "exe-server-owned");
+        assert_eq!(labels["centaur.slack_user_id"], "U123");
+    }
+
+    #[test]
+    fn recovered_delivery_requires_sync_renewal_for_near_expiry_pin() {
+        let now = OffsetDateTime::UNIX_EPOCH + TimeDuration::days(1);
+        let mut pin = ExecutionCredentialPin {
+            execution_id: "exe-recovery".to_owned(),
+            acquire_operation_id: "op-acquire".to_owned(),
+            release_operation_id: "op-release".to_owned(),
+            state: ExecutionCredentialPinState::Held,
+            pin_id: Some("pin-recovery".to_owned()),
+            credential_version: Some("version-recovery".to_owned()),
+            expires_at: Some(now + AUTOROTATE_PIN_MINIMUM_REMAINING_LIFETIME),
+            quota_evidence_operation_id: None,
+            quota_evidence_at: None,
+            quota_reported_at: None,
+            release_attempts: 0,
+            last_release_error: None,
+        };
+
+        assert!(credential_pin_requires_synchronous_renewal(&pin, now).unwrap());
+
+        pin.expires_at =
+            Some(now + AUTOROTATE_PIN_MINIMUM_REMAINING_LIFETIME + TimeDuration::seconds(1));
+        assert!(!credential_pin_requires_synchronous_renewal(&pin, now).unwrap());
     }
 
     #[test]
@@ -12464,8 +13140,8 @@ mod tests {
             Some(true),
         );
         assert_eq!(
-            proxy_labels_for_execution(&session_labels, &first),
-            proxy_labels_for_execution(&session_labels, &retry)
+            proxy_labels_for_execution(&session_labels, &first, None),
+            proxy_labels_for_execution(&session_labels, &retry, None)
         );
         assert_ne!(
             first[WORKFLOW_RUN_ID_METADATA_KEY],
@@ -12480,7 +13156,7 @@ mod tests {
         );
 
         assert_eq!(
-            proxy_labels_for_execution(&session_labels, &different_task),
+            proxy_labels_for_execution(&session_labels, &different_task, None),
             BTreeMap::from([
                 ("centaur.slack_user_id".to_owned(), "U123".to_owned()),
                 (

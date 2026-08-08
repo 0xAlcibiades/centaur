@@ -28,7 +28,7 @@ use crate::models::{
     PgDsnSettingInput, PgDsnSettingValueFromInput, ReplaceConfig, RequestRule, SecretSource,
     StaticSecretInput,
 };
-use crate::util::{managed_labels, slugify};
+use crate::util::{MANAGED_LABEL_KEY, MANAGED_LABEL_VALUE, managed_labels, slugify};
 
 /// A role to register secrets against. ``foreign_id`` is the stable upsert key
 /// (e.g. ``infra`` or ``tool-github``); ``name`` is the human label.
@@ -102,8 +102,11 @@ pub fn gcp_auth_scopes_or_default(scopes: Vec<String>) -> Vec<String> {
     }
 }
 
-/// Upsert ``role``, upsert every secret the fragment declares, and grant each
-/// to the role. Idempotent: foreign-id upserts mean re-running converges.
+/// Reconcile Centaur-owned grants on ``role`` to the fragment's secrets. The
+/// shared infra role is not exclusive: grants backed by a secret without the
+/// Centaur management label are never removed. A mode transition revokes only
+/// stale Centaur grants before a proxy can sync it. Foreign-id upserts keep
+/// desired secret resources stable across reruns.
 /// Returns the role's iron-control OID so callers can assign it to principals
 /// without a follow-up lookup.
 pub async fn register_role(
@@ -122,8 +125,32 @@ pub async fn register_role(
             labels: managed_labels(),
         })
         .await?;
-    grant_inputs_to_role(client, &role_record.id, inputs).await?;
+    reconcile_inputs_to_role(client, &role_record.id, inputs).await?;
     Ok(role_record.id)
+}
+
+/// Materialize desired secrets, revoke stale Centaur-owned grants, then grant
+/// the desired set. Revocation happens before new grants so a partial
+/// transition fails closed rather than allowing a proxy to use a stale
+/// credential. The role can also carry grants owned by another registrar;
+/// those survive reconciliation.
+async fn reconcile_inputs_to_role(
+    client: &IronControlClient,
+    role_oid: &str,
+    inputs: Vec<SecretInput>,
+) -> Result<Vec<String>, IronControlError> {
+    let existing = client.list_role_grants(role_oid).await?;
+    let secrets = materialize_secret_inputs(client, inputs).await?;
+    let desired = secrets
+        .iter()
+        .map(|secret| secret.oid().to_owned())
+        .collect::<BTreeSet<_>>();
+
+    for grant_id in registrar_owned_stale_grant_ids(client, &existing, &desired).await? {
+        client.delete_grant(&grant_id).await?;
+    }
+
+    create_missing_role_grants(client, role_oid, &existing, secrets).await
 }
 
 /// Upsert each secret in ``inputs`` and grant it to the role identified by
@@ -139,7 +166,15 @@ pub async fn grant_inputs_to_role(
     inputs: Vec<SecretInput>,
 ) -> Result<Vec<String>, IronControlError> {
     let existing = client.list_role_grants(role_oid).await?;
-    let mut grant_ids = Vec::with_capacity(inputs.len());
+    let secrets = materialize_secret_inputs(client, inputs).await?;
+    create_missing_role_grants(client, role_oid, &existing, secrets).await
+}
+
+async fn materialize_secret_inputs(
+    client: &IronControlClient,
+    inputs: Vec<SecretInput>,
+) -> Result<Vec<GrantSecret>, IronControlError> {
+    let mut secrets = Vec::with_capacity(inputs.len());
     for input in inputs {
         let secret = match input {
             SecretInput::Static(input) => {
@@ -164,6 +199,19 @@ pub async fn grant_inputs_to_role(
                 GrantSecret::AwsAuth(client.upsert_aws_auth_secret(&input).await?.id)
             }
         };
+        secrets.push(secret);
+    }
+    Ok(secrets)
+}
+
+async fn create_missing_role_grants(
+    client: &IronControlClient,
+    role_oid: &str,
+    existing: &[crate::models::Grant],
+    secrets: Vec<GrantSecret>,
+) -> Result<Vec<String>, IronControlError> {
+    let mut grant_ids = Vec::with_capacity(secrets.len());
+    for secret in secrets {
         if let Some(grant) = existing
             .iter()
             .find(|grant| grant.secret_id() == Some(secret.oid()))
@@ -177,6 +225,59 @@ pub async fn grant_inputs_to_role(
         grant_ids.push(grant.id);
     }
     Ok(grant_ids)
+}
+
+async fn registrar_owned_stale_grant_ids(
+    client: &IronControlClient,
+    existing: &[crate::models::Grant],
+    desired: &BTreeSet<String>,
+) -> Result<Vec<String>, IronControlError> {
+    let mut registrar_owned_secret_ids = BTreeSet::new();
+    for grant in existing {
+        let Some(secret_id) = grant.secret_id() else {
+            continue;
+        };
+        if desired.contains(secret_id) {
+            continue;
+        }
+        let Some((_, collection, oid)) = grant.secret_target() else {
+            continue;
+        };
+        match client.get_secret(collection, oid).await {
+            Ok(secret) if is_centaur_managed(&secret.labels) => {
+                registrar_owned_secret_ids.insert(secret_id.to_owned());
+            }
+            Ok(_) | Err(IronControlError::Status { status: 404, .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(managed_stale_grant_ids(
+        existing,
+        desired,
+        &registrar_owned_secret_ids,
+    ))
+}
+
+fn is_centaur_managed(labels: &BTreeMap<String, String>) -> bool {
+    labels
+        .get(MANAGED_LABEL_KEY)
+        .is_some_and(|value| value == MANAGED_LABEL_VALUE)
+}
+
+fn managed_stale_grant_ids(
+    existing: &[crate::models::Grant],
+    desired: &BTreeSet<String>,
+    registrar_owned_secret_ids: &BTreeSet<String>,
+) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|grant| {
+            grant.secret_id().is_some_and(|secret_id| {
+                !desired.contains(secret_id) && registrar_owned_secret_ids.contains(secret_id)
+            })
+        })
+        .map(|grant| grant.id.clone())
+        .collect()
 }
 
 /// Pure translation: a fragment's transforms → the secret resources to upsert.
@@ -959,8 +1060,64 @@ mod tests {
     use super::*;
     use centaur_iron_proxy::load_fragment_str;
 
+    fn static_grant(id: &str, secret_id: &str) -> crate::models::Grant {
+        crate::models::Grant {
+            id: id.to_owned(),
+            principal_id: None,
+            role_id: Some("role_infra".to_owned()),
+            static_secret_id: Some(secret_id.to_owned()),
+            oauth_token_secret_id: None,
+            gcp_auth_secret_id: None,
+            gcp_id_token_secret_id: None,
+            pg_dsn_secret_id: None,
+            hmac_secret_id: None,
+            aws_auth_secret_id: None,
+        }
+    }
+
     fn env_policy() -> SourcePolicy {
         SourcePolicy::env()
+    }
+
+    #[test]
+    fn autorotate_transition_and_repeated_reconcile_only_touch_registrar_owned_grants() {
+        let existing = vec![
+            static_grant("grt_bearer", "ssr_openai_codex_bearer"),
+            static_grant("grt_account", "ssr_openai_codex_account"),
+            static_grant("grt_github", "ssr_github_token"),
+            static_grant("grt_operator", "ssr_operator_owned"),
+        ];
+        let desired = BTreeSet::from(["ssr_github_token".to_owned()]);
+        let registrar_owned = BTreeSet::from([
+            "ssr_openai_codex_bearer".to_owned(),
+            "ssr_openai_codex_account".to_owned(),
+            "ssr_github_token".to_owned(),
+        ]);
+
+        assert_eq!(
+            managed_stale_grant_ids(&existing, &desired, &registrar_owned),
+            vec!["grt_bearer".to_owned(), "grt_account".to_owned()]
+        );
+
+        // A subsequent reconciler sees the first replica's desired state and
+        // leaves both retained and externally owned grants untouched.
+        let after_first_reconcile = vec![
+            static_grant("grt_github", "ssr_github_token"),
+            static_grant("grt_operator", "ssr_operator_owned"),
+        ];
+        assert!(
+            managed_stale_grant_ids(&after_first_reconcile, &desired, &registrar_owned,).is_empty()
+        );
+    }
+
+    #[test]
+    fn centaur_management_label_is_the_shared_role_ownership_fence() {
+        assert!(is_centaur_managed(&managed_labels()));
+        assert!(!is_centaur_managed(&BTreeMap::new()));
+        assert!(!is_centaur_managed(&BTreeMap::from([(
+            MANAGED_LABEL_KEY.to_owned(),
+            "another-registrar".to_owned(),
+        )])));
     }
 
     #[test]

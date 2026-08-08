@@ -68,11 +68,12 @@ class HttpClient
     )
   end
 
-  def delete(url, params: {}, headers: {})
+  def delete(url, params: {}, json: nil, headers: {})
     request(
       method: :delete,
       url: url,
       params: params,
+      json: json,
       headers: headers
     )
   end
