@@ -288,14 +288,29 @@ class WorkflowHostTests(unittest.TestCase):
             run_id="run-123",
             task_id="task-456",
             workflow_name="sample",
-            agent_defaults={"model": "claude-opus-4-8", "reasoning": "high"},
+            agent_defaults={
+                "model": "claude-opus-4-8",
+                "reasoning": "high",
+                "principal": "workflow-default",
+            },
         )
 
-        result = asyncio.run(ctx.agent_turn("cheap step", reasoning="low"))
+        result = asyncio.run(
+            ctx.agent_turn(
+                "cheap step",
+                reasoning="low",
+                principal="agent-specific",
+            )
+        )
 
         self.assertEqual(
             result,
-            {"model": "claude-opus-4-8", "reasoning": "low", "text": "cheap step"},
+            {
+                "model": "claude-opus-4-8",
+                "reasoning": "low",
+                "principal": "agent-specific",
+                "text": "cheap step",
+            },
         )
 
     def test_start_workflow_enqueues_durable_child_with_idempotency_key(self) -> None:
@@ -492,6 +507,21 @@ class WorkflowHostTests(unittest.TestCase):
 
         assert registered is not None
         self.assertEqual(host.normalize_principal(registered), True)
+
+    def test_load_workflow_file_reads_specific_workflow_principal(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "principal_workflow.py"
+            path.write_text(
+                "WORKFLOW_NAME = 'principal_workflow'\n"
+                "WORKFLOW_PRINCIPAL = '  shared-automation  '\n"
+                "def handler(inp, ctx):\n"
+                "    return None\n"
+            )
+            registered = host.load_workflow_file(path)
+
+        assert registered is not None
+        self.assertEqual(host.normalize_principal(registered), "shared-automation")
 
     def test_workflow_name_from_source_reads_string_constant(self) -> None:
         host = load_workflow_host()

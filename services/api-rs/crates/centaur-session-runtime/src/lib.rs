@@ -1365,6 +1365,28 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+        )
+        .await
+    }
+
+    /// Create or load a session and optionally bind it to an existing Iron
+    /// Control principal instead of deriving one from the thread key.
+    pub async fn create_or_get_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        iron_control_principal: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1391,10 +1413,13 @@ impl SessionRuntime {
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
-            let registered_principal = self
-                .iron_control
-                .register_session(thread_key.as_str(), Some(&session_metadata))
-                .await?;
+            let registered_principal = if let Some(principal) = iron_control_principal {
+                self.iron_control.get_principal(principal).await?
+            } else {
+                self.iron_control
+                    .register_session(thread_key.as_str(), Some(&session_metadata))
+                    .await?
+            };
             let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
             let persona_resolution =
                 self.resolve_persona_for_create(persona_id, &desired_capabilities)?;
@@ -1437,6 +1462,14 @@ impl SessionRuntime {
                 }
                 Err(error) => return Err(error.into()),
             };
+            if iron_control_principal.is_some()
+                && let Some(existing) = session.iron_control_principal.as_deref()
+                && existing != registered_principal.id
+            {
+                return Err(SessionRuntimeError::BadRequest(format!(
+                    "session {thread_key} is already bound to a different Iron Control principal"
+                )));
+            }
             if let Some(context) = self.resolve_stored_persona(
                 session.persona_id.as_deref(),
                 harness_type,

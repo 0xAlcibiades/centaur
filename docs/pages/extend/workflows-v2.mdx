@@ -132,8 +132,8 @@ WORKFLOW_PRINCIPAL = True
 ```
 
 The API derives and registers the `workflow-nightly-report` principal in the
-Centaur Console and runs that workflow's host sandbox under it. Grant only the
-roles or secrets that workflow needs:
+Centaur Console and runs that workflow's host sandbox and agent turns under it.
+Grant only the roles or secrets that workflow needs:
 
 ```bash
 cargo run -p centaur-perms -- \
@@ -141,22 +141,43 @@ cargo run -p centaur-perms -- \
   --tool slack
 ```
 
-The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
-Workflow code cannot choose another principal id, display name, or labels.
-`WORKFLOW_PRINCIPAL = True` requires `apiRs.workflowHostSandbox=true`, which
-renders `WORKFLOW_HOST_SANDBOX=true`; startup fails if a workflow declares a
-principal while workflow-host sandboxing is disabled.
+Set `WORKFLOW_PRINCIPAL` to an existing principal foreign id or `prn_...` id to
+reuse that principal instead:
+
+```python
+WORKFLOW_PRINCIPAL = "shared-automation"
+```
+
+Centaur resolves string references without creating or updating the principal.
+Startup fails if the principal does not exist. `WORKFLOW_PRINCIPAL = True`
+still derives `workflow-` plus the slugged `WORKFLOW_NAME`. Any declared
+workflow principal requires `apiRs.workflowHostSandbox=true`, which renders
+`WORKFLOW_HOST_SANDBOX=true`.
+
+Agent turns inherit `WORKFLOW_PRINCIPAL`. A turn can select another existing
+principal for its session with `principal`:
+
+```python
+await ctx.agent_turn(
+    "Publish the approved report.",
+    principal="report-publisher",
+)
+```
+
+An explicit `thread_key` cannot be reused with a different principal. Centaur
+rejects the turn instead of changing the identity of an existing session.
 
 #### Pick the model and reasoning effort
 
 `ctx.agent_turn(...)` accepts optional `model`, `provider`, and `reasoning`
-kwargs. They ride the turn exactly like the Slack `--model` / `--bedrock` /
+kwargs. It also accepts `principal` as described above. Model kwargs ride the
+turn exactly like the Slack `--model` / `--bedrock` /
 `-rsn` flags: `model` selects the model within the harness, `reasoning` sets the
 codex reasoning effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`),
 and `provider` selects the codex model provider. `provider` and `reasoning` only
 affect the codex harness; claude and amp ignore them. `reasoning` also accepts
 the `reasoning_effort` and `effort` aliases. When a kwarg is omitted the
-deployment/baked harness default stands — dispatched turns are no longer pinned
+deployment/baked harness default stands. Dispatched turns are no longer pinned
 to the deployment default.
 
 To set a default for **every** turn in a workflow, declare a module-level
