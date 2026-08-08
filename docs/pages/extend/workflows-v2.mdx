@@ -141,21 +141,21 @@ cargo run -p centaur-perms -- \
   --tool slack
 ```
 
-Set `WORKFLOW_PRINCIPAL` to an existing principal foreign id or `prn_...` id to
-reuse that principal instead:
+Set `WORKFLOW_PRINCIPAL` to an existing principal foreign id to reuse that
+principal instead:
 
 ```python
 WORKFLOW_PRINCIPAL = "shared-automation"
 ```
 
 Centaur resolves string references without creating or updating the principal.
-Startup fails if the principal does not exist. `WORKFLOW_PRINCIPAL = True`
-still derives `workflow-` plus the slugged `WORKFLOW_NAME`. Any declared
-workflow principal requires `apiRs.workflowHostSandbox=true`, which renders
-`WORKFLOW_HOST_SANDBOX=true`.
+Principal OIDs such as `prn_...` are not accepted. Startup fails if the foreign
+id does not exist. `WORKFLOW_PRINCIPAL = True` still derives `workflow-` plus
+the slugged `WORKFLOW_NAME`. Any declared workflow principal requires
+`apiRs.workflowHostSandbox=true`, which renders `WORKFLOW_HOST_SANDBOX=true`.
 
 Agent turns inherit `WORKFLOW_PRINCIPAL`. A turn can select another existing
-principal for its session with `principal`:
+principal by foreign id for its session with `principal`:
 
 ```python
 await ctx.agent_turn(

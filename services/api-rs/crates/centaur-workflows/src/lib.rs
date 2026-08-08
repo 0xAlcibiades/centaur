@@ -221,7 +221,13 @@ pub struct WorkflowHostSandboxRuntime {
 #[derive(Clone, Default)]
 struct WorkflowPrincipalAssignments {
     required: BTreeMap<String, WorkflowPrincipalDeclaration>,
-    registered: BTreeMap<String, String>,
+    registered: BTreeMap<String, RegisteredWorkflowPrincipal>,
+}
+
+#[derive(Clone)]
+struct RegisteredWorkflowPrincipal {
+    id: String,
+    foreign_id: String,
 }
 
 impl WorkflowPrincipalAssignments {
@@ -230,7 +236,7 @@ impl WorkflowPrincipalAssignments {
         workflow_name: &str,
     ) -> Result<Option<String>, WorkflowRuntimeError> {
         if let Some(principal) = self.registered.get(workflow_name) {
-            return Ok(Some(principal.clone()));
+            return Ok(Some(principal.foreign_id.clone()));
         }
         if self.required.contains_key(workflow_name) {
             return Err(WorkflowRuntimeError::Internal(format!(
@@ -252,7 +258,7 @@ impl WorkflowHostSandboxRuntime {
 
     fn update_workflow_principals(
         &self,
-        registered: BTreeMap<String, String>,
+        registered: BTreeMap<String, RegisteredWorkflowPrincipal>,
         required: BTreeMap<String, WorkflowPrincipalDeclaration>,
     ) {
         let mut current = self
@@ -270,15 +276,21 @@ impl WorkflowHostSandboxRuntime {
         workflow_name: &str,
     ) -> Result<(SandboxSpec, Option<String>), WorkflowRuntimeError> {
         let mut spec = self.spec.clone();
-        let principal = {
+        let (principal, principal_id) = {
             let assignments = self
                 .workflow_principals
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assignments.principal_for_workflow(workflow_name)?
+            (
+                assignments.principal_for_workflow(workflow_name)?,
+                assignments
+                    .registered
+                    .get(workflow_name)
+                    .map(|registered| registered.id.clone()),
+            )
         };
-        if let Some(principal) = principal.as_ref() {
-            spec.iron_control_principal = Some(principal.clone());
+        if let Some(principal_id) = principal_id {
+            spec.iron_control_principal = Some(principal_id);
         }
         Ok((spec, principal))
     }
@@ -301,16 +313,17 @@ impl WorkflowPrincipalRegistrar {
     async fn resolve_workflow_principals(
         &self,
         principals: &BTreeMap<String, WorkflowPrincipalDeclaration>,
-    ) -> Result<BTreeMap<String, String>, WorkflowRuntimeError> {
+    ) -> Result<BTreeMap<String, RegisteredWorkflowPrincipal>, WorkflowRuntimeError> {
         let mut registered = BTreeMap::new();
         for (workflow_name, declaration) in principals {
-            let record = match declaration {
+            let (record, foreign_id) = match declaration {
                 WorkflowPrincipalDeclaration::Derived => {
                     let foreign_id = canonical_workflow_principal_foreign_id(workflow_name);
-                    self.client
+                    let record = self
+                        .client
                         .upsert_principal(&PrincipalInput {
                             namespace: self.namespace.clone(),
-                            foreign_id,
+                            foreign_id: foreign_id.clone(),
                             name: format!("Workflow {workflow_name}"),
                             labels: workflow_principal_labels(workflow_name),
                             kind: Some("workflow".to_owned()),
@@ -319,15 +332,24 @@ impl WorkflowPrincipalRegistrar {
                             slack_team_id: None,
                             slack_email: None,
                         })
-                        .await?
+                        .await?;
+                    (record, foreign_id)
                 }
                 WorkflowPrincipalDeclaration::Existing(principal) => {
-                    self.client
+                    let record = self
+                        .client
                         .get_principal(&self.namespace, principal)
-                        .await?
+                        .await?;
+                    (record, principal.clone())
                 }
             };
-            registered.insert(workflow_name.clone(), record.id);
+            registered.insert(
+                workflow_name.clone(),
+                RegisteredWorkflowPrincipal {
+                    id: record.id,
+                    foreign_id,
+                },
+            );
         }
         Ok(registered)
     }
@@ -1693,15 +1715,11 @@ impl PythonWorkflowPrincipal {
             Self::Enabled(true) => Ok(Some(WorkflowPrincipalDeclaration::Derived)),
             Self::Enabled(false) => Ok(None),
             Self::Existing(principal) => {
-                let principal = principal.trim();
-                if principal.is_empty() {
-                    return Err(WorkflowRuntimeError::BadRequest(format!(
-                        "workflow {workflow_name} declares an empty WORKFLOW_PRINCIPAL"
-                    )));
-                }
-                Ok(Some(WorkflowPrincipalDeclaration::Existing(
-                    principal.to_owned(),
-                )))
+                let principal = validate_principal_foreign_id(
+                    &principal,
+                    &format!("workflow {workflow_name} WORKFLOW_PRINCIPAL"),
+                )?;
+                Ok(Some(WorkflowPrincipalDeclaration::Existing(principal)))
             }
         }
     }
@@ -3710,19 +3728,32 @@ fn explicit_agent_principal(args: &Value) -> Result<Option<String>, WorkflowRunt
         if value.is_null() {
             continue;
         }
-        let principal = value.as_str().map(str::trim).ok_or_else(|| {
+        let principal = value.as_str().ok_or_else(|| {
             WorkflowRuntimeError::BadRequest(
-                "ctx.agent_turn principal must be a non-empty string".to_owned(),
+                "ctx.agent_turn principal must be a principal foreign id".to_owned(),
             )
         })?;
-        if principal.is_empty() {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "ctx.agent_turn principal must be a non-empty string".to_owned(),
-            ));
-        }
-        return Ok(Some(principal.to_owned()));
+        return validate_principal_foreign_id(principal, "ctx.agent_turn principal").map(Some);
     }
     Ok(None)
+}
+
+fn validate_principal_foreign_id(
+    principal: &str,
+    field: &str,
+) -> Result<String, WorkflowRuntimeError> {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "{field} must be a non-empty principal foreign id"
+        )));
+    }
+    if principal.starts_with("prn_") {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "{field} must use a principal foreign id, not a prn_ id"
+        )));
+    }
+    Ok(principal.to_owned())
 }
 
 fn agent_principal(
@@ -4624,6 +4655,23 @@ mod tests {
     }
 
     #[test]
+    fn discovery_metadata_rejects_a_principal_oid() {
+        let payload: PythonWorkflowDiscoveryPayload = serde_json::from_value(json!({
+            "workflows": [{
+                "workflow_name": "nightly_report",
+                "source_path": "workflows/nightly_report.py",
+                "principal": "prn_123",
+            }],
+        }))
+        .unwrap();
+
+        let error = metadata_from_discovery_payload(payload).unwrap_err();
+
+        assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        assert!(error.to_string().contains("foreign id, not a prn_ id"));
+    }
+
+    #[test]
     fn agent_turn_inherits_or_overrides_the_workflow_principal() {
         assert_eq!(
             agent_principal(&json!({}), Some("workflow-default")).unwrap(),
@@ -4642,6 +4690,7 @@ mod tests {
             Some("agent-specific".to_owned())
         );
         assert!(agent_principal(&json!({"principal": "  "}), None).is_err());
+        assert!(agent_principal(&json!({"principal": "prn_123"}), None).is_err());
     }
 
     #[test]
@@ -4685,6 +4734,30 @@ mod tests {
         assert!(matches!(error, WorkflowRuntimeError::Internal(_)));
         assert!(error.to_string().contains("nightly_report"));
         assert!(error.to_string().contains("WORKFLOW_PRINCIPAL"));
+    }
+
+    #[test]
+    fn registered_workflow_principal_exposes_its_foreign_id_to_agent_turns() {
+        let assignments = WorkflowPrincipalAssignments {
+            required: BTreeMap::from([(
+                "nightly_report".to_owned(),
+                WorkflowPrincipalDeclaration::Existing("shared-automation".to_owned()),
+            )]),
+            registered: BTreeMap::from([(
+                "nightly_report".to_owned(),
+                RegisteredWorkflowPrincipal {
+                    id: "prn_123".to_owned(),
+                    foreign_id: "shared-automation".to_owned(),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            assignments
+                .principal_for_workflow("nightly_report")
+                .expect("registered principal should resolve"),
+            Some("shared-automation".to_owned())
+        );
     }
 
     #[test]

@@ -1377,7 +1377,8 @@ impl SessionRuntime {
     }
 
     /// Create or load a session and optionally bind it to an existing Iron
-    /// Control principal instead of deriving one from the thread key.
+    /// Control principal foreign id instead of deriving one from the thread
+    /// key. Principal OIDs are not accepted.
     pub async fn create_or_get_session_with_principal(
         &self,
         thread_key: &ThreadKey,
@@ -1387,6 +1388,9 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         iron_control_principal: Option<&str>,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let iron_control_principal = iron_control_principal
+            .map(validate_explicit_principal_foreign_id)
+            .transpose()?;
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -5628,6 +5632,21 @@ fn ensure_session_principal_matches(
     Ok(())
 }
 
+fn validate_explicit_principal_foreign_id(principal: &str) -> Result<&str, SessionRuntimeError> {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        return Err(SessionRuntimeError::BadRequest(
+            "explicit session principal must be a non-empty foreign id".to_owned(),
+        ));
+    }
+    if principal.starts_with("prn_") {
+        return Err(SessionRuntimeError::BadRequest(
+            "explicit session principal must use a foreign id, not a prn_ id".to_owned(),
+        ));
+    }
+    Ok(principal)
+}
+
 fn session_principal_conflict_error(thread_key: &ThreadKey) -> SessionRuntimeError {
     SessionRuntimeError::BadRequest(format!(
         "session {thread_key} is already bound to a different Iron Control principal"
@@ -6933,6 +6952,16 @@ mod tests {
     use centaur_session_core::SessionStatus;
     use serde_json::json;
     use time::OffsetDateTime;
+
+    #[test]
+    fn explicit_session_principal_accepts_only_foreign_ids() {
+        assert_eq!(
+            validate_explicit_principal_foreign_id(" report-publisher ").unwrap(),
+            "report-publisher"
+        );
+        assert!(validate_explicit_principal_foreign_id("").is_err());
+        assert!(validate_explicit_principal_foreign_id("prn_123").is_err());
+    }
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {

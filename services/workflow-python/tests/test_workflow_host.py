@@ -545,6 +545,28 @@ class WorkflowHostTests(unittest.TestCase):
         ):
             host.discovery_payload()
 
+    def test_principal_oid_fails_discovery(self) -> None:
+        host = load_workflow_host()
+        workflow = host.RegisteredWorkflow(
+            workflow_name="principal_workflow",
+            source_path="workflows/principal_workflow.py",
+            handler=lambda inp, ctx: None,
+            input_cls=None,
+            webhooks=None,
+            schedule=None,
+            principal="prn_123",
+        )
+
+        with (
+            patch.object(
+                host,
+                "discover_workflows",
+                return_value={"principal_workflow": workflow},
+            ),
+            self.assertRaisesRegex(ValueError, "foreign id, not a prn_ id"),
+        ):
+            host.discovery_payload()
+
     def test_workflow_name_from_source_reads_string_constant(self) -> None:
         host = load_workflow_host()
         with tempfile.TemporaryDirectory() as tmp:

@@ -69,13 +69,14 @@ directly with `ctx.call_tool(...)` and should have its own credential boundary.
 The API derives and registers the `workflow-nightly-report` principal from
 `WORKFLOW_NAME` and runs that workflow-host sandbox and its agent turns under
 it. Set `WORKFLOW_PRINCIPAL = "shared-automation"` to use an existing principal
-foreign id or `prn_...` id instead. String references are resolved without
-creating or updating the principal. Grant the required tool roles or secrets
-to the selected principal. Any declared workflow principal requires
+foreign id instead. Principal OIDs such as `prn_...` are rejected. String
+references are resolved without creating or updating the principal. Grant the
+required tool roles or secrets to the selected principal. Any declared
+workflow principal requires
 `apiRs.workflowHostSandbox=true`, which renders `WORKFLOW_HOST_SANDBOX=true`.
 
-Agent turns inherit the workflow principal by default. Pass
-`principal="report-publisher"` to `ctx.agent_turn(...)` to use a different
+Agent turns inherit the workflow principal by default. Pass a foreign id such
+as `principal="report-publisher"` to `ctx.agent_turn(...)` to use a different
 existing principal for that session. Centaur rejects an explicit `thread_key`
 that is already bound to a different principal.
 
