@@ -2709,6 +2709,7 @@ mod tests {
             env.iter()
                 .any(|(name, value)| name == "META_AI_API_KEY" && value == "META_AI_API_KEY")
         );
+        assert!(env.iter().all(|(name, _)| name != "NOUS_API_KEY"));
     }
 
     #[test]
@@ -3218,6 +3219,27 @@ mod tests {
         assert_eq!(
             harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
             Some("access_token")
+        );
+    }
+
+    #[test]
+    fn hermes_default_has_a_native_provider_proxy_fragment() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-iron-proxy-harness-engine",
+            "hermes",
+            "--kubernetes-iron-proxy-harness-auth-mode",
+            "api_key",
+        ])
+        .unwrap();
+
+        let fragment = args.sandbox.iron_proxy.harness.fragment().unwrap();
+        let placeholders = centaur_iron_proxy::placeholder_env(&[fragment]);
+        assert_eq!(
+            placeholders.get("NOUS_API_KEY").map(String::as_str),
+            Some("NOUS_API_KEY")
         );
     }
 }

@@ -368,10 +368,8 @@ impl HermesChild {
                 }
                 Err(RecvTimeoutError::Timeout) => return Err(gateway_timeout()),
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(HarnessServerError::HarnessExited {
-                        kind: crate::HarnessKind::Codex,
+                    return Err(HarnessServerError::HermesExited {
                         status: self.child.wait()?,
-                        stderr: String::new(),
                     });
                 }
             }
@@ -583,10 +581,8 @@ fn run_hermes_turn<W: Write>(
             }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                return Err(HarnessServerError::HarnessExited {
-                    kind: crate::HarnessKind::Codex,
+                return Err(HarnessServerError::HermesExited {
                     status: child.child.wait()?,
-                    stderr: String::new(),
                 });
             }
         }
