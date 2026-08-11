@@ -54,6 +54,8 @@ class BrokerCredential < ApplicationRecord
   # undeliverable. The operator must remove the references first.
   before_destroy :ensure_not_referenced
   after_commit :auto_grant_matching_principals, on: %i[create update], if: :oauth_app_id?
+  after_commit :auto_link_matching_slack_dm_principals,
+               on: %i[create update], if: :slack_identity_link_relevant_change?
   before_validation :default_preqin_token_endpoint
   before_commit :bump_referencing_principal_sync_config_versions, if: :sync_config_relevant_change?
 
@@ -179,6 +181,19 @@ class BrokerCredential < ApplicationRecord
 
   def auto_grant_matching_principals
     PrincipalCredentialReconciliation.new.apply_for_credential(self)
+  end
+
+  def auto_link_matching_slack_dm_principals
+    PrincipalConsoleUserReconciliation.new.apply_for_slack_credential(self)
+  rescue StandardError => e
+    Rails.logger.warn("principal_console_user_reconciliation_failed source=broker_credential error=#{e.class}")
+  end
+
+  def slack_identity_link_relevant_change?
+    return false unless oauth_app&.provider == Oauth::Providers::Slack::KEY
+
+    previously_new_record? ||
+      (previous_changes.keys & %w[oauth_app_id created_by_id provider_subject labels]).any?
   end
 
   def perform_refresh

@@ -2,18 +2,26 @@ require "test_helper"
 
 class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
   setup do
+    users(:member_user).user_identities.create!(
+      provider: "slack",
+      subject: "U5123456789",
+      team_id: "T5123456789",
+      email: users(:member_user).email,
+      email_verified: true
+    )
     principal = Principal.create!(
       namespace: "sandbox-skill-test",
-      foreign_id: "console-user-member",
+      foreign_id: "slack-user-t5123456789-u5123456789",
       name: "Member User",
-      kind: :console_user,
-      console_user: users(:member_user),
-      console_user_email: users(:member_user).email,
+      kind: :slack_dm,
+      slack_user_id: "U5123456789",
+      slack_team_id: "T5123456789",
       labels: {},
       created_by: users(:member_user)
     )
-    @member_proxy = Proxy.create!(
-      name: "member-console-proxy",
+    assert_equal users(:member_user), principal.console_user
+    @slack_dm_proxy = Proxy.create!(
+      name: "member-slack-dm-proxy",
       principal: principal,
       bearer_token_hash: Digest::SHA256.hexdigest("iprx_#{'d' * 64}")
     )
@@ -21,7 +29,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "user principal sees its private skills and shared skills" do
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       get "/api/v1/sandbox/skills", headers: headers
     end
     assert_response :ok
@@ -43,20 +51,20 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "search is principal scoped and read returns current content" do
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       get "/api/v1/sandbox/skills/search", params: { q: "production incidents" }, headers: headers
     end
     assert_response :ok
     assert_equal skills(:member_private).oid, json_body.dig("data", 0, "id")
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
     end
     assert_response :ok
     assert_equal skills(:member_private).skill_document, json_body.dig("data", "document")
     assert_equal "no-store", response.headers["Cache-Control"]
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       get "/api/v1/sandbox/skills/#{skills(:member_private).name}", headers: headers
     end
     assert_response :ok
@@ -80,8 +88,8 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
   end
 
-  test "console user principal authors through the sandbox namespace" do
-    with_token(@member_proxy) do |headers|
+  test "automatically linked Slack DM principal authors through the sandbox namespace" do
+    with_token(@slack_dm_proxy) do |headers|
       post "/api/v1/sandbox/skills",
            params: {
              data: {
@@ -98,7 +106,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "shared", skill.visibility
     assert_not_nil skill.shared_at
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       patch "/api/v1/sandbox/skills/#{skill.oid}",
             params: {
               data: {
@@ -115,19 +123,19 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Updated through the sandbox API.", skill.reload.description
     assert_includes skill.content, "Updated instructions."
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       post "/api/v1/sandbox/skills/#{skill.oid}/share", headers: headers
     end
     assert_response :ok
     assert skill.reload.shared?
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       post "/api/v1/sandbox/skills/#{skill.oid}/unshare", headers: headers
     end
     assert_response :ok
     assert_not skill.reload.shared?
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       delete "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
     end
     assert_response :no_content
@@ -152,13 +160,58 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_response :forbidden
   end
 
+  test "unmatched and disabled Slack DM principals remain shared-only" do
+    unmatched_proxy = create_slack_dm_proxy(
+      name: "unmatched-slack-dm-proxy",
+      slack_user_id: "U5223456789",
+      slack_team_id: "T5223456789"
+    )
+    users(:disabled_user).user_identities.create!(
+      provider: "slack",
+      subject: "U5323456789",
+      team_id: "T5323456789",
+      email: users(:disabled_user).email,
+      email_verified: true
+    )
+    disabled_proxy = create_slack_dm_proxy(
+      name: "disabled-slack-dm-proxy",
+      slack_user_id: "U5323456789",
+      slack_team_id: "T5323456789"
+    )
+    assert_equal users(:disabled_user), disabled_proxy.principal.console_user
+
+    [ unmatched_proxy, disabled_proxy ].each do |proxy|
+      with_token(proxy) do |headers|
+        get "/api/v1/sandbox/skills", headers: headers
+      end
+      assert_response :ok
+      assert_equal [ skills(:admin_shared).oid ], json_body.fetch("data").map { |skill| skill.fetch("id") }
+
+      assert_no_difference("Skill.count") do
+        with_token(proxy) do |headers|
+          post "/api/v1/sandbox/skills",
+               params: {
+                 data: {
+                   name: "forbidden-#{proxy.name}",
+                   description: "Must not be created.",
+                   instructions: "# Instructions"
+                 }
+               },
+               headers: headers,
+               as: :json
+        end
+      end
+      assert_response :forbidden
+    end
+  end
+
   test "duplicate-name create races return a validation response" do
     duplicate_race = lambda do |skill|
       raise ActiveRecord::RecordNotUnique, "duplicate skill name" if skill.name == "duplicate-skill"
     end
     Skill.set_callback(:validation, :after, duplicate_race)
 
-    with_token(@member_proxy) do |headers|
+    with_token(@slack_dm_proxy) do |headers|
       post "/api/v1/sandbox/skills",
            params: {
              data: {
@@ -179,14 +232,31 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
 
   test "rejects a token after its proxy principal changes" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
-      token = SandboxEntitlements::Jwt.encode_for_proxy(@member_proxy)
-      @member_proxy.update!(principal: principals(:acme_channel))
+      token = SandboxEntitlements::Jwt.encode_for_proxy(@slack_dm_proxy)
+      @slack_dm_proxy.update!(principal: principals(:acme_channel))
       get "/api/v1/sandbox/skills", headers: auth_headers(token)
     end
     assert_response :unauthorized
   end
 
   private
+
+  def create_slack_dm_proxy(name:, slack_user_id:, slack_team_id:)
+    principal = Principal.create!(
+      namespace: "sandbox-skill-test",
+      foreign_id: "#{name}-principal",
+      name: name,
+      kind: "slack_dm",
+      slack_user_id: slack_user_id,
+      slack_team_id: slack_team_id,
+      created_by: users(:acme_admin)
+    )
+    Proxy.create!(
+      name: name,
+      principal: principal,
+      bearer_token_hash: Digest::SHA256.hexdigest("iprx_#{name.ljust(64, '0').first(64)}")
+    )
+  end
 
   def with_token(proxy)
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do

@@ -27,6 +27,7 @@ class Principal < ApplicationRecord
   before_validation :apply_sandbox_repo_cache_label
   before_validation :validate_identity_label_consistency
   before_validation :promote_identity_labels_to_fields
+  before_validation :link_console_user_from_slack_identity
   before_validation :strip_identity_labels
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
@@ -255,6 +256,12 @@ class Principal < ApplicationRecord
   # authoritative.
   def promote_identity_labels_to_fields
     PrincipalIdentityLabels.assign(self)
+  end
+
+  def link_console_user_from_slack_identity
+    PrincipalConsoleUserReconciliation.new.assign_for_principal(self)
+  rescue StandardError => e
+    Rails.logger.warn("principal_console_user_reconciliation_failed source=principal error=#{e.class}")
   end
 
   def strip_identity_labels
