@@ -1,36 +1,27 @@
 //! Hermes Agent harness — drives `hermes-agent`'s `tui_gateway` JSON-RPC
-//! stdio wire as a first-class Centaur harness.
+//! stdio wire as a Centaur harness.
 //!
 //! Unlike claude/amp (spawn-per-turn stream-json CLIs), Hermes ships a
 //! long-lived JSON-RPC gateway (`python -m tui_gateway.entry`) that owns the
 //! agent loop, durable session store, skills, persistent memory, background
 //! self-improvement reviews, and the cron scheduler. This runtime therefore
-//! mirrors the codex runtime shape: one persistent child per sandbox, a
+//! mirrors the codex runtime shape — one persistent child per sandbox, a
 //! handshake (`gateway.ready` → `session.create`), then one `prompt.submit`
-//! per turn with events pumped into the shared `CodexTurnNormalizer`.
+//! per turn with events pumped into the shared `CodexTurnNormalizer`:
 //!
-//! What "first-class" means here (vs. driving `hermes -z` one-shots):
-//! - **Session continuity**: one Hermes session per Centaur thread; the
-//!   prompt cache and conversation history survive across turns, and
-//!   `HERMES_CONTINUE_SESSION_ID` resumes the durable session after a
-//!   sandbox restart.
-//! - **Learning loop**: the background memory/skill review forks Hermes
-//!   spawns after turns run inside the same process and write to the
-//!   sandbox-mounted HERMES_HOME, so memories and skills accumulate.
-//! - **Crons**: Hermes cron jobs created during a conversation are ticked
-//!   by this runtime (`hermes cron tick` every `HERMES_CRON_TICK_SECONDS`,
-//!   cross-process file-locked on Hermes's side), so scheduled work fires
-//!   for as long as the sandbox lives.
-//! - **Interrupts**: Centaur's blocks `interrupt` maps to Hermes's
-//!   `session.interrupt` RPC — the turn ends as Interrupted without
-//!   killing the child, preserving the session for the next turn.
+//! - `message.delta`                       → AgentTextDelta
+//! - `reasoning.delta` / `thinking.delta`  → ReasoningTextDelta
+//! - `tool.start`                          → AssistantMessage(ToolUse)
+//! - `tool.complete`                       → ToolResults
+//! - `turn.usage`                          → TokenUsage
+//! - `message.complete`                    → AssistantMessage(final) + Result
 //!
-//! Wire mapping (Hermes event → NormalizedEvent):
-//! - `message.delta {text}`         → AgentTextDelta
-//! - `reasoning.delta`/`thinking.delta {text}` → ReasoningTextDelta
-//! - `tool.start {tool_id,name,args}`  → AssistantMessage(ToolUse)
-//! - `tool.complete {tool_id,result}`  → ToolResults
-//! - `message.complete {text,status}`  → AssistantMessage(final) + Result
+//! Because the gateway (not this process) owns the agent loop, Hermes's
+//! session history, prompt cache, learning loop, and cron jobs all survive
+//! across turns. `HERMES_CONTINUE_SESSION_ID` resumes the durable session
+//! after a sandbox restart (the hermes counterpart of
+//! `CODEX_CONTINUE_THREAD_ID`), and Centaur's `interrupt` maps to Hermes's
+//! `session.interrupt` — the turn ends Interrupted while the session lives on.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -48,9 +39,15 @@ use crate::traits::{
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::write_value;
+use crate::wire::notification_to_wire_value;
 use crate::{HarnessServerError, Result};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Gateway startup + RPC response budget. Generous because a cold Hermes
+/// start imports its agent stack and may run MCP discovery first.
+const RPC_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long an interrupted turn may take to deliver its terminal
+/// `message.complete` before we stop draining and move on.
+const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CRON_TICK_SECONDS: u64 = 60;
 
 /// Entry point for `harness-server hermes`.
@@ -71,28 +68,23 @@ pub fn run_hermes_blocks_server() -> Result<()> {
             if trimmed.is_empty() {
                 continue;
             }
-            match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                Ok(BlocksCommand::Interrupt) => {
-                    if interrupt_tx.send(()).is_err() {
-                        break;
-                    }
-                }
-                Ok(command) => {
-                    if command_tx.send(Ok(command)).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    if command_tx.send(Err(error.to_string())).is_err() {
-                        break;
-                    }
-                }
+            let sent = match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
+                Ok(BlocksCommand::Interrupt) => interrupt_tx.send(()).is_ok(),
+                Ok(command) => command_tx.send(Ok(command)).is_ok(),
+                Err(error) => command_tx.send(Err(error.to_string())).is_ok(),
+            };
+            if !sent {
+                break;
             }
         }
     });
 
-    let mut turn_counter = 0u64;
+    let mut turn = 0u64;
     while let Ok(input) = command_rx.recv() {
+        let thread_id = hermes
+            .as_ref()
+            .map_or("hermes", HermesChild::thread_id)
+            .to_owned();
         match input {
             Ok(BlocksCommand::User {
                 input,
@@ -102,33 +94,25 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                 reasoning,
                 trace_context: _,
             }) => {
-                turn_counter += 1;
-                let result = (|| -> Result<()> {
-                    if hermes.is_none() {
-                        hermes = Some(HermesChild::start(model.clone())?);
-                    }
-                    let child = hermes.as_mut().expect("hermes started");
+                turn += 1;
+                let result = ensure_child(&mut hermes, model).and_then(|child| {
                     run_hermes_turn(
                         child,
                         &mut stdout,
                         input,
                         client_user_message_id,
                         reasoning,
-                        turn_counter,
+                        turn,
                         &interrupt_rx,
                     )
-                })();
+                });
                 if let Err(error) = result {
-                    let thread_id = hermes
-                        .as_ref()
-                        .map(|child| child.thread_id())
-                        .unwrap_or("hermes");
                     eprintln!("Hermes blocks turn failed: {error:#}");
-                    write_blocks_error(&mut stdout, thread_id, "turn", error.to_string())?;
-                    // A dead child cannot serve the next turn; drop it so the
-                    // next user message restarts Hermes and resumes the durable
+                    write_blocks_error(&mut stdout, &thread_id, "turn", error.to_string())?;
+                    // A dead gateway cannot serve the next turn; drop it so the
+                    // next message restarts Hermes and resumes the durable
                     // session via HERMES_CONTINUE_SESSION_ID.
-                    if hermes.as_mut().is_some_and(|c| !c.is_alive()) {
+                    if hermes.as_mut().is_some_and(|child| !child.is_alive()) {
                         hermes = None;
                     }
                 }
@@ -139,11 +123,7 @@ pub fn run_hermes_blocks_server() -> Result<()> {
             Ok(BlocksCommand::AttachmentChunk) => {}
             Err(error) => {
                 eprintln!("invalid Hermes blocks input: {error}");
-                let thread_id = hermes
-                    .as_ref()
-                    .map(|child| child.thread_id())
-                    .unwrap_or("hermes");
-                write_blocks_error(&mut stdout, thread_id, "input", error)?;
+                write_blocks_error(&mut stdout, &thread_id, "input", error)?;
             }
         }
         // Drain interrupts that arrived between turns so a stale one cannot
@@ -153,11 +133,20 @@ pub fn run_hermes_blocks_server() -> Result<()> {
     Ok(())
 }
 
+fn ensure_child(
+    hermes: &mut Option<HermesChild>,
+    model: Option<String>,
+) -> Result<&mut HermesChild> {
+    if hermes.is_none() {
+        *hermes = Some(HermesChild::start(model)?);
+    }
+    Ok(hermes.as_mut().expect("hermes started"))
+}
+
 /// Tick `hermes cron tick` on an interval so cron jobs created inside the
 /// conversation fire while the sandbox lives. Hermes serializes ticks
-/// cross-process with a file lock, so this is safe alongside any other
-/// Hermes process on the same HERMES_HOME. `HERMES_CRON_TICK_SECONDS=0`
-/// disables the ticker.
+/// cross-process with a file lock, so this is safe alongside any other Hermes
+/// process on the same HERMES_HOME. `HERMES_CRON_TICK_SECONDS=0` disables it.
 fn spawn_cron_ticker() {
     let interval = env::var("HERMES_CRON_TICK_SECONDS")
         .ok()
@@ -166,7 +155,7 @@ fn spawn_cron_ticker() {
     if interval == 0 {
         return;
     }
-    let bin = hermes_bin();
+    let bin = env::var("HERMES_BIN").unwrap_or_else(|_| "hermes".to_string());
     thread::spawn(move || {
         let mut warned = false;
         loop {
@@ -187,26 +176,6 @@ fn spawn_cron_ticker() {
     });
 }
 
-fn hermes_bin() -> String {
-    env::var("HERMES_BIN").unwrap_or_else(|_| "hermes".to_string())
-}
-
-fn hermes_gateway_command() -> ProcessCommand {
-    // The JSON-RPC gateway is a Python module, not a `hermes` subcommand.
-    // HERMES_PYTHON overrides the interpreter (sandbox venvs).
-    let python = env::var("HERMES_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let mut command = ProcessCommand::new(python);
-    command.args(["-m", "tui_gateway.entry"]);
-    command.env("HERMES_QUIET", "1");
-    // Centaur owns approval policy at the sandbox boundary (iron-proxy egress,
-    // placeholder credentials); inside the sandbox Hermes runs unattended.
-    command.env(
-        "HERMES_APPROVAL_MODE",
-        env::var("HERMES_APPROVAL_MODE").unwrap_or_else(|_| "off".to_string()),
-    );
-    command
-}
-
 struct HermesChild {
     child: Child,
     stdin: ChildStdin,
@@ -224,7 +193,18 @@ impl Drop for HermesChild {
 
 impl HermesChild {
     fn start(model: Option<String>) -> Result<Self> {
-        let mut child = hermes_gateway_command()
+        // The JSON-RPC gateway is a Python module, not a `hermes` subcommand;
+        // HERMES_PYTHON points at the interpreter whose env has hermes-agent.
+        let python = env::var("HERMES_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let mut child = ProcessCommand::new(python)
+            .args(["-m", "tui_gateway.entry"])
+            .env("HERMES_QUIET", "1")
+            // Centaur owns approval policy at the sandbox boundary (isolated
+            // sandbox, iron-proxy egress); inside it Hermes runs unattended.
+            .env(
+                "HERMES_APPROVAL_MODE",
+                env::var("HERMES_APPROVAL_MODE").unwrap_or_else(|_| "off".to_string()),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -247,6 +227,9 @@ impl HermesChild {
             .take()
             .ok_or(HarnessServerError::HarnessStderrUnavailable)?;
         thread::spawn(move || {
+            // Unlocked handle on purpose: the child lives across turns, so
+            // holding the StderrLock for the copy's lifetime would block
+            // every eprintln! in the server until the child exits.
             let mut parent_stderr = io::stderr();
             let _ = io::copy(&mut stderr, &mut parent_stderr);
         });
@@ -286,21 +269,16 @@ impl HermesChild {
     }
 
     fn wait_for_gateway_ready(&mut self) -> Result<()> {
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let deadline = Instant::now() + RPC_TIMEOUT;
         loop {
-            let frame = self.read_frame_until(deadline)?;
-            if frame.get("method").and_then(Value::as_str) == Some("event")
-                && frame.pointer("/params/type").and_then(Value::as_str) == Some("gateway.ready")
-            {
+            if event_type(&self.read_frame_until(deadline)?) == Some("gateway.ready".to_string()) {
                 return Ok(());
             }
         }
     }
 
     /// Create the thread's Hermes session, or resume the durable one after a
-    /// sandbox restart (`HERMES_CONTINUE_SESSION_ID`, persisted by the
-    /// session runtime from our `thread.started` output — mirrors
-    /// CODEX_CONTINUE_THREAD_ID).
+    /// sandbox restart.
     fn create_or_resume_session(&mut self, model: Option<String>) -> Result<()> {
         let resume = env::var("HERMES_CONTINUE_SESSION_ID").unwrap_or_default();
         let resume = resume.trim();
@@ -315,10 +293,7 @@ impl HermesChild {
 
         let mut params = json!({
             "cols": 200,
-            "cwd": env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
+            "cwd": env::current_dir().unwrap_or_default().to_string_lossy(),
             "title": "Centaur thread",
             "source": "centaur",
         });
@@ -338,28 +313,36 @@ impl HermesChild {
         Ok(())
     }
 
-    fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Send a request frame without waiting for the response (the caller
+    /// pumps the stream itself, as `run_hermes_turn` does for prompt.submit).
+    fn send_request(&mut self, method: &str, params: Value) -> Result<()> {
         self.next_rpc_id += 1;
-        let id = self.next_rpc_id;
         self.write_frame(&json!({
             "jsonrpc": "2.0",
-            "id": id,
+            "id": self.next_rpc_id,
             "method": method,
             "params": params,
-        }))?;
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        }))
+    }
+
+    /// Send a request and block for its response, dropping unrelated frames.
+    /// Only for out-of-turn RPCs (handshake, interrupt) — events skipped here
+    /// would be lost to the turn pump.
+    fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.send_request(method, params)?;
+        let id = self.next_rpc_id;
+        let deadline = Instant::now() + RPC_TIMEOUT;
         loop {
             let frame = self.read_frame_until(deadline)?;
-            if frame.get("id").and_then(Value::as_i64) == Some(id) {
-                if let Some(error) = frame.get("error") {
-                    return Err(HarnessServerError::Protocol(format!(
-                        "hermes {method} failed: {error}"
-                    )));
-                }
-                return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
+            if frame.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
             }
-            // Events and stale responses between request and response are
-            // dropped here; per-turn event pumping happens in run_hermes_turn.
+            if let Some(error) = frame.get("error") {
+                return Err(HarnessServerError::Protocol(format!(
+                    "hermes {method} failed: {error}"
+                )));
+            }
+            return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
         }
     }
 
@@ -372,36 +355,22 @@ impl HermesChild {
 
     fn read_frame_until(&mut self, deadline: Instant) -> Result<Value> {
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(HarnessServerError::Protocol(
-                    "timed out waiting for hermes gateway".to_string(),
-                ));
-            }
-            match self.stdout.recv_timeout(deadline - now) {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(gateway_timeout)?;
+            match self.stdout.recv_timeout(remaining) {
                 Ok(line) => {
-                    let line = line?;
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<Value>(trimmed) {
-                        Ok(value) => return Ok(value),
-                        // Hermes keeps its own stdout clean of non-JSON in
-                        // quiet mode; tolerate stray lines anyway.
-                        Err(_) => continue,
+                    // Hermes keeps stdout clean of non-JSON in quiet mode;
+                    // tolerate stray lines anyway.
+                    if let Ok(value) = serde_json::from_str::<Value>(line?.trim()) {
+                        return Ok(value);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(HarnessServerError::Protocol(
-                        "timed out waiting for hermes gateway".to_string(),
-                    ));
-                }
+                Err(RecvTimeoutError::Timeout) => return Err(gateway_timeout()),
                 Err(RecvTimeoutError::Disconnected) => {
-                    let status = self.child.wait()?;
                     return Err(HarnessServerError::HarnessExited {
                         kind: crate::HarnessKind::Codex,
-                        status,
+                        status: self.child.wait()?,
                         stderr: String::new(),
                     });
                 }
@@ -410,166 +379,119 @@ impl HermesChild {
     }
 }
 
-/// Per-turn translation state: Hermes emits deltas + one final
-/// `message.complete` whose text REPEATS the streamed content, so the final
-/// text must be reconciled (suffix-delta) rather than double-emitted —
-/// `CodexTurnNormalizer::emit_agent_text` already handles that when the final
-/// AssistantMessage carries the full canonical text.
-#[derive(Debug, Default)]
-pub struct HermesEventState {
-    text_item_id: Option<String>,
-    saw_error: Option<String>,
+fn gateway_timeout() -> HarnessServerError {
+    HarnessServerError::Protocol("timed out waiting for hermes gateway".to_string())
 }
 
-/// Translate one Hermes gateway event frame into normalized events.
-/// Returns `(events, terminal)`.
-pub fn normalize_hermes_frame(
-    state: &mut HermesEventState,
-    turn: u64,
-    frame: &Value,
-) -> (Vec<NormalizedEvent>, bool) {
-    if frame.get("method").and_then(Value::as_str) != Some("event") {
-        return (Vec::new(), false);
-    }
-    let params = frame.get("params").cloned().unwrap_or_default();
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    let payload = params.get("payload").cloned().unwrap_or_default();
+/// The `params.type` of an event frame, or None for responses/other frames.
+fn event_type(frame: &Value) -> Option<String> {
+    (frame.get("method").and_then(Value::as_str) == Some("event"))
+        .then(|| frame.pointer("/params/type").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_string)
+}
 
-    let text_item = state
-        .text_item_id
-        .get_or_insert_with(|| format!("hermes-msg-{turn}"))
-        .clone();
+/// Translate one Hermes gateway frame into normalized events. Pure: the text
+/// item id is deterministic per turn, and a failed turn's error rides the
+/// terminal `Result` event (which `CodexTurnNormalizer` latches into
+/// `last_error` for `finish_turn`). Terminal frames are recognized with the
+/// standard `NormalizedEvent::is_terminal()`.
+fn normalize_hermes_frame(turn: u64, frame: &Value) -> Vec<NormalizedEvent> {
+    let Some(kind) = event_type(frame) else {
+        return Vec::new();
+    };
+    let empty = json!({});
+    let payload = frame.pointer("/params/payload").unwrap_or(&empty);
+    let text_of = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
 
-    match kind {
-        "message.delta" => {
-            let delta = payload.get("text").and_then(Value::as_str).unwrap_or("");
-            if delta.is_empty() {
-                return (Vec::new(), false);
-            }
-            (
-                vec![NormalizedEvent::AgentTextDelta {
-                    item_id: text_item,
-                    delta: delta.to_string(),
-                }],
-                false,
-            )
+    match kind.as_str() {
+        "message.delta" if !text_of("text").is_empty() => vec![NormalizedEvent::AgentTextDelta {
+            item_id: format!("hermes-msg-{turn}"),
+            delta: text_of("text").to_string(),
+        }],
+        "reasoning.delta" | "thinking.delta" if !text_of("text").is_empty() => {
+            vec![NormalizedEvent::ReasoningTextDelta {
+                item_id: format!("hermes-reasoning-{turn}"),
+                delta: text_of("text").to_string(),
+            }]
         }
-        "reasoning.delta" | "thinking.delta" => {
-            let delta = payload.get("text").and_then(Value::as_str).unwrap_or("");
-            if delta.is_empty() {
-                return (Vec::new(), false);
-            }
-            (
-                vec![NormalizedEvent::ReasoningTextDelta {
-                    item_id: format!("hermes-reasoning-{turn}"),
-                    delta: delta.to_string(),
-                }],
-                false,
-            )
-        }
-        "tool.start" => {
-            let tool_id = payload
-                .get("tool_id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string();
-            let name = payload
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string();
-            let arguments = payload.get("args").cloned().unwrap_or(json!({}));
-            (
-                vec![NormalizedEvent::AssistantMessage {
-                    partial: false,
-                    stop_reason: None,
-                    content: vec![NormalizedContent::ToolUse {
-                        raw_id: tool_id,
-                        tool: name,
-                        arguments,
-                    }],
-                }],
-                false,
-            )
-        }
+        "tool.start" => vec![NormalizedEvent::AssistantMessage {
+            partial: false,
+            stop_reason: None,
+            content: vec![NormalizedContent::ToolUse {
+                raw_id: nonempty_or(text_of("tool_id"), "tool"),
+                tool: nonempty_or(text_of("name"), "tool"),
+                arguments: payload.get("args").cloned().unwrap_or(json!({})),
+            }],
+        }],
         "tool.complete" => {
-            let tool_id = payload
-                .get("tool_id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string();
-            let content = tool_result_text(&payload);
-            let is_error = payload
-                .get("result")
-                .map(|result| {
-                    result.get("success").and_then(Value::as_bool) == Some(false)
-                        || result.get("error").is_some_and(|e| !e.is_null())
-                })
-                .unwrap_or(false);
-            (
-                vec![NormalizedEvent::ToolResults(vec![NormalizedToolResult {
-                    tool_use_id: tool_id,
-                    content,
-                    is_error,
-                    exit_code: payload
-                        .pointer("/result/exit_code")
-                        .and_then(Value::as_i64)
-                        .map(|code| code as i32),
-                }])],
-                false,
-            )
+            let result = payload.get("result");
+            let is_error = result.is_some_and(|result| {
+                result.get("success").and_then(Value::as_bool) == Some(false)
+                    || result.get("error").is_some_and(|error| !error.is_null())
+            });
+            vec![NormalizedEvent::ToolResults(vec![NormalizedToolResult {
+                tool_use_id: nonempty_or(text_of("tool_id"), "tool"),
+                content: tool_result_text(payload),
+                is_error,
+                exit_code: payload
+                    .pointer("/result/exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|code| code as i32),
+            }])]
         }
         "turn.usage" | "session.usage" => {
+            let count = |key: &str| payload.get(key).and_then(Value::as_i64);
             let usage = NormalizedTokenUsage {
                 model: payload
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                input_tokens: payload.get("input_tokens").and_then(Value::as_i64),
-                output_tokens: payload.get("output_tokens").and_then(Value::as_i64),
+                input_tokens: count("input_tokens"),
+                output_tokens: count("output_tokens"),
                 cache_creation_input_tokens: None,
-                cache_read_input_tokens: payload.get("cached_tokens").and_then(Value::as_i64),
+                cache_read_input_tokens: count("cached_tokens"),
                 reasoning_output_tokens: None,
-                total_tokens: payload.get("total_tokens").and_then(Value::as_i64),
+                total_tokens: count("total_tokens"),
             };
             if usage.has_counts() {
-                (vec![NormalizedEvent::TokenUsage { usage }], false)
+                vec![NormalizedEvent::TokenUsage { usage }]
             } else {
-                (Vec::new(), false)
+                Vec::new()
             }
         }
         "message.complete" => {
-            let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
-            let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = text_of("text");
+            if text_of("status") == "error" {
+                let error = [text_of("error"), text, "hermes turn failed"]
+                    .into_iter()
+                    .find(|candidate| !candidate.is_empty())
+                    .expect("last candidate is non-empty")
+                    .to_string();
+                return vec![NormalizedEvent::Result { error: Some(error) }];
+            }
             let mut events = Vec::new();
-            if status == "error" {
-                let error =
-                    payload
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or(if text.is_empty() {
-                            "hermes turn failed"
-                        } else {
-                            text
-                        });
-                state.saw_error = Some(error.to_string());
-            } else if !text.is_empty() {
+            if !text.is_empty() {
+                // The final text repeats the streamed deltas; the normalizer's
+                // suffix-delta reconciliation prevents double emission.
                 events.push(NormalizedEvent::AssistantMessage {
                     partial: false,
                     stop_reason: Some("end_turn".to_string()),
                     content: vec![NormalizedContent::AgentText {
-                        item_id: text_item,
+                        item_id: format!("hermes-msg-{turn}"),
                         text: text.to_string(),
                     }],
                 });
             }
-            events.push(NormalizedEvent::Result {
-                error: state.saw_error.clone(),
-            });
-            (events, true)
+            events.push(NormalizedEvent::Result { error: None });
+            events
         }
-        _ => (Vec::new(), false),
+        _ => Vec::new(),
     }
+}
+
+fn nonempty_or(value: &str, fallback: &str) -> String {
+    if value.is_empty() { fallback } else { value }.to_string()
 }
 
 fn tool_result_text(payload: &Value) -> String {
@@ -596,10 +518,7 @@ fn run_hermes_turn<W: Write>(
     turn: u64,
     interrupt_rx: &Receiver<()>,
 ) -> Result<()> {
-    use crate::wire::notification_to_wire_value;
-
-    let turn_id = format!("turn-{turn}");
-    let mut config = BridgeConfig::new(child.thread_id().to_string(), turn_id);
+    let mut config = BridgeConfig::new(child.thread_id().to_string(), format!("turn-{turn}"));
     config.cli_version = "hermes".to_string();
     config.model_provider = "hermes".to_string();
     let mut normalizer = CodexTurnNormalizer::new(config);
@@ -611,35 +530,28 @@ fn run_hermes_turn<W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
 
-    let text = user_input_text(&input);
     let mut params = json!({
         "session_id": child.session_id,
-        "text": text,
+        "text": user_input_text(&input),
     });
     if let Some(reasoning) = reasoning.filter(|value| !value.trim().is_empty()) {
         params["reasoning_effort"] = Value::String(reasoning);
     }
-    child.next_rpc_id += 1;
-    let submit_id = child.next_rpc_id;
-    child.write_frame(&json!({
-        "jsonrpc": "2.0",
-        "id": submit_id,
-        "method": "prompt.submit",
-        "params": params,
-    }))?;
+    child.send_request("prompt.submit", params)?;
 
-    let mut state = HermesEventState::default();
     loop {
         if interrupt_rx.try_recv().is_ok() {
-            let session_id = child.session_id.clone();
-            let _ = child.rpc("session.interrupt", json!({"session_id": session_id}));
-            // Hermes ends the interrupted turn with its own message.complete;
-            // keep pumping until it arrives (bounded) so the trailing terminal
-            // frame can't leak into the next turn.
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let params = json!({"session_id": child.session_id});
+            let _ = child.rpc("session.interrupt", params);
+            // Hermes ends the interrupted turn with its own terminal frame;
+            // drain until it arrives (bounded) so it can't leak into the
+            // next turn as an instant terminal.
+            let deadline = Instant::now() + INTERRUPT_DRAIN_TIMEOUT;
             while let Ok(frame) = child.read_frame_until(deadline) {
-                let (_, terminal) = normalize_hermes_frame(&mut state, turn, &frame);
-                if terminal {
+                if normalize_hermes_frame(turn, &frame)
+                    .iter()
+                    .any(NormalizedEvent::is_terminal)
+                {
                     break;
                 }
             }
@@ -651,22 +563,19 @@ fn run_hermes_turn<W: Write>(
 
         match child.stdout.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => {
-                let line = line?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(frame) = serde_json::from_str::<Value>(trimmed) else {
+                let Ok(frame) = serde_json::from_str::<Value>(line?.trim()) else {
                     continue;
                 };
-                let (events, terminal) = normalize_hermes_frame(&mut state, turn, &frame);
-                for event in events {
+                let mut terminal = false;
+                for event in normalize_hermes_frame(turn, &frame) {
+                    terminal |= event.is_terminal();
                     for notification in normalizer.process_event(&event)? {
                         write_value(stdout, &notification_to_wire_value(&notification)?)?;
                     }
                 }
                 if terminal {
-                    if let Some(notification) = normalizer.finish_turn(state.saw_error.clone())? {
+                    // A failed turn's error was latched from the Result event.
+                    if let Some(notification) = normalizer.finish_turn(None)? {
                         write_value(stdout, &notification_to_wire_value(&notification)?)?;
                     }
                     return Ok(());
@@ -674,10 +583,9 @@ fn run_hermes_turn<W: Write>(
             }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                let status = child.child.wait()?;
                 return Err(HarnessServerError::HarnessExited {
                     kind: crate::HarnessKind::Codex,
-                    status,
+                    status: child.child.wait()?,
                     stderr: String::new(),
                 });
             }
@@ -709,7 +617,7 @@ mod tests {
 
     use crate::traits::{NormalizedContent, NormalizedEvent};
 
-    use super::{HermesEventState, normalize_hermes_frame};
+    use super::normalize_hermes_frame;
 
     fn frame(kind: &str, payload: serde_json::Value) -> serde_json::Value {
         json!({
@@ -719,15 +627,14 @@ mod tests {
         })
     }
 
+    fn is_terminal(events: &[NormalizedEvent]) -> bool {
+        events.iter().any(NormalizedEvent::is_terminal)
+    }
+
     #[test]
     fn message_delta_becomes_agent_text_delta() {
-        let mut state = HermesEventState::default();
-        let (events, terminal) = normalize_hermes_frame(
-            &mut state,
-            1,
-            &frame("message.delta", json!({"text": "hi"})),
-        );
-        assert!(!terminal);
+        let events = normalize_hermes_frame(1, &frame("message.delta", json!({"text": "hi"})));
+        assert!(!is_terminal(&events));
         assert!(matches!(
             &events[..],
             [NormalizedEvent::AgentTextDelta { delta, .. }] if delta == "hi"
@@ -736,12 +643,8 @@ mod tests {
 
     #[test]
     fn reasoning_delta_becomes_reasoning_text_delta() {
-        let mut state = HermesEventState::default();
-        let (events, _) = normalize_hermes_frame(
-            &mut state,
-            1,
-            &frame("reasoning.delta", json!({"text": "thinking"})),
-        );
+        let events =
+            normalize_hermes_frame(1, &frame("reasoning.delta", json!({"text": "thinking"})));
         assert!(matches!(
             &events[..],
             [NormalizedEvent::ReasoningTextDelta { delta, .. }] if delta == "thinking"
@@ -750,9 +653,7 @@ mod tests {
 
     #[test]
     fn tool_start_and_complete_round_trip() {
-        let mut state = HermesEventState::default();
-        let (start_events, _) = normalize_hermes_frame(
-            &mut state,
+        let start_events = normalize_hermes_frame(
             1,
             &frame(
                 "tool.start",
@@ -768,8 +669,7 @@ mod tests {
                 if raw_id == "t1" && tool == "terminal"
         ));
 
-        let (complete_events, _) = normalize_hermes_frame(
-            &mut state,
+        let complete_events = normalize_hermes_frame(
             1,
             &frame(
                 "tool.complete",
@@ -786,18 +686,11 @@ mod tests {
 
     #[test]
     fn message_complete_finishes_turn_with_canonical_text() {
-        let mut state = HermesEventState::default();
-        let _ = normalize_hermes_frame(
-            &mut state,
-            1,
-            &frame("message.delta", json!({"text": "par"})),
-        );
-        let (events, terminal) = normalize_hermes_frame(
-            &mut state,
+        let events = normalize_hermes_frame(
             1,
             &frame("message.complete", json!({"text": "partial then final"})),
         );
-        assert!(terminal);
+        assert!(is_terminal(&events));
         assert!(matches!(
             &events[..],
             [
@@ -812,16 +705,14 @@ mod tests {
 
     #[test]
     fn message_complete_error_becomes_failed_result() {
-        let mut state = HermesEventState::default();
-        let (events, terminal) = normalize_hermes_frame(
-            &mut state,
+        let events = normalize_hermes_frame(
             1,
             &frame(
                 "message.complete",
                 json!({"text": "boom", "status": "error", "error": "provider 500"}),
             ),
         );
-        assert!(terminal);
+        assert!(is_terminal(&events));
         assert!(matches!(
             &events[..],
             [NormalizedEvent::Result { error: Some(error) }] if error == "provider 500"
@@ -829,10 +720,23 @@ mod tests {
     }
 
     #[test]
+    fn message_complete_error_falls_back_to_text() {
+        let events = normalize_hermes_frame(
+            1,
+            &frame(
+                "message.complete",
+                json!({"text": "boom", "status": "error"}),
+            ),
+        );
+        assert!(matches!(
+            &events[..],
+            [NormalizedEvent::Result { error: Some(error) }] if error == "boom"
+        ));
+    }
+
+    #[test]
     fn tool_complete_marks_failures() {
-        let mut state = HermesEventState::default();
-        let (events, _) = normalize_hermes_frame(
-            &mut state,
+        let events = normalize_hermes_frame(
             1,
             &frame(
                 "tool.complete",
@@ -847,30 +751,22 @@ mod tests {
 
     #[test]
     fn unknown_events_are_ignored() {
-        let mut state = HermesEventState::default();
-        let (events, terminal) =
-            normalize_hermes_frame(&mut state, 1, &frame("session.info", json!({"model": "x"})));
+        let events = normalize_hermes_frame(1, &frame("session.info", json!({"model": "x"})));
         assert!(events.is_empty());
-        assert!(!terminal);
     }
 
     #[test]
     fn non_event_frames_are_ignored() {
-        let mut state = HermesEventState::default();
-        let (events, terminal) = normalize_hermes_frame(
-            &mut state,
+        let events = normalize_hermes_frame(
             1,
             &json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}),
         );
         assert!(events.is_empty());
-        assert!(!terminal);
     }
 
     #[test]
     fn usage_event_maps_token_counts() {
-        let mut state = HermesEventState::default();
-        let (events, _) = normalize_hermes_frame(
-            &mut state,
+        let events = normalize_hermes_frame(
             1,
             &frame(
                 "turn.usage",
