@@ -2028,6 +2028,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
+        HarnessType::Hermes => "hermes",
     }
 }
 
@@ -2045,6 +2046,9 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        // Hermes resolves providers through its own credential store /
+        // iron-proxy placeholder injection; no dedicated auth-mode env.
+        HarnessType::Hermes => None,
     }
 }
 
