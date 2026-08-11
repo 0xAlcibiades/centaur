@@ -3,9 +3,8 @@ require "test_helper"
 class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
   setup do
     users(:member_user).user_identities.create!(
-      provider: "slack",
-      subject: "U5123456789",
-      team_id: "T5123456789",
+      provider: "google",
+      subject: "google-member-skill-user",
       email: users(:member_user).email,
       email_verified: true
     )
@@ -16,6 +15,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
       kind: :slack_dm,
       slack_user_id: "U5123456789",
       slack_team_id: "T5123456789",
+      slack_email: users(:member_user).email,
       labels: {},
       created_by: users(:member_user)
     )
@@ -167,16 +167,16 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
       slack_team_id: "T5223456789"
     )
     users(:disabled_user).user_identities.create!(
-      provider: "slack",
-      subject: "U5323456789",
-      team_id: "T5323456789",
+      provider: "google",
+      subject: "google-disabled-skill-user",
       email: users(:disabled_user).email,
       email_verified: true
     )
     disabled_proxy = create_slack_dm_proxy(
       name: "disabled-slack-dm-proxy",
       slack_user_id: "U5323456789",
-      slack_team_id: "T5323456789"
+      slack_team_id: "T5323456789",
+      slack_email: users(:disabled_user).email
     )
     assert_equal users(:disabled_user), disabled_proxy.principal.console_user
 
@@ -241,7 +241,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
 
   private
 
-  def create_slack_dm_proxy(name:, slack_user_id:, slack_team_id:)
+  def create_slack_dm_proxy(name:, slack_user_id:, slack_team_id:, slack_email: nil)
     principal = Principal.create!(
       namespace: "sandbox-skill-test",
       foreign_id: "#{name}-principal",
@@ -249,6 +249,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
       kind: "slack_dm",
       slack_user_id: slack_user_id,
       slack_team_id: slack_team_id,
+      slack_email: slack_email,
       created_by: users(:acme_admin)
     )
     Proxy.create!(

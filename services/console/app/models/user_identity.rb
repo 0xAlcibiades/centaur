@@ -21,7 +21,7 @@ class UserIdentity < ApplicationRecord
   after_commit :reconcile_owner_oauth_credentials,
                on: %i[create update], if: :slack_identity_reconciliation_required?
   after_commit :link_slack_dm_principals,
-               on: %i[create update], if: :slack_identity_reconciliation_required?
+               on: %i[create update], if: :console_user_link_reconciliation_required?
 
   normalizes :email, with: ->(e) { e.to_s.strip.downcase.presence }
   normalizes :team_id, with: ->(id) { id.to_s.strip.presence }
@@ -53,12 +53,20 @@ class UserIdentity < ApplicationRecord
   private
 
   def slack_identity_reconciliation_required?
-    slack? && (previously_new_record? || saved_change_to_subject? ||
+    slack? && (previously_new_record? || saved_change_to_provider? || saved_change_to_subject? ||
       saved_change_to_team_id? || saved_change_to_user_id?)
   end
 
+  def console_user_link_reconciliation_required?
+    return true if slack_identity_reconciliation_required?
+
+    email_verified? && email.present? &&
+      (previously_new_record? || saved_change_to_email? ||
+        saved_change_to_email_verified? || saved_change_to_user_id?)
+  end
+
   def link_slack_dm_principals
-    PrincipalConsoleUserReconciliation.new.apply_for_slack_identity(self)
+    PrincipalConsoleUserReconciliation.new.apply_for_user_identity(self)
   rescue StandardError => e
     Rails.logger.warn("principal_console_user_reconciliation_failed source=user_identity error=#{e.class}")
   end

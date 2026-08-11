@@ -103,25 +103,23 @@ class PrincipalConsoleUserReconciliationTest < ActiveSupport::TestCase
     assert_equal user, principal.reload.console_user
   end
 
-  test "deduplicates SSO and OAuth evidence owned by the same user" do
+  test "deduplicates Slack and verified email evidence owned by the same user" do
     user = users(:member_user)
     create_slack_identity(user:, slack_user_id: "U2523456789", slack_team_id: "T2523456789")
     create_slack_credential(user:, slack_user_id: "U2523456789", slack_team_id: "T2523456789")
+    create_google_identity(user:, email: "same-user@example.com")
 
     principal = create_slack_dm_principal(
       slack_user_id: "U2523456789",
-      slack_team_id: "T2523456789"
+      slack_team_id: "T2523456789",
+      slack_email: "same-user@example.com"
     )
 
     assert_equal user, principal.console_user
   end
 
   test "does not link when authenticated sources resolve to different users" do
-    create_slack_identity(
-      user: users(:member_user),
-      slack_user_id: "U2623456789",
-      slack_team_id: "T2623456789"
-    )
+    create_google_identity(user: users(:member_user), email: "conflict@example.com")
     create_slack_credential(
       user: users(:acme_admin),
       slack_user_id: "U2623456789",
@@ -130,20 +128,66 @@ class PrincipalConsoleUserReconciliationTest < ActiveSupport::TestCase
 
     principal = create_slack_dm_principal(
       slack_user_id: "U2623456789",
-      slack_team_id: "T2623456789"
+      slack_team_id: "T2623456789",
+      slack_email: "conflict@example.com"
     )
 
     assert_nil principal.console_user
     assert_nil principal.console_user_email
   end
 
-  test "does not use Slack email as identity evidence" do
+  test "links through a Slack profile email matching a verified Google identity" do
     user = users(:member_user)
+    create_google_identity(user:, email: "Person@Example.com")
 
     principal = create_slack_dm_principal(
       slack_user_id: "U2723456789",
       slack_team_id: "T2723456789",
-      slack_email: user.email
+      slack_email: "PERSON@EXAMPLE.COM"
+    )
+
+    assert_equal user, principal.console_user
+    assert_equal user.email, principal.console_user_email
+  end
+
+  test "links an existing Slack DM when a verified Google identity arrives" do
+    user = users(:member_user)
+    principal = create_slack_dm_principal(
+      slack_user_id: "U3523456789",
+      slack_team_id: "T3523456789",
+      slack_email: "late-google@example.com"
+    )
+
+    assert_nil principal.console_user
+    create_google_identity(user:, email: "late-google@example.com")
+
+    assert_equal user, principal.reload.console_user
+  end
+
+  test "waits for an identity email to become verified" do
+    user = users(:member_user)
+    identity = create_google_identity(user:, email: "unverified@example.com", email_verified: false)
+
+    principal = create_slack_dm_principal(
+      slack_user_id: "U3623456789",
+      slack_team_id: "T3623456789",
+      slack_email: "unverified@example.com"
+    )
+
+    assert_nil principal.console_user
+    identity.update!(email_verified: true)
+
+    assert_equal user, principal.reload.console_user
+  end
+
+  test "does not link when a verified email belongs to multiple users" do
+    create_google_identity(user: users(:member_user), email: "shared@example.com")
+    create_google_identity(user: users(:acme_admin), email: "shared@example.com")
+
+    principal = create_slack_dm_principal(
+      slack_user_id: "U3723456789",
+      slack_team_id: "T3723456789",
+      slack_email: "shared@example.com"
     )
 
     assert_nil principal.console_user
@@ -197,16 +241,12 @@ class PrincipalConsoleUserReconciliationTest < ActiveSupport::TestCase
     assert_equal existing_user.email, principal.console_user_email
   end
 
-  test "source callback failures do not abort Slack identity or credential writes" do
+  test "source callback failures do not abort SSO identity or credential writes" do
     failure = proc { raise "boom" }
 
     PrincipalConsoleUserReconciliation.stub(:new, failure) do
       assert_difference("UserIdentity.count", 1) do
-        create_slack_identity(
-          user: users(:member_user),
-          slack_user_id: "U3123456789",
-          slack_team_id: "T3123456789"
-        )
+        create_google_identity(user: users(:member_user), email: "failure@example.com")
       end
 
       assert_difference("BrokerCredential.count", 1) do
@@ -228,6 +268,15 @@ class PrincipalConsoleUserReconciliationTest < ActiveSupport::TestCase
       team_id: slack_team_id,
       email: user.email,
       email_verified: true
+    )
+  end
+
+  def create_google_identity(user:, email:, email_verified: true)
+    user.user_identities.create!(
+      provider: "google",
+      subject: "google-#{SecureRandom.hex(8)}",
+      email: email,
+      email_verified: email_verified
     )
   end
 

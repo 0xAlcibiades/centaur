@@ -2,7 +2,7 @@ class BackfillSlackDmConsoleUsers < ActiveRecord::Migration[8.1]
   def up
     execute <<~SQL.squish
       WITH eligible_principals AS (
-        SELECT id, slack_team_id, slack_user_id
+        SELECT id, slack_team_id, slack_user_id, slack_email
         FROM principals
         WHERE kind = 'slack_dm'
           AND console_user_id IS NULL
@@ -15,6 +15,14 @@ class BackfillSlackDmConsoleUsers < ActiveRecord::Migration[8.1]
           ON user_identities.provider = 'slack'
          AND user_identities.subject = principals.slack_user_id
          AND user_identities.team_id = principals.slack_team_id
+
+        UNION
+
+        SELECT principals.id AS principal_id, user_identities.user_id
+        FROM eligible_principals principals
+        INNER JOIN user_identities
+          ON user_identities.email_verified = TRUE
+         AND lower(trim(user_identities.email)) = lower(trim(principals.slack_email))
 
         UNION
 
