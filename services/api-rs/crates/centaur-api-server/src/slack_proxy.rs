@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -10,6 +14,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use crate::{
     ApiError,
@@ -21,6 +26,8 @@ const DEFAULT_SLACK_API_URL: &str = "https://slack.com/api";
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_SLACK_FILES_LIST_LIMIT: u16 = 100;
 const MAX_SLACK_FILES_LIST_LIMIT: u16 = 200;
+const SLACK_CHANNEL_LIST_LIMIT: u16 = 999;
+const SLACK_PUBLIC_CHANNEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -185,6 +192,11 @@ struct SlackChannelItem {
     can_upload: bool,
     can_download: bool,
     can_read_history: bool,
+}
+
+struct SlackPublicChannelCacheEntry {
+    fetched_at: Instant,
+    channels: Vec<Value>,
 }
 
 async fn upload_slack_file(
@@ -399,8 +411,19 @@ async fn get_slack_channels(headers: HeaderMap) -> Result<Json<SlackChannelsResp
 
     let config = slack_proxy_config()?;
     let client = http_client();
-    let mut channels = Vec::with_capacity(channel_ids.len());
-    for channel_id in channel_ids {
+    let public_channels = match slack_public_channels(client, config).await {
+        Ok(channels) => channels,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to list Slack public channels; falling back to per-channel metadata"
+            );
+            Vec::new()
+        }
+    };
+    let (mut channels, missing_channel_ids) =
+        slack_channel_items_from_catalog(&claims, &channel_ids, &public_channels);
+    for channel_id in missing_channel_ids {
         match slack_channel_info(client, config, &channel_id).await {
             Ok(channel) => channels.push(slack_channel_item(&claims, &channel_id, &channel)),
             Err(error) => {
@@ -641,6 +664,115 @@ async fn slack_channel_info(
     value.get("channel").cloned().ok_or_else(|| {
         ApiError::BadRequest("Slack channel info response did not include channel".to_owned())
     })
+}
+
+fn slack_public_channel_cache() -> &'static Mutex<Option<SlackPublicChannelCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<SlackPublicChannelCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+async fn slack_public_channels(
+    client: &reqwest::Client,
+    config: &SlackFileProxyConfig,
+) -> Result<Vec<Value>, ApiError> {
+    let mut cache = slack_public_channel_cache().lock().await;
+    if let Some(entry) = cache.as_ref()
+        && entry.fetched_at.elapsed() < SLACK_PUBLIC_CHANNEL_CACHE_TTL
+    {
+        return Ok(entry.channels.clone());
+    }
+
+    let channels = fetch_slack_public_channels(client, config).await?;
+    *cache = Some(SlackPublicChannelCacheEntry {
+        fetched_at: Instant::now(),
+        channels: channels.clone(),
+    });
+    Ok(channels)
+}
+
+async fn fetch_slack_public_channels(
+    client: &reqwest::Client,
+    config: &SlackFileProxyConfig,
+) -> Result<Vec<Value>, ApiError> {
+    let mut channels = Vec::new();
+    let mut cursor = None;
+    loop {
+        let value = slack_api_post_form(
+            client,
+            config,
+            "conversations.list",
+            &slack_channel_list_form(cursor.as_deref()),
+        )
+        .await?;
+        channels.extend(
+            value
+                .get("channels")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        cursor = slack_response_next_cursor(&value);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(channels)
+}
+
+fn slack_channel_list_form(cursor: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("types", "public_channel".to_owned()),
+        ("exclude_archived", "false".to_owned()),
+        ("limit", SLACK_CHANNEL_LIST_LIMIT.to_string()),
+        ("cursor", cursor.unwrap_or_default().to_owned()),
+    ];
+    form.retain(|(_, value)| !value.is_empty());
+    form
+}
+
+fn slack_response_next_cursor(value: &Value) -> Option<String> {
+    value
+        .get("response_metadata")
+        .and_then(|metadata| metadata.get("next_cursor"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_owned)
+}
+
+fn slack_channel_items_from_catalog(
+    claims: &SlackFileProxyClaims,
+    channel_ids: &[String],
+    catalog: &[Value],
+) -> (Vec<SlackChannelItem>, Vec<String>) {
+    let allowed_channel_ids = channel_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let catalog_by_id = catalog
+        .iter()
+        .filter_map(|channel| {
+            let channel_id = channel.get("id").and_then(Value::as_str)?;
+            allowed_channel_ids
+                .contains(channel_id)
+                .then_some((channel_id, channel))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let channels = channel_ids
+        .iter()
+        .filter_map(|channel_id| {
+            catalog_by_id
+                .get(channel_id.as_str())
+                .map(|channel| slack_channel_item(claims, channel_id, channel))
+        })
+        .collect();
+    let missing_channel_ids = channel_ids
+        .iter()
+        .filter(|channel_id| !catalog_by_id.contains_key(channel_id.as_str()))
+        .cloned()
+        .collect();
+    (channels, missing_channel_ids)
 }
 
 fn slack_channel_info_form(channel_id: &str) -> Vec<(&'static str, String)> {
@@ -1170,7 +1302,37 @@ fn content_disposition_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, extract::Form, routing::post};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+
+    async fn slack_channel_list_test_handler(
+        Form(form): Form<BTreeMap<String, String>>,
+    ) -> Json<Value> {
+        assert_eq!(
+            form.get("types").map(String::as_str),
+            Some("public_channel")
+        );
+        assert_eq!(
+            form.get("exclude_archived").map(String::as_str),
+            Some("false")
+        );
+        let expected_limit = SLACK_CHANNEL_LIST_LIMIT.to_string();
+        assert_eq!(form.get("limit"), Some(&expected_limit));
+
+        if form.get("cursor").map(String::as_str) == Some("page-2") {
+            return Json(json!({
+                "ok": true,
+                "channels": [{"id": "C222222222", "name": "second"}],
+                "response_metadata": {"next_cursor": ""}
+            }));
+        }
+
+        Json(json!({
+            "ok": true,
+            "channels": [{"id": "C111111111", "name": "first"}],
+            "response_metadata": {"next_cursor": "page-2"}
+        }))
+    }
 
     fn test_jwt(secret: &[u8], claims: Value) -> String {
         encode(
@@ -1282,6 +1444,88 @@ mod tests {
             vec![
                 ("channel", "C123456789".to_owned()),
                 ("include_num_members", "true".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_paginated_public_channel_catalog() {
+        let app = Router::new().route("/conversations.list", post(slack_channel_list_test_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = SlackFileProxyConfig {
+            api_url: format!("http://{address}"),
+            bot_token: "test-token".to_owned(),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+        };
+
+        let channels = fetch_slack_public_channels(&reqwest::Client::new(), &config)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(
+            channels
+                .iter()
+                .filter_map(|channel| channel.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["C111111111", "C222222222"]
+        );
+    }
+
+    #[test]
+    fn channel_catalog_only_enriches_authorized_ids() {
+        let claims = SlackFileProxyClaims {
+            slack: SlackProxyClaims {
+                upload_channels: vec![],
+                download_channels: vec![],
+                history_channels: vec!["C111111111".to_owned(), "G333333333".to_owned()],
+            },
+        };
+        let channel_ids = slack_channel_ids_from_claims(&claims).unwrap();
+        let catalog = vec![
+            json!({
+                "id": "C111111111",
+                "name": "allowed",
+                "purpose": {"value": "Allowed purpose"},
+                "topic": {"value": "Allowed topic"},
+                "num_members": 10,
+                "is_private": false,
+                "is_member": true
+            }),
+            json!({"id": "C222222222", "name": "not-allowed"}),
+        ];
+
+        let (channels, missing_channel_ids) =
+            slack_channel_items_from_catalog(&claims, &channel_ids, &catalog);
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].id, "C111111111");
+        assert_eq!(channels[0].name, "allowed");
+        assert!(channels[0].can_read_history);
+        assert_eq!(missing_channel_ids, vec!["G333333333"]);
+    }
+
+    #[test]
+    fn channel_list_form_omits_empty_cursor() {
+        assert_eq!(
+            slack_channel_list_form(None),
+            vec![
+                ("types", "public_channel".to_owned()),
+                ("exclude_archived", "false".to_owned()),
+                ("limit", SLACK_CHANNEL_LIST_LIMIT.to_string()),
+            ]
+        );
+        assert_eq!(
+            slack_channel_list_form(Some("next-page")),
+            vec![
+                ("types", "public_channel".to_owned()),
+                ("exclude_archived", "false".to_owned()),
+                ("limit", SLACK_CHANNEL_LIST_LIMIT.to_string()),
+                ("cursor", "next-page".to_owned()),
             ]
         );
     }
