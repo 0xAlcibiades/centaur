@@ -2016,6 +2016,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
+        HarnessType::Hermes => "hermes",
     }
 }
 
@@ -2033,6 +2034,9 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        // Hermes resolves providers through its own credential store /
+        // iron-proxy placeholder injection; no dedicated auth-mode env.
+        HarnessType::Hermes => None,
     }
 }
 
@@ -2693,6 +2697,7 @@ mod tests {
             env.iter()
                 .any(|(name, value)| name == "META_AI_API_KEY" && value == "META_AI_API_KEY")
         );
+        assert!(env.iter().all(|(name, _)| name != "NOUS_API_KEY"));
     }
 
     #[test]
@@ -3202,6 +3207,27 @@ mod tests {
         assert_eq!(
             harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
             Some("access_token")
+        );
+    }
+
+    #[test]
+    fn hermes_default_has_a_native_provider_proxy_fragment() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-iron-proxy-harness-engine",
+            "hermes",
+            "--kubernetes-iron-proxy-harness-auth-mode",
+            "api_key",
+        ])
+        .unwrap();
+
+        let fragment = args.sandbox.iron_proxy.harness.fragment().unwrap();
+        let placeholders = centaur_iron_proxy::placeholder_env(&[fragment]);
+        assert_eq!(
+            placeholders.get("NOUS_API_KEY").map(String::as_str),
+            Some("NOUS_API_KEY")
         );
     }
 }
