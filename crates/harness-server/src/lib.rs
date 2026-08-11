@@ -3,6 +3,7 @@ pub mod anthropic;
 pub mod claude;
 pub mod codex;
 mod error;
+mod hermes;
 mod nanocodex;
 mod nanocodex_subagents;
 mod otel;

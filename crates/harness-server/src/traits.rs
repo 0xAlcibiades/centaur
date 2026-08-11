@@ -15,6 +15,7 @@ pub enum HarnessKind {
     Codex,
     ClaudeCode,
     Amp,
+    Hermes,
 }
 
 pub struct ThreadState {
@@ -62,11 +63,39 @@ pub trait HarnessServer {
     fn default_model(&self) -> String;
     fn default_model_provider(&self) -> &'static str;
     fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand;
+    /// Perform any native protocol handshake after the harness process starts.
+    /// Stream-JSON harnesses are ready immediately; protocol servers such as
+    /// ACP use this hook to initialize and create or restore their session.
+    fn initialize_process(&self, _state: &mut ThreadState) -> Result<()> {
+        Ok(())
+    }
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
+    fn stdin_for_state_turn(&self, _state: &ThreadState, input: &[UserInput]) -> Result<Vec<u8>> {
+        self.stdin_for_turn(input)
+    }
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
     }
+    fn stdin_for_state_steer(&self, _state: &ThreadState, input: &[UserInput]) -> Result<Vec<u8>> {
+        self.stdin_for_steer(input)
+    }
+    /// Return a native cancellation message when the process can cancel a turn
+    /// without being killed. `None` retains the default kill-and-respawn path.
+    fn stdin_for_interrupt(&self, _state: &ThreadState) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// Finish any native cancellation handshake before the interrupted turn is
+    /// reported complete. This prevents a late native terminal response from
+    /// being mistaken for the following turn.
+    fn wait_for_interrupt(&self, _state: &mut ThreadState) -> Result<()> {
+        Ok(())
+    }
     fn parse_stdout_line(&self, line: &str) -> Result<Self::Event>;
+    /// Some harness protocols can issue client requests while a turn runs (for
+    /// example ACP permission requests). Return the response to write back.
+    fn response_for_event(&self, _event: &Self::Event) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
     fn normalize_events(
         &self,
         normalizer: &mut Self::EventNormalizer,

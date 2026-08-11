@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use codex_app_server_protocol::{JSONRPCMessage, ServerNotification};
 use harness_server::is_known_untyped_server_notification;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const LONG_PROMPT: &str = "Write exactly 24 lines. Each line must be 'LONG_STREAM_DELTA_LINE_N: abcdefghijklmnopqrstuvwxyz 0123456789' where N is 01 through 24. Do not use markdown, bullets, tools, or extra text.";
@@ -19,6 +20,7 @@ enum Harness {
     ClaudeCode,
     Amp,
     Codex,
+    Hermes,
 }
 
 impl Harness {
@@ -27,6 +29,7 @@ impl Harness {
             Self::ClaudeCode => "claude-code",
             Self::Amp => "amp",
             Self::Codex => "codex",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -35,6 +38,7 @@ impl Harness {
             Self::ClaudeCode => &["claude-code", "--mode", "jsonrpc"],
             Self::Amp => &["amp", "--mode", "jsonrpc"],
             Self::Codex => &["codex", "--mode", "jsonrpc"],
+            Self::Hermes => &["hermes", "--mode", "jsonrpc"],
         }
     }
 
@@ -43,6 +47,7 @@ impl Harness {
             Self::ClaudeCode => &["claude-code"],
             Self::Amp => &["amp"],
             Self::Codex => &["codex"],
+            Self::Hermes => &["hermes"],
         }
     }
 
@@ -51,6 +56,7 @@ impl Harness {
             Self::ClaudeCode => Some("CENTAUR_CLAUDE_APP_BRIDGE_COMMAND"),
             Self::Amp => Some("CENTAUR_AMP_APP_BRIDGE_COMMAND"),
             Self::Codex => None,
+            Self::Hermes => Some("CENTAUR_HERMES_ACP_COMMAND"),
         }
     }
 
@@ -79,8 +85,191 @@ impl Harness {
                 }
                 params
             }
+            Self::Hermes => json!({}),
         }
     }
+}
+
+#[test]
+fn fake_hermes_acp_streams_codex_v2_notifications() {
+    let fake_hermes_path = temp_path("fake-hermes-acp.sh");
+    std::fs::write(&fake_hermes_path, fake_hermes_acp_script())
+        .expect("write fake Hermes ACP server");
+    let mut permissions = std::fs::metadata(&fake_hermes_path)
+        .expect("fake Hermes ACP metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_hermes_path, permissions).expect("chmod fake Hermes ACP server");
+    let hermes_home = temp_path("fake-hermes-home");
+    std::fs::create_dir_all(&hermes_home).unwrap();
+    let hermes_home = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home.as_str())),
+    );
+    let timeout = Duration::from_secs(10);
+    let thread_id = bridge.initialize_and_start_thread(Harness::Hermes, timeout);
+    let turn = bridge.run_turn(&thread_id, 3, "say hello", None, timeout);
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "hello from Hermes");
+    assert_eq!(turn.reasoning_delta_count, 1);
+    assert_codex_v2_turn(&turn);
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
+}
+
+#[test]
+fn fake_hermes_acp_supports_the_blocks_harness_interface() {
+    let fake_hermes_path = temp_path("fake-hermes-blocks-acp.sh");
+    std::fs::write(&fake_hermes_path, fake_hermes_acp_script())
+        .expect("write fake Hermes ACP server");
+    let mut permissions = std::fs::metadata(&fake_hermes_path)
+        .expect("fake Hermes ACP metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_hermes_path, permissions).expect("chmod fake Hermes ACP server");
+    let hermes_home = temp_path("fake-hermes-blocks-home");
+    std::fs::create_dir_all(&hermes_home).expect("create fake Hermes home");
+    let hermes_home = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home.as_str())),
+    );
+    let turn = bridge.run_blocks_user_turn("say hello", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "hello from Hermes");
+    assert_codex_v2_turn(&turn);
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
+}
+
+#[test]
+fn fake_hermes_acp_cancel_settles_before_the_next_turn() {
+    let fake_hermes_path = temp_path("fake-hermes-cancel-acp.sh");
+    std::fs::write(&fake_hermes_path, fake_hermes_cancel_script())
+        .expect("write cancellable fake Hermes ACP server");
+    let mut permissions = std::fs::metadata(&fake_hermes_path)
+        .expect("fake Hermes ACP metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_hermes_path, permissions).expect("chmod fake Hermes ACP server");
+    let hermes_home = temp_path("fake-hermes-cancel-home");
+    std::fs::create_dir_all(&hermes_home).expect("create fake Hermes home");
+    let hermes_home = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home.as_str())),
+    );
+    let timeout = Duration::from_secs(10);
+    let thread_id = bridge.initialize_and_start_thread(Harness::Hermes, timeout);
+
+    let interrupted =
+        bridge.run_interrupted_turn(&thread_id, 3, 4, "wait", Duration::from_secs(10));
+    assert_eq!(interrupted.terminal_status.as_deref(), Some("interrupted"));
+
+    let fresh = bridge.run_turn(&thread_id, 5, "continue", None, timeout);
+    bridge.finish_successfully();
+    assert_completed_turn(&fresh);
+    assert_eq!(fresh.text_from_deltas, "after cancel");
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
+}
+
+#[test]
+fn fake_hermes_acp_recovers_when_a_mapped_session_is_missing() {
+    let fake_hermes_path = temp_path("fake-hermes-load-error-acp.sh");
+    write_executable(&fake_hermes_path, fake_hermes_load_error_script());
+    let hermes_home = temp_path("fake-hermes-load-error-home");
+    std::fs::create_dir_all(&hermes_home).expect("create fake Hermes home");
+    let hermes_home_string = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home_string.as_str())),
+    );
+    let timeout = Duration::from_secs(10);
+    let thread_id = bridge.initialize_and_start_thread(Harness::Hermes, timeout);
+    write_hermes_session_mapping(&hermes_home, &thread_id, "missing-native-session");
+
+    let turn = bridge.run_turn(&thread_id, 3, "recover", None, timeout);
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "recovered session");
+    assert_eq!(
+        read_hermes_session_mapping(&hermes_home, &thread_id),
+        "replacement-session"
+    );
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
+}
+
+#[test]
+fn fake_hermes_acp_accepts_an_empty_successful_load_response() {
+    let fake_hermes_path = temp_path("fake-hermes-empty-load-acp.sh");
+    write_executable(&fake_hermes_path, fake_hermes_empty_load_script());
+    let hermes_home = temp_path("fake-hermes-empty-load-home");
+    std::fs::create_dir_all(&hermes_home).expect("create fake Hermes home");
+    let hermes_home_string = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home_string.as_str())),
+    );
+    let timeout = Duration::from_secs(10);
+    let thread_id = bridge.initialize_and_start_thread(Harness::Hermes, timeout);
+    write_hermes_session_mapping(&hermes_home, &thread_id, "existing-native-session");
+
+    let turn = bridge.run_turn(&thread_id, 3, "continue", None, timeout);
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "loaded existing session");
+    assert_eq!(
+        read_hermes_session_mapping(&hermes_home, &thread_id),
+        "existing-native-session"
+    );
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
+}
+
+#[test]
+fn fake_hermes_acp_cancel_error_restarts_before_the_next_turn() {
+    let fake_hermes_path = temp_path("fake-hermes-cancel-error-acp.sh");
+    write_executable(&fake_hermes_path, fake_hermes_cancel_error_script());
+    let hermes_home = temp_path("fake-hermes-cancel-error-home");
+    std::fs::create_dir_all(&hermes_home).expect("create fake Hermes home");
+    let hermes_home_string = hermes_home.to_string_lossy().to_string();
+    let mut bridge = BridgeProcess::spawn_harness(
+        Harness::Hermes,
+        Some(fake_hermes_path.to_string_lossy().to_string()),
+        Some(("HERMES_HOME", hermes_home_string.as_str())),
+    );
+    let timeout = Duration::from_secs(10);
+    let thread_id = bridge.initialize_and_start_thread(Harness::Hermes, timeout);
+
+    let interrupted = bridge.run_interrupted_turn(&thread_id, 3, 4, "wait", timeout);
+    assert_eq!(interrupted.terminal_status.as_deref(), Some("interrupted"));
+
+    let fresh = bridge.run_turn(&thread_id, 5, "continue", None, timeout);
+    bridge.finish_successfully();
+    assert_completed_turn(&fresh);
+    assert_eq!(fresh.text_from_deltas, "after failed cancel");
+
+    std::fs::remove_file(fake_hermes_path).expect("remove fake Hermes ACP server");
+    std::fs::remove_dir_all(hermes_home).expect("remove fake Hermes home");
 }
 
 #[test]
@@ -1931,7 +2120,9 @@ fn run_native_anthropic(harness: Harness, prompt: &str, timeout: Duration) -> Na
             ]);
             command
         }
-        Harness::Codex => panic!("native anthropic runner does not support Codex"),
+        Harness::Codex | Harness::Hermes => {
+            panic!("native anthropic runner does not support this harness")
+        }
     };
     command
         .stdin(Stdio::piped())
@@ -2349,6 +2540,214 @@ fn temp_path(name: &str) -> PathBuf {
         std::process::id(),
         Uuid::new_v4().simple()
     ))
+}
+
+fn fake_hermes_acp_script() -> &'static str {
+    r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-initialize","result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":{"sessionId":"hermes-session","modes":{"currentModeId":"default","availableModes":[]}}}'
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-mode","result":{}}'
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-model","result":{}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"hermes-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"hermes-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from Hermes"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"end_turn","usage":{"inputTokens":8,"outputTokens":3,"totalTokens":11}}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#
+}
+
+fn fake_hermes_cancel_script() -> &'static str {
+    r#"#!/bin/sh
+prompt_count=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-initialize","result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":{"sessionId":"hermes-session","modes":{"currentModeId":"default","availableModes":[]}}}'
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-mode","result":{}}'
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-model","result":{}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      prompt_count=$((prompt_count + 1))
+      if [ "$prompt_count" -gt 1 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"hermes-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after cancel"}}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"end_turn"}}'
+      fi
+      ;;
+    *'"method":"session/cancel"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"cancelled"}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#
+}
+
+fn fake_hermes_load_error_script() -> &'static str {
+    r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-initialize","result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","error":{"code":-32001,"message":"unknown session"}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":{"sessionId":"replacement-session"}}'
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-mode","result":{}}'
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-model","result":{}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"replacement-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"recovered session"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"end_turn"}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#
+}
+
+fn fake_hermes_empty_load_script() -> &'static str {
+    r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-initialize","result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":null}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' 'session/new must not follow a successful session/load' >&2
+      exit 65
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-mode","result":{}}'
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-model","result":{}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"existing-native-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"loaded existing session"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"end_turn"}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#
+}
+
+fn fake_hermes_cancel_error_script() -> &'static str {
+    r#"#!/bin/sh
+marker="${HERMES_HOME}/cancel-error-restarted"
+if [ -f "$marker" ]; then
+  restarted=1
+else
+  restarted=0
+  : > "$marker"
+fi
+
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-initialize","result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":{"sessionId":"hermes-session"}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-session","result":{}}'
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-mode","result":{}}'
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-model","result":{}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      if [ "$restarted" -eq 1 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"hermes-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after failed cancel"}}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","result":{"stopReason":"end_turn"}}'
+      fi
+      ;;
+    *'"method":"session/cancel"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"centaur-hermes-prompt","error":{"code":-32002,"message":"cancel did not settle"}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write executable fixture");
+    let mut permissions = std::fs::metadata(path)
+        .expect("executable fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod executable fixture");
+}
+
+fn hermes_session_mapping_path(home: &Path, thread_id: &str) -> PathBuf {
+    let digest = Sha256::digest(thread_id.as_bytes());
+    let filename = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    home.join("centaur-acp-sessions").join(filename)
+}
+
+fn write_hermes_session_mapping(home: &Path, thread_id: &str, session_id: &str) {
+    let path = hermes_session_mapping_path(home, thread_id);
+    std::fs::create_dir_all(path.parent().expect("mapping parent"))
+        .expect("create Hermes mapping directory");
+    std::fs::write(path, format!("{session_id}\n")).expect("write Hermes mapping");
+}
+
+fn read_hermes_session_mapping(home: &Path, thread_id: &str) -> String {
+    std::fs::read_to_string(hermes_session_mapping_path(home, thread_id))
+        .expect("read Hermes mapping")
+        .trim()
+        .to_string()
 }
 
 fn shell_quote(path: &Path) -> String {
