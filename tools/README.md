@@ -66,6 +66,8 @@ The open-source tool inventory lives in this `tools/` tree and changes over time
   with best-effort vlogs/vmetrics context without exposing message context.
 - `datadog`: query Datadog logs, metrics, monitors, hosts, and dashboards
   read-only with `DD_API_KEY` and `DD_APP_KEY`.
+- `grid`: discover and call Grid presentation tools over Streamable HTTP MCP;
+  authentication is injected by iron-proxy for `grid.tempo.xyz`.
 - `preqin`: query Preqin Operational API fund and fund-manager data, with
   redacted auth diagnostics for `PREQIN_*` credentials.
 
