@@ -50,6 +50,13 @@ here, including OpenRouter and the Nous inference API. A per-thread
 `--model <name>` override is passed through to Hermes's session as a
 per-session model override.
 
+:::note
+Cron jobs resolve their model from `config.yaml`'s `model.default` (they run
+outside any interactive session), so give the sandbox `HERMES_HOME` a
+`config.yaml` with `model.default` set — a `.env` with provider keys alone is
+enough for turns, but not for scheduled jobs.
+:::
+
 ## Persistence model
 
 Everything Hermes learns lives under `HERMES_HOME`. With the default
