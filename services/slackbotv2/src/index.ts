@@ -3158,7 +3158,7 @@ async function slackApiMessageFromSlack(
     author: {
       fullName: actorId,
       isBot,
-      isMe: Boolean(actorId && actorId === currentMessage.author.userId),
+      isMe: Boolean(actorId && options.botUserId && actorId === options.botUserId),
       userId: actorId,
       userName: actorId
     },
