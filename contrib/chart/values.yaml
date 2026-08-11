@@ -270,7 +270,8 @@ sandbox:
   #                  subscription token (proxy injects the brokered credential).
   codexAuthMode: api_key
   claudeCodeAuthMode: api_key
-  # The deployment's default harness: codex | amp | claudecode. Decides what
+  # The deployment's default harness: codex | amp | claudecode | nanocodex |
+  # hermes. Decides what
   # warm sandboxes boot (SESSION_SANDBOX_HARNESS) and which harness auth
   # fragment is required at startup (the other harnesses' fragments are
   # registered too when available, so per-session --claude/--amp/--codex
@@ -278,7 +279,8 @@ sandbox:
   # their session's harness via container args; the sandbox image CMD only
   # matters for containers started outside api-rs.
   harnessEngine: codex
-  # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here are also
+  # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL / HERMES_MODEL
+  # set here are also
   # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT is
   # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
   # with the policy the sandbox actually runs.

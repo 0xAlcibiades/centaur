@@ -16,7 +16,8 @@ const HARNESS_DISPLAY_NAMES: Record<string, string> = {
   amp: 'Amp',
   claudecode: 'Claude Code',
   codex: 'Codex',
-  nanocodex: 'Nanocodex'
+  nanocodex: 'Nanocodex',
+  hermes: 'Hermes Agent'
 }
 
 const REASONING_DISPLAY_NAMES: Record<string, string> = {
@@ -69,12 +70,13 @@ const CODEX_CONFIG = codexConfig as {
 // Deployers who override the sandbox model via CLAUDE_MODEL / CODEX_MODEL
 // (sandbox.extraEnv) get the same values mirrored into slackbotv2 by the chart
 // and passed here through SlackbotV2Options.harnessDefaultModels, which takes
-// precedence. Amp has no fixed default model (deep/fast modes), so it is
-// intentionally absent.
+// precedence. Hermes defaults to OpenRouter's model router. Amp has no fixed
+// default model (deep/fast modes), so it is intentionally absent.
 const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
   claudecode: typeof claudeSettings.model === 'string' ? claudeSettings.model : undefined,
   codex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined,
-  nanocodex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined
+  nanocodex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined,
+  hermes: 'openrouter/auto'
 }
 
 // Nanocodex deliberately shares Codex's default reasoning policy. Its harness

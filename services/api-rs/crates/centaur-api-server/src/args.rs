@@ -1972,7 +1972,9 @@ impl IronProxyHarnessArgs {
                 fragments.push(fragment);
             }
         }
-        if let Some(fragment) = harness_auth_fragment("openrouter", "api_key")? {
+        if harness_fragment_engine_name(&self.engine) != "openrouter"
+            && let Some(fragment) = harness_auth_fragment("openrouter", "api_key")?
+        {
             fragments.push(fragment);
         }
         if let Some(fragment) = harness_auth_fragment("meta-ai", "api_key")? {
@@ -2028,6 +2030,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::Amp => "amp",
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
+        HarnessType::Hermes => "openrouter",
     }
 }
 
@@ -2045,6 +2048,7 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
         HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
+        HarnessType::Hermes => None,
     }
 }
 
@@ -3215,5 +3219,14 @@ mod tests {
             harness_auth_mode_env(&HarnessType::Nanocodex).as_deref(),
             Some("access_token")
         );
+    }
+
+    #[test]
+    fn hermes_uses_the_openrouter_proxy_fragment() {
+        assert_eq!(
+            harness_fragment_engine_name(&HarnessType::Hermes),
+            "openrouter"
+        );
+        assert_eq!(harness_auth_mode_env(&HarnessType::Hermes), None);
     }
 }

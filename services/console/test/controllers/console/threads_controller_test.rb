@@ -603,6 +603,8 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Codex", controller.send(:thread_harness_label, session)
     session.harness_type = "nanocodex"
     assert_equal "Nanocodex", controller.send(:thread_harness_label, session)
+    session.harness_type = "hermes"
+    assert_equal "Hermes Agent", controller.send(:thread_harness_label, session)
   end
 
   test "thread model label prefers the latest execution's recorded model override" do
@@ -675,6 +677,17 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       :thread_model_label,
       TranscriptSession.new(metadata_hash: {}, harness_type: "amp")
     )
+  end
+
+  test "thread model label uses the Hermes OpenRouter default" do
+    controller = Console::ThreadsController.new
+
+    with_env("HERMES_MODEL" => nil) do
+      assert_equal "OPENROUTER/AUTO", controller.send(
+        :thread_model_label,
+        TranscriptSession.new(metadata_hash: {}, harness_type: "hermes")
+      )
+    end
   end
 
   test "visible thread scope matches Slack threads owned by the current user's Slack OAuth record" do

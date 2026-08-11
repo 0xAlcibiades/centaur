@@ -73,7 +73,8 @@ class Console::ThreadsController < ApplicationController
   # the chart. Amp has no fixed default model, so it is intentionally absent.
   HARNESS_DEFAULT_MODEL_ENVS = {
     "claudecode" => "CLAUDE_MODEL",
-    "codex" => "CODEX_MODEL"
+    "codex" => "CODEX_MODEL",
+    "hermes" => "HERMES_MODEL"
   }.freeze
   # Harness config files carrying each harness's baked-in default model, used
   # when no env override is set. Resolved against CENTAUR_HARNESS_CONFIG_DIR
@@ -83,6 +84,9 @@ class Console::ThreadsController < ApplicationController
   HARNESS_CONFIG_FILES = {
     "claudecode" => "claude/settings.json",
     "codex" => "codex/config.toml"
+  }.freeze
+  HARNESS_FALLBACK_DEFAULT_MODELS = {
+    "hermes" => "openrouter/auto"
   }.freeze
 
   SlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
@@ -118,6 +122,8 @@ class Console::ThreadsController < ApplicationController
                       efforts: CODEX_EFFORTS + [ %w[max Max] ]),
     ComposerAgent.new(value: "nanocodex", label: "Nanocodex (GPT-5.6 Sol)",
                       harness: "nanocodex", model: nil, efforts: []),
+    ComposerAgent.new(value: "hermes", label: "Hermes Agent",
+                      harness: "hermes", model: nil, efforts: []),
     ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
                       harness: "codex", model: "gpt-5.5",
                       efforts: CODEX_EFFORTS),
@@ -1473,6 +1479,7 @@ class Console::ThreadsController < ApplicationController
     when "claudecode" then "Claude Code"
     when "amp" then "Amp"
     when "nanocodex" then "Nanocodex"
+    when "hermes" then "Hermes Agent"
     else source_label(session.harness_type)
     end
   end
@@ -1501,7 +1508,8 @@ class Console::ThreadsController < ApplicationController
     env_name = HARNESS_DEFAULT_MODEL_ENVS[harness_type]
     return unless env_name
 
-    ENV[env_name].presence || self.class.baked_harness_default_model(harness_type)
+    ENV[env_name].presence || self.class.baked_harness_default_model(harness_type) ||
+      HARNESS_FALLBACK_DEFAULT_MODELS[harness_type]
   end
 
   # Cached per (config dir, harness): the files are immutable within a deploy,

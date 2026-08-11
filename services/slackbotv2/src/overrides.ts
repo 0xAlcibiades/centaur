@@ -1,6 +1,6 @@
 /**
  * Inline message directives, restored from the v1 slackbot:
- *   --claude | --claude-code | --amp | --codex | --nanocodex
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes
  *                                                  pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
@@ -44,7 +44,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   'claude-code': 'claudecode',
   claudecode: 'claudecode',
   codex: 'codex',
-  nanocodex: 'nanocodex'
+  nanocodex: 'nanocodex',
+  hermes: 'hermes'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -72,7 +73,7 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
     ])
   )
 
-const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'nanocodex'])
+const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'nanocodex', 'hermes'])
 const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 const STRATEGY_REASONING_EFFORTS = new Set([
   'none',

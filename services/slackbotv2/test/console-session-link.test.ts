@@ -18,6 +18,7 @@ describe('harnessDisplayName', () => {
     expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
     expect(harnessDisplayName('claudecode')).toBe('Claude Code')
     expect(harnessDisplayName('amp')).toBe('Amp')
+    expect(harnessDisplayName('hermes')).toBe('Hermes Agent')
   })
 
   test('is case-insensitive and trims', () => {
@@ -107,6 +108,7 @@ describe('defaultModelForHarness', () => {
     expect(defaultModelForHarness('claudecode')).toBe(bakedClaudeModel)
     expect(defaultModelForHarness('codex')).toBe(bakedCodexModel)
     expect(defaultModelForHarness('nanocodex')).toBe(bakedCodexModel)
+    expect(defaultModelForHarness('hermes')).toBe('openrouter/auto')
   })
 
   test('prefers the deployment-configured model over the baked default', () => {

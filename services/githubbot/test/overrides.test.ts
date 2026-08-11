@@ -31,6 +31,9 @@ describe("extractMessageOverrides", () => {
     expect(extractMessageOverrides("--nanocodex review this").harnessType).toBe(
       "nanocodex",
     );
+    expect(extractMessageOverrides("--hermes review this").harnessType).toBe(
+      "hermes",
+    );
   });
 
   test("parses harness flag anywhere in the message", () => {
