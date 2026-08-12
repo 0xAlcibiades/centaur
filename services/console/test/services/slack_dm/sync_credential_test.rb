@@ -2,6 +2,12 @@ require "test_helper"
 
 module SlackDm
   class SyncCredentialTest < ActiveSupport::TestCase
+    CapturingLogger = Struct.new(:warnings) do
+      def warn(entry)
+        warnings << entry
+      end
+    end
+
     class FakeApiClient
       attr_reader :batch
 
@@ -279,6 +285,194 @@ module SlackDm
       assert_nil api_client.batch
     ensure
       previous.nil? ? ENV.delete(env_key) : ENV[env_key] = previous
+    end
+
+    test "paces repeated Slack methods at their documented tier floor" do
+      api_client = FakeApiClient.new
+      now = 1_000.0
+      sleeps = []
+      sleeper = lambda do |seconds|
+        sleeps << seconds
+        now += seconds
+      end
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [
+              { "id" => "D123", "is_im" => true, "user" => "U_ONE" },
+              { "id" => "D456", "is_im" => true, "user" => "U_TWO" }
+            ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          assert_includes %w[D123 D456], params["channel"]
+          { "ok" => true, "messages" => [], "response_metadata" => { "next_cursor" => "" } }
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+
+      SlackDm::SyncCredential.new(
+        credential,
+        api_client: api_client,
+        slack_api_http: slack_http,
+        rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
+        clock: -> { now },
+        sleeper: sleeper
+      ).call
+
+      assert_equal 1, sleeps.length
+      assert_in_delta 1.2, sleeps.first, 0.001
+    end
+
+    test "shares method pacing across sync instances in the same app and workspace" do
+      credential.labels = { "slack_team_id" => "T123" }
+      store = ActiveSupport::Cache::MemoryStore.new
+      now = 1_000.0
+      sleeps = []
+      sleeper = lambda do |seconds|
+        sleeps << seconds
+        now += seconds
+      end
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [ { "id" => "D123", "is_im" => true, "user" => "U_OTHER" } ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          assert_equal "D123", params["channel"]
+          { "ok" => true, "messages" => [], "response_metadata" => { "next_cursor" => "" } }
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+
+      2.times do
+        SlackDm::SyncCredential.new(
+          credential,
+          api_client: FakeApiClient.new,
+          slack_api_http: slack_http,
+          rate_limit_store: store,
+          clock: -> { now },
+          sleeper: sleeper
+        ).call
+      end
+
+      assert_equal 1, sleeps.length
+      assert_in_delta 3.0, sleeps.first, 0.001
+    end
+
+    test "honors Retry-After and logs one structured rate limit event" do
+      api_client = FakeApiClient.new
+      now = 1_000.0
+      sleeps = []
+      history_attempts = 0
+      logger = CapturingLogger.new([])
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [ { "id" => "D123", "is_im" => true, "user" => "U_OTHER" } ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          history_attempts += 1
+          if history_attempts == 1
+            HttpClient::Response.new(status: 429, body: "", headers: { "retry-after" => "2" })
+          else
+            { "ok" => true, "messages" => [], "response_metadata" => { "next_cursor" => "" } }
+          end
+        else
+          flunk "unexpected Slack endpoint #{endpoint} with #{params}"
+        end
+      end
+      sleeper = lambda do |seconds|
+        sleeps << seconds
+        now += seconds
+      end
+
+      Rails.stub(:logger, logger) do
+        SlackDm::SyncCredential.new(
+          credential,
+          api_client: api_client,
+          slack_api_http: slack_http,
+          rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
+          clock: -> { now },
+          sleeper: sleeper
+        ).call
+      end
+
+      assert_equal 2, history_attempts
+      assert_equal [ 2.25 ], sleeps
+      assert_equal 1, logger.warnings.length
+      assert_equal "slack_dm_sync_rate_limited", logger.warnings.first[:event]
+      assert_equal "conversations.history", logger.warnings.first[:slack_method]
+      assert_equal "T123", logger.warnings.first[:slack_team_id]
+      assert_equal 2.0, logger.warnings.first[:retry_after_seconds]
+    end
+
+    test "stops the conversation scan when rate limit retries are exhausted" do
+      api_client = FakeApiClient.new
+      now = 1_000.0
+      requested_channels = []
+      logger = CapturingLogger.new([])
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [
+              { "id" => "D123", "is_im" => true, "user" => "U_ONE" },
+              { "id" => "D456", "is_im" => true, "user" => "U_TWO" }
+            ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          requested_channels << params["channel"]
+          HttpClient::Response.new(status: 429, body: "", headers: { "retry-after" => "1" })
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+      sleeper = ->(seconds) { now += seconds }
+
+      with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_RATE_LIMIT_MAX_RETRIES" => "1") do
+        Rails.stub(:logger, logger) do
+          error = assert_raises(SlackDm::SyncCredential::SlackApiRateLimited) do
+            SlackDm::SyncCredential.new(
+              credential,
+              api_client: api_client,
+              slack_api_http: slack_http,
+              rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
+              clock: -> { now },
+              sleeper: sleeper
+            ).call
+          end
+          assert_equal "conversations.history", error.slack_method
+        end
+      end
+
+      assert_equal %w[D123 D123], requested_channels
+      assert_equal 1, logger.warnings.length
+      assert_nil api_client.batch
     end
   end
 end

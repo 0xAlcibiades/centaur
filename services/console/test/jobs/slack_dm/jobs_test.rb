@@ -17,7 +17,8 @@ module SlackDm
       app:,
       scopes: SlackDm::SyncCredential::REQUIRED_SCOPES,
       access_token: "xoxp-live",
-      provider_subject: "U#{SecureRandom.hex(4).upcase}"
+      provider_subject: "U#{SecureRandom.hex(4).upcase}",
+      labels: {}
     )
       BrokerCredential.create!(
         oauth_app: app,
@@ -28,7 +29,8 @@ module SlackDm
         last_refresh: Time.current,
         expires_at: 1.hour.from_now,
         scopes: scopes,
-        provider_subject: provider_subject
+        provider_subject: provider_subject,
+        labels: labels
       )
     end
 
@@ -51,6 +53,35 @@ module SlackDm
       refute_includes enqueued_ids, missing_scope.id
       refute_includes enqueued_ids, no_token.id
       refute_includes enqueued_ids, other.id
+
+      enqueued_scopes = enqueued_jobs
+        .select { |job| job[:job] == SlackDm::SyncCredentialJob }
+        .to_h { |job| [ job[:args].first, job[:args].second ] }
+      assert_equal "#{app.id}:unknown-team", enqueued_scopes.fetch(good.id)
+      assert_equal "#{app.id}:unknown-team", enqueued_scopes.fetch(dm_only.id)
+    end
+
+    test "SyncCredentialJob serializes credentials for the same app and workspace" do
+      app = slack_app
+      first = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
+      second = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
+      other_team = slack_credential(app: app, labels: { "slack_team_id" => "T456" })
+
+      first_job = SlackDm::SyncCredentialJob.new(
+        first.id,
+        SlackDm::SyncCredential.sync_scope_for(first)
+      )
+      second_job = SlackDm::SyncCredentialJob.new(
+        second.id,
+        SlackDm::SyncCredential.sync_scope_for(second)
+      )
+      other_team_job = SlackDm::SyncCredentialJob.new(
+        other_team.id,
+        SlackDm::SyncCredential.sync_scope_for(other_team)
+      )
+
+      assert_equal first_job.concurrency_key, second_job.concurrency_key
+      refute_equal first_job.concurrency_key, other_team_job.concurrency_key
     end
 
     test "SyncCredentialJob is a no-op for missing credentials" do

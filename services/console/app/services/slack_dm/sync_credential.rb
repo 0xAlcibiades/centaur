@@ -14,6 +14,35 @@ module SlackDm
     CONVERSATIONS_REPLIES_ENDPOINT = "https://slack.com/api/conversations.replies"
 
     SlackApiError = Class.new(StandardError)
+    class SlackApiRateLimited < SlackApiError
+      attr_reader :slack_method, :retry_after_seconds
+
+      def initialize(slack_method:, retry_after_seconds:)
+        @slack_method = slack_method
+        @retry_after_seconds = retry_after_seconds
+        super("Slack API rate limited #{slack_method}; retry after #{retry_after_seconds}s")
+      end
+    end
+
+    SLACK_METHODS = {
+      AUTH_TEST_ENDPOINT => "auth.test",
+      CONVERSATIONS_LIST_ENDPOINT => "conversations.list",
+      CONVERSATIONS_MEMBERS_ENDPOINT => "conversations.members",
+      CONVERSATIONS_HISTORY_ENDPOINT => "conversations.history",
+      CONVERSATIONS_REPLIES_ENDPOINT => "conversations.replies"
+    }.freeze
+    # Slack rate limits are shared per method, app, and workspace. Stay at the
+    # documented floor for each tier instead of relying on burst tolerance.
+    REQUESTS_PER_MINUTE = {
+      "auth.test" => 20,
+      "conversations.list" => 20,
+      "conversations.members" => 100,
+      "conversations.history" => 50,
+      "conversations.replies" => 50
+    }.freeze
+    RATE_LIMIT_CACHE_TTL = 10.minutes
+    RETRY_AFTER_BUFFER_SECONDS = 0.25
+    SLACK_TEAM_LABEL = "slack_team_id"
 
     class << self
       attr_accessor :slack_api_http
@@ -34,12 +63,31 @@ module SlackDm
         types << "private_channel" if (PRIVATE_CHANNEL_REQUIRED_SCOPES - granted).empty?
         types
       end
+
+      def sync_scope_for(credential)
+        app_scope = credential.oauth_app_id || credential.oauth_app&.slug || "unknown-app"
+        team_scope = credential.labels&.[](SlackDm::SyncCredential::SLACK_TEAM_LABEL).presence ||
+                     credential.oauth_app&.labels&.[](SlackDm::SyncCredential::SLACK_TEAM_LABEL).presence ||
+                     "unknown-team"
+        "#{app_scope}:#{team_scope}"
+      end
     end
 
-    def initialize(credential, api_client: CentaurApiClient.new, slack_api_http: nil)
+    def initialize(
+      credential,
+      api_client: CentaurApiClient.new,
+      slack_api_http: nil,
+      rate_limit_store: Rails.cache,
+      clock: -> { Time.current.to_f },
+      sleeper: ->(seconds) { sleep(seconds) }
+    )
       @credential = credential
       @api_client = api_client
       @slack_api_http = slack_api_http || self.class.slack_api_http
+      @rate_limit_store = rate_limit_store
+      @clock = clock
+      @sleeper = sleeper
+      @last_request_started_at = {}
       @run_id = "sdms_#{SecureRandom.hex(16)}"
       @messages_fetched = 0
       @replies_fetched = 0
@@ -48,6 +96,7 @@ module SlackDm
     def call
       auth = slack_api(AUTH_TEST_ENDPOINT)
       home_team_id = auth.fetch("team_id")
+      @home_team_id = home_team_id
       source_user_id = auth["user_id"].presence || @credential.provider_subject.to_s
       checkpoints = load_checkpoints(home_team_id)
       batch = empty_batch(home_team_id, source_user_id)
@@ -60,6 +109,8 @@ module SlackDm
         normalize_members(conversation, home_team_id, batch)
         sync_history(conversation, home_team_id, checkpoints[conversation.fetch("id")], batch)
         batch[:run][:conversations_synced] += 1
+      rescue SlackApiRateLimited
+        raise
       rescue StandardError => e
         raise if Rails.env.test?
 
@@ -314,6 +365,42 @@ module SlackDm
     end
 
     def slack_api(endpoint, params = {})
+      slack_method = SLACK_METHODS.fetch(endpoint)
+      retry_count = 0
+      rate_limit_logged = false
+
+      loop do
+        pace_slack_method(slack_method)
+        response = slack_api_response(endpoint, params)
+        return response if response.is_a?(Hash)
+
+        if response.status == 429
+          retry_after_seconds = parse_retry_after(response["retry-after"])
+          unless rate_limit_logged
+            log_rate_limit(slack_method, retry_after_seconds)
+            rate_limit_logged = true
+          end
+          if retry_count >= rate_limit_max_retries
+            raise SlackApiRateLimited.new(
+              slack_method: slack_method,
+              retry_after_seconds: retry_after_seconds
+            )
+          end
+
+          retry_count += 1
+          @sleeper.call(retry_after_seconds + RETRY_AFTER_BUFFER_SECONDS)
+          next
+        end
+
+        parsed = response.json
+        raise SlackApiError, "Slack API returned HTTP #{response.status}" unless response.success?
+        raise SlackApiError, "Slack API returned #{parsed['error']}" unless parsed["ok"] == true
+
+        return parsed
+      end
+    end
+
+    def slack_api_response(endpoint, params)
       if @slack_api_http
         return @slack_api_http.call(
           endpoint: endpoint,
@@ -322,18 +409,58 @@ module SlackDm
         )
       end
 
-      response = HttpClient.new(open_timeout: slack_timeout, read_timeout: slack_timeout).get(
+      HttpClient.new(open_timeout: slack_timeout, read_timeout: slack_timeout).get(
         endpoint,
         params: params,
         headers: { "Authorization" => "Bearer #{@credential.access_token}" }
       )
-      raise SlackApiError, "Slack API rate limited" if response.status == 429
+    end
 
-      parsed = response.json
-      raise SlackApiError, "Slack API returned HTTP #{response.status}" unless response.success?
-      raise SlackApiError, "Slack API returned #{parsed['error']}" unless parsed["ok"] == true
+    def pace_slack_method(slack_method)
+      interval = 60.0 / REQUESTS_PER_MINUTE.fetch(slack_method)
+      cache_key = rate_limit_cache_key(slack_method)
+      last_started_at = [
+        @last_request_started_at[cache_key],
+        @rate_limit_store.read(cache_key)&.to_f
+      ].compact.max
+      now = @clock.call
+      elapsed = [ now - last_started_at, 0.0 ].max if last_started_at
+      wait_seconds = interval - elapsed if elapsed
+      @sleeper.call(wait_seconds) if wait_seconds&.positive?
 
-      parsed
+      started_at = @clock.call
+      @last_request_started_at[cache_key] = started_at
+      @rate_limit_store.write(cache_key, started_at, expires_in: RATE_LIMIT_CACHE_TTL)
+    end
+
+    def rate_limit_cache_key(slack_method)
+      app_scope = @credential.oauth_app_id || @credential.oauth_app&.slug || "unknown-app"
+      team_scope = @home_team_id.presence ||
+                   @credential.labels&.[](SLACK_TEAM_LABEL).presence ||
+                   @credential.oauth_app&.labels&.[](SLACK_TEAM_LABEL).presence ||
+                   "unknown-team"
+      "slack_dm_sync_rate_limit:#{app_scope}:#{team_scope}:#{slack_method}"
+    end
+
+    def parse_retry_after(value)
+      parsed = Float(value)
+      parsed.finite? && parsed.positive? ? parsed : 1.0
+    rescue ArgumentError, TypeError
+      5.0
+    end
+
+    def log_rate_limit(slack_method, retry_after_seconds)
+      Rails.logger.warn(
+        event: "slack_dm_sync_rate_limited",
+        message: "Slack DM sync paused after Slack API rate limit",
+        slack_method: slack_method,
+        slack_team_id: @home_team_id.presence ||
+          @credential.labels&.[](SLACK_TEAM_LABEL).presence ||
+          @credential.oauth_app&.labels&.[](SLACK_TEAM_LABEL).presence,
+        oauth_app_id: @credential.oauth_app_id,
+        credential_id: @credential.oid,
+        retry_after_seconds: retry_after_seconds
+      )
     end
 
     def max_slack_ts(left, right)
@@ -364,6 +491,7 @@ module SlackDm
     end
 
     def slack_timeout = positive_env("SLACK_DM_SYNC_TIMEOUT_SECONDS", 20)
+    def rate_limit_max_retries = positive_env("SLACK_DM_SYNC_RATE_LIMIT_MAX_RETRIES", 3)
     def list_page_size = positive_env("SLACK_DM_SYNC_LIST_PAGE_SIZE", 200)
     def list_max_pages = positive_env("SLACK_DM_SYNC_LIST_MAX_PAGES", 10)
     def members_page_size = positive_env("SLACK_DM_SYNC_MEMBERS_PAGE_SIZE", 200)

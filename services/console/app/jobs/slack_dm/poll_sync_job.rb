@@ -17,7 +17,10 @@ module SlackDm
         next if credential.access_token.blank?
         next unless SlackDm::SyncCredential.required_scopes_granted?(credential.scopes)
 
-        SlackDm::SyncCredentialJob.perform_later(credential.id)
+        SlackDm::SyncCredentialJob.perform_later(
+          credential.id,
+          SlackDm::SyncCredential.sync_scope_for(credential)
+        )
       end
     end
   end
