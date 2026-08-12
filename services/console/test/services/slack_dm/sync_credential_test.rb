@@ -440,29 +440,92 @@ module SlackDm
           }
         when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
           requested_channels << params["channel"]
-          HttpClient::Response.new(status: 429, body: "", headers: { "retry-after" => "1" })
+          if params["channel"] == "D123"
+            {
+              "ok" => true,
+              "messages" => [ { "type" => "message", "ts" => "1700000000.000002", "text" => "kept" } ],
+              "response_metadata" => { "next_cursor" => "" }
+            }
+          else
+            HttpClient::Response.new(status: 429, body: "", headers: { "retry-after" => "1" })
+          end
         else
           flunk "unexpected Slack endpoint #{endpoint}"
         end
       end
       with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_RATE_LIMIT_MAX_RETRIES" => "1") do
         Rails.stub(:logger, logger) do
-          error = assert_raises(SlackDm::SyncCredential::SlackApiRateLimited) do
-            SlackDm::SyncCredential.new(
-              credential,
-              api_client: api_client,
-              slack_api_http: slack_http,
-              rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
-              sleeper: advancing_sleeper
-            ).call
-          end
-          assert_equal "conversations.history", error.slack_method
+          SlackDm::SyncCredential.new(
+            credential,
+            api_client: api_client,
+            slack_api_http: slack_http,
+            rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
+            sleeper: advancing_sleeper
+          ).call
         end
       end
 
-      assert_equal %w[D123 D123], requested_channels
+      assert_equal %w[D123 D456 D456], requested_channels
       assert_equal 1, logger.warnings.length
-      assert_nil api_client.batch
+      assert_equal "partial", api_client.batch[:run][:status]
+      assert_match "rate limited conversations.history", api_client.batch[:run][:error_text]
+      assert_equal [ "kept" ], api_client.batch[:messages].map { |message| message[:text] }
+      assert_equal [ "D123" ], api_client.batch[:checkpoints].map { |checkpoint| checkpoint[:conversation_id] }
+    end
+
+    test "persists and resumes completed conversations when the per-run request budget is exhausted" do
+      api_client = FakeApiClient.new
+      store = ActiveSupport::Cache::MemoryStore.new
+      travel_to Time.zone.at(1_000), with_usec: true
+      requested_channels = []
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [
+              { "id" => "D123", "is_im" => true, "user" => "U_ONE" },
+              { "id" => "D456", "is_im" => true, "user" => "U_TWO" }
+            ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          requested_channels << params["channel"]
+          { "ok" => true, "messages" => [], "response_metadata" => { "next_cursor" => "" } }
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+
+      with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_MAX_API_CALLS_PER_RUN" => "3") do
+        SlackDm::SyncCredential.new(
+          credential,
+          api_client: api_client,
+          slack_api_http: slack_http,
+          rate_limit_store: store,
+          sleeper: advancing_sleeper
+        ).call
+      end
+
+      assert_equal [ "D123" ], requested_channels
+      assert_equal "partial", api_client.batch[:run][:status]
+      assert_equal "Slack DM sync request budget exhausted", api_client.batch[:run][:error_text]
+      assert_equal [ "D123" ], api_client.batch[:checkpoints].map { |checkpoint| checkpoint[:conversation_id] }
+
+      with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_MAX_API_CALLS_PER_RUN" => "3") do
+        SlackDm::SyncCredential.new(
+          credential,
+          api_client: FakeApiClient.new,
+          slack_api_http: slack_http,
+          rate_limit_store: store,
+          sleeper: advancing_sleeper
+        ).call
+      end
+
+      assert_equal %w[D123 D456], requested_channels
     end
   end
 end

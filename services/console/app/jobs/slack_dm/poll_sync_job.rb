@@ -13,15 +13,16 @@ module SlackDm
           enabled: true
         })
 
-      credentials.find_each do |credential|
-        next if credential.access_token.blank?
-        next unless SlackDm::SyncCredential.required_scopes_granted?(credential.scopes)
-
-        SlackDm::SyncCredentialJob.perform_later(
-          credential.id,
-          SlackDm::SyncCredential.sync_scope_for(credential)
-        )
-      end
+      credentials
+        .select { |credential| credential.access_token.present? }
+        .select { |credential| SlackDm::SyncCredential.required_scopes_granted?(credential.scopes) }
+        .group_by { |credential| SlackDm::SyncCredential.sync_scope_for(credential) }
+        .each do |sync_scope, scoped_credentials|
+          SlackDm::SyncCredentialJob.perform_later(
+            sync_scope,
+            scoped_credentials.map(&:id).sort
+          )
+        end
     end
   end
 end

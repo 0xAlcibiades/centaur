@@ -23,6 +23,7 @@ module SlackDm
         super("Slack API rate limited #{slack_method}; retry after #{retry_after_seconds}s")
       end
     end
+    SyncBudgetExhausted = Class.new(SlackApiError)
 
     SLACK_METHODS = {
       AUTH_TEST_ENDPOINT => "auth.test",
@@ -41,7 +42,9 @@ module SlackDm
       "conversations.replies" => 50
     }.freeze
     RATE_LIMIT_CACHE_TTL = 10.minutes
+    CONVERSATION_CURSOR_CACHE_TTL = 30.days
     RETRY_AFTER_BUFFER_SECONDS = 0.25
+    MAX_RETRY_AFTER_SECONDS = 30.0
     SLACK_TEAM_LABEL = "slack_team_id"
 
     class << self
@@ -67,8 +70,8 @@ module SlackDm
       def sync_scope_for(credential)
         app_scope = credential.oauth_app_id || credential.oauth_app&.slug || "unknown-app"
         team_scope = credential.labels&.[](SlackDm::SyncCredential::SLACK_TEAM_LABEL).presence ||
-                     credential.oauth_app&.labels&.[](SlackDm::SyncCredential::SLACK_TEAM_LABEL).presence ||
-                     "unknown-team"
+                     credential.oauth_app&.labels&.[](SlackDm::SyncCredential::SLACK_TEAM_LABEL).presence
+        team_scope ||= "credential:#{credential.id || credential.oid}"
         "#{app_scope}:#{team_scope}"
       end
     end
@@ -86,12 +89,14 @@ module SlackDm
       @rate_limit_store = rate_limit_store
       @sleeper = sleeper
       @last_request_started_at = {}
+      @slack_api_calls = 0
       @run_id = "sdms_#{SecureRandom.hex(16)}"
       @messages_fetched = 0
       @replies_fetched = 0
     end
 
     def call
+      @run_started_at = Time.current.to_f
       auth = slack_api(AUTH_TEST_ENDPOINT)
       home_team_id = auth.fetch("team_id")
       @home_team_id = home_team_id
@@ -99,32 +104,47 @@ module SlackDm
       checkpoints = load_checkpoints(home_team_id)
       batch = empty_batch(home_team_id, source_user_id)
 
-      conversations = list_conversations
+      conversations = rotate_conversations(list_conversations, home_team_id)
       batch[:run][:conversations_requested] = conversations.length
+      conversations_handled = 0
+      terminal_error = nil
 
-      conversations.each do |conversation|
-        normalize_conversation(conversation, home_team_id, batch)
-        normalize_members(conversation, home_team_id, batch)
-        sync_history(conversation, home_team_id, checkpoints[conversation.fetch("id")], batch)
-        batch[:run][:conversations_synced] += 1
-      rescue SlackApiRateLimited
-        raise
-      rescue StandardError => e
-        raise if Rails.env.test?
+      begin
+        conversations.each do |conversation|
+          normalize_conversation(conversation, home_team_id, batch)
+          normalize_members(conversation, home_team_id, batch)
+          sync_history(conversation, home_team_id, checkpoints[conversation.fetch("id")], batch)
+          batch[:run][:conversations_synced] += 1
+          conversations_handled += 1
+        rescue SlackApiRateLimited, SyncBudgetExhausted
+          raise
+        rescue StandardError => e
+          raise if Rails.env.test?
 
-        batch[:run][:conversations_failed] += 1
-        Rails.logger.warn do
-          "slack DM sync failed for conversation #{conversation['id']}: #{e.class}: #{e.message}"
+          batch[:run][:conversations_failed] += 1
+          conversations_handled += 1
+          Rails.logger.warn do
+            "slack DM sync failed for conversation #{conversation['id']}: #{e.class}: #{e.message}"
+          end
         end
+      rescue SlackApiRateLimited, SyncBudgetExhausted => e
+        terminal_error = e
       end
 
-      batch[:run][:status] = batch[:run][:conversations_failed].positive? ? "partial" : "completed"
+      batch[:run][:status] = if terminal_error || batch[:run][:conversations_failed].positive?
+        "partial"
+      else
+        "completed"
+      end
+      batch[:run][:error_text] = terminal_error&.message.to_s
       batch[:run][:messages_fetched] = @messages_fetched
       batch[:run][:messages_upserted] = batch[:messages].length
       batch[:run][:replies_fetched] = @replies_fetched
       batch[:run][:replies_upserted] = batch[:messages].count { |message| message[:parent_message_ts].present? }
       batch[:run][:finished] = true
-      @api_client.ingest_slack_dm_sync_batch(sanitize_for_postgres(batch))
+      result = @api_client.ingest_slack_dm_sync_batch(sanitize_for_postgres(batch))
+      advance_conversation_cursor(home_team_id, conversations.length, conversations_handled)
+      result
     end
 
     private
@@ -368,7 +388,10 @@ module SlackDm
       rate_limit_logged = false
 
       loop do
+        enforce_sync_budget!
         pace_slack_method(slack_method)
+        enforce_sync_budget!
+        @slack_api_calls += 1
         response = slack_api_response(endpoint, params)
         return response if response.is_a?(Hash)
 
@@ -442,7 +465,8 @@ module SlackDm
 
     def parse_retry_after(value)
       parsed = Float(value)
-      parsed.finite? && parsed.positive? ? parsed : 1.0
+      seconds = parsed.finite? && parsed.positive? ? parsed : 1.0
+      [ seconds, MAX_RETRY_AFTER_SECONDS ].min
     rescue ArgumentError, TypeError
       5.0
     end
@@ -459,6 +483,39 @@ module SlackDm
         credential_id: @credential.oid,
         retry_after_seconds: retry_after_seconds
       )
+    end
+
+    def rotate_conversations(conversations, home_team_id)
+      return conversations if conversations.empty?
+
+      @conversation_cursor_key = [
+        "slack_dm_sync_conversation_cursor",
+        @credential.oid,
+        home_team_id
+      ].join(":")
+      @conversation_cursor = @rate_limit_store.read(@conversation_cursor_key).to_i % conversations.length
+      conversations.rotate(@conversation_cursor)
+    end
+
+    def advance_conversation_cursor(home_team_id, conversation_count, conversations_handled)
+      return if conversation_count.zero? || conversations_handled.zero?
+
+      key = @conversation_cursor_key || [
+        "slack_dm_sync_conversation_cursor",
+        @credential.oid,
+        home_team_id
+      ].join(":")
+      next_cursor = (@conversation_cursor.to_i + conversations_handled) % conversation_count
+      @rate_limit_store.write(key, next_cursor, expires_in: CONVERSATION_CURSOR_CACHE_TTL)
+    end
+
+    def enforce_sync_budget!
+      if @slack_api_calls >= max_api_calls_per_run
+        raise SyncBudgetExhausted, "Slack DM sync request budget exhausted"
+      end
+      if Time.current.to_f - @run_started_at >= max_run_seconds
+        raise SyncBudgetExhausted, "Slack DM sync time budget exhausted"
+      end
     end
 
     def max_slack_ts(left, right)
@@ -490,6 +547,8 @@ module SlackDm
 
     def slack_timeout = positive_env("SLACK_DM_SYNC_TIMEOUT_SECONDS", 20)
     def rate_limit_max_retries = positive_env("SLACK_DM_SYNC_RATE_LIMIT_MAX_RETRIES", 3)
+    def max_api_calls_per_run = positive_env("SLACK_DM_SYNC_MAX_API_CALLS_PER_RUN", 250)
+    def max_run_seconds = positive_env("SLACK_DM_SYNC_MAX_RUN_SECONDS", 15.minutes.to_i)
     def list_page_size = positive_env("SLACK_DM_SYNC_LIST_PAGE_SIZE", 200)
     def list_max_pages = positive_env("SLACK_DM_SYNC_LIST_MAX_PAGES", 10)
     def members_page_size = positive_env("SLACK_DM_SYNC_MEMBERS_PAGE_SIZE", 200)
