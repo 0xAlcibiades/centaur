@@ -2,6 +2,8 @@ require "test_helper"
 
 module SlackDm
   class SyncCredentialTest < ActiveSupport::TestCase
+    include ActiveSupport::Testing::TimeHelpers
+
     CapturingLogger = Struct.new(:warnings) do
       def warn(entry)
         warnings << entry
@@ -53,6 +55,13 @@ module SlackDm
         scopes: SlackDm::SyncCredential::REQUIRED_SCOPES,
         provider_subject: "U_ME"
       )
+    end
+
+    def advancing_sleeper(sleeps = nil)
+      lambda do |seconds|
+        sleeps << seconds if sleeps
+        travel seconds, with_usec: true
+      end
     end
 
     test "oauth_app_slug defaults to slack and honors console env prefix" do
@@ -289,12 +298,8 @@ module SlackDm
 
     test "paces repeated Slack methods at their documented tier floor" do
       api_client = FakeApiClient.new
-      now = 1_000.0
+      travel_to Time.zone.at(1_000), with_usec: true
       sleeps = []
-      sleeper = lambda do |seconds|
-        sleeps << seconds
-        now += seconds
-      end
       slack_http = lambda do |endpoint:, params:, access_token:|
         assert_equal "xoxp-live", access_token
         case endpoint
@@ -322,8 +327,7 @@ module SlackDm
         api_client: api_client,
         slack_api_http: slack_http,
         rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
-        clock: -> { now },
-        sleeper: sleeper
+        sleeper: advancing_sleeper(sleeps)
       ).call
 
       assert_equal 1, sleeps.length
@@ -333,12 +337,8 @@ module SlackDm
     test "shares method pacing across sync instances in the same app and workspace" do
       credential.labels = { "slack_team_id" => "T123" }
       store = ActiveSupport::Cache::MemoryStore.new
-      now = 1_000.0
+      travel_to Time.zone.at(1_000), with_usec: true
       sleeps = []
-      sleeper = lambda do |seconds|
-        sleeps << seconds
-        now += seconds
-      end
       slack_http = lambda do |endpoint:, params:, access_token:|
         assert_equal "xoxp-live", access_token
         case endpoint
@@ -364,8 +364,7 @@ module SlackDm
           api_client: FakeApiClient.new,
           slack_api_http: slack_http,
           rate_limit_store: store,
-          clock: -> { now },
-          sleeper: sleeper
+          sleeper: advancing_sleeper(sleeps)
         ).call
       end
 
@@ -375,7 +374,7 @@ module SlackDm
 
     test "honors Retry-After and logs one structured rate limit event" do
       api_client = FakeApiClient.new
-      now = 1_000.0
+      travel_to Time.zone.at(1_000), with_usec: true
       sleeps = []
       history_attempts = 0
       logger = CapturingLogger.new([])
@@ -401,19 +400,13 @@ module SlackDm
           flunk "unexpected Slack endpoint #{endpoint} with #{params}"
         end
       end
-      sleeper = lambda do |seconds|
-        sleeps << seconds
-        now += seconds
-      end
-
       Rails.stub(:logger, logger) do
         SlackDm::SyncCredential.new(
           credential,
           api_client: api_client,
           slack_api_http: slack_http,
           rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
-          clock: -> { now },
-          sleeper: sleeper
+          sleeper: advancing_sleeper(sleeps)
         ).call
       end
 
@@ -428,7 +421,7 @@ module SlackDm
 
     test "stops the conversation scan when rate limit retries are exhausted" do
       api_client = FakeApiClient.new
-      now = 1_000.0
+      travel_to Time.zone.at(1_000), with_usec: true
       requested_channels = []
       logger = CapturingLogger.new([])
       slack_http = lambda do |endpoint:, params:, access_token:|
@@ -452,8 +445,6 @@ module SlackDm
           flunk "unexpected Slack endpoint #{endpoint}"
         end
       end
-      sleeper = ->(seconds) { now += seconds }
-
       with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_RATE_LIMIT_MAX_RETRIES" => "1") do
         Rails.stub(:logger, logger) do
           error = assert_raises(SlackDm::SyncCredential::SlackApiRateLimited) do
@@ -462,8 +453,7 @@ module SlackDm
               api_client: api_client,
               slack_api_http: slack_http,
               rate_limit_store: ActiveSupport::Cache::MemoryStore.new,
-              clock: -> { now },
-              sleeper: sleeper
+              sleeper: advancing_sleeper
             ).call
           end
           assert_equal "conversations.history", error.slack_method

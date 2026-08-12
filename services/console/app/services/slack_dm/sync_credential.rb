@@ -78,14 +78,12 @@ module SlackDm
       api_client: CentaurApiClient.new,
       slack_api_http: nil,
       rate_limit_store: Rails.cache,
-      clock: -> { Time.current.to_f },
       sleeper: ->(seconds) { sleep(seconds) }
     )
       @credential = credential
       @api_client = api_client
       @slack_api_http = slack_api_http || self.class.slack_api_http
       @rate_limit_store = rate_limit_store
-      @clock = clock
       @sleeper = sleeper
       @last_request_started_at = {}
       @run_id = "sdms_#{SecureRandom.hex(16)}"
@@ -423,12 +421,12 @@ module SlackDm
         @last_request_started_at[cache_key],
         @rate_limit_store.read(cache_key)&.to_f
       ].compact.max
-      now = @clock.call
+      now = Time.current.to_f
       elapsed = [ now - last_started_at, 0.0 ].max if last_started_at
       wait_seconds = interval - elapsed if elapsed
       @sleeper.call(wait_seconds) if wait_seconds&.positive?
 
-      started_at = @clock.call
+      started_at = Time.current.to_f
       @last_request_started_at[cache_key] = started_at
       @rate_limit_store.write(cache_key, started_at, expires_in: RATE_LIMIT_CACHE_TTL)
     end
