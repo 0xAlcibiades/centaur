@@ -209,17 +209,7 @@ pub fn derive_principal_with_slack_team(
             .map(str::trim)
             .filter(|user| !user.is_empty())
             .ok_or(PrincipalDerivationError::MissingSlackUserId)?;
-        return Ok(PrincipalRef {
-            foreign_id: format!("slack-user-{}-{}", slugify(team), slugify(user)),
-            name: display_name
-                .map(|name| format!("Slack DM @{name}"))
-                .unwrap_or_else(|| format!("Slack User {user} (team {team})")),
-            kind: Some(SLACK_DM_KIND.to_owned()),
-            slack_user_id: Some(user.to_owned()),
-            slack_channel_id: None,
-            slack_team_id: Some(team.to_owned()),
-            labels: BTreeMap::new(),
-        });
+        return Ok(slack_user_principal(user, team, display_name));
     }
 
     // Channel principals must never be scoped by the message-derived metadata
@@ -260,6 +250,62 @@ pub fn derive_principal_with_slack_team(
         slack_team_id: None,
         labels: BTreeMap::new(),
     })
+}
+
+/// Resolve the requesting user's principal for a Slack channel thread. This is
+/// the same per-user principal a 1:1 DM with that user resolves to (both key on
+/// the user's own workspace), so a user first seen in a channel and later in a
+/// DM (or vice versa) maps to one identity. Returns `None` for DM threads (the
+/// conversation principal already is the user's) and for non-Slack thread keys,
+/// which have no Slack requester.
+///
+/// ``slack_team_id`` must be a workspace the user is proven to belong to —
+/// callers pass the home-team-gate-validated metadata team. The thread key's
+/// team segment is deliberately never used: it names where the conversation
+/// lives, not where the user belongs, and Slack user ids are only unique
+/// within a workspace, so keying a user on the thread's team could mint (or
+/// collide with) an identity in a workspace the user is not a member of.
+pub fn derive_slack_requester_principal(
+    thread_key: &str,
+    slack_user_id: &str,
+    slack_team_id: &str,
+    display_name: Option<&str>,
+) -> Option<PrincipalRef> {
+    let (_, conversation_id) = parse_slack_segments(thread_key);
+    let conversation_id = conversation_id?;
+    if is_direct_message(Some(conversation_id)) {
+        return None;
+    }
+    let user = slack_user_id.trim();
+    let team = slack_team_id.trim();
+    if user.is_empty() || team.is_empty() {
+        return None;
+    }
+    Some(slack_user_principal(
+        user,
+        team,
+        display_name.map(str::trim).filter(|name| !name.is_empty()),
+    ))
+}
+
+/// The per-user Slack principal shared by the DM branch of
+/// [`derive_principal_with_slack_team`] and
+/// [`derive_slack_requester_principal`], so the two can never mint diverging
+/// foreign ids or labels for the same user. ``team`` must be a workspace the
+/// user is proven to belong to, never one inferred from where the message
+/// happened to land.
+fn slack_user_principal(user: &str, team: &str, display_name: Option<&str>) -> PrincipalRef {
+    PrincipalRef {
+        foreign_id: format!("slack-user-{}-{}", slugify(team), slugify(user)),
+        name: display_name
+            .map(|name| format!("Slack DM @{name}"))
+            .unwrap_or_else(|| format!("Slack User {user} (team {team})")),
+        kind: Some(SLACK_DM_KIND.to_owned()),
+        slack_user_id: Some(user.to_owned()),
+        slack_channel_id: None,
+        slack_team_id: Some(team.to_owned()),
+        labels: BTreeMap::new(),
+    }
 }
 
 /// Identify the team and conversation segments by their Slack prefix, ignoring
@@ -638,6 +684,109 @@ mod tests {
         );
         assert_eq!(principal.kind.as_deref(), Some("teams_user"));
         assert!(!principal.labels.contains_key("kind"));
+    }
+
+    #[test]
+    fn requester_channel_thread_keys_on_the_user() {
+        let principal = derive_slack_requester_principal(
+            "slack:T123:C456:1780000000.0001",
+            "U07ABC",
+            "T123",
+            Some("Ada Lovelace"),
+        )
+        .unwrap();
+        assert_eq!(principal.foreign_id, "slack-user-t123-u07abc");
+        assert_eq!(principal.name, "Slack DM @Ada Lovelace");
+        assert_eq!(principal.kind.as_deref(), Some("slack_dm"));
+        assert_eq!(principal.slack_user_id.as_deref(), Some("U07ABC"));
+        assert_eq!(principal.slack_team_id.as_deref(), Some("T123"));
+        assert!(principal.labels.is_empty());
+    }
+
+    #[test]
+    fn requester_matches_the_dm_principal_for_the_same_user() {
+        let requester = derive_slack_requester_principal(
+            "slack:T123:C456:1780000000.0001",
+            "U07ABC",
+            "T123",
+            None,
+        )
+        .unwrap();
+        let dm = derive_principal("slack:T123:D9:ts", Some("U07ABC"), None);
+        assert_eq!(requester.foreign_id, dm.foreign_id);
+        assert_eq!(requester.kind, dm.kind);
+        assert_eq!(requester.slack_user_id, dm.slack_user_id);
+        assert_eq!(requester.slack_team_id, dm.slack_team_id);
+    }
+
+    #[test]
+    fn requester_dm_thread_resolves_none() {
+        assert_eq!(
+            derive_slack_requester_principal("slack:T123:D9:ts", "U07ABC", "T123", None),
+            None
+        );
+    }
+
+    #[test]
+    fn requester_non_slack_threads_resolve_none() {
+        for thread_key in [
+            "discord:111:222:333",
+            "linear:issue-1:s:sess-a",
+            "teams:abc:def",
+            "mcp:prn_x",
+            "api",
+        ] {
+            assert_eq!(
+                derive_slack_requester_principal(thread_key, "U07ABC", "T123", None),
+                None,
+                "expected no requester for {thread_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn requester_teamless_thread_key_uses_verified_team() {
+        let principal = derive_slack_requester_principal("chat:C123:ts", "U1", "T9", None).unwrap();
+        assert_eq!(principal.foreign_id, "slack-user-t9-u1");
+        assert_eq!(principal.slack_team_id.as_deref(), Some("T9"));
+    }
+
+    #[test]
+    fn requester_ignores_the_thread_key_team() {
+        let principal = derive_slack_requester_principal(
+            "slack:T_FROM_KEY:C456:ts",
+            "U1",
+            "T_FROM_METADATA",
+            None,
+        )
+        .unwrap();
+        assert_eq!(principal.foreign_id, "slack-user-t-from-metadata-u1");
+        assert_eq!(principal.slack_team_id.as_deref(), Some("T_FROM_METADATA"));
+    }
+
+    // The thread key's team must never substitute for a missing verified team:
+    // it names where the conversation lives, not where the user belongs.
+    #[test]
+    fn requester_blank_team_resolves_none() {
+        assert_eq!(
+            derive_slack_requester_principal("slack:T123:C456:ts", "U07ABC", "  ", None),
+            None
+        );
+    }
+
+    #[test]
+    fn requester_blank_user_resolves_none() {
+        assert_eq!(
+            derive_slack_requester_principal("slack:T123:C456:ts", "  ", "T123", None),
+            None
+        );
+    }
+
+    #[test]
+    fn requester_synthetic_name_without_display_name() {
+        let principal =
+            derive_slack_requester_principal("slack:T123:C456:ts", "U07ABC", "T123", None).unwrap();
+        assert_eq!(principal.name, "Slack User U07ABC (team T123)");
     }
 
     #[test]
