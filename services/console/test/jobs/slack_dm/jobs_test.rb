@@ -2,6 +2,8 @@ require "test_helper"
 
 module SlackDm
   class JobsTest < ActiveJob::TestCase
+    include ActiveSupport::Testing::TimeHelpers
+
     def slack_app(slug: "slack-dms")
       OauthApp.create!(
         provider: "slack",
@@ -16,105 +18,99 @@ module SlackDm
     def slack_credential(
       app:,
       scopes: SlackDm::SyncCredential::REQUIRED_SCOPES,
-      access_token: "xoxp-live",
-      provider_subject: "U#{SecureRandom.hex(4).upcase}",
-      labels: {}
+      access_token: "xoxp-live"
     )
       BrokerCredential.create!(
         oauth_app: app,
         foreign_id: "slack-dms-#{SecureRandom.hex(6)}",
         token_endpoint: "https://slack.com/api/oauth.v2.access",
         access_token: access_token,
-        refresh_token: "refresh",
-        last_refresh: Time.current,
-        expires_at: 1.hour.from_now,
         scopes: scopes,
-        provider_subject: provider_subject,
-        labels: labels
+        provider_subject: "U#{SecureRandom.hex(4).upcase}"
       )
     end
 
-    test "PollSyncJob enqueues credentials with any supported private conversation scopes" do
+    test "poll enqueues one inventory job per syncable credential" do
       app = slack_app
-      good = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
-      dm_only = slack_credential(
-        app: app,
-        scopes: SlackDm::SyncCredential::DM_REQUIRED_SCOPES,
-        labels: { "slack_team_id" => "T123" }
-      )
-      missing_scope = slack_credential(app: app, scopes: %w[chat:write])
-      no_token = slack_credential(app: app, access_token: nil)
-      other_app = slack_app(slug: "other-slack")
-      other = slack_credential(app: other_app)
+      good = slack_credential(app: app)
+      dm_only = slack_credential(app: app, scopes: SlackDm::SyncCredential::DM_REQUIRED_SCOPES)
+      slack_credential(app: app, scopes: %w[chat:write])
+      slack_credential(app: app, access_token: nil)
+      slack_credential(app: slack_app(slug: "other-slack"))
 
       SlackDm::PollSyncJob.perform_now("slack-dms")
 
-      sync_jobs = enqueued_jobs.select { |job| job[:job] == SlackDm::SyncCredentialJob }
-      assert_equal 1, sync_jobs.length
-      assert_equal "#{app.id}:T123", sync_jobs.first[:args].first
-      assert_equal [ good.id, dm_only.id ].sort, sync_jobs.first[:args].second
-      refute_includes sync_jobs.first[:args].second, missing_scope.id
-      refute_includes sync_jobs.first[:args].second, no_token.id
-      refute_includes sync_jobs.first[:args].second, other.id
+      inventory_jobs = enqueued_jobs.select { |job| job[:job] == SlackDm::InventoryCredentialJob }
+      assert_equal [ good.id, dm_only.id ].sort, inventory_jobs.map { |job| job[:args].first }.sort
     end
 
-    test "credentials without a team label retain per-credential scopes" do
-      app = slack_app
-      first = slack_credential(app: app)
-      second = slack_credential(app: app)
+    test "inventory jobs deduplicate per credential" do
+      job = SlackDm::InventoryCredentialJob.new(123)
 
-      refute_equal SlackDm::SyncCredential.sync_scope_for(first),
-                   SlackDm::SyncCredential.sync_scope_for(second)
-      assert_equal "#{app.id}:credential:#{first.id}", SlackDm::SyncCredential.sync_scope_for(first)
+      assert job.concurrency_key.end_with?("/slack_dm_inventory_123")
+      assert_equal :discard, SlackDm::InventoryCredentialJob.concurrency_on_conflict
+      assert_equal 30.minutes, SlackDm::InventoryCredentialJob.concurrency_duration
     end
 
-    test "SyncCredentialJob deduplicates work for the same app and workspace" do
-      app = slack_app
-      first = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
-      second = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
-      other_team = slack_credential(app: app, labels: { "slack_team_id" => "T456" })
+    test "legacy credential jobs become inventory jobs" do
+      SlackDm::SyncCredentialJob.perform_now("old-scope", [ 12, 34 ])
 
-      first_job = SlackDm::SyncCredentialJob.new(
-        SlackDm::SyncCredential.sync_scope_for(first),
-        [ first.id, second.id ]
-      )
-      other_team_job = SlackDm::SyncCredentialJob.new(
-        SlackDm::SyncCredential.sync_scope_for(other_team),
-        [ other_team.id ]
-      )
-
-      refute_equal first_job.concurrency_key, other_team_job.concurrency_key
-      assert_equal :discard, SlackDm::SyncCredentialJob.concurrency_on_conflict
-      assert_equal 30.minutes, SlackDm::SyncCredentialJob.concurrency_duration
+      inventory_jobs = enqueued_jobs.select { |job| job[:job] == SlackDm::InventoryCredentialJob }
+      assert_equal [ 12, 34 ], inventory_jobs.map { |job| job[:args].first }
     end
 
-    test "SyncCredentialJob rotates one credential per scope run" do
-      app = slack_app
-      first = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
-      second = slack_credential(app: app, labels: { "slack_team_id" => "T123" })
-      ids = [ first.id, second.id ].sort
-      scope = "#{app.id}:T123"
-      cache = ActiveSupport::Cache::MemoryStore.new
-      synced_ids = []
-      fake_sync = Object.new
-      fake_sync.define_singleton_method(:call) { true }
-      factory = lambda do |credential|
-        synced_ids << credential.id
-        fake_sync
+    test "dispatcher claims oldest due rows and enqueues bounded unit jobs" do
+      travel_to Time.zone.at(1_000), with_usec: true
+      credential = slack_credential(app: slack_app)
+      later = create_ledger(credential, "D2", next_sync_at: 2.minutes.ago)
+      earlier = create_ledger(credential, "D1", next_sync_at: 3.minutes.ago)
+
+      with_env("CENTAUR_CONSOLE_SLACK_DM_SYNC_DISPATCH_BATCH_SIZE" => "1") do
+        SlackDm::DispatchSyncJob.perform_now("slack-dms")
       end
 
-      Rails.stub(:cache, cache) do
-        SlackDm::SyncCredential.stub(:new, factory) do
-          SlackDm::SyncCredentialJob.perform_now(scope, ids)
-          SlackDm::SyncCredentialJob.perform_now(scope, ids)
-        end
-      end
-
-      assert_equal ids, synced_ids
+      jobs = enqueued_jobs.select { |job| job[:job] == SlackDm::SyncConversationJob }
+      assert_equal 1, jobs.length
+      assert_equal earlier.id, jobs.first[:args].first
+      assert_equal earlier.reload.claim_token, jobs.first[:args].second
+      assert_nil later.reload.claim_token
     end
 
-    test "SyncCredentialJob is a no-op for missing credentials" do
-      assert_nothing_raised { SlackDm::SyncCredentialJob.perform_now(-1) }
+    test "unit job records failures as row backoff without raising" do
+      travel_to Time.zone.at(1_000), with_usec: true
+      credential = slack_credential(app: slack_app)
+      ledger = create_ledger(
+        credential,
+        "D1",
+        claim_token: "claim",
+        claimed_until: 1.hour.from_now
+      )
+      failing_sync = Object.new
+      failing_sync.define_singleton_method(:call) { raise SlackDm::ApiClient::SlackApiError, "rate limited" }
+
+      SlackDm::SyncConversation.stub(:new, ->(*) { failing_sync }) do
+        assert_nothing_raised { SlackDm::SyncConversationJob.perform_now(ledger.id, "claim") }
+      end
+
+      ledger.reload
+      assert_equal 1, ledger.backoff_level
+      assert_match "SlackDm::ApiClient::SlackApiError: rate limited", ledger.last_error
+      assert_equal 5.seconds.from_now, ledger.next_sync_at
+      assert_nil ledger.claim_token
+    end
+
+    private
+
+    def create_ledger(credential, conversation_id, **attributes)
+      SlackDm::SyncLedger.create!(
+        {
+          broker_credential: credential,
+          home_team_id: "T123",
+          conversation_id: conversation_id,
+          conversation_type: "im",
+          raw_payload: { "id" => conversation_id, "is_im" => true }
+        }.merge(attributes)
+      )
     end
   end
 end

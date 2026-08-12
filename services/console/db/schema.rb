@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_11_200000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_12_162858) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_search"
@@ -435,6 +435,41 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_200000) do
     t.check_constraint "(principal_id IS NOT NULL) <> (role_id IS NOT NULL)", name: "slack_channel_permissions_exactly_one_grantee"
   end
 
+  create_table "slack_dm_rate_limits", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "home_team_id", null: false
+    t.datetime "next_available_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
+    t.bigint "oauth_app_id", null: false
+    t.string "slack_method", null: false
+    t.datetime "updated_at", null: false
+    t.index ["oauth_app_id", "home_team_id", "slack_method"], name: "idx_slack_dm_rate_limits_scope", unique: true
+    t.index ["oauth_app_id"], name: "index_slack_dm_rate_limits_on_oauth_app_id"
+  end
+
+  create_table "slack_dm_sync_ledgers", force: :cascade do |t|
+    t.boolean "active", default: true, null: false
+    t.integer "backoff_level", default: 0, null: false
+    t.bigint "broker_credential_id", null: false
+    t.string "claim_token"
+    t.datetime "claimed_until"
+    t.string "conversation_id", null: false
+    t.string "conversation_type", null: false
+    t.datetime "created_at", null: false
+    t.string "home_team_id", null: false
+    t.boolean "is_archived", default: false, null: false
+    t.boolean "is_ext_shared", default: false, null: false
+    t.text "last_error", default: "", null: false
+    t.datetime "last_seen_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
+    t.datetime "next_sync_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
+    t.jsonb "raw_payload", default: {}, null: false
+    t.datetime "updated_at", null: false
+    t.string "watermark_ts"
+    t.index ["active", "next_sync_at", "claimed_until"], name: "idx_slack_dm_sync_ledgers_due"
+    t.index ["broker_credential_id", "home_team_id", "conversation_id"], name: "idx_slack_dm_sync_ledgers_identity", unique: true
+    t.index ["broker_credential_id"], name: "index_slack_dm_sync_ledgers_on_broker_credential_id"
+    t.index ["claim_token"], name: "index_slack_dm_sync_ledgers_on_claim_token", unique: true, where: "(claim_token IS NOT NULL)"
+  end
+
   create_table "static_secrets", force: :cascade do |t|
     t.bigint "broker_credential_id"
     t.datetime "created_at", null: false
@@ -548,6 +583,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_200000) do
   add_foreign_key "skills", "users", on_delete: :cascade
   add_foreign_key "slack_channel_permissions", "principals"
   add_foreign_key "slack_channel_permissions", "roles"
+  add_foreign_key "slack_dm_rate_limits", "oauth_apps"
+  add_foreign_key "slack_dm_sync_ledgers", "broker_credentials"
   add_foreign_key "static_secrets", "broker_credentials"
   add_foreign_key "static_secrets", "users", column: "created_by_id"
   add_foreign_key "thread_shares", "users", column: "created_by_id"

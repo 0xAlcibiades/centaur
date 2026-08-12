@@ -27,6 +27,7 @@ class OauthApp < ApplicationRecord
   # The operator deletes/unlinks the credentials first. Mirrors
   # BrokerCredential#ensure_not_referenced.
   has_many :broker_credentials, dependent: :restrict_with_error
+  has_many :slack_dm_rate_limits, class_name: "SlackDm::RateLimit", dependent: :destroy
 
   encrypts :client_secret
 

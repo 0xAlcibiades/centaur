@@ -21,7 +21,10 @@ production:
     schedule: every minute
   slack_dm_poll_sync:
     class: "SlackDm::PollSyncJob"
-    schedule: every 10 minutes
+    schedule: every hour
+  slack_dm_dispatch_sync:
+    class: "SlackDm::DispatchSyncJob"
+    schedule: every minute
   google_docs_poll_sync:
     class: "GoogleDocs::PollSyncJob"
     schedule: every 30 minutes
