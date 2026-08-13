@@ -17,7 +17,6 @@ const CONSOLE_SERVICE_SUBJECT: &str = "centaur-console";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Capability {
-    PersonasRead,
     SessionsRead,
     SessionsWrite,
     SlackProxy,
@@ -30,8 +29,7 @@ pub(crate) enum Capability {
 }
 
 impl Capability {
-    const ALL: [Self; 10] = [
-        Self::PersonasRead,
+    const ALL: [Self; 9] = [
         Self::SessionsRead,
         Self::SessionsWrite,
         Self::SlackProxy,
@@ -150,11 +148,7 @@ impl ApiAuthConfig {
             let Some(token) = optional_env(spec.env_var) else {
                 continue;
             };
-            let mut capabilities = vec![
-                Capability::PersonasRead,
-                Capability::SessionsRead,
-                Capability::SessionsWrite,
-            ];
+            let mut capabilities = vec![Capability::SessionsRead, Capability::SessionsWrite];
             if spec.workflow_events {
                 capabilities.push(Capability::WorkflowsEvents);
             }
@@ -195,7 +189,6 @@ impl ApiAuthConfig {
             CallerClass::Ingress,
             slack_key.into(),
             [
-                Capability::PersonasRead,
                 Capability::SessionsRead,
                 Capability::SessionsWrite,
                 Capability::WorkflowsEvents,
