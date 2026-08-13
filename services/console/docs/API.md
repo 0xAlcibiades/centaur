@@ -679,7 +679,7 @@ labels instead of storing a literal, by replacing `value` with `value_from`:
 | Key               | Resolves to |
 | ----------------- | ----------- |
 | `principal_label` | The named label on the assigned principal. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
-| `principal_field` | One of the principal's fields: `id` (the opaque `prn_...` id), `foreign_id`, `name`, `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`, `slack_email`, `console_user_id`, `console_user_email`, or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
+| `principal_field` | One of the principal's fields: `id` (the opaque `prn_...` id), `foreign_id`, `name`, `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`, `slack_email`, `console_user_id`, `console_user_email` (the associated Console user's current email), or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
 | `proxy_label`     | The named label on the proxy. A label the proxy does not carry resolves to an empty string, so RLS-style policies fail closed. |
 
 A setting has either `value` or `value_from`, never both; unknown
@@ -1174,8 +1174,7 @@ system-managed `infra` role.
 | `slack_channel_id` | optional | First-class Slack conversation identity. |
 | `slack_team_id` | optional | First-class Slack team or enterprise scope. |
 | `slack_email` | optional | First-class Slack email identity. |
-| `console_user_id` | optional | Database ID of the associated console user for a `console_user` principal. |
-| `console_user_email` | optional | Email identity for a `console_user` principal. |
+| `console_user_id` | optional | Database ID of the associated Console user. A `slack_dm` principal is linked automatically when an explicitly supplied `slack_email` matches a Console user's email. |
 | `labels`     | optional    | Extensible metadata. Identity is read from the first-class fields, not from labels with matching names. |
 | `slack_channel_permissions` | optional | Direct permissions owned by the principal. Full replacement when present on create or update. |
 | `effective_slack_channel_permissions` | response only | Direct permissions merged with permissions inherited from assigned roles. |
@@ -1447,7 +1446,7 @@ Console stores and validates `name`, `description`, and Markdown `instructions` 
 
 ### Sandbox Operations
 
-These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Console-user principals can see their own private skills and every public skill. Other principal kinds can see public skills only. Mutations require an active Console user linked to the sandbox principal and can change only that user's skills.
+These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal and can change only that user's skills.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
