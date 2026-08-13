@@ -1370,7 +1370,7 @@ def download(
 def feedback(
     action: str = typer.Argument(
         "collect",
-        help="Action: collect, backfill, digest, show, update-status, improve, loop",
+        help="Action: collect, backfill, digest, show, update-status",
     ),
     channels: str = typer.Option(
         "test-bot",
@@ -1393,24 +1393,6 @@ def feedback(
     item_id: int = typer.Option(None, "--id", help="Feedback item ID (for show/update-status)"),
     new_status: str = typer.Option(None, "--new-status", help="New status for update-status"),
     output: str = typer.Option(None, "--output", "-o", help="Output file path"),
-    max_items: int = typer.Option(
-        8, "--max-items", help="Max actionable feedback items per improvement run"
-    ),
-    persona: str = typer.Option(
-        "eng", "--persona", help="Persona to use for auto-improvement runs"
-    ),
-    harness: str = typer.Option(
-        "amp", "--harness", help="Harness to use for auto-improvement runs"
-    ),
-    interval_sec: int = typer.Option(
-        900, "--interval-sec", help="Sleep interval between loop iterations"
-    ),
-    iterations: int = typer.Option(
-        0, "--iterations", help="Number of loop iterations to run; 0 means forever"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Build the improvement prompt without dispatching an agent run"
-    ),
 ):
     """Collect and analyze feedback from bot interactions.
 
@@ -1420,8 +1402,6 @@ def feedback(
       digest   - Generate markdown digest of feedback
       show     - Show details of a specific feedback item
       update-status - Update status of a feedback item
-      improve  - Collect feedback and dispatch a background agent improvement run
-      loop     - Repeatedly run the improvement cycle
 
     Examples:
         slack feedback collect -c test-bot
@@ -1430,11 +1410,8 @@ def feedback(
         slack feedback digest --severity medium
         slack feedback digest --status new -o /tmp/digest.md
         slack feedback update-status --id 42 --new-status triaged
-        slack feedback improve --persona eng --harness amp
-        slack feedback loop --iterations 1 --interval-sec 300
     """
     import json
-    import time
 
     from .feedback import (
         backfill_feedback,
@@ -1442,7 +1419,6 @@ def feedback(
         format_digest_markdown,
         get_feedback_digest,
         init_db,
-        run_improvement_cycle,
         update_feedback_status,
     )
 
@@ -1547,79 +1523,10 @@ def feedback(
             console.print(f"[red]Error: Item {item_id} not found[/]")
             raise typer.Exit(1)
 
-    elif action == "improve":
-        console.print("[bold]Running auto-improvement cycle...[/]\n")
-        result = run_improvement_cycle(
-            channels=channel_list,
-            since_days=since_days or 7,
-            limit_per_channel=limit_per_channel,
-            max_items=max_items,
-            min_severity=severity or "medium",
-            harness=harness,
-            persona_id=persona,
-            dry_run=dry_run,
-        )
-
-        collect_stats = result["collect_stats"]
-        console.print(
-            f"[dim]Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated[/]"
-        )
-
-        if result["actionable_items"] == 0:
-            console.print("\n[green]✓ No actionable feedback found![/]")
-            console.print("[dim]All recent interactions were successful or low severity.[/]")
-            return
-
-        console.print(f"[cyan]Actionable items:[/] {result['actionable_items']}")
-        console.print(f"[cyan]Item IDs:[/] {result['item_ids']}")
-        if dry_run:
-            print(result["prompt"])
-            return
-
-        console.print("\n[green]✓ Improvement agent dispatched[/]")
-        console.print(f"  Thread key: {result['thread_key']}")
-        console.print(f"  Execution id: {result['execution_id']}")
-
-    elif action == "loop":
-        console.print("[bold]Starting auto-improvement loop...[/]")
-        cycle = 0
-        while iterations == 0 or cycle < iterations:
-            cycle += 1
-            console.print(f"\n[bold]Cycle {cycle}[/]")
-            result = run_improvement_cycle(
-                channels=channel_list,
-                since_days=since_days or 7,
-                limit_per_channel=limit_per_channel,
-                max_items=max_items,
-                min_severity=severity or "medium",
-                harness=harness,
-                persona_id=persona,
-                dry_run=dry_run,
-            )
-            collect_stats = result["collect_stats"]
-            console.print(
-                f"  Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated"
-            )
-            console.print(f"  Actionable: {result['actionable_items']}")
-            if result["dispatched"]:
-                console.print(f"  Execution id: {result['execution_id']}")
-                console.print(f"  Thread key: {result['thread_key']}")
-            elif dry_run and result["actionable_items"]:
-                print(result["prompt"])
-
-            if iterations != 0 and cycle >= iterations:
-                break
-            console.print(f"[dim]Sleeping for {interval_sec}s...[/]")
-            try:
-                time.sleep(interval_sec)
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Loop interrupted[/]")
-                break
-
     else:
         console.print(f"[red]Unknown action: {action}[/]")
         console.print(
-            "Valid actions: collect, backfill, digest, show, update-status, improve, loop"
+            "Valid actions: collect, backfill, digest, show, update-status"
         )
         raise typer.Exit(1)
 
