@@ -348,13 +348,13 @@ fn configured_default_thinking() -> Thinking {
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        return Thinking::Low;
+        return Thinking::Medium;
     };
     match parse_thinking(&value) {
         Ok(thinking) => thinking,
         Err(error) => {
             eprintln!("ignoring invalid CODEX_MODEL_REASONING_EFFORT: {error}");
-            Thinking::Low
+            Thinking::Medium
         }
     }
 }
@@ -362,7 +362,7 @@ fn configured_default_thinking() -> Thinking {
 fn parse_thinking(value: &str) -> Result<Thinking> {
     let normalized = value.trim().to_ascii_lowercase();
     // Nanocodex does not expose a distinct `minimal` level. Low is the nearest
-    // supported Responses effort and is also Centaur's stock Codex default.
+    // supported Responses effort. Centaur's stock Codex default is medium.
     let normalized = if normalized == "minimal" {
         "low"
     } else {
