@@ -1446,7 +1446,7 @@ Console stores and validates `name`, `description`, and Markdown `instructions` 
 
 ### Sandbox Operations
 
-These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal and can change only that user's skills.
+These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills, private skills they have been added to as an editor, and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal. Owners can perform every mutation on their skills, while editors can update skill content but cannot share, unshare, or archive the skill.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
@@ -1454,12 +1454,15 @@ These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy
 | `GET` | `/api/v1/sandbox/skills/search?q=...` | Full-text search visible skills. |
 | `GET` | `/api/v1/sandbox/skills/:id` | Read a visible skill by its exact name or `skl_...` OID. |
 | `POST` | `/api/v1/sandbox/skills` | Create a public skill from `data.name`, `data.description`, and `data.instructions`. |
-| `PUT`/`PATCH` | `/api/v1/sandbox/skills/:id` | Update an owned skill using those fields; optional `data.lock_version` detects concurrent edits. |
+| `PUT`/`PATCH` | `/api/v1/sandbox/skills/:id` | Update an owned or editable skill using those fields; optional `data.lock_version` detects concurrent edits. |
 | `DELETE` | `/api/v1/sandbox/skills/:id` | Archive an owned skill. |
 | `POST` | `/api/v1/sandbox/skills/:id/share` | Make an owned skill public. |
 | `POST` | `/api/v1/sandbox/skills/:id/unshare` | Make an owned skill private. |
+| `GET` | `/api/v1/sandbox/skills/:id/editors` | List editors for any visible skill by exact name or OID. |
+| `POST` | `/api/v1/sandbox/skills/:id/editors` | Add an editor to an owned skill OID using an exact email or `usr_...` OID in `data.user`. |
+| `DELETE` | `/api/v1/sandbox/skills/:id/editors` | Remove an editor from an owned skill OID using an exact email or `usr_...` OID in `data.user`. |
 
-Catalog responses include the skill ID and a checksum over the generated document. Read responses set `Cache-Control: no-store`.
+Editor responses include each editor's OID, email, name, and account status, plus the skill's current `lock_version`. The editor list follows skill visibility: every principal that can read a shared skill can also read its editor list, while a private skill's list remains visible only to its owner and editors. Adding an editor is idempotent. Catalog responses include the skill ID and a checksum over the generated document. Read responses set `Cache-Control: no-store`.
 
 ## Proxies
 
