@@ -1356,6 +1356,38 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+        )
+        .await
+    }
+
+    /// Create or load a session and bind it to an existing iron-control
+    /// principal selected by foreign ID. When no foreign ID is supplied, the
+    /// session keeps the normal principal derived from its thread key.
+    pub async fn create_or_get_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_foreign_id: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        let principal_foreign_id = match principal_foreign_id {
+            Some(foreign_id) if foreign_id.trim().is_empty() => {
+                return Err(SessionRuntimeError::BadRequest(
+                    "principal must be a non-empty foreign ID".to_owned(),
+                ));
+            }
+            Some(foreign_id) => Some(foreign_id.trim()),
+            None => None,
+        };
         let span = info_span!(
             "centaur.api_rs.session.create_or_get",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1382,17 +1414,21 @@ impl SessionRuntime {
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
-            let registered_principal = self
-                .iron_control
-                .register_session(thread_key.as_str(), Some(&session_metadata))
-                .await?;
+            let registered_principal = match principal_foreign_id {
+                Some(foreign_id) => self.iron_control.get_principal(foreign_id).await?,
+                None => {
+                    self.iron_control
+                        .register_session(thread_key.as_str(), Some(&session_metadata))
+                        .await?
+                }
+            };
             let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
             let persona_resolution =
                 self.resolve_persona_for_create(persona_id, &desired_capabilities)?;
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
             }
-            let session = match self
+            match self
                 .store
                 .create_or_get_session(
                     thread_key,
@@ -1428,6 +1464,14 @@ impl SessionRuntime {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Persist the principal OID on the session row so a resumed session
+            // can recreate its sandbox after a restart without re-deriving it.
+            // Existing sessions are immutable at this boundary: changing their
+            // credential identity requires a different session.
+            let session = self
+                .store
+                .bind_iron_control_principal(thread_key, &registered_principal.id)
+                .await?;
             if let Some(context) = self.resolve_stored_persona(
                 session.persona_id.as_deref(),
                 harness_type,
@@ -1446,12 +1490,6 @@ impl SessionRuntime {
                     )
                     .await?;
             }
-            // Persist the principal OID on the session row so a resumed session
-            // can recreate its sandbox after a restart without re-deriving it.
-            let session = self
-                .store
-                .set_iron_control_principal(thread_key, Some(&registered_principal.id))
-                .await?;
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_create_or_get_completed",
@@ -9171,6 +9209,64 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_can_select_principal_by_foreign_id() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:principal-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        let outcome = runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Reject,
+                Some(" finance-automation "),
+            )
+            .await
+            .expect("create session with selected principal");
+
+        assert_eq!(
+            outcome.session.iron_control_principal.as_deref(),
+            Some("finance-automation")
+        );
+
+        let error = runtime
+            .create_or_get_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                HarnessConflictPolicy::Reject,
+                Some("support-automation"),
+            )
+            .await
+            .expect_err("existing session principal must not be rebound");
+        assert!(matches!(
+            error,
+            SessionRuntimeError::Store(SessionStoreError::PrincipalConflict {
+                existing,
+                requested,
+                ..
+            }) if existing == "finance-automation" && requested == "support-automation"
+        ));
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("get session after conflict")
+                .iron_control_principal
+                .as_deref(),
+            Some("finance-automation")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
