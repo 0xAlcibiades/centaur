@@ -943,6 +943,7 @@ name = "centaur-iron-proxy"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "serde_yaml",
  "strum",
  "thiserror 2.0.20",
@@ -4975,7 +4976,7 @@ dependencies = [
  "base64 0.21.7",
  "hmac-sha256",
  "http 1.4.2",
- "thiserror 2.0.19",
+ "thiserror 1.0.69",
  "time",
 ]
 
