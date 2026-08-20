@@ -57,6 +57,13 @@ Rails.application.routes.draw do
         post :run, action: :force_start
       end
     end
+    resources :scheduled_tasks, except: :show do
+      post :run, on: :member
+      get :slack_channel_options,
+          on: :collection,
+          to: "slack_channel_options#index",
+          defaults: { owner_type: "scheduled_task" }
+    end
     resources :skills do
       collection do
         get :mine
@@ -221,10 +228,14 @@ Rails.application.routes.draw do
       resources :principals, only: %i[index show create update] do
         collection do
           get "lookup/default/:foreign_id/effective_config",
-              action: :effective_config, as: :default_lookup_effective_config
-          get "lookup/:foreign_id/effective_config", action: :effective_config, as: :lookup_effective_config
-          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
-          get "lookup/:foreign_id", action: :lookup, as: :lookup
+              action: :effective_config, as: :default_lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id/effective_config", action: :effective_config, as: :lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id", action: :lookup, as: :lookup,
+              constraints: { foreign_id: /[^\/]+/ }
         end
         member do
           get "effective_config"

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_20_174601) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_20_191500) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_search"
@@ -380,6 +380,26 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_20_174601) do
     t.index ["labels"], name: "index_roles_on_labels", using: :gin
   end
 
+  create_table "scheduled_tasks", force: :cascade do |t|
+    t.bigint "author_id", null: false
+    t.datetime "created_at", null: false
+    t.string "cron_expression", null: false
+    t.string "delivery_channel", null: false
+    t.boolean "enabled", default: true, null: false
+    t.datetime "last_enqueued_at"
+    t.text "last_error"
+    t.datetime "last_run_at"
+    t.string "last_run_id"
+    t.string "name", null: false
+    t.datetime "next_run_at"
+    t.text "prompt", null: false
+    t.string "timezone", default: "America/Los_Angeles", null: false
+    t.datetime "updated_at", null: false
+    t.index ["author_id", "name"], name: "index_scheduled_tasks_on_author_id_and_name", unique: true
+    t.index ["author_id"], name: "index_scheduled_tasks_on_author_id"
+    t.index ["enabled", "next_run_at"], name: "index_scheduled_tasks_on_enabled_and_next_run_at"
+  end
+
   create_table "secret_sources", force: :cascade do |t|
     t.bigint "aws_auth_secret_id"
     t.jsonb "config", default: {}, null: false
@@ -576,6 +596,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_20_174601) do
   add_foreign_key "request_rules", "oauth_token_secrets"
   add_foreign_key "request_rules", "static_secrets"
   add_foreign_key "roles", "users", column: "created_by_id"
+  add_foreign_key "scheduled_tasks", "users", column: "author_id"
   add_foreign_key "secret_sources", "aws_auth_secrets"
   add_foreign_key "secret_sources", "gcp_auth_secrets"
   add_foreign_key "secret_sources", "gcp_id_token_secrets"
