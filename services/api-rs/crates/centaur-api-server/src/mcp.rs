@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tracing::{Instrument as _, Span, info_span};
 
 use crate::{
     ApiError,
@@ -72,6 +73,34 @@ struct CentaurToolMcpArguments {
     method: String,
     #[serde(default)]
     arguments: Value,
+}
+
+struct McpToolCallOutcome {
+    result: Value,
+    status: &'static str,
+}
+
+impl McpToolCallOutcome {
+    fn completed(result: Value) -> Self {
+        Self {
+            result,
+            status: "completed",
+        }
+    }
+
+    fn failed(result: Value) -> Self {
+        Self {
+            result,
+            status: "failed",
+        }
+    }
+
+    fn timed_out(result: Value) -> Self {
+        Self {
+            result,
+            status: "timed_out",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,14 +157,15 @@ pub(crate) async fn mcp_post(
             ensure_mcp_scope(&principal.scopes, "mcp:tools")?;
             let params = serde_json::from_value::<McpToolCallParams>(request.params.clone())
                 .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-            if params.name == "centaur_whoami" {
-                mcp_whoami_result(&principal, params.arguments)?
+            let tool = if params.name == "centaur_whoami" {
+                None
             } else {
                 let Some(tool) = mcp_find_centaur_tool(&params.name)? else {
                     return Ok(mcp_json_error(id, -32602, "unknown tool"));
                 };
-                mcp_centaur_tool_result(&state, &principal, tool, params.arguments).await?
-            }
+                Some(tool)
+            };
+            mcp_tool_call_result(&state, &principal, params, tool).await?
         }
         _ => return Ok(mcp_json_error(id, -32601, "method not found")),
     };
@@ -146,6 +176,87 @@ pub(crate) async fn mcp_post(
         "result": result,
     }))
     .into_response())
+}
+
+async fn mcp_tool_call_result(
+    state: &AppState,
+    principal: &McpPrincipal,
+    params: McpToolCallParams,
+    tool: Option<DiscoveredTool>,
+) -> Result<Value, ApiError> {
+    let method = mcp_tool_trace_method(&params);
+    let thread_key = format!("mcp:{}", principal.principal_id);
+    let span_input = mcp_tool_trace_input(&params.name, &method);
+    let span = info_span!(
+        parent: None,
+        "centaur.api_rs.mcp.tool",
+        component = "mcp",
+        event = "mcp_tool_call",
+        "lmnr.span.type" = "TOOL",
+        "lmnr.span.input" = span_input,
+        "lmnr.span.output" = tracing::field::Empty,
+        "lmnr.association.properties.session_id" = thread_key.as_str(),
+        "lmnr.association.properties.metadata.thread_key" = thread_key.as_str(),
+        "lmnr.association.properties.metadata.execution_id" = tracing::field::Empty,
+        "lmnr.association.properties.metadata.request_id" = tracing::field::Empty,
+        "otel.status_code" = tracing::field::Empty,
+        "centaur.thread_key" = thread_key.as_str(),
+        "centaur.execution_id" = tracing::field::Empty,
+        "centaur.sandbox_id" = tracing::field::Empty,
+        "tool.kind" = "mcp",
+        "tool.name" = params.name.as_str(),
+        "tool.method" = method.as_str(),
+        "tool.status" = tracing::field::Empty,
+    );
+
+    async move {
+        let outcome = if let Some(tool) = tool {
+            mcp_centaur_tool_result(state, principal, tool, params.arguments).await
+        } else {
+            mcp_whoami_result(principal, params.arguments).map(McpToolCallOutcome::completed)
+        };
+        match outcome {
+            Ok(outcome) => {
+                finish_mcp_tool_span(&Span::current(), outcome.status);
+                Ok(outcome.result)
+            }
+            Err(error) => {
+                finish_mcp_tool_span(&Span::current(), "failed");
+                Err(error)
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
+fn mcp_tool_trace_method(params: &McpToolCallParams) -> String {
+    params
+        .arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|method| !method.is_empty())
+        .unwrap_or("call")
+        .to_owned()
+}
+
+fn mcp_tool_trace_input(name: &str, method: &str) -> String {
+    json!({
+        "kind": "mcp",
+        "name": name,
+        "method": method,
+    })
+    .to_string()
+}
+
+fn finish_mcp_tool_span(span: &Span, status: &str) {
+    span.record("tool.status", status);
+    span.record("lmnr.span.output", json!({ "status": status }).to_string());
+    span.record(
+        "otel.status_code",
+        if status == "completed" { "OK" } else { "ERROR" },
+    );
 }
 
 fn mcp_whoami_tool() -> Value {
@@ -352,7 +463,7 @@ async fn mcp_centaur_tool_result(
     principal: &McpPrincipal,
     tool: DiscoveredTool,
     arguments: Value,
-) -> Result<Value, ApiError> {
+) -> Result<McpToolCallOutcome, ApiError> {
     let params = serde_json::from_value::<CentaurToolMcpArguments>(arguments)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     if params.method.trim().is_empty() {
@@ -361,10 +472,10 @@ async fn mcp_centaur_tool_result(
     let method = params.method.trim().to_owned();
     let methods = mcp_tool_methods(&tool);
     if method == "help" {
-        return mcp_tool_help_result(&tool, &methods);
+        return mcp_tool_help_result(&tool, &methods).map(McpToolCallOutcome::completed);
     }
     if !methods.iter().any(|candidate| candidate.name == method) {
-        return Ok(mcp_text_result(
+        return Ok(McpToolCallOutcome::failed(mcp_text_result(
             format!(
                 "centaur tool {} has no method {method}. Available methods: {}",
                 tool.name,
@@ -375,18 +486,18 @@ async fn mcp_centaur_tool_result(
                     .join(", ")
             ),
             true,
-        ));
+        )));
     }
     let arguments = match normalize_centaur_tool_arguments(params.arguments) {
         Ok(arguments) => arguments,
         Err(kind) => {
-            return Ok(mcp_text_result(
+            return Ok(McpToolCallOutcome::failed(mcp_text_result(
                 format!(
                     "centaur tool {}.{method} arguments must be an object; got {kind}",
                     tool.name
                 ),
                 true,
-            ));
+            )));
         }
     };
     run_tool_host_centaur_tool(state.runtime()?, principal, &tool, &method, arguments).await
@@ -419,7 +530,7 @@ async fn run_tool_host_centaur_tool(
     tool: &DiscoveredTool,
     method: &str,
     arguments: Value,
-) -> Result<Value, ApiError> {
+) -> Result<McpToolCallOutcome, ApiError> {
     let output = runtime
         .run_tool_host_call(ToolHostCallInput {
             principal_id: principal.principal_id.clone(),
@@ -430,8 +541,21 @@ async fn run_tool_host_centaur_tool(
             timeout: Duration::from_secs(120),
         })
         .await?;
+    let span = Span::current();
+    span.record("centaur.execution_id", output.execution_id.as_str());
+    span.record(
+        "lmnr.association.properties.metadata.execution_id",
+        output.execution_id.as_str(),
+    );
+    span.record(
+        "lmnr.association.properties.metadata.request_id",
+        output.request_id.as_str(),
+    );
+    if !output.sandbox_id.is_empty() {
+        span.record("centaur.sandbox_id", output.sandbox_id.as_str());
+    }
     if output.timed_out {
-        return Ok(mcp_text_result(
+        return Ok(McpToolCallOutcome::timed_out(mcp_text_result(
             format!(
                 "centaur tool {}.{method} timed out in {}: {}",
                 tool.name,
@@ -439,7 +563,7 @@ async fn run_tool_host_centaur_tool(
                 output.stderr
             ),
             true,
-        ));
+        )));
     }
     if output.exit_status != Some(0) {
         let raw = if output.stderr.is_empty() {
@@ -448,7 +572,7 @@ async fn run_tool_host_centaur_tool(
             &output.stderr
         };
         let detail = mcp_tool_failure_detail(raw);
-        return Ok(mcp_text_result(
+        return Ok(McpToolCallOutcome::failed(mcp_text_result(
             format!(
                 "centaur tool {}.{method} failed in {} with status {:?}: {detail}\n\nCall the {} tool with method \"help\" to list available methods and their signatures.",
                 tool.name,
@@ -457,25 +581,28 @@ async fn run_tool_host_centaur_tool(
                 tool.name
             ),
             true,
-        ));
+        )));
     }
     let stdout = output.stdout.trim();
     if stdout.is_empty() {
-        return Ok(mcp_text_result("null".to_owned(), false));
+        return Ok(McpToolCallOutcome::completed(mcp_text_result(
+            "null".to_owned(),
+            false,
+        )));
     }
     match serde_json::from_str::<Value>(stdout) {
-        Ok(value) => Ok(mcp_text_result(
+        Ok(value) => Ok(McpToolCallOutcome::completed(mcp_text_result(
             serde_json::to_string_pretty(&value)?,
             false,
-        )),
-        Err(error) => Ok(mcp_text_result(
+        ))),
+        Err(error) => Ok(McpToolCallOutcome::failed(mcp_text_result(
             format!(
                 "centaur tool {}.{method} returned non-json output in {}: {error}: {stdout}",
                 tool.name,
                 tool_host_error_context(&output)
             ),
             true,
-        )),
+        ))),
     }
 }
 
@@ -921,6 +1048,26 @@ mod mcp_tests {
         }
     }
 
+    #[test]
+    fn mcp_tool_trace_input_excludes_call_arguments() {
+        let params = McpToolCallParams {
+            name: "demo".to_owned(),
+            arguments: json!({
+                "method": "search",
+                "arguments": {"query": "private search text"},
+            }),
+        };
+
+        let method = mcp_tool_trace_method(&params);
+        let input = mcp_tool_trace_input(&params.name, &method);
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&input).unwrap(),
+            json!({"kind": "mcp", "name": "demo", "method": "search"})
+        );
+        assert!(!input.contains("private search text"));
+    }
+
     fn test_jwt(secret: &str, claims: Value) -> String {
         let header = general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({"alg": "HS256", "typ": "JWT"})).unwrap());
@@ -1086,8 +1233,9 @@ def search(query, limit=20):
         .await
         .unwrap();
 
-        assert_eq!(result["isError"], true);
-        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.result["isError"], true);
+        let text = result.result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("has no method missing"));
         assert!(text.contains("search"));
 
@@ -1115,8 +1263,9 @@ def search(query, limit=20):
         .await
         .unwrap();
 
-        assert_eq!(result["isError"], true);
-        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.result["isError"], true);
+        let text = result.result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("has no method missing"));
 
         let _ = fs::remove_dir_all(temp);
@@ -1150,8 +1299,9 @@ def search(query, limit=20):
         .await
         .unwrap();
 
-        assert_eq!(result["isError"], true);
-        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.result["isError"], true);
+        let text = result.result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("arguments must be an object"));
         assert!(text.contains("demo.search"));
 
