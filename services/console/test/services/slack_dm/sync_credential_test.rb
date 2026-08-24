@@ -538,11 +538,76 @@ module SlackDm
       assert_equal "D100", conversation_cursor
     end
 
-    test "429 responses expose the full Retry-After to the cursor job" do
+    test "short rate limits retry the same paginated Slack call" do
+      api_client = FakeApiClient.new
+      list_cursors = []
+      rate_limited = true
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          cursor = params["cursor"]
+          list_cursors << cursor
+          if cursor.nil?
+            {
+              "ok" => true,
+              "channels" => [],
+              "response_metadata" => { "next_cursor" => "page-2" }
+            }
+          elsif rate_limited
+            rate_limited = false
+            raise SlackApi::RateLimitedError.new(retry_after: 5.minutes.to_i - 1)
+          else
+            {
+              "ok" => true,
+              "channels" => [],
+              "response_metadata" => { "next_cursor" => "" }
+            }
+          end
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+      client = SlackDm::SyncCredential.new(
+        credential,
+        api_client: api_client,
+        slack_api_http: slack_http
+      )
+      sleeps = []
+
+      client.stub(:sleep, ->(seconds) { sleeps << seconds }) do
+        assert client.call
+      end
+
+      assert_equal [ 5.minutes.to_i - 1 ], sleeps
+      assert_equal [ nil, "page-2", "page-2" ], list_cursors
+    end
+
+    test "short rate limits escape after five retries of one Slack call" do
+      attempts = 0
+      slack_http = lambda do |endpoint:, **|
+        assert_equal SlackDm::SyncCredential::AUTH_TEST_ENDPOINT, endpoint
+        attempts += 1
+        raise SlackApi::RateLimitedError.new(retry_after: 1)
+      end
+      client = SlackDm::SyncCredential.new(credential, slack_api_http: slack_http)
+      sleeps = []
+
+      error = assert_raises(SlackApi::RateLimitedError) do
+        client.stub(:sleep, ->(seconds) { sleeps << seconds }) { client.call }
+      end
+
+      assert_equal 1, error.retry_after
+      assert_equal SlackDm::SyncCredential::MAX_INLINE_RATE_LIMIT_RETRIES + 1, attempts
+      assert_equal Array.new(SlackDm::SyncCredential::MAX_INLINE_RATE_LIMIT_RETRIES, 1), sleeps
+    end
+
+    test "long 429 responses expose the full Retry-After to the cursor job" do
       [
-        [ "120", 120 ],
-        [ "600", 600 ],
-        [ "invalid", 1 ]
+        [ "300", 300 ],
+        [ "600", 600 ]
       ].each do |header, expected|
         response = HttpClient::Response.new(
           status: 429,
