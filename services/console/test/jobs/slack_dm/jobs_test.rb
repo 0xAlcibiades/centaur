@@ -133,13 +133,25 @@ module SlackDm
       first = slack_credential(app: app)
       second = slack_credential(app: app)
       attempted_ids = []
+      observed_states = []
       rate_limited = true
+      page_state = {
+        "phase" => "history",
+        "history_cursor" => "history-2",
+        "oldest_ts" => "1700000000.000001",
+        "max_message_ts" => "1700000000.000003"
+      }
+      persisted_page_state = page_state.merge(
+        "_broker_credential_id" => first.oid,
+        "_conversation_id" => "D200"
+      )
       sync_factory = lambda do |credential|
         Object.new.tap do |sync|
-          sync.define_singleton_method(:call) do |**_kwargs, &checkpoint|
+          sync.define_singleton_method(:call) do |conversation_state:, **_kwargs, &checkpoint|
             attempted_ids << credential.id
+            observed_states << [ credential.id, conversation_state.deep_dup ]
             if credential == first && rate_limited
-              checkpoint.call("D200")
+              checkpoint.call("D200", page_state)
               raise SlackApi::RateLimitedError.new(retry_after: 20.minutes.to_i)
             end
 
@@ -162,6 +174,7 @@ module SlackDm
         cursor = SlackDmSyncCursor.find_by!(oauth_app_slug: "slack-dms")
         assert_equal first.id, cursor.next_credential_id
         assert_equal "D200", cursor.next_conversation_id
+        assert_equal persisted_page_state, cursor.conversation_state
         assert_equal retry_at, cursor.not_before
         assert_equal [ first.id ], attempted_ids
 
@@ -175,9 +188,15 @@ module SlackDm
       end
 
       assert_equal [ first.id, first.id, second.id ], attempted_ids
+      assert_equal [
+        [ first.id, {} ],
+        [ first.id, persisted_page_state ],
+        [ second.id, {} ]
+      ], observed_states
       cursor = SlackDmSyncCursor.find_by!(oauth_app_slug: "slack-dms")
       assert_equal first.id, cursor.next_credential_id
       assert_nil cursor.next_conversation_id
+      assert_empty cursor.conversation_state
       assert_nil cursor.not_before
     end
 

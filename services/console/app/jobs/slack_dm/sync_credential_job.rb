@@ -24,7 +24,12 @@ module SlackDm
 
       credentials = eligible_credentials(oauth_app_slug)
       if credentials.empty?
-        cursor.update!(next_credential_id: nil, next_conversation_id: nil, not_before: nil)
+        cursor.update!(
+          next_credential_id: nil,
+          next_conversation_id: nil,
+          conversation_state: {},
+          not_before: nil
+        )
         return
       end
 
@@ -38,6 +43,7 @@ module SlackDm
         cursor.update!(
           next_credential_id: next_credential.id,
           next_conversation_id: nil,
+          conversation_state: {},
           not_before: nil
         )
       end
@@ -74,11 +80,17 @@ module SlackDm
     def sync_credential(cursor, credential, deadline)
       SlackDm::SyncCredential.new(credential).call(
         starting_conversation_id: cursor.next_conversation_id,
+        conversation_state: cursor.conversation_state,
         deadline: deadline
-      ) do |conversation_id|
+      ) do |conversation_id, conversation_state|
+        persisted_state = conversation_state.to_h.deep_stringify_keys.merge(
+          "_broker_credential_id" => credential.oid,
+          "_conversation_id" => conversation_id
+        )
         cursor.update!(
           next_credential_id: credential.id,
           next_conversation_id: conversation_id,
+          conversation_state: persisted_state,
           not_before: nil
         )
       end

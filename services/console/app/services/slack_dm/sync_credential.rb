@@ -47,7 +47,7 @@ module SlackDm
       @replies_upserted = 0
     end
 
-    def call(starting_conversation_id: nil, deadline: nil)
+    def call(starting_conversation_id: nil, conversation_state: {}, deadline: nil)
       auth = slack_api(AUTH_TEST_ENDPOINT)
       home_team_id = auth.fetch("team_id")
       source_user_id = auth["user_id"].presence || @credential.provider_subject.to_s
@@ -57,6 +57,10 @@ module SlackDm
       run = empty_batch(home_team_id, source_user_id).fetch(:run)
       run[:conversations_requested] = conversations.length
       checkpointed_conversation_id = starting_conversation_id
+      active_conversation_state = resumable_conversation_state(
+        conversation_state,
+        starting_conversation_id
+      )
 
       conversations.each_with_index do |conversation, index|
         if deadline && Time.current >= deadline
@@ -66,43 +70,50 @@ module SlackDm
 
         conversation_id = conversation.fetch("id")
         if conversation_id != checkpointed_conversation_id
-          yield conversation_id if block_given?
+          active_conversation_state = {}
+          yield conversation_id, active_conversation_state if block_given?
           checkpointed_conversation_id = conversation_id
         end
 
-        batch = empty_batch(home_team_id, source_user_id)
-        conversation_failed = false
         begin
-          normalize_conversation(conversation, home_team_id, batch)
-          normalize_members(conversation, home_team_id, batch)
-          sync_history(conversation, home_team_id, checkpoints[conversation_id], batch)
+          completed = sync_conversation(
+            conversation,
+            home_team_id,
+            source_user_id,
+            checkpoints[conversation_id],
+            active_conversation_state,
+            run,
+            deadline
+          ) do |new_state|
+            active_conversation_state = new_state
+            yield conversation_id, new_state if block_given?
+          end
+          unless completed
+            finish_run(run, status: "partial")
+            return false
+          end
+        rescue CentaurApiClient::Error => e
+          raise unless SKIPPABLE_INGEST_STATUSES.include?(e.status)
+
+          run[:conversations_failed] += 1
+          Rails.logger.warn do
+            "Slack DM ingest rejected conversation #{conversation_id}: " \
+              "status=#{e.status} error=#{e.message}"
+          end
         rescue StandardError => e
           raise if e.is_a?(SlackApi::RetryableError)
           raise if Rails.env.test?
 
-          conversation_failed = true
           run[:conversations_failed] += 1
           Rails.logger.warn do
             "slack DM sync failed for conversation #{conversation_id}: #{e.class}: #{e.message}"
           end
         end
-        unless conversation_failed
-          begin
-            ingest_conversation_batch(batch, run)
-          rescue CentaurApiClient::Error => e
-            raise unless SKIPPABLE_INGEST_STATUSES.include?(e.status)
-
-            run[:conversations_failed] += 1
-            Rails.logger.warn do
-              "Slack DM ingest rejected conversation #{conversation_id}: " \
-                "status=#{e.status} error=#{e.message}"
-            end
-          end
-        end
 
         next_conversation_id = conversations[index + 1]&.fetch("id")
         if next_conversation_id
-          yield next_conversation_id if block_given?
+          active_conversation_state = {}
+          yield next_conversation_id, active_conversation_state if block_given?
           checkpointed_conversation_id = next_conversation_id
         end
       end
@@ -124,7 +135,7 @@ module SlackDm
       end
     end
 
-    def empty_batch(home_team_id, source_user_id)
+    def empty_batch(home_team_id, source_user_id, replace_memberships: true)
       {
         run: {
           run_id: @run_id,
@@ -145,13 +156,242 @@ module SlackDm
             credential_id: @credential.oid
           }
         },
-        replace_memberships: true,
+        replace_memberships: replace_memberships,
         conversations: [],
         members: [],
         messages: [],
         attachments: [],
         checkpoints: []
       }
+    end
+
+    def sync_conversation(conversation, home_team_id, source_user_id, checkpoint,
+                          conversation_state, run, deadline)
+      state = normalized_conversation_state(conversation_state, checkpoint)
+      yield state if conversation_state.blank?
+      pages_processed = Hash.new(0)
+
+      loop do
+        return false if deadline && Time.current >= deadline
+
+        case state.fetch("phase")
+        when "members"
+          return false if pages_processed["members"] >= members_max_pages
+
+          state = sync_members_page(conversation, state)
+          pages_processed["members"] += 1 unless conversation["is_im"]
+          yield state
+        when "members_ingest"
+          batch = empty_batch(home_team_id, source_user_id)
+          normalize_conversation(conversation, home_team_id, batch)
+          normalize_members(conversation, home_team_id, state.fetch("member_ids"), batch)
+          ingest_sync_batch(batch, run)
+          state = {
+            "phase" => "history",
+            "history_cursor" => nil,
+            "oldest_ts" => state["oldest_ts"],
+            "max_message_ts" => state["max_message_ts"]
+          }
+          yield state
+        when "history"
+          return false if pages_processed["history"] >= history_max_pages
+
+          state = sync_history_page(
+            conversation,
+            home_team_id,
+            source_user_id,
+            state,
+            run
+          )
+          pages_processed["history"] += 1
+          yield state
+        when "replies"
+          return false if pages_processed["replies"] >= replies_max_pages
+
+          state = sync_replies_page(
+            conversation,
+            home_team_id,
+            source_user_id,
+            state,
+            run
+          )
+          pages_processed["replies"] += 1
+          yield state
+        when "complete"
+          finish_conversation(conversation, home_team_id, source_user_id, state, run)
+          return true
+        else
+          raise SlackApi::Error,
+                "Invalid Slack conversation sync phase #{state['phase'].inspect}"
+        end
+      end
+    end
+
+    def normalized_conversation_state(conversation_state, checkpoint)
+      state = conversation_state.to_h.deep_stringify_keys
+      return state unless state.empty?
+
+      {
+        "phase" => "members",
+        "members_cursor" => nil,
+        "member_ids" => [],
+        "oldest_ts" => checkpoint,
+        "max_message_ts" => checkpoint
+      }
+    end
+
+    def resumable_conversation_state(conversation_state, conversation_id)
+      state = conversation_state.to_h.deep_stringify_keys
+      broker_credential_id = state.delete("_broker_credential_id")
+      state_conversation_id = state.delete("_conversation_id")
+      has_identity = broker_credential_id.present? || state_conversation_id.present?
+      return state unless has_identity
+      return {} unless broker_credential_id == @credential.oid
+      return {} unless state_conversation_id == conversation_id
+
+      state
+    end
+
+    def sync_members_page(conversation, state)
+      if conversation["is_im"] && conversation["user"].present?
+        member_ids = [ conversation["user"], @credential.provider_subject ].compact_blank.uniq
+        return state.merge("phase" => "members_ingest", "member_ids" => member_ids)
+      end
+
+      page = slack_api(
+        CONVERSATIONS_MEMBERS_ENDPOINT,
+        {
+          "channel" => conversation.fetch("id"),
+          "limit" => members_page_size,
+          "cursor" => state["members_cursor"]
+        }.compact
+      )
+      member_ids = (Array(state["member_ids"]) + Array(page["members"])).compact
+      cursor = page.dig("response_metadata", "next_cursor").presence
+      if cursor
+        state.merge("members_cursor" => cursor, "member_ids" => member_ids.uniq)
+      else
+        member_ids << @credential.provider_subject if @credential.provider_subject.present?
+        state.merge(
+          "phase" => "members_ingest",
+          "members_cursor" => nil,
+          "member_ids" => member_ids.uniq
+        )
+      end
+    end
+
+    def sync_history_page(conversation, home_team_id, source_user_id, state, run)
+      conversation_id = conversation.fetch("id")
+      params = history_params(conversation_id, state["oldest_ts"])
+      params["cursor"] = state["history_cursor"] if state["history_cursor"].present?
+      page = slack_api(CONVERSATIONS_HISTORY_ENDPOINT, params)
+      batch = empty_batch(home_team_id, source_user_id, replace_memberships: false)
+      max_message_ts = state["max_message_ts"]
+      pending_threads = []
+
+      Array(page["messages"]).each do |message|
+        @messages_fetched += 1
+        max_message_ts = max_slack_ts(max_message_ts, message["ts"])
+        normalize_message(message, home_team_id, conversation_id, nil, batch)
+        normalize_files(message, home_team_id, conversation_id, batch)
+        if message["reply_count"].to_i.positive?
+          pending_threads << {
+            "thread_ts" => message["thread_ts"].presence || message.fetch("ts"),
+            "root_message_ts" => message.fetch("ts")
+          }
+        end
+      end
+
+      ingest_sync_batch(batch, run)
+      history_cursor = page.dig("response_metadata", "next_cursor").presence
+      if pending_threads.any?
+        {
+          "phase" => "replies",
+          "history_cursor" => history_cursor,
+          "oldest_ts" => state["oldest_ts"],
+          "max_message_ts" => max_message_ts,
+          "pending_threads" => pending_threads,
+          "replies_cursor" => nil
+        }
+      elsif history_cursor
+        {
+          "phase" => "history",
+          "history_cursor" => history_cursor,
+          "oldest_ts" => state["oldest_ts"],
+          "max_message_ts" => max_message_ts
+        }
+      else
+        {
+          "phase" => "complete",
+          "oldest_ts" => state["oldest_ts"],
+          "max_message_ts" => max_message_ts
+        }
+      end
+    end
+
+    def sync_replies_page(conversation, home_team_id, source_user_id, state, run)
+      conversation_id = conversation.fetch("id")
+      pending_threads = Array(state["pending_threads"])
+      thread = pending_threads.first || raise(
+        SlackApi::Error,
+        "Slack replies state has no pending thread for #{conversation_id}"
+      )
+      params = {
+        "channel" => conversation_id,
+        "ts" => thread.fetch("thread_ts"),
+        "limit" => replies_page_size,
+        "cursor" => state["replies_cursor"]
+      }.compact
+      page = slack_api(CONVERSATIONS_REPLIES_ENDPOINT, params)
+      batch = empty_batch(home_team_id, source_user_id, replace_memberships: false)
+
+      Array(page["messages"]).each do |reply|
+        next if reply["ts"] == thread.fetch("root_message_ts")
+
+        @replies_fetched += 1
+        normalize_message(
+          reply,
+          home_team_id,
+          conversation_id,
+          thread.fetch("root_message_ts"),
+          batch
+        )
+        normalize_files(reply, home_team_id, conversation_id, batch)
+      end
+
+      ingest_sync_batch(batch, run)
+      replies_cursor = page.dig("response_metadata", "next_cursor").presence
+      return state.merge("replies_cursor" => replies_cursor) if replies_cursor
+
+      pending_threads = pending_threads.drop(1)
+      if pending_threads.any?
+        state.merge("pending_threads" => pending_threads, "replies_cursor" => nil)
+      elsif state["history_cursor"].present?
+        {
+          "phase" => "history",
+          "history_cursor" => state["history_cursor"],
+          "oldest_ts" => state["oldest_ts"],
+          "max_message_ts" => state["max_message_ts"]
+        }
+      else
+        {
+          "phase" => "complete",
+          "oldest_ts" => state["oldest_ts"],
+          "max_message_ts" => state["max_message_ts"]
+        }
+      end
+    end
+
+    def finish_conversation(conversation, home_team_id, source_user_id, state, run)
+      batch = empty_batch(home_team_id, source_user_id, replace_memberships: false)
+      batch[:checkpoints] << {
+        broker_credential_id: @credential.oid,
+        home_team_id: home_team_id,
+        conversation_id: conversation.fetch("id"),
+        watermark_ts: state["max_message_ts"],
+        last_run_id: @run_id
+      }
+      ingest_sync_batch(batch, run, conversation_completed: true)
     end
 
     def remaining_conversations(conversations, starting_conversation_id)
@@ -162,14 +402,15 @@ module SlackDm
       end
     end
 
-    def ingest_conversation_batch(batch, run)
+    def ingest_sync_batch(batch, run, conversation_completed: false)
       batch_replies_upserted = batch[:messages].count do |message|
         message[:parent_message_ts].present?
       end
       messages_upserted = @messages_upserted + batch[:messages].length
       replies_upserted = @replies_upserted + batch_replies_upserted
+      conversations_synced = run[:conversations_synced] + (conversation_completed ? 1 : 0)
       batch[:run] = run.merge(
-        conversations_synced: run[:conversations_synced] + 1,
+        conversations_synced: conversations_synced,
         messages_fetched: @messages_fetched,
         messages_upserted: messages_upserted,
         replies_fetched: @replies_fetched,
@@ -177,7 +418,7 @@ module SlackDm
         finished: false
       )
       @api_client.ingest_slack_dm_sync_batch(sanitize_for_postgres(batch))
-      run[:conversations_synced] += 1
+      run[:conversations_synced] = conversations_synced
       @messages_upserted = messages_upserted
       @replies_upserted = replies_upserted
     end
@@ -225,10 +466,9 @@ module SlackDm
       }
     end
 
-    def normalize_members(conversation, home_team_id, batch)
+    def normalize_members(conversation, home_team_id, member_ids, batch)
       conversation_id = conversation.fetch("id")
-      members = conversation_members(conversation)
-      members.each do |member_id|
+      member_ids.each do |member_id|
         batch[:members] << {
           home_team_id: home_team_id,
           conversation_id: conversation_id,
@@ -240,89 +480,12 @@ module SlackDm
       end
     end
 
-    def conversation_members(conversation)
-      if conversation["is_im"] && conversation["user"].present?
-        members = [ conversation["user"] ]
-        members << @credential.provider_subject if @credential.provider_subject.present?
-        return members.uniq
-      end
-
-      complete = true
-      pages = each_page(
-        CONVERSATIONS_MEMBERS_ENDPOINT,
-        { "channel" => conversation.fetch("id"), "limit" => members_page_size },
-        max_pages: members_max_pages
-      ) do |_page, truncated|
-        complete = false if truncated
-      end
-      unless complete
-        raise SlackApi::Error,
-              "Slack membership pagination truncated for #{conversation.fetch('id')}"
-      end
-
-      members = pages.flat_map { |page| Array(page["members"]) }.compact
-      members << @credential.provider_subject if @credential.provider_subject.present?
-      members.uniq
-    end
-
     def conversation_type(conversation)
       return "mpim" if conversation["is_mpim"]
       return "im" if conversation["is_im"]
       return "private_channel" if conversation["is_private"]
 
       raise SlackApi::Error, "Unsupported Slack conversation #{conversation['id']}"
-    end
-
-    def sync_history(conversation, home_team_id, checkpoint, batch)
-      conversation_id = conversation.fetch("id")
-      max_message_ts = checkpoint
-      completed = true
-      pages = each_page(
-        CONVERSATIONS_HISTORY_ENDPOINT,
-        history_params(conversation_id, checkpoint),
-        max_pages: history_max_pages
-      ) do |_page, truncated|
-        completed = false if truncated
-      end
-
-      pages.each do |page|
-        Array(page["messages"]).each do |message|
-          @messages_fetched += 1
-          max_message_ts = max_slack_ts(max_message_ts, message["ts"])
-          normalize_message(message, home_team_id, conversation_id, nil, batch)
-          normalize_files(message, home_team_id, conversation_id, batch)
-          sync_replies(message, home_team_id, conversation_id, batch) if message["reply_count"].to_i.positive?
-        end
-      end
-
-      return unless completed
-
-      batch[:checkpoints] << {
-        broker_credential_id: @credential.oid,
-        home_team_id: home_team_id,
-        conversation_id: conversation_id,
-        watermark_ts: max_message_ts,
-        last_run_id: @run_id
-      }
-    end
-
-    def sync_replies(root_message, home_team_id, conversation_id, batch)
-      thread_ts = root_message["thread_ts"].presence || root_message["ts"]
-      pages = each_page(
-        CONVERSATIONS_REPLIES_ENDPOINT,
-        { "channel" => conversation_id, "ts" => thread_ts, "limit" => replies_page_size },
-        max_pages: replies_max_pages
-      )
-
-      pages.each do |page|
-        Array(page["messages"]).each do |reply|
-          next if reply["ts"] == root_message["ts"]
-
-          @replies_fetched += 1
-          normalize_message(reply, home_team_id, conversation_id, root_message["ts"], batch)
-          normalize_files(reply, home_team_id, conversation_id, batch)
-        end
-      end
     end
 
     def normalize_message(message, home_team_id, conversation_id, parent_message_ts, batch)

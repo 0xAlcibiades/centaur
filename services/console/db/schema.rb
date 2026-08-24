@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_23_054500) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_24_032738) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_search"
@@ -490,6 +490,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_23_054500) do
   end
 
   create_table "slack_dm_sync_cursors", force: :cascade do |t|
+    t.jsonb "conversation_state", default: {}, null: false
     t.datetime "created_at", null: false
     t.string "next_conversation_id"
     t.bigint "next_credential_id"
