@@ -312,6 +312,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             get(get_google_docs_sync_checkpoint),
         )
         .route(
+            "/api/admin/google/docs-sync/content-status",
+            post(get_google_docs_content_status),
+        )
+        .route(
             "/api/admin/google/docs-sync/batch",
             post(ingest_google_docs_sync_batch).layer(DefaultBodyLimit::disable()),
         )
@@ -1574,6 +1578,10 @@ struct GoogleDocsSyncBatchRequest {
     #[serde(default)]
     observations: Vec<GoogleDocsSyncObservationPayload>,
     #[serde(default)]
+    observation_deactivations: Vec<GoogleDocsObservationDeactivationPayload>,
+    #[serde(default)]
+    observation_sweeps: Vec<GoogleDocsObservationSweepPayload>,
+    #[serde(default)]
     contents: Vec<GoogleDocsSyncContentPayload>,
     #[serde(default)]
     context_documents: Vec<GoogleDocsContextDocumentPayload>,
@@ -1581,6 +1589,19 @@ struct GoogleDocsSyncBatchRequest {
     checkpoint: Option<GoogleDocsSyncCheckpointPayload>,
     #[serde(default = "default_true")]
     replace_context_documents: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleDocsContentStatusRequest {
+    #[serde(default)]
+    files: Vec<GoogleDocsContentVersionPayload>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GoogleDocsContentVersionPayload {
+    file_id: String,
+    #[serde(default)]
+    source_version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1676,6 +1697,18 @@ struct GoogleDocsSyncObservationPayload {
     raw_payload: Value,
     #[serde(default)]
     source_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleDocsObservationDeactivationPayload {
+    broker_credential_id: String,
+    observed_file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleDocsObservationSweepPayload {
+    broker_credential_id: String,
+    source_run_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2348,6 +2381,70 @@ async fn get_google_docs_sync_checkpoint(
     Ok(Json(json!({ "ok": true, "checkpoint": checkpoint })))
 }
 
+async fn get_google_docs_content_status(
+    State(state): State<AppState>,
+    Json(request): Json<GoogleDocsContentStatusRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = db_pool(&state)?;
+    for file in &request.files {
+        require_non_empty("file.file_id", &file.file_id)?;
+    }
+
+    let file_ids = request
+        .files
+        .iter()
+        .map(|file| file.file_id.as_str())
+        .collect::<Vec<_>>();
+    let available = sqlx::query_as::<_, (String, String)>(
+        "SELECT file_id, source_version \
+         FROM google_docs_sync_document_contents \
+         WHERE file_id = ANY($1) AND last_error = ''",
+    )
+    .bind(&file_ids)
+    .fetch_all(&pool)
+    .await?
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let missing = request
+        .files
+        .into_iter()
+        .filter(|file| {
+            !available
+                .get(&file.file_id)
+                .is_some_and(|stored| content_version_satisfies(stored, &file.source_version))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({ "ok": true, "missing": missing })))
+}
+
+fn content_version_satisfies(stored: &str, requested: &str) -> bool {
+    stored == requested
+        || stored
+            .parse::<u128>()
+            .ok()
+            .zip(requested.parse::<u128>().ok())
+            .is_some_and(|(stored, requested)| stored >= requested)
+}
+
+#[cfg(test)]
+mod google_docs_content_status_tests {
+    use super::content_version_satisfies;
+
+    #[test]
+    fn newer_numeric_google_drive_versions_satisfy_older_requests() {
+        assert!(content_version_satisfies("12", "7"));
+        assert!(content_version_satisfies("7", "7"));
+        assert!(!content_version_satisfies("6", "7"));
+    }
+
+    #[test]
+    fn opaque_versions_only_satisfy_exact_requests() {
+        assert!(content_version_satisfies("version-a", "version-a"));
+        assert!(!content_version_satisfies("version-b", "version-a"));
+    }
+}
+
 async fn ingest_google_docs_sync_batch(
     State(state): State<AppState>,
     Json(request): Json<GoogleDocsSyncBatchRequest>,
@@ -2449,6 +2546,31 @@ async fn ingest_google_docs_sync_batch(
         .bind(observation.active)
         .bind(&observation.raw_payload)
         .bind(empty_to_none(observation.source_run_id.as_deref()))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for sweep in &request.observation_sweeps {
+        sqlx::query(
+            "UPDATE google_docs_sync_file_observations \
+             SET active = FALSE, updated_at = NOW() \
+             WHERE broker_credential_id = $1 AND active = TRUE \
+             AND source_run_id IS DISTINCT FROM $2",
+        )
+        .bind(&sweep.broker_credential_id)
+        .bind(&sweep.source_run_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for deactivation in &request.observation_deactivations {
+        sqlx::query(
+            "UPDATE google_docs_sync_file_observations \
+             SET active = FALSE, updated_at = NOW() \
+             WHERE broker_credential_id = $1 AND observed_file_id = $2",
+        )
+        .bind(&deactivation.broker_credential_id)
+        .bind(&deactivation.observed_file_id)
         .execute(&mut *tx)
         .await?;
     }
@@ -2572,7 +2694,7 @@ async fn ingest_google_docs_sync_batch(
              provider_subject = EXCLUDED.provider_subject, \
              provider_email = EXCLUDED.provider_email, \
              start_page_token = COALESCE(NULLIF(EXCLUDED.start_page_token, ''), google_docs_sync_checkpoints.start_page_token), \
-             changes_page_token = COALESCE(NULLIF(EXCLUDED.changes_page_token, ''), google_docs_sync_checkpoints.changes_page_token), \
+             changes_page_token = EXCLUDED.changes_page_token, \
              last_full_sync_at = COALESCE(EXCLUDED.last_full_sync_at, google_docs_sync_checkpoints.last_full_sync_at), \
              last_incremental_sync_at = COALESCE(EXCLUDED.last_incremental_sync_at, google_docs_sync_checkpoints.last_incremental_sync_at), \
              last_run_id = EXCLUDED.last_run_id, \
@@ -2607,6 +2729,7 @@ async fn ingest_google_docs_sync_batch(
         "counts": {
             "files": request.files.len(),
             "observations": request.observations.len(),
+            "observation_sweeps": request.observation_sweeps.len(),
             "contents": request.contents.len(),
             "context_documents": request.context_documents.len(),
             "checkpoint": request.checkpoint.is_some(),
@@ -3338,6 +3461,23 @@ fn validate_google_docs_sync_batch(request: &GoogleDocsSyncBatchRequest) -> Resu
             false,
         )?;
         validate_json_shape("observation.raw_payload", &observation.raw_payload, true)?;
+    }
+    for deactivation in &request.observation_deactivations {
+        require_non_empty(
+            "observation_deactivation.broker_credential_id",
+            &deactivation.broker_credential_id,
+        )?;
+        require_non_empty(
+            "observation_deactivation.observed_file_id",
+            &deactivation.observed_file_id,
+        )?;
+    }
+    for sweep in &request.observation_sweeps {
+        require_non_empty(
+            "observation_sweep.broker_credential_id",
+            &sweep.broker_credential_id,
+        )?;
+        require_non_empty("observation_sweep.source_run_id", &sweep.source_run_id)?;
     }
     for content in &request.contents {
         require_non_empty("content.file_id", &content.file_id)?;
