@@ -562,11 +562,8 @@ class Console::ThreadsController < ApplicationController
   end
 
   # The authenticated user is the per-turn requester of every console execute
-  # (RFC 0005): provision their console-user principal (idempotent, cheap on
-  # repeat turns) so api-rs can bind it to the turn's proxy and hoist the
-  # user's always-available OAuth credentials. The thread's own principal is
-  # untouched, so a shared thread never hands the creator's credentials to
-  # another user's turn.
+  # (RFC 0005), never the thread's creator — so a reply on a shared thread
+  # binds the replier's credentials, not the creator's.
   def console_requester_principal
     return unless current_user
 
