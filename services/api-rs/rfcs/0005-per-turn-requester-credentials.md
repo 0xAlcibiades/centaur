@@ -111,10 +111,18 @@ This change also creates and uses it from channel turns. On each execute:
    DM thread keys.)
 3. Put the principal's id on the proxy assignment for this turn, as an
    optional `requester_principal_id`. Clear the field when the metadata has
-   no requester (console-driven runs, workflow executions).
+   no requester (workflow executions).
 
 The session's own principal, the conversation, is untouched. No requester
 in the metadata means exactly today's behavior.
+
+Console-driven runs carry a requester too: the console provisions the
+authenticated user's console-user principal
+(`ConsoleUserPrincipalProvisioner`) and passes its foreign ID as
+`requester_principal_foreign_id` in the execute metadata. api-rs resolves it
+fetch-only for `console:` thread keys — a thread namespace only the console
+service may write — and never upserts console-user principals, whose identity
+fields and reconciliation the console owns.
 
 ### 2. Grant union on the proxy (console)
 

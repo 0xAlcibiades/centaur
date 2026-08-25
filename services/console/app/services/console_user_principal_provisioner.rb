@@ -21,7 +21,9 @@ class ConsoleUserPrincipalProvisioner
       principal.console_user = user
       principal.assign_attributes(slack_identity_fields)
       principal.labels = principal.labels.merge("managed-by" => "centaur")
-      principal.save!
+      # Repeat calls (e.g. every console execute) must not write: an unchanged
+      # save would still fire the principal after_commit hooks each time.
+      principal.save! if principal.changed?
       assign_user_mcp_role(principal) if newly_created
       principal
     end

@@ -122,6 +122,9 @@ impl SessionRegistrar {
         let Some(metadata) = metadata else {
             return Ok(None);
         };
+        if thread_key.starts_with("console:") {
+            return self.console_requester(metadata).await;
+        }
         let Some(slack_team_id) = eligible_slack_requester_team(metadata) else {
             return Ok(None);
         };
@@ -143,6 +146,26 @@ impl SessionRegistrar {
         );
         self.merge_existing_labels(&mut input).await?;
         Ok(Some(self.client.upsert_principal(&input).await?))
+    }
+
+    /// Resolve the requester for a console thread. Console sessions have no
+    /// Slack identity to derive, so the console service provisions a
+    /// console-user principal for its authenticated user and passes that
+    /// foreign ID in the execute metadata. Fetch-only: the console owns
+    /// console-user principals' identity fields and reconciliation, so api-rs
+    /// never upserts them, and a lookup failure degrades to a requester-less
+    /// turn at the caller. Only reachable for `console:` thread keys, which
+    /// only the console service's caller class may write.
+    async fn console_requester(&self, metadata: &Value) -> Result<Option<Principal>> {
+        let Some(foreign_id) = metadata
+            .get("requester_principal_foreign_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|foreign_id| !foreign_id.is_empty())
+        else {
+            return Ok(None);
+        };
+        self.client.get_principal(foreign_id).await.map(Some)
     }
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
@@ -684,6 +707,84 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn register_requester_resolves_console_requester_principal() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "requester_principal_foreign_id": "console-user-ada-example-com-abc123"
+        });
+
+        let principal = registrar
+            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .await
+            .unwrap()
+            .expect("console requester resolves to the provisioned principal");
+        assert_eq!(principal.id, "prn_console_user");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            ["GET /api/v1/principals/lookup/console-user-ada-example-com-abc123".to_owned()],
+            "console requesters are fetched, never upserted"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_ignores_requester_foreign_id_outside_console_threads() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "requester_principal_foreign_id": "console-user-ada-example-com-abc123"
+        });
+
+        let principal = registrar
+            .register_requester("linear:issue-1", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_for_console_thread_without_foreign_id() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({ "user_email": "ada@example.com" });
+
+        let principal = registrar
+            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_errors_for_unknown_console_principal() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "requester_principal_foreign_id": "console-user-ghost"
+        });
+
+        let result = registrar
+            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/lookup/console-user-ghost".to_owned()]
+        );
+        server.abort();
+    }
+
     #[test]
     fn requester_team_eligibility_requires_matching_non_blank_teams() {
         for metadata in [
@@ -761,6 +862,12 @@ mod tests {
                     ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
                         ("200 OK", user_principal_body())
                     }
+                    ("GET", "/api/v1/principals/lookup/console-user-ada-example-com-abc123") => {
+                        ("200 OK", console_user_principal_body())
+                    }
+                    ("GET", "/api/v1/principals/lookup/console-user-ghost") => {
+                        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+                    }
                     (
                         "POST",
                         "/api/v1/principals/prn_channel/slack_channel_permissions"
@@ -791,5 +898,9 @@ mod tests {
 
     fn user_principal_body() -> String {
         r#"{"data":{"id":"prn_user","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+    }
+
+    fn console_user_principal_body() -> String {
+        r#"{"data":{"id":"prn_console_user","foreign_id":"console-user-ada-example-com-abc123","name":"Ada Lovelace","labels":{}}}"#.to_owned()
     }
 }

@@ -444,6 +444,9 @@ class Console::ThreadsController < ApplicationController
     )
 
     execute_metadata = console_actor_metadata.merge(action: "execute")
+    if (requester = console_requester_principal)
+      execute_metadata[:requester_principal_foreign_id] = requester.foreign_id
+    end
     execute_metadata[:model] = model if model.present?
     execute_metadata[:provider] = provider if provider.present?
     execute_metadata[:reasoning] = effort if effort.present?
@@ -556,6 +559,18 @@ class Console::ThreadsController < ApplicationController
       end
       identity
     end
+  end
+
+  # The authenticated user is the per-turn requester of every console execute
+  # (RFC 0005): provision their console-user principal (idempotent, cheap on
+  # repeat turns) so api-rs can bind it to the turn's proxy and hoist the
+  # user's always-available OAuth credentials. The thread's own principal is
+  # untouched, so a shared thread never hands the creator's credentials to
+  # another user's turn.
+  def console_requester_principal
+    return unless current_user
+
+    @console_requester_principal ||= ConsoleUserPrincipalProvisioner.call(current_user)
   end
 
   def load_threads
