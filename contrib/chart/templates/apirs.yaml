@@ -375,6 +375,10 @@ spec:
             - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
               value: {{ .Values.sandbox.runtimeClassName | quote }}
 {{- end }}
+{{- if and .Values.sandbox.serviceAccountName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_SERVICE_ACCOUNT_NAME")) }}
+            - name: SESSION_SANDBOX_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.sandbox.serviceAccountName | quote }}
+{{- end }}
 {{- if and .Values.sandbox.priorityClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_PRIORITY_CLASS_NAME")) }}
             - name: SESSION_SANDBOX_PRIORITY_CLASS_NAME
               value: {{ .Values.sandbox.priorityClassName | quote }}
