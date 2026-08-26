@@ -318,8 +318,14 @@ sandbox:
   # ServiceAccount for sandbox pods (session, warm, and workflow-host), e.g.
   # for cloud workload identity (EKS IRSA). Must already exist in the release
   # namespace; iron-proxy pods are unaffected, and the Kubernetes API token
-  # stays unmounted (automountServiceAccountToken remains false).
+  # stays unmounted (automountServiceAccountToken remains false). Changing
+  # this value drains retained sandbox pods before api-rs enables reuse.
   serviceAccountName: ""
+  # PriorityClass for sandbox + iron-proxy pods. Point this at a dedicated
+  # (low-priority) PriorityClass to scope a ResourceQuota to sandbox
+  # workloads and let the kubelet/scheduler sacrifice them before the
+  # control plane under node pressure.
+  priorityClassName: ""
   reposPath: ""
   # How the in-sandbox harness authenticates upstream. Single source of truth:
   # the control plane reads it to register the matching iron-proxy credential
@@ -549,6 +555,10 @@ apiRs:
   terminationGracePeriodSeconds: 35
   extraEnv: {}
   resources: {}
+  # PriorityClass for the api-rs control plane pod itself. Pair with
+  # Guaranteed-QoS resources so runaway sandboxes are evicted before the
+  # control plane.
+  priorityClassName: ""
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
