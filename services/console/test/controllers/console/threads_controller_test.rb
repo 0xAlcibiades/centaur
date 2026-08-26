@@ -1313,6 +1313,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
 
     assert_equal %i[append_session_messages execute_session], client.calls.map(&:first)
     assert_equal thread_key, client.calls[0].last[:thread_key]
+    principal = Principal.find_by!(kind: "console_user", console_user: @operator)
+    assert_equal principal.foreign_id,
+                 client.calls[1].last[:metadata][:requester_principal_foreign_id]
     assert_redirected_to console_threads_path(thread: thread_key)
   end
 

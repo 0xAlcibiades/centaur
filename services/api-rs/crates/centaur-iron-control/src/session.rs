@@ -102,13 +102,14 @@ impl SessionRegistrar {
         Ok(record)
     }
 
-    /// Upsert the principal of the human requesting a Slack channel turn,
-    /// derived from the execute metadata (``slack_user_id`` and friends).
-    /// Returns ``Ok(None)`` for DM threads (the conversation principal already
-    /// is the user's), for non-Slack threads, when the metadata carries no
-    /// ``slack_user_id``, and when the requester is not proven to belong to the
-    /// Slack app's home team. This prevents Slack Connect users from supplying
-    /// requester credentials to a shared channel turn.
+    /// Resolve the principal of the human requesting a turn. An authenticated
+    /// Console request carries a fetch-only console-user foreign ID. Otherwise,
+    /// Slack channel turns derive and upsert the requester from
+    /// ``slack_user_id`` and friends. Returns ``Ok(None)`` for DM threads (the
+    /// conversation principal already is the user's), for non-Slack threads,
+    /// when the metadata carries no requester, and when the Slack requester is
+    /// not proven to belong to the app's home team. This prevents Slack Connect
+    /// users from supplying requester credentials to a shared channel turn.
     ///
     /// Unlike [`Self::register_session`], this never writes Slack channel
     /// permissions: the requester principal only scopes proxy credentials, and
@@ -122,7 +123,11 @@ impl SessionRegistrar {
         let Some(metadata) = metadata else {
             return Ok(None);
         };
-        if thread_key.starts_with("console:") {
+        // The API server strips this reserved identity assertion from every
+        // caller except the authenticated Console service. Checking the field,
+        // rather than the thread namespace, also covers Console replies to
+        // readable Slack and other non-Console sessions.
+        if metadata.get("requester_principal_foreign_id").is_some() {
             return self.console_requester(metadata).await;
         }
         let Some(slack_team_id) = eligible_slack_requester_team(metadata) else {
@@ -154,8 +159,8 @@ impl SessionRegistrar {
     /// foreign ID in the execute metadata. Fetch-only: the console owns
     /// console-user principals' identity fields and reconciliation, so api-rs
     /// never upserts them, and a lookup failure degrades to a requester-less
-    /// turn at the caller. Only reachable for `console:` thread keys, which
-    /// only the console service's caller class may write.
+    /// turn at the caller. The API server strips this metadata field from
+    /// every caller except the authenticated console service.
     async fn console_requester(&self, metadata: &Value) -> Result<Option<Principal>> {
         let Some(foreign_id) = metadata
             .get("requester_principal_foreign_id")
@@ -716,7 +721,10 @@ mod tests {
         });
 
         let principal = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await
             .unwrap()
             .expect("console requester resolves to the provisioned principal");
@@ -732,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_requester_ignores_requester_foreign_id_outside_console_threads() {
+    async fn register_requester_resolves_console_requester_for_slack_thread() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
         let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
@@ -740,12 +748,16 @@ mod tests {
         });
 
         let principal = registrar
-            .register_requester("linear:issue-1", Some(&metadata))
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("console requester resolves independently of the thread namespace");
 
-        assert_eq!(principal, None);
-        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(principal.id, "prn_console_user");
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/v1/principals/lookup/console-user-ada-example-com-abc123".to_owned()]
+        );
         server.abort();
     }
 
@@ -756,7 +768,10 @@ mod tests {
         let metadata = json!({ "user_email": "ada@example.com" });
 
         let principal = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await
             .unwrap();
 
@@ -774,7 +789,10 @@ mod tests {
         });
 
         let result = registrar
-            .register_requester("console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c", Some(&metadata))
+            .register_requester(
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                Some(&metadata),
+            )
             .await;
 
         assert!(result.is_err());

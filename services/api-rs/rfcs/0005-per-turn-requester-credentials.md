@@ -120,9 +120,12 @@ Console-driven runs carry a requester too: the console provisions the
 authenticated user's console-user principal
 (`ConsoleUserPrincipalProvisioner`) and passes its foreign ID as
 `requester_principal_foreign_id` in the execute metadata. api-rs resolves it
-fetch-only for `console:` thread keys — a thread namespace only the console
-service may write — and never upserts console-user principals, whose identity
-fields and reconciliation the console owns.
+fetch-only for every execution submitted by the authenticated console service,
+including replies to readable Slack threads, and never upserts console-user
+principals, whose identity fields and reconciliation the console owns. The API
+server strips `requester_principal_foreign_id` from every other caller class
+before persisting the execution, so ingress callers cannot assert a console
+identity through metadata.
 
 ### 2. Grant union on the proxy (console)
 
