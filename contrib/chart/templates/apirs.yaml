@@ -372,6 +372,10 @@ spec:
             - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
               value: {{ .Values.sandbox.runtimeClassName | quote }}
 {{- end }}
+{{- if and .Values.sandbox.serviceAccountName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_SERVICE_ACCOUNT_NAME")) }}
+            - name: SESSION_SANDBOX_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.sandbox.serviceAccountName | quote }}
+{{- end }}
             # Sandboxes call back into this control plane via the in-cluster Service.
             - name: SESSION_SANDBOX_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}

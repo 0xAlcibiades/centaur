@@ -74,6 +74,10 @@ pub struct AgentSandboxConfig {
     pub tolerations: Vec<Toleration>,
     /// RuntimeClass for sandbox and iron-proxy pods (e.g. `gvisor`).
     pub runtime_class_name: Option<String>,
+    /// ServiceAccount for sandbox pods (session, warm, and workflow-host),
+    /// e.g. for cloud workload identity (EKS IRSA). Not applied to iron-proxy
+    /// pods; `automountServiceAccountToken` stays `false`.
+    pub service_account_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: IronControlSettings,
@@ -130,6 +134,7 @@ impl AgentSandboxConfig {
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
             runtime_class_name: None,
+            service_account_name: None,
             state_volume: None,
             iron_proxy: None,
             iron_control,
@@ -827,6 +832,15 @@ fn build_agent_sandbox(
             .map(str::trim)
             .filter(|name| !name.is_empty()),
     );
+    insert_optional(
+        &mut pod_spec,
+        "serviceAccountName",
+        config
+            .service_account_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+    );
 
     let mut agent_spec = json!({
         "replicas": 1,
@@ -1149,6 +1163,42 @@ mod tests {
         assert!(pod_spec.node_selector.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
+        assert!(pod_spec.service_account_name.is_none());
+    }
+
+    #[test]
+    fn service_account_name_reaches_the_sandbox_pod_template() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        config.service_account_name = Some("centaur-sandbox".to_owned());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        assert_eq!(
+            pod_spec.service_account_name.as_deref(),
+            Some("centaur-sandbox")
+        );
+        // The Kubernetes API token stays unmounted even with an account set.
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn blank_service_account_name_is_omitted() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        config.service_account_name = Some("  ".to_owned());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(
+            sandbox
+                .spec
+                .pod_template
+                .spec
+                .service_account_name
+                .is_none()
+        );
     }
 
     #[test]

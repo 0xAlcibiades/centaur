@@ -315,6 +315,11 @@ sandbox:
   #   effect: NoSchedule
   # RuntimeClass for sandbox + iron-proxy pods, e.g. gVisor.
   runtimeClassName: ""
+  # ServiceAccount for sandbox pods (session, warm, and workflow-host), e.g.
+  # for cloud workload identity (EKS IRSA). Must already exist in the release
+  # namespace; iron-proxy pods are unaffected, and the Kubernetes API token
+  # stays unmounted (automountServiceAccountToken remains false).
+  serviceAccountName: ""
   reposPath: ""
   # How the in-sandbox harness authenticates upstream. Single source of truth:
   # the control plane reads it to register the matching iron-proxy credential
