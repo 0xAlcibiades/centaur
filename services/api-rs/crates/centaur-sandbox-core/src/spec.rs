@@ -59,10 +59,10 @@ pub struct SandboxSpec {
     pub command: Option<Vec<String>>,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
-    /// Files materialized in the sandbox user's home before the workload
-    /// starts. Paths are relative to that home and must not traverse upward.
+    /// Files materialized in the sandbox before the workload starts.
+    /// Target paths are absolute paths inside the sandbox.
     #[serde(default)]
-    pub home_files: Vec<SandboxHomeFile>,
+    pub files: Vec<SandboxFile>,
     pub working_dir: Option<String>,
     pub mounts: Vec<Mount>,
     pub resources: Option<ResourceRequirements>,
@@ -93,7 +93,7 @@ impl SandboxSpec {
             command: None,
             args: Vec::new(),
             env: Vec::new(),
-            home_files: Vec::new(),
+            files: Vec::new(),
             working_dir: None,
             mounts: Vec::new(),
             resources: None,
@@ -134,8 +134,8 @@ impl SandboxSpec {
         self
     }
 
-    pub fn home_file(mut self, path: impl Into<String>, contents: impl Into<String>) -> Self {
-        self.home_files.push(SandboxHomeFile::new(path, contents));
+    pub fn file(mut self, target_path: impl Into<String>, contents: impl Into<String>) -> Self {
+        self.files.push(SandboxFile::new(target_path, contents));
         self
     }
 
@@ -156,16 +156,16 @@ impl SandboxSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SandboxHomeFile {
-    /// Path relative to the sandbox user's home directory.
-    pub path: String,
+pub struct SandboxFile {
+    /// Absolute destination path inside the sandbox.
+    pub target_path: String,
     pub contents: String,
 }
 
-impl SandboxHomeFile {
-    pub fn new(path: impl Into<String>, contents: impl Into<String>) -> Self {
+impl SandboxFile {
+    pub fn new(target_path: impl Into<String>, contents: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            target_path: target_path.into(),
             contents: contents.into(),
         }
     }

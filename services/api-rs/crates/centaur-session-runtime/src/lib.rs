@@ -5744,18 +5744,17 @@ fn apply_persona_spec(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -
     ] {
         remove_spec_env(&mut spec, name);
     }
-    spec.home_files
-        .retain(|file| file.path != "AGENTS_PERSONA.md");
+    spec.files
+        .retain(|file| file.target_path != "/home/agent/AGENTS_PERSONA.md");
     let Some(persona) = persona else {
         return spec;
     };
     upsert_spec_env(&mut spec, "AGENT_PERSONA", persona.persona_id.clone());
     upsert_spec_env(&mut spec, "CENTAUR_PERSONA_ID", persona.persona_id.clone());
-    spec.home_files
-        .push(centaur_sandbox_core::SandboxHomeFile::new(
-            "AGENTS_PERSONA.md",
-            persona.prompt.clone(),
-        ));
+    spec.files.push(centaur_sandbox_core::SandboxFile::new(
+        "/home/agent/AGENTS_PERSONA.md",
+        persona.prompt.clone(),
+    ));
     upsert_spec_env(
         &mut spec,
         "CENTAUR_PERSONA_PROMPT_HASH",
@@ -8003,9 +8002,9 @@ mod tests {
 
         assert_eq!(env_value(&spec, "AGENT_PERSONA"), Some("eng"));
         assert_eq!(env_value(&spec, "CENTAUR_PERSONA_ID"), Some("eng"));
-        assert_eq!(spec.home_files.len(), 1);
-        assert_eq!(spec.home_files[0].path, "AGENTS_PERSONA.md");
-        assert_eq!(spec.home_files[0].contents, "eng persona prompt");
+        assert_eq!(spec.files.len(), 1);
+        assert_eq!(spec.files[0].target_path, "/home/agent/AGENTS_PERSONA.md");
+        assert_eq!(spec.files[0].contents, "eng persona prompt");
         assert_eq!(env_value(&spec, "CENTAUR_PERSONA_PROMPT_BASE64"), None);
         assert_eq!(
             env_value(&spec, "CENTAUR_PERSONA_PROMPT_HASH"),
@@ -8016,7 +8015,7 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(env_value(&workload.warm_spec(), "AGENT_PERSONA"), None);
-        assert!(workload.warm_spec().home_files.is_empty());
+        assert!(workload.warm_spec().files.is_empty());
     }
 
     #[test]

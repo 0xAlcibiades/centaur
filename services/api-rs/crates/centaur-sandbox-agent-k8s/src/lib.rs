@@ -41,8 +41,7 @@ const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
-const SANDBOX_HOME_FILES_VOLUME: &str = "sandbox-home-files";
-const SANDBOX_HOME_PATH: &str = "/home/agent";
+const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
@@ -869,19 +868,19 @@ fn build_agent_sandbox(
     insert_optional(&mut container, "resources", resources_json(spec));
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
-    if !spec.home_files.is_empty() {
+    if !spec.files.is_empty() {
         volumes.push(json!({
-            "name": SANDBOX_HOME_FILES_VOLUME,
+            "name": SANDBOX_FILES_VOLUME,
             "configMap": {
                 "name": sandbox_files_config_map_name(id),
                 "defaultMode": 0o444,
             },
         }));
-        for (index, file) in spec.home_files.iter().enumerate() {
-            validate_sandbox_home_file_path(&file.path)?;
+        for (index, file) in spec.files.iter().enumerate() {
+            validate_sandbox_file_target_path(&file.target_path)?;
             volume_mounts.push(json!({
-                "name": SANDBOX_HOME_FILES_VOLUME,
-                "mountPath": format!("{SANDBOX_HOME_PATH}/{}", file.path),
+                "name": SANDBOX_FILES_VOLUME,
+                "mountPath": file.target_path,
                 "subPath": sandbox_file_key(index),
                 "readOnly": true,
             }));
@@ -1089,16 +1088,20 @@ fn sandbox_file_key(index: usize) -> String {
     format!("file-{index}")
 }
 
-fn validate_sandbox_home_file_path(path: &str) -> SandboxResult<()> {
+fn validate_sandbox_file_target_path(path: &str) -> SandboxResult<()> {
     let path = std::path::Path::new(path);
     if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
     {
         return Err(SandboxError::InvalidSpec(format!(
-            "invalid sandbox home file path {path:?}"
+            "invalid sandbox file target path {path:?}"
         )));
     }
     Ok(())
@@ -1108,17 +1111,17 @@ fn build_sandbox_files_config_map(
     id: &SandboxId,
     spec: &SandboxSpec,
 ) -> SandboxResult<Option<ConfigMap>> {
-    if spec.home_files.is_empty() {
+    if spec.files.is_empty() {
         return Ok(None);
     }
     let mut paths = BTreeSet::new();
     let mut data = BTreeMap::new();
-    for (index, file) in spec.home_files.iter().enumerate() {
-        validate_sandbox_home_file_path(&file.path)?;
-        if !paths.insert(file.path.as_str()) {
+    for (index, file) in spec.files.iter().enumerate() {
+        validate_sandbox_file_target_path(&file.target_path)?;
+        if !paths.insert(file.target_path.as_str()) {
             return Err(SandboxError::InvalidSpec(format!(
-                "duplicate sandbox home file path {:?}",
-                file.path
+                "duplicate sandbox file target path {:?}",
+                file.target_path
             )));
         }
         data.insert(sandbox_file_key(index), file.contents.clone());
@@ -1323,10 +1326,11 @@ mod tests {
     }
 
     #[test]
-    fn mounts_large_sandbox_home_files_without_putting_contents_in_env() {
+    fn mounts_large_sandbox_files_without_putting_contents_in_env() {
         let prompt = "p".repeat(256 * 1024);
-        let spec =
-            SandboxSpec::new("centaur-agent:latest").home_file("AGENTS_PERSONA.md", prompt.clone());
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .file("/home/agent/AGENTS_PERSONA.md", prompt.clone())
+            .file("/tmp/runtime-config", "runtime config");
         let id = SandboxId::new("asbx-test");
         let config_map = build_sandbox_files_config_map(&id, &spec)
             .unwrap()
@@ -1335,6 +1339,14 @@ mod tests {
         assert_eq!(
             config_map.data.as_ref().and_then(|data| data.get("file-0")),
             Some(&prompt)
+        );
+        assert_eq!(
+            config_map
+                .data
+                .as_ref()
+                .and_then(|data| data.get("file-1"))
+                .map(String::as_str),
+            Some("runtime config")
         );
 
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
@@ -1352,9 +1364,21 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|mount| {
-                    mount["name"] == SANDBOX_HOME_FILES_VOLUME
+                    mount["name"] == SANDBOX_FILES_VOLUME
                         && mount["mountPath"] == "/home/agent/AGENTS_PERSONA.md"
                         && mount["subPath"] == "file-0"
+                        && mount["readOnly"] == true
+                })
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == SANDBOX_FILES_VOLUME
+                        && mount["mountPath"] == "/tmp/runtime-config"
+                        && mount["subPath"] == "file-1"
                         && mount["readOnly"] == true
                 })
         );

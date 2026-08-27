@@ -15,7 +15,7 @@ use std::{
 
 use async_trait::async_trait;
 use centaur_sandbox_core::{
-    ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxHomeFile, SandboxId,
+    ObservedSandbox, SandboxBackend, SandboxError, SandboxFile, SandboxHandle, SandboxId,
     SandboxIo, SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use tempfile::TempDir;
@@ -74,7 +74,7 @@ impl SandboxBackend for LocalSandboxBackend {
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let (program, args) = command_parts(&spec)?;
-        let materialized_home = materialize_home_files(&spec.home_files)?;
+        let materialized_home = materialize_files(&spec.files)?;
         let mut command = Command::new(program);
         command.args(args);
         command.stdin(Stdio::piped());
@@ -208,7 +208,7 @@ impl SandboxBackend for LocalSandboxBackend {
     }
 }
 
-fn materialize_home_files(files: &[SandboxHomeFile]) -> SandboxResult<Option<TempDir>> {
+fn materialize_files(files: &[SandboxFile]) -> SandboxResult<Option<TempDir>> {
     if files.is_empty() {
         return Ok(None);
     }
@@ -217,18 +217,14 @@ fn materialize_home_files(files: &[SandboxHomeFile]) -> SandboxResult<Option<Tem
         .tempdir()
         .map_err(|error| SandboxError::backend_source("create sandbox home directory", error))?;
     for file in files {
-        let relative_path = std::path::Path::new(&file.path);
-        if file.path.trim().is_empty()
-            || relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(SandboxError::InvalidSpec(format!(
-                "invalid sandbox home file path {:?}",
-                file.path
-            )));
-        }
+        let target_path = std::path::Path::new(&file.target_path);
+        let relative_path = target_path.strip_prefix("/home/agent").map_err(|_| {
+            SandboxError::InvalidSpec(format!(
+                "local sandbox files must target /home/agent, got {:?}",
+                file.target_path
+            ))
+        })?;
+        validate_local_file_path(relative_path, &file.target_path)?;
         let path = dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -239,6 +235,20 @@ fn materialize_home_files(files: &[SandboxHomeFile]) -> SandboxResult<Option<Tem
             .map_err(|error| SandboxError::backend_source("write sandbox home file", error))?;
     }
     Ok(Some(dir))
+}
+
+fn validate_local_file_path(path: &std::path::Path, target_path: &str) -> SandboxResult<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid sandbox file target path {target_path:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn command_parts(spec: &SandboxSpec) -> SandboxResult<(&str, Vec<&str>)> {
@@ -353,14 +363,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_backend_materializes_sandbox_home_files() {
+    async fn local_backend_materializes_sandbox_files() {
         let backend = Arc::new(LocalSandboxBackend::new());
         let manager = SandboxManager::new(backend);
         let prompt = "large persona prompt\n";
         let spec = SandboxSpec::new("/bin/sh")
             .command(["/bin/sh", "-lc"])
             .args(["cat \"$HOME/AGENTS_PERSONA.md\"; cat"])
-            .home_file("AGENTS_PERSONA.md", prompt);
+            .file("/home/agent/AGENTS_PERSONA.md", prompt);
         let handle = manager.create_running(spec).await.unwrap();
         let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
 
