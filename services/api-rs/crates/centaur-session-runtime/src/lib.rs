@@ -11,7 +11,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
@@ -4140,7 +4139,7 @@ impl SandboxWorkloadMode {
         persona: Option<&PersonaContext>,
     ) -> SandboxSpec {
         match self {
-            Self::MockAppServer { image } => apply_persona_spec_env(
+            Self::MockAppServer { image } => apply_persona_spec(
                 SandboxSpec::new(image)
                     .command(["/bin/sh", "-lc"])
                     .args([mock_app_server_script()])
@@ -4173,7 +4172,7 @@ impl SandboxWorkloadMode {
                 for (name, value) in env {
                     spec = spec.env(name.clone(), value.clone());
                 }
-                apply_persona_spec_env(spec, persona)
+                apply_persona_spec(spec, persona)
             }
         }
     }
@@ -5733,27 +5732,30 @@ fn append_spec_env_csv(spec: &mut SandboxSpec, name: &str, values: &str) {
     upsert_spec_env(spec, name, merged.join(","));
 }
 
-fn apply_persona_spec_env(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -> SandboxSpec {
+fn apply_persona_spec(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -> SandboxSpec {
     for name in [
         "AGENT_PERSONA",
         "CENTAUR_PERSONA_ID",
         "CENTAUR_PERSONA_PROMPT_BASE64",
+        "CENTAUR_PERSONA_PROMPT_PATH",
         "CENTAUR_PERSONA_PROMPT_HASH",
         "CENTAUR_PERSONA_SOURCE_PATH",
         "CENTAUR_PERSONA_SOURCE_REF",
     ] {
         remove_spec_env(&mut spec, name);
     }
+    spec.home_files
+        .retain(|file| file.path != "AGENTS_PERSONA.md");
     let Some(persona) = persona else {
         return spec;
     };
     upsert_spec_env(&mut spec, "AGENT_PERSONA", persona.persona_id.clone());
     upsert_spec_env(&mut spec, "CENTAUR_PERSONA_ID", persona.persona_id.clone());
-    upsert_spec_env(
-        &mut spec,
-        "CENTAUR_PERSONA_PROMPT_BASE64",
-        BASE64_STANDARD.encode(persona.prompt.as_bytes()),
-    );
+    spec.home_files
+        .push(centaur_sandbox_core::SandboxHomeFile::new(
+            "AGENTS_PERSONA.md",
+            persona.prompt.clone(),
+        ));
     upsert_spec_env(
         &mut spec,
         "CENTAUR_PERSONA_PROMPT_HASH",
@@ -8001,15 +8003,10 @@ mod tests {
 
         assert_eq!(env_value(&spec, "AGENT_PERSONA"), Some("eng"));
         assert_eq!(env_value(&spec, "CENTAUR_PERSONA_ID"), Some("eng"));
-        assert_eq!(
-            BASE64_STANDARD
-                .decode(
-                    env_value(&spec, "CENTAUR_PERSONA_PROMPT_BASE64")
-                        .expect("persona prompt payload")
-                )
-                .expect("base64 persona prompt"),
-            b"eng persona prompt"
-        );
+        assert_eq!(spec.home_files.len(), 1);
+        assert_eq!(spec.home_files[0].path, "AGENTS_PERSONA.md");
+        assert_eq!(spec.home_files[0].contents, "eng persona prompt");
+        assert_eq!(env_value(&spec, "CENTAUR_PERSONA_PROMPT_BASE64"), None);
         assert_eq!(
             env_value(&spec, "CENTAUR_PERSONA_PROMPT_HASH"),
             Some(expected_prompt_hash.as_str())
@@ -8019,10 +8016,7 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(env_value(&workload.warm_spec(), "AGENT_PERSONA"), None);
-        assert_eq!(
-            env_value(&workload.warm_spec(), "CENTAUR_PERSONA_PROMPT_BASE64"),
-            None
-        );
+        assert!(workload.warm_spec().home_files.is_empty());
     }
 
     #[test]

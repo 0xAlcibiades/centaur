@@ -18,5 +18,5 @@ pub use lifecycle::{
 };
 pub use spec::{
     EnvVar, Mount, MountKind, RepoCacheAccess, ResourceClaim, ResourceRequirements,
-    SandboxCapabilities, SandboxSpec,
+    SandboxCapabilities, SandboxHomeFile, SandboxSpec,
 };

@@ -59,6 +59,10 @@ pub struct SandboxSpec {
     pub command: Option<Vec<String>>,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
+    /// Files materialized in the sandbox user's home before the workload
+    /// starts. Paths are relative to that home and must not traverse upward.
+    #[serde(default)]
+    pub home_files: Vec<SandboxHomeFile>,
     pub working_dir: Option<String>,
     pub mounts: Vec<Mount>,
     pub resources: Option<ResourceRequirements>,
@@ -89,6 +93,7 @@ impl SandboxSpec {
             command: None,
             args: Vec::new(),
             env: Vec::new(),
+            home_files: Vec::new(),
             working_dir: None,
             mounts: Vec::new(),
             resources: None,
@@ -129,6 +134,11 @@ impl SandboxSpec {
         self
     }
 
+    pub fn home_file(mut self, path: impl Into<String>, contents: impl Into<String>) -> Self {
+        self.home_files.push(SandboxHomeFile::new(path, contents));
+        self
+    }
+
     pub fn working_dir(mut self, working_dir: impl Into<String>) -> Self {
         self.working_dir = Some(working_dir.into());
         self
@@ -142,6 +152,22 @@ impl SandboxSpec {
     pub fn resources(mut self, resources: ResourceRequirements) -> Self {
         self.resources = Some(resources);
         self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxHomeFile {
+    /// Path relative to the sandbox user's home directory.
+    pub path: String,
+    pub contents: String,
+}
+
+impl SandboxHomeFile {
+    pub fn new(path: impl Into<String>, contents: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            contents: contents.into(),
+        }
     }
 }
 
