@@ -11,6 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
@@ -195,6 +196,8 @@ pub struct PersonaContext {
     pub source_path: String,
     pub source_ref: Option<String>,
     pub prompt_hash: String,
+    #[serde(skip_serializing)]
+    pub prompt: String,
     pub defaulted: bool,
     pub overlay_chain: Vec<String>,
 }
@@ -281,6 +284,7 @@ impl PersonaRegistry {
             source_path: persona.source_path.clone(),
             source_ref: persona.source_ref.clone(),
             prompt_hash: persona.prompt_hash.clone(),
+            prompt: persona.prompt.clone(),
             defaulted,
             overlay_chain: self.overlay_chain.clone(),
         })
@@ -5733,6 +5737,7 @@ fn apply_persona_spec_env(mut spec: SandboxSpec, persona: Option<&PersonaContext
     for name in [
         "AGENT_PERSONA",
         "CENTAUR_PERSONA_ID",
+        "CENTAUR_PERSONA_PROMPT_BASE64",
         "CENTAUR_PERSONA_PROMPT_HASH",
         "CENTAUR_PERSONA_SOURCE_PATH",
         "CENTAUR_PERSONA_SOURCE_REF",
@@ -5744,6 +5749,11 @@ fn apply_persona_spec_env(mut spec: SandboxSpec, persona: Option<&PersonaContext
     };
     upsert_spec_env(&mut spec, "AGENT_PERSONA", persona.persona_id.clone());
     upsert_spec_env(&mut spec, "CENTAUR_PERSONA_ID", persona.persona_id.clone());
+    upsert_spec_env(
+        &mut spec,
+        "CENTAUR_PERSONA_PROMPT_BASE64",
+        BASE64_STANDARD.encode(persona.prompt.as_bytes()),
+    );
     upsert_spec_env(
         &mut spec,
         "CENTAUR_PERSONA_PROMPT_HASH",
@@ -7209,6 +7219,16 @@ mod tests {
                 .get("prompt")
                 .is_none()
         );
+        let context = registry
+            .context_for_access("eng", false, &SessionRepoCacheAccess::All)
+            .unwrap();
+        assert_eq!(context.prompt, "secret prompt");
+        assert!(
+            serde_json::to_value(context)
+                .unwrap()
+                .get("prompt")
+                .is_none()
+        );
         assert!(PersonaRegistry::new(Vec::new(), Some("missing".to_owned()), Vec::new()).is_err());
     }
 
@@ -7975,20 +7995,34 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
         let persona = test_persona_context("eng");
+        let expected_prompt_hash = persona.prompt_hash.clone();
 
         let spec = workload.spec(&thread_key, &HarnessType::Codex, Some(&persona));
 
         assert_eq!(env_value(&spec, "AGENT_PERSONA"), Some("eng"));
         assert_eq!(env_value(&spec, "CENTAUR_PERSONA_ID"), Some("eng"));
         assert_eq!(
+            BASE64_STANDARD
+                .decode(
+                    env_value(&spec, "CENTAUR_PERSONA_PROMPT_BASE64")
+                        .expect("persona prompt payload")
+                )
+                .expect("base64 persona prompt"),
+            b"eng persona prompt"
+        );
+        assert_eq!(
             env_value(&spec, "CENTAUR_PERSONA_PROMPT_HASH"),
-            Some("sha256:prompt")
+            Some(expected_prompt_hash.as_str())
         );
         assert_eq!(
             env_value(&spec, "CENTAUR_PERSONA_SOURCE_REF"),
             Some("abc123")
         );
         assert_eq!(env_value(&workload.warm_spec(), "AGENT_PERSONA"), None);
+        assert_eq!(
+            env_value(&workload.warm_spec(), "CENTAUR_PERSONA_PROMPT_BASE64"),
+            None
+        );
     }
 
     #[test]
@@ -8463,12 +8497,14 @@ mod tests {
     }
 
     fn test_persona_context(persona_id: &str) -> PersonaContext {
+        let prompt = format!("{persona_id} persona prompt");
         PersonaContext {
             persona_id: persona_id.to_owned(),
             source_root: "/repo/tools".to_owned(),
             source_path: format!("/repo/tools/personas/{persona_id}"),
             source_ref: Some("abc123".to_owned()),
-            prompt_hash: "sha256:prompt".to_owned(),
+            prompt_hash: format!("sha256:{}", hex::encode(Sha256::digest(prompt.as_bytes()))),
+            prompt,
             defaulted: false,
             overlay_chain: vec!["/repo/tools".to_owned()],
         }
