@@ -15,8 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use centaur_sandbox_core::{
-    ObservedSandbox, SandboxBackend, SandboxError, SandboxFile, SandboxHandle, SandboxId,
-    SandboxIo, SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
+    ObservedSandbox, SANDBOX_AGENT_HOME, SandboxBackend, SandboxError, SandboxFile, SandboxHandle,
+    SandboxId, SandboxIo, SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -218,10 +218,10 @@ fn materialize_files(files: &[SandboxFile]) -> SandboxResult<Option<TempDir>> {
         .map_err(|error| SandboxError::backend_source("create sandbox home directory", error))?;
     for file in files {
         let target_path = std::path::Path::new(&file.target_path);
-        let relative_path = target_path.strip_prefix("/home/agent").map_err(|_| {
+        let relative_path = target_path.strip_prefix(SANDBOX_AGENT_HOME).map_err(|_| {
             SandboxError::InvalidSpec(format!(
-                "local sandbox files must target /home/agent, got {:?}",
-                file.target_path
+                "local sandbox files must target {SANDBOX_AGENT_HOME}, got {:?}",
+                file.target_path,
             ))
         })?;
         validate_local_file_path(relative_path, &file.target_path)?;

@@ -13,9 +13,9 @@ use std::{
 
 use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
-    Mount, RepoCacheAccess, ResourceRequirements, SandboxBackend,
-    SandboxCapabilities as BackendSandboxCapabilities, SandboxError, SandboxId, SandboxIoGuard,
-    SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
+    Mount, RepoCacheAccess, ResourceRequirements, SANDBOX_AGENT_HOME, SandboxBackend,
+    SandboxCapabilities as BackendSandboxCapabilities, SandboxError, SandboxFile, SandboxId,
+    SandboxIoGuard, SandboxRead, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, SandboxReaper, SandboxReaperConfig, WarmPoolConfig, WarmPoolError,
@@ -5733,6 +5733,7 @@ fn append_spec_env_csv(spec: &mut SandboxSpec, name: &str, values: &str) {
 }
 
 fn apply_persona_spec(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -> SandboxSpec {
+    let persona_prompt_path = format!("{SANDBOX_AGENT_HOME}/AGENTS_PERSONA.md");
     for name in [
         "AGENT_PERSONA",
         "CENTAUR_PERSONA_ID",
@@ -5743,14 +5744,14 @@ fn apply_persona_spec(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -
         remove_spec_env(&mut spec, name);
     }
     spec.files
-        .retain(|file| file.target_path != "/home/agent/AGENTS_PERSONA.md");
+        .retain(|file| file.target_path != persona_prompt_path);
     let Some(persona) = persona else {
         return spec;
     };
     upsert_spec_env(&mut spec, "AGENT_PERSONA", persona.persona_id.clone());
     upsert_spec_env(&mut spec, "CENTAUR_PERSONA_ID", persona.persona_id.clone());
-    spec.files.push(centaur_sandbox_core::SandboxFile::new(
-        "/home/agent/AGENTS_PERSONA.md",
+    spec.files.push(SandboxFile::new(
+        persona_prompt_path,
         persona.prompt.clone(),
     ));
     upsert_spec_env(
