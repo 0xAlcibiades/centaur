@@ -1353,11 +1353,11 @@ mod tests {
         let sandbox = build_agent_sandbox(&id, &spec, &config).unwrap();
         let sandbox = serde_json::to_value(sandbox).unwrap();
         let container = &sandbox["spec"]["podTemplate"]["spec"]["containers"][0];
-        assert!(container["env"].as_array().is_none_or(|env| {
-            env.iter().all(|entry| {
-                entry["value"] != prompt && entry["name"] != "CENTAUR_PERSONA_PROMPT_PATH"
-            })
-        }));
+        assert!(
+            container["env"]
+                .as_array()
+                .is_none_or(|env| { env.iter().all(|entry| entry["value"] != prompt) })
+        );
         assert!(
             container["volumeMounts"]
                 .as_array()

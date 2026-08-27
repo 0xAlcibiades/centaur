@@ -5736,8 +5736,6 @@ fn apply_persona_spec(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -
     for name in [
         "AGENT_PERSONA",
         "CENTAUR_PERSONA_ID",
-        "CENTAUR_PERSONA_PROMPT_BASE64",
-        "CENTAUR_PERSONA_PROMPT_PATH",
         "CENTAUR_PERSONA_PROMPT_HASH",
         "CENTAUR_PERSONA_SOURCE_PATH",
         "CENTAUR_PERSONA_SOURCE_REF",
@@ -8005,7 +8003,6 @@ mod tests {
         assert_eq!(spec.files.len(), 1);
         assert_eq!(spec.files[0].target_path, "/home/agent/AGENTS_PERSONA.md");
         assert_eq!(spec.files[0].contents, "eng persona prompt");
-        assert_eq!(env_value(&spec, "CENTAUR_PERSONA_PROMPT_BASE64"), None);
         assert_eq!(
             env_value(&spec, "CENTAUR_PERSONA_PROMPT_HASH"),
             Some(expected_prompt_hash.as_str())
