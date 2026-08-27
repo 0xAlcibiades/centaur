@@ -3,7 +3,7 @@
 //! The Agent Sandbox CRD types are generated from the upstream CRD with
 //! `just codegen-agent-sandbox-crd`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,11 +15,12 @@ use centaur_sandbox_core::{
     MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
     SandboxResult, SandboxSpec, SandboxStatus,
 };
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
-use kube::{Api, Client, Error};
+use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -40,6 +41,7 @@ const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
+const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
@@ -231,6 +233,10 @@ impl AgentSandboxBackend {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
+    fn config_maps(&self) -> Api<ConfigMap> {
+        Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
     async fn get_sandbox(&self, id: &SandboxId) -> SandboxResult<Option<crd::Sandbox>> {
         match self.sandboxes().get(id.as_str()).await {
             Ok(sandbox) => Ok(Some(sandbox)),
@@ -323,6 +329,59 @@ impl AgentSandboxBackend {
         }
     }
 
+    async fn create_sandbox_files_config_map(
+        &self,
+        id: &SandboxId,
+        spec: &SandboxSpec,
+    ) -> SandboxResult<()> {
+        let Some(config_map) = build_sandbox_files_config_map(id, spec)? else {
+            return Ok(());
+        };
+        self.config_maps()
+            .create(&PostParams::default(), &config_map)
+            .await
+            .map(|_| ())
+            .map_err(|error| map_kube_error("create sandbox files config map", error))
+    }
+
+    async fn adopt_sandbox_files_config_map(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
+        let Some(owner_reference) = sandbox_owner_reference(sandbox) else {
+            return Ok(());
+        };
+        let patch = Patch::Merge(json!({
+            "metadata": { "ownerReferences": [owner_reference] },
+        }));
+        match self
+            .config_maps()
+            .patch(
+                &sandbox_files_config_map_name(id),
+                &PatchParams::default(),
+                &patch,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(map_kube_error("adopt sandbox files config map", error)),
+        }
+    }
+
+    async fn delete_sandbox_files_config_map(&self, id: &SandboxId) -> SandboxResult<()> {
+        match self
+            .config_maps()
+            .delete(&sandbox_files_config_map_name(id), &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(map_kube_error("delete sandbox files config map", error)),
+        }
+    }
+
     async fn wait_until_running(&self, id: &SandboxId) -> SandboxResult<()> {
         let deadline = Instant::now() + self.config.ready_timeout;
         loop {
@@ -400,7 +459,18 @@ impl SandboxBackend for AgentSandboxBackend {
             let _ = self.delete_iron_proxy_resources(&id).await;
             return Err(err);
         }
-        let sandbox = build_agent_sandbox(&id, &spec, &self.config)?;
+        if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
+            let _ = self.delete_iron_proxy_resources(&id).await;
+            return Err(error);
+        }
+        let sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                let _ = self.delete_sandbox_files_config_map(&id).await;
+                let _ = self.delete_iron_proxy_resources(&id).await;
+                return Err(error);
+            }
+        };
         let created = match self
             .sandboxes()
             .create(&PostParams::default(), &sandbox)
@@ -408,6 +478,7 @@ impl SandboxBackend for AgentSandboxBackend {
         {
             Ok(created) => created,
             Err(err) => {
+                let _ = self.delete_sandbox_files_config_map(&id).await;
                 let _ = self.delete_iron_proxy_resources(&id).await;
                 return Err(map_kube_error("create sandbox", err));
             }
@@ -420,6 +491,13 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_id = id.as_str(),
                 %error,
                 "failed to set ownerReferences on iron-proxy resources"
+            );
+        }
+        if let Err(error) = self.adopt_sandbox_files_config_map(&id, &created).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to set ownerReference on sandbox files config map"
             );
         }
         if let Err(err) = self.wait_until_running(&id).await {
@@ -500,6 +578,7 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
         let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let files_result = self.delete_sandbox_files_config_map(id).await;
         match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
@@ -507,10 +586,12 @@ impl SandboxBackend for AgentSandboxBackend {
         {
             Ok(_) => {
                 proxy_result?;
+                files_result?;
                 self.delete_state_pvc(id).await
             }
             Err(err) if is_not_found(&err) => {
                 proxy_result?;
+                files_result?;
                 self.delete_state_pvc(id).await
             }
             Err(err) => Err(map_kube_error("delete sandbox", err)),
@@ -787,6 +868,24 @@ fn build_agent_sandbox(
     insert_optional(&mut container, "resources", resources_json(spec));
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
+    if !spec.files.is_empty() {
+        volumes.push(json!({
+            "name": SANDBOX_FILES_VOLUME,
+            "configMap": {
+                "name": sandbox_files_config_map_name(id),
+                "defaultMode": 0o444,
+            },
+        }));
+        for (index, file) in spec.files.iter().enumerate() {
+            validate_sandbox_file_target_path(&file.target_path)?;
+            volume_mounts.push(json!({
+                "name": SANDBOX_FILES_VOLUME,
+                "mountPath": file.target_path,
+                "subPath": sandbox_file_key(index),
+                "readOnly": true,
+            }));
+        }
+    }
     let mut init_containers = Vec::new();
     if let Some(state_volume) = &config.state_volume {
         volume_mounts.push(json!({
@@ -981,6 +1080,78 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
     (volumes, mounts)
 }
 
+fn sandbox_files_config_map_name(id: &SandboxId) -> String {
+    format!("{}-files", id.as_str())
+}
+
+fn sandbox_file_key(index: usize) -> String {
+    format!("file-{index}")
+}
+
+fn validate_sandbox_file_target_path(path: &str) -> SandboxResult<()> {
+    let path = std::path::Path::new(path);
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path.file_name().is_none()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid sandbox file target path {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn build_sandbox_files_config_map(
+    id: &SandboxId,
+    spec: &SandboxSpec,
+) -> SandboxResult<Option<ConfigMap>> {
+    if spec.files.is_empty() {
+        return Ok(None);
+    }
+    let mut paths = BTreeSet::new();
+    let mut data = BTreeMap::new();
+    for (index, file) in spec.files.iter().enumerate() {
+        validate_sandbox_file_target_path(&file.target_path)?;
+        if !paths.insert(file.target_path.as_str()) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "duplicate sandbox file target path {:?}",
+                file.target_path
+            )));
+        }
+        data.insert(sandbox_file_key(index), file.contents.clone());
+    }
+    Ok(Some(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(sandbox_files_config_map_name(id)),
+            labels: Some(BTreeMap::from([
+                (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
+                (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
+            ])),
+            ..ObjectMeta::default()
+        },
+        data: Some(data),
+        immutable: Some(true),
+        ..ConfigMap::default()
+    }))
+}
+
+fn sandbox_owner_reference(sandbox: &crd::Sandbox) -> Option<Value> {
+    let name = sandbox.metadata.name.as_ref()?;
+    let uid = sandbox.metadata.uid.as_ref()?;
+    Some(json!({
+        "apiVersion": crd::Sandbox::api_version(&()),
+        "kind": crd::Sandbox::kind(&()),
+        "name": name,
+        "uid": uid,
+    }))
+}
+
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     let resources = spec.resources.as_ref()?;
     (!resources.is_empty()).then(|| json!(resources))
@@ -1151,6 +1322,65 @@ mod tests {
         assert_eq!(
             resources.limits.as_ref().unwrap().get("example.com/gpu"),
             Some(&quantity("1"))
+        );
+    }
+
+    #[test]
+    fn mounts_large_sandbox_files_without_putting_contents_in_env() {
+        let prompt = "p".repeat(256 * 1024);
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .file("/home/agent/AGENTS_PERSONA.md", prompt.clone())
+            .file("/tmp/runtime-config", "runtime config");
+        let id = SandboxId::new("asbx-test");
+        let config_map = build_sandbox_files_config_map(&id, &spec)
+            .unwrap()
+            .expect("sandbox files config map");
+
+        assert_eq!(
+            config_map.data.as_ref().and_then(|data| data.get("file-0")),
+            Some(&prompt)
+        );
+        assert_eq!(
+            config_map
+                .data
+                .as_ref()
+                .and_then(|data| data.get("file-1"))
+                .map(String::as_str),
+            Some("runtime config")
+        );
+
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(&id, &spec, &config).unwrap();
+        let sandbox = serde_json::to_value(sandbox).unwrap();
+        let container = &sandbox["spec"]["podTemplate"]["spec"]["containers"][0];
+        assert!(
+            container["env"]
+                .as_array()
+                .is_none_or(|env| { env.iter().all(|entry| entry["value"] != prompt) })
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == SANDBOX_FILES_VOLUME
+                        && mount["mountPath"] == "/home/agent/AGENTS_PERSONA.md"
+                        && mount["subPath"] == "file-0"
+                        && mount["readOnly"] == true
+                })
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == SANDBOX_FILES_VOLUME
+                        && mount["mountPath"] == "/tmp/runtime-config"
+                        && mount["subPath"] == "file-1"
+                        && mount["readOnly"] == true
+                })
         );
     }
 
