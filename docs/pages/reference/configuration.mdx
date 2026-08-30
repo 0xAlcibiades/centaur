@@ -129,9 +129,15 @@ Sandbox lifecycle:
 | `SESSION_MAX_DURATION_MS` | `slackbotv2.extraEnv`. | Optional per-execution max duration forwarded to api-rs. api-rs rejects requests where `idle_timeout_ms` is greater than `max_duration_ms`. |
 | `apiRs.sandboxMaxLifetimeSecs` / `SESSION_SANDBOX_MAX_LIFETIME_SECS` | Helm value, default `259200` (72 hours). | Restart-surviving sandbox deletion backstop. The reaper stops any non-terminal sandbox older than this, regardless of whether it is running or suspended. Set `0` to disable max-lifetime reaping. |
 | `apiRs.sandboxReapIntervalSecs` / `SESSION_SANDBOX_REAP_INTERVAL_SECS` | Helm value, default `300`. | How often api-rs sweeps observed sandboxes for max-lifetime expiry. |
+| `apiRs.sandboxPausedProxySweepIntervalSecs` / `SESSION_SANDBOX_PAUSED_PROXY_SWEEP_INTERVAL_SECS` | Helm value, default `300`. | Paused-proxy retention sweep interval. Paused sandboxes keep their iron-proxy pod for fast resume; this sweep evicts the longest-paused proxies when a node runs out of pod slots for them, so new sandbox pods keep scheduling. `0` disables the sweep. |
+| `apiRs.sandboxPausedProxyMarginPods` / `SESSION_SANDBOX_PAUSED_PROXY_MARGIN_PODS` | Helm value, default `2`. | Pod headroom each node keeps free beyond its current load, covering the agent pod and proxy pod a new sandbox schedules. |
+| `apiRs.sandboxPausedProxyCap` / `SESSION_SANDBOX_PAUSED_PROXY_CAP` | Helm value, default `0` (none). | Absolute ceiling on retained paused proxies; `0` sizes the ceiling from node capacity alone. |
 
 There is no separate suspended-only delete timer. Pausing is controlled by the
 per-execution idle timeout; deletion is controlled by sandbox max lifetime.
+Evicting a paused proxy is not deletion: the sandbox CR survives and resume
+recreates the proxy, so only the evicted session's resume pays a
+cold-create.
 
 Execution tuning:
 
