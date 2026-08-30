@@ -19,6 +19,7 @@ import pg from "pg";
 import {
   parseIssueAssignmentWebhook,
   parseIssueCommentWebhook,
+  parseIssueReleaseWebhook,
   type IssueAssignmentEvent,
   type IssueCommentEvent,
 } from "./issue-comments";
@@ -57,6 +58,7 @@ import { extractMessageOverrides, resolveStickyProvider } from "./overrides";
 import {
   executeSessionTurn,
   forwardToSessionApi,
+  interruptSession,
   isRetryableSessionApiError,
   openSessionEventStream,
   serializeMessage,
@@ -241,6 +243,9 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
         ) ??
         requestContext.run(context, () =>
           handleIssueAssignment(rawBody, handlerInput),
+        ) ??
+        requestContext.run(context, () =>
+          handleIssueRelease(rawBody, handlerInput),
         );
       if (handled) handoffTasks.push(handled);
       try {
@@ -656,6 +661,31 @@ async function appendThreadFollowup(input: {
  * on the issue's sandbox and post the result as a comment. Uses the Issue
  * webhook (not an AgentSessionEvent) so it survives agent sessions being off.
  */
+const RELEASE_INTERRUPT_REASON =
+  "The issue was taken back from the bot while this turn was running.";
+
+/**
+ * Assignment turns still owed a start, by thread key.
+ *
+ * A turn is not instantaneous: it waits its place among concurrent handoffs,
+ * then spends seconds fetching issue context and spawning a sandbox. Somebody
+ * can take the issue back inside that window, and the release path needs to
+ * tell "not started yet, so drop it" from "already running, so interrupt it" —
+ * a dropped turn leaves nothing behind, while an interrupt has a sandbox and a
+ * half-written comment to account for.
+ *
+ * Per process, like the work it tracks. A restart loses the entries, which
+ * costs nothing: it also loses the turns.
+ */
+const pendingAssignments = new Map<string, PendingAssignment>();
+
+type PendingAssignment = {
+  /** Set when the issue is taken back before the turn starts. */
+  released: boolean;
+  /** Set once the turn is actually running. */
+  started: boolean;
+};
+
 function handleIssueAssignment(
   rawBody: string,
   input: ThreadHandlerInput,
@@ -688,21 +718,102 @@ function handleIssueAssignment(
     await thread.setState({ lastAssignmentTrigger: event.updatedAt });
     const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
       .linearClient;
+    const pending: PendingAssignment = { released: false, started: false };
+    pendingAssignments.set(threadKey, pending);
     backgroundWaitUntil(
-      runThreadTurn({
-        announceStart: true,
-        applyStatus: true,
-        botUserId: input.botUserId,
-        client,
-        executeMessage: assignmentInstructionMessage(event, threadKey),
-        issueId: event.issueId,
-        options,
-        overrides: {},
-        thread,
-        threadKey,
-        trace,
-      }),
+      (async () => {
+        try {
+          if (pending.released) {
+            // Taken back before this got a start. Nothing has been posted and
+            // no sandbox exists, so dropping it is the whole of the cleanup.
+            traceLog(options, "linearbot_assignment_dropped_on_release", trace, {
+              issue_id: event.issueId,
+            });
+            return;
+          }
+          pending.started = true;
+          await runThreadTurn({
+            announceStart: true,
+            applyStatus: true,
+            botUserId: input.botUserId,
+            client,
+            executeMessage: assignmentInstructionMessage(event, threadKey),
+            issueId: event.issueId,
+            options,
+            overrides: {},
+            thread,
+            threadKey,
+            trace,
+          });
+        } finally {
+          if (pendingAssignments.get(threadKey) === pending) {
+            pendingAssignments.delete(threadKey);
+          }
+        }
+      })(),
     );
+  })();
+}
+
+/**
+ * Stops work on an issue the bot no longer holds.
+ *
+ * Two shapes, and they need different handling. A turn still waiting to start
+ * is dropped where it stands: nothing has been posted, no sandbox exists, and
+ * the cheapest correct thing is to never start. A turn already running is
+ * interrupted through api-rs, which ends the execution and lets the sandbox
+ * fall to the usual idle reclaim instead of holding a fleet slot to the end of
+ * work nobody asked for any more.
+ *
+ * Interrupting is also right when this process knows nothing about the thread:
+ * a turn started before a restart is exactly the case where the issue looks
+ * busy and no local state explains it.
+ *
+ * The issue's status is left alone deliberately. Whoever took the issue back
+ * decides where it belongs; moving it here would fight them.
+ */
+function handleIssueRelease(
+  rawBody: string,
+  input: ThreadHandlerInput,
+): Promise<void> | null {
+  if (!input.botUserId) return null;
+  const event = parseIssueReleaseWebhook(rawBody, input.botUserId);
+  if (!event) return null;
+  const { options } = input;
+  const threadKey = `linear:${event.issueId}`;
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: `release-${event.issueId}-${event.updatedAt}`,
+    mode: "execute",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const pending = pendingAssignments.get(threadKey);
+    if (pending) pending.released = true;
+    if (pending && !pending.started) {
+      traceLog(options, "linearbot_assignment_release_pending", trace, {
+        issue_id: event.issueId,
+      });
+      return;
+    }
+    try {
+      const interrupted = await interruptSession(
+        options,
+        threadKey,
+        RELEASE_INTERRUPT_REASON,
+      );
+      traceLog(options, "linearbot_assignment_release_interrupted", trace, {
+        interrupted,
+        issue_id: event.issueId,
+      });
+    } catch (error) {
+      (options.logger ?? noopLogger).warn("linearbot_assignment_release_failed", {
+        error: errorMessage(error),
+        issue_id: event.issueId,
+      });
+    }
   })();
 }
 
