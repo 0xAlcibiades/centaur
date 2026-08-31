@@ -285,9 +285,12 @@ impl AgentSandboxBackend {
             return Ok(());
         };
         // A merge patch on `containers` would replace the whole array, so this
-        // has to be a JSON patch at the container's own index.
+        // has to be a JSON patch at the container's own index. `add` rather
+        // than `replace`: a container created before this existed has no
+        // `resources` member, and `replace` errors on a missing target, while
+        // `add` inserts it when absent and replaces it when present.
         let patch = json!([{
-            "op": "replace",
+            "op": "add",
             "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
             "value": desired_value,
         }]);
