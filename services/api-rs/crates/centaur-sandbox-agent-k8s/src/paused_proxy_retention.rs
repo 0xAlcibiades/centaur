@@ -192,11 +192,17 @@ impl PausedProxyRetentionSweep {
         let retained = self.paused_proxy_candidates(&candidates).await?;
 
         for budget in &mut node_budgets {
-            budget.load_pods = load.get(&budget.name).copied().unwrap_or_default();
-            budget.retained_pods = retained
+            let retained_on_node = retained
                 .iter()
                 .filter(|entry| entry.node == budget.name)
                 .count();
+            // The census counted the evictable paused proxies as load too; they
+            // are the budget being managed, not the load that constrains it, so
+            // take them back out. What remains is the non-evictable load --
+            // agent pods and the proxies of running sandboxes.
+            let total = load.get(&budget.name).copied().unwrap_or_default();
+            budget.load_pods = total.saturating_sub(retained_on_node);
+            budget.retained_pods = retained_on_node;
         }
 
         let victims = select_evictions(
@@ -293,8 +299,10 @@ impl PausedProxyRetentionSweep {
     }
 
     /// A cluster-wide pod census over the steering nodes: per-node load
-    /// (everything except evictable paused proxies) and the candidate proxy
-    /// pods, keyed by sandbox id with their node.
+    /// (every scheduled pod) and the candidate proxy pods, keyed by sandbox id
+    /// with their node. Load includes the proxies because a running sandbox's
+    /// proxy pod holds a real slot; only the evictable paused proxies are
+    /// subtracted back out in `sweep_once`.
     async fn observe_cluster_pods(
         &self,
         steering: &BTreeSet<&str>,
@@ -321,13 +329,15 @@ impl PausedProxyRetentionSweep {
             } else {
                 None
             };
-            match sandbox_id {
-                // A proxy pod we cannot attribute to a sandbox still counts
-                // as load: it holds a slot the node budget has to cover.
-                Some(sandbox_id) => {
-                    candidates.entry(sandbox_id).or_insert_with(|| node_name);
-                }
-                None => *load.entry(node_name).or_default() += 1,
+            // Every scheduled pod counts as load, including proxies: a running
+            // sandbox's proxy pod holds a real slot the node budget has to
+            // cover. Counting the evictable paused proxies here too is safe --
+            // `sweep_once` takes them back out of the per-node load before
+            // sizing the headroom, so the running proxies (which stay) are not
+            // silently dropped from the budget.
+            *load.entry(node_name.clone()).or_default() += 1;
+            if let Some(sandbox_id) = sandbox_id {
+                candidates.entry(sandbox_id).or_insert_with(|| node_name);
             }
         }
         Ok((load, candidates))

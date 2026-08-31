@@ -197,8 +197,13 @@ metadata:
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
 subjects:
+  # A ClusterRoleBinding is cluster-scoped, so its ServiceAccount subject must
+  # name the namespace the account lives in; the API server rejects the
+  # binding without it, which is what leaves the sweep's pods+nodes reads
+  # ungranted.
   - kind: ServiceAccount
     name: {{ $apiRsName }}
+    namespace: {{ .Release.Namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
