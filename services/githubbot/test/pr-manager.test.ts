@@ -953,9 +953,23 @@ describe("management turn reaction ack", () => {
 });
 
 describe("pull request closed", () => {
-  function closeCtx(calls: { url: string; body: unknown }[]) {
+  function closeCtx(
+    calls: { url: string; body: unknown }[],
+    owned = true,
+  ) {
+    // fetchPr round-trips through summarizePr, which reads head/labels, so the
+    // mock must be a shaped PR. The bot owns it only when it is an assignee.
+    const data = {
+      number: 41,
+      state: "closed",
+      title: "Add the thing",
+      merged: false,
+      head: { ref: "feature", sha: "abc123" },
+      labels: [],
+      assignees: owned ? [{ login: "centaur-bot" }] : [],
+    };
     return {
-      octokit: { rest: { pulls: { get: async () => ({ data: {} }) } } },
+      octokit: { rest: { pulls: { get: async () => ({ data }) } } },
       options: {
         apiUrl: "http://localhost",
         logger: { debug() {}, warn() {}, error() {}, info() {} },
@@ -975,10 +989,10 @@ describe("pull request closed", () => {
     } as unknown as PrManagerContext;
   }
 
-  async function runClose(merged: boolean) {
+  async function runClose(merged: boolean, owned = true) {
     const calls: { url: string; body: unknown }[] = [];
     await handlePullRequestEvent(
-      closeCtx(calls),
+      closeCtx(calls, owned),
       JSON.stringify({
         action: "closed",
         pull_request: { merged, number: 41, title: "Add the thing" },
@@ -1008,6 +1022,14 @@ describe("pull request closed", () => {
     // they are separate sessions and either may be mid-flight.
     expect(urls).toContain(encodeURIComponent("github-manage:base/repo:41"));
     expect(urls).toContain(encodeURIComponent("github-review:base/repo:41"));
+  });
+
+  test("notifies nothing when the pull request is not the bot's", async () => {
+    // The session API mints a session on the first append, so an unrelated
+    // close must not reach notifyPullRequestClosed at all -- otherwise every
+    // closed PR in the workspace becomes a pair of empty Centaur sessions.
+    const calls = await runClose(false, false);
+    expect(calls).toEqual([]);
   });
 
   test("starts no execution, so a close consumes no sandbox slot", async () => {

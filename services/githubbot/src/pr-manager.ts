@@ -308,6 +308,13 @@ export async function handlePullRequestEvent(
     // Nothing is driven here -- the turn is not cancelled, because cancelling
     // discards unpushed work. The close is delivered as durable context so the
     // turn can finish its current step knowing the outcome.
+    //
+    // Only the bot's own PRs have a management or review session to tell. The
+    // notice is appended via the session API, which mints the session on the
+    // first append, so an unrelated close -- a PR nobody handed to the bot --
+    // would otherwise create two empty sessions per closed PR in the workspace.
+    const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
+    if (!pr || !owns(ctx, pr)) return;
     await notifyPullRequestClosed(ctx, repo.owner, repo.repo, number, prNode);
     return;
   }
