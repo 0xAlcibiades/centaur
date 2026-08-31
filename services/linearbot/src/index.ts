@@ -684,6 +684,12 @@ type PendingAssignment = {
   released: boolean;
   /** Set once the turn is actually running. */
   started: boolean;
+  /**
+   * The issue `updatedAt` (Linear clock) when this assignment was processed.
+   * A release older than this is stale -- it preceded this assignment, so it
+   * belongs to a turn the re-delegation has already superseded.
+   */
+  assignmentUpdatedAtMs: number;
 };
 
 function handleIssueAssignment(
@@ -718,7 +724,11 @@ function handleIssueAssignment(
     await thread.setState({ lastAssignmentTrigger: event.updatedAt });
     const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
       .linearClient;
-    const pending: PendingAssignment = { released: false, started: false };
+    const pending: PendingAssignment = {
+      released: false,
+      started: false,
+      assignmentUpdatedAtMs: event.updatedAt ? Date.parse(event.updatedAt) : NaN,
+    };
     pendingAssignments.set(threadKey, pending);
     backgroundWaitUntil(
       (async () => {
@@ -774,16 +784,23 @@ function handleIssueAssignment(
  */
 /**
  * The release action, split out so its one non-obvious property is testable:
- * it interrupts unconditionally.
+ * it interrupts the thread's turn unless the release is stale.
  *
- * The local pending entry is not a reliable liveness signal. It is keyed by
- * thread and overwritten by a newer assignment, so at release time it can read
- * `started: false` while an earlier turn -- the one the overwrite evicted --
- * is still streaming on the now-taken-back issue. Gating the interrupt on that
- * flag (as the old drop-and-return did) is exactly the race that lets work
- * start after the issue is taken back. Interrupting is always safe: it is a
- * no-op when nothing is running, and `pending.released` separately keeps a
- * still-queued turn from ever starting.
+ * The local pending entry is keyed by thread and overwritten by a newer
+ * assignment, so at release time it can describe a turn *newer* than the
+ * webhook -- a take-back redelivered out of order after the issue was
+ * re-delegated. Interrupting that would kill a legitimate turn, and marking it
+ * `released` would drop it before it starts. Both are skipped when the release
+ * is stale: Linear advances the issue `updatedAt` on every change, so a release
+ * older than the assignment that owns the current entry precedes the
+ * re-delegation and belongs to a turn that has already been superseded.
+ *
+ * The `started` flag is not a liveness signal, so the interrupt is never gated
+ * on it (gating on it is the race that lets work start after a take-back). With
+ * no local entry there is nothing to compare against, so the interrupt runs
+ * unconditionally there: a turn started before a restart is exactly the case it
+ * must reach. `pending.released` separately keeps a still-queued turn from ever
+ * starting.
  */
 export async function applyRelease(
   options: LinearbotOptions,
@@ -791,7 +808,20 @@ export async function applyRelease(
   pending: PendingAssignment | undefined,
   trace: LinearbotTrace,
   issueId: string,
+  releaseUpdatedAt: string,
 ): Promise<void> {
+  const releaseUpdatedAtMs = releaseUpdatedAt ? Date.parse(releaseUpdatedAt) : NaN;
+  if (
+    pending &&
+    Number.isFinite(releaseUpdatedAtMs) &&
+    Number.isFinite(pending.assignmentUpdatedAtMs) &&
+    releaseUpdatedAtMs < pending.assignmentUpdatedAtMs
+  ) {
+    traceLog(options, "linearbot_release_stale_skipped", trace, {
+      issue_id: issueId,
+    });
+    return;
+  }
   if (pending) pending.released = true;
   try {
     const interrupted = await interruptSession(
@@ -828,7 +858,14 @@ function handleIssueRelease(
     startedAtMs: nowMs(),
     threadId: threadKey,
   };
-  return applyRelease(options, threadKey, pendingAssignments.get(threadKey), trace, event.issueId);
+  return applyRelease(
+    options,
+    threadKey,
+    pendingAssignments.get(threadKey),
+    trace,
+    event.issueId,
+    event.updatedAt,
+  );
 }
 
 /**
