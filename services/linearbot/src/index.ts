@@ -772,6 +772,45 @@ function handleIssueAssignment(
  * The issue's status is left alone deliberately. Whoever took the issue back
  * decides where it belongs; moving it here would fight them.
  */
+/**
+ * The release action, split out so its one non-obvious property is testable:
+ * it interrupts unconditionally.
+ *
+ * The local pending entry is not a reliable liveness signal. It is keyed by
+ * thread and overwritten by a newer assignment, so at release time it can read
+ * `started: false` while an earlier turn -- the one the overwrite evicted --
+ * is still streaming on the now-taken-back issue. Gating the interrupt on that
+ * flag (as the old drop-and-return did) is exactly the race that lets work
+ * start after the issue is taken back. Interrupting is always safe: it is a
+ * no-op when nothing is running, and `pending.released` separately keeps a
+ * still-queued turn from ever starting.
+ */
+export async function applyRelease(
+  options: LinearbotOptions,
+  threadKey: string,
+  pending: PendingAssignment | undefined,
+  trace: LinearbotTrace,
+  issueId: string,
+): Promise<void> {
+  if (pending) pending.released = true;
+  try {
+    const interrupted = await interruptSession(
+      options,
+      threadKey,
+      RELEASE_INTERRUPT_REASON,
+    );
+    traceLog(options, "linearbot_assignment_release_interrupted", trace, {
+      interrupted,
+      issue_id: issueId,
+    });
+  } catch (error) {
+    (options.logger ?? noopLogger).warn("linearbot_assignment_release_failed", {
+      error: errorMessage(error),
+      issue_id: issueId,
+    });
+  }
+}
+
 function handleIssueRelease(
   rawBody: string,
   input: ThreadHandlerInput,
@@ -789,32 +828,7 @@ function handleIssueRelease(
     startedAtMs: nowMs(),
     threadId: threadKey,
   };
-  return (async () => {
-    const pending = pendingAssignments.get(threadKey);
-    if (pending) pending.released = true;
-    if (pending && !pending.started) {
-      traceLog(options, "linearbot_assignment_release_pending", trace, {
-        issue_id: event.issueId,
-      });
-      return;
-    }
-    try {
-      const interrupted = await interruptSession(
-        options,
-        threadKey,
-        RELEASE_INTERRUPT_REASON,
-      );
-      traceLog(options, "linearbot_assignment_release_interrupted", trace, {
-        interrupted,
-        issue_id: event.issueId,
-      });
-    } catch (error) {
-      (options.logger ?? noopLogger).warn("linearbot_assignment_release_failed", {
-        error: errorMessage(error),
-        issue_id: event.issueId,
-      });
-    }
-  })();
+  return applyRelease(options, threadKey, pendingAssignments.get(threadKey), trace, event.issueId);
 }
 
 /**
