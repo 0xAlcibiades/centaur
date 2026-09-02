@@ -416,6 +416,87 @@ pub struct ToolHostCallOutput {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct ToolHostCallError {
+    request_id: Option<String>,
+    execution_id: Option<String>,
+    sandbox_id: Option<String>,
+    #[source]
+    source: Box<SessionRuntimeError>,
+}
+
+impl ToolHostCallError {
+    fn new(source: SessionRuntimeError) -> Self {
+        Self {
+            request_id: None,
+            execution_id: None,
+            sandbox_id: None,
+            source: Box::new(source),
+        }
+    }
+
+    fn with_request(source: SessionRuntimeError, request_id: &str) -> Self {
+        Self {
+            request_id: Some(request_id.to_owned()),
+            execution_id: None,
+            sandbox_id: None,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    pub fn execution_id(&self) -> Option<&str> {
+        self.execution_id.as_deref()
+    }
+
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.as_deref()
+    }
+
+    pub fn into_source(self) -> SessionRuntimeError {
+        *self.source
+    }
+}
+
+impl From<SessionRuntimeError> for ToolHostCallError {
+    fn from(source: SessionRuntimeError) -> Self {
+        Self::new(source)
+    }
+}
+
+struct SessionExecutionAttempt {
+    execution: SessionExecution,
+    sandbox_id: Option<String>,
+}
+
+struct SessionExecutionAttemptError {
+    execution_id: Option<String>,
+    sandbox_id: Option<String>,
+    source: Box<SessionRuntimeError>,
+}
+
+impl SessionExecutionAttemptError {
+    fn new(
+        execution_id: Option<String>,
+        sandbox_id: Option<String>,
+        source: SessionRuntimeError,
+    ) -> Self {
+        Self {
+            execution_id,
+            sandbox_id,
+            source: Box::new(source),
+        }
+    }
+
+    fn into_source(self) -> SessionRuntimeError {
+        *self.source
+    }
+}
+
 #[derive(Clone)]
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
@@ -974,34 +1055,38 @@ impl SessionRuntime {
         &self,
         input: ToolHostCallInput,
         policy: ToolHostCallPolicy,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+    ) -> Result<ToolHostCallOutput, ToolHostCallError> {
         let principal_id = input.principal_id.trim().to_owned();
         let tool_name = input.tool_name.trim().to_owned();
         let method = input.method.trim().to_owned();
         if principal_id.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
                 "tool host principal_id is required".to_owned(),
-            ));
+            )
+            .into());
         }
         if tool_name.is_empty() {
             return Err(SessionRuntimeError::BadRequest(
                 "tool host tool_name is required".to_owned(),
-            ));
+            )
+            .into());
         }
         if method.is_empty() {
-            return Err(SessionRuntimeError::BadRequest(
-                "tool host method is required".to_owned(),
-            ));
+            return Err(
+                SessionRuntimeError::BadRequest("tool host method is required".to_owned()).into(),
+            );
         }
         if input.timeout.is_zero() {
             return Err(SessionRuntimeError::BadRequest(
                 "tool host timeout must be non-zero".to_owned(),
-            ));
+            )
+            .into());
         }
         if policy.principal_id != principal_id {
             return Err(SessionRuntimeError::BadRequest(
                 "tool host policy principal does not match the call principal".to_owned(),
-            ));
+            )
+            .into());
         }
 
         let thread_key = tool_host_thread_key(&principal_id)?;
@@ -1068,7 +1153,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ToolHostCallInput,
         sandbox_capabilities: SessionSandboxCapabilities,
-    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+    ) -> Result<ToolHostCallOutput, ToolHostCallError> {
         let ToolHostCallInput {
             principal_id,
             console_user_email,
@@ -1097,22 +1182,28 @@ impl SessionRuntime {
             token_id,
             timeout_seconds: timeout.as_secs().max(1),
         };
-        let input_line = serde_json::to_string(&request).map_err(|error| {
-            SessionRuntimeError::Sandbox(SandboxError::io_source("encode tool host request", error))
-        })?;
+        let input_line = serde_json::to_string(&request)
+            .map_err(|error| {
+                SessionRuntimeError::Sandbox(SandboxError::io_source(
+                    "encode tool host request",
+                    error,
+                ))
+            })
+            .map_err(|error| ToolHostCallError::with_request(error, &request_id))?;
         let response_timeout = timeout.saturating_add(Duration::from_secs(5));
-        let execution = self
+        let execution_metadata = tool_host_execution_metadata(
+            &request_id,
+            &tool_name,
+            &method,
+            timeout,
+            centaur_telemetry::traceparent_for_span(&Span::current()),
+        );
+        let attempt = match self
             .execute_session_impl(
                 thread_key,
                 ExecuteSessionInput {
                     idempotency_key: Some(request_id.clone()),
-                    metadata: Some(json!({
-                        "mcp_tool_host_call": true,
-                        "request_id": request_id.clone(),
-                        "tool": tool_name,
-                        "method": method,
-                        "timeout_ms": duration_millis_u64(timeout),
-                    })),
+                    metadata: Some(execution_metadata),
                     input_lines: vec![input_line],
                     idle_timeout_ms: None,
                     max_duration_ms: Some(duration_millis_u64(response_timeout)),
@@ -1120,14 +1211,37 @@ impl SessionRuntime {
                 None,
                 Some(sandbox_capabilities),
             )
-            .await?;
-        self.wait_for_tool_host_call(
-            thread_key,
-            &execution.execution_id,
-            &request_id,
-            response_timeout,
-        )
-        .await
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Err(ToolHostCallError {
+                    request_id: Some(request_id),
+                    execution_id: error.execution_id,
+                    sandbox_id: error.sandbox_id,
+                    source: error.source,
+                });
+            }
+        };
+        let execution_id = attempt.execution.execution_id;
+        let result = self
+            .wait_for_tool_host_call(
+                thread_key,
+                &execution_id,
+                &request_id,
+                attempt.sandbox_id.as_deref(),
+                response_timeout,
+            )
+            .await;
+        match result {
+            Ok(output) => Ok(output),
+            Err(source) => Err(ToolHostCallError {
+                request_id: Some(request_id),
+                execution_id: Some(execution_id),
+                sandbox_id: attempt.sandbox_id,
+                source: Box::new(source),
+            }),
+        }
     }
 
     async fn create_or_get_tool_host_session(
@@ -1167,6 +1281,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         execution_id: &str,
         request_id: &str,
+        sandbox_id: Option<&str>,
         response_timeout: Duration,
     ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
         let events = self
@@ -1180,16 +1295,16 @@ impl SessionRuntime {
                     "session.execution_completed" => {
                         return self
                             .tool_host_completed_output(
-                                thread_key,
                                 &event,
                                 execution_id,
                                 request_id,
+                                sandbox_id,
                             )
                             .await;
                     }
                     "session.execution_failed" => {
                         return self
-                            .tool_host_failed_output(thread_key, &event, execution_id, request_id)
+                            .tool_host_failed_output(&event, execution_id, request_id, sandbox_id)
                             .await;
                     }
                     _ => {}
@@ -1202,15 +1317,10 @@ impl SessionRuntime {
         .await
         {
             Ok(output) => output,
-            // Best-effort sandbox id: a store error must not replace the
-            // timeout result with an internal error.
             Err(_) => Ok(ToolHostCallOutput {
                 request_id: request_id.to_owned(),
                 execution_id: execution_id.to_owned(),
-                sandbox_id: self
-                    .current_sandbox_id(thread_key)
-                    .await
-                    .unwrap_or_default(),
+                sandbox_id: sandbox_id.unwrap_or_default().to_owned(),
                 stdout: String::new(),
                 stderr: format!(
                     "tool host call timed out after {} ms",
@@ -1224,12 +1334,12 @@ impl SessionRuntime {
 
     async fn tool_host_completed_output(
         &self,
-        thread_key: &ThreadKey,
         event: &SessionEvent,
         execution_id: &str,
         request_id: &str,
+        sandbox_id: Option<&str>,
     ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
-        let sandbox_id = self.current_sandbox_id(thread_key).await?;
+        let sandbox_id = sandbox_id.unwrap_or_default().to_owned();
         let Some(result_text) = event.payload.get("result_text").and_then(Value::as_str) else {
             return Ok(ToolHostCallOutput {
                 request_id: request_id.to_owned(),
@@ -1260,10 +1370,10 @@ impl SessionRuntime {
 
     async fn tool_host_failed_output(
         &self,
-        thread_key: &ThreadKey,
         event: &SessionEvent,
         execution_id: &str,
         request_id: &str,
+        sandbox_id: Option<&str>,
     ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
         let error = event
             .payload
@@ -1279,24 +1389,12 @@ impl SessionRuntime {
         Ok(ToolHostCallOutput {
             request_id: request_id.to_owned(),
             execution_id: execution_id.to_owned(),
-            sandbox_id: self.current_sandbox_id(thread_key).await?,
+            sandbox_id: sandbox_id.unwrap_or_default().to_owned(),
             stdout: String::new(),
             stderr: error,
             exit_status: None,
             timed_out,
         })
-    }
-
-    async fn current_sandbox_id(
-        &self,
-        thread_key: &ThreadKey,
-    ) -> Result<String, SessionRuntimeError> {
-        Ok(self
-            .store
-            .get_session(thread_key)
-            .await?
-            .sandbox_id
-            .unwrap_or_default())
     }
 
     async fn claim_stdout_owner(&self, execution_id: &str) -> Result<(), SessionRuntimeError> {
@@ -1930,6 +2028,8 @@ impl SessionRuntime {
     ) -> Result<SessionExecution, SessionRuntimeError> {
         self.execute_session_impl(thread_key, input, None, None)
             .await
+            .map(|attempt| attempt.execution)
+            .map_err(SessionExecutionAttemptError::into_source)
     }
 
     async fn drive_session_execution(
@@ -1940,6 +2040,8 @@ impl SessionRuntime {
     ) -> Result<SessionExecution, SessionRuntimeError> {
         self.execute_session_impl(thread_key, input, Some(execution_id), None)
             .await
+            .map(|attempt| attempt.execution)
+            .map_err(SessionExecutionAttemptError::into_source)
     }
 
     async fn execute_session_impl(
@@ -1950,14 +2052,27 @@ impl SessionRuntime {
         // Present only for an immediately dispatched tool-host call. Durable
         // recovery passes None and resolves the principal's current policy.
         pre_resolved_sandbox_capabilities: Option<SessionSandboxCapabilities>,
-    ) -> Result<SessionExecution, SessionRuntimeError> {
+    ) -> Result<SessionExecutionAttempt, SessionExecutionAttemptError> {
+        let mut execution_id = persisted_execution_id.map(str::to_owned);
+        let mut correlation_sandbox_id = None;
         if self.shutting_down.load(Ordering::SeqCst) {
-            return Err(SessionRuntimeError::ShuttingDown);
+            return Err(SessionExecutionAttemptError::new(
+                execution_id,
+                correlation_sandbox_id,
+                SessionRuntimeError::ShuttingDown,
+            ));
         }
         let persisted_request = persisted_execution_id
             .is_none()
             .then(|| persisted_execute_request(&input))
-            .transpose()?;
+            .transpose()
+            .map_err(|source| {
+                SessionExecutionAttemptError::new(
+                    execution_id.clone(),
+                    correlation_sandbox_id.clone(),
+                    source,
+                )
+            })?;
         let ExecuteSessionInput {
             idempotency_key,
             metadata,
@@ -1990,6 +2105,7 @@ impl SessionRuntime {
                 "starting session execution"
             );
             let session = self.store.get_session(thread_key).await?;
+            correlation_sandbox_id = session.sandbox_id.clone();
             let harness_label = session.harness_type.to_string();
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
@@ -2009,6 +2125,7 @@ impl SessionRuntime {
                         persisted_request.expect("new executions have a persisted request"),
                     )
                     .await?;
+                execution_id = Some(execution.execution.execution_id.clone());
                 span.record(
                     "centaur.execution_id",
                     execution.execution.execution_id.as_str(),
@@ -2030,6 +2147,7 @@ impl SessionRuntime {
                     .await?
             };
             let execution = claim.execution;
+            execution_id = Some(execution.execution_id.clone());
             if execution.thread_key != *thread_key {
                 return Err(SessionRuntimeError::BadRequest(format!(
                     "execution {} belongs to thread {}, not {}",
@@ -2145,6 +2263,7 @@ impl SessionRuntime {
                     return Err(error);
                 }
             };
+            correlation_sandbox_id = Some(sandbox_id.clone());
             span.record("centaur.sandbox_id", sandbox_id.as_str());
             span.record("sandbox_id", sandbox_id.as_str());
             execution_trace_span.record("centaur.sandbox_id", sandbox_id.as_str());
@@ -2220,6 +2339,13 @@ impl SessionRuntime {
             );
         }
         result
+            .map(|execution| SessionExecutionAttempt {
+                execution,
+                sandbox_id: correlation_sandbox_id.clone(),
+            })
+            .map_err(|source| {
+                SessionExecutionAttemptError::new(execution_id, correlation_sandbox_id, source)
+            })
     }
 
     /// Persist an execution request and return before sandbox provisioning or
@@ -6784,9 +6910,37 @@ fn nonzero_duration_millis(value: u64) -> Result<Duration, SessionRuntimeError> 
     Ok(Duration::from_millis(value))
 }
 
-fn tool_host_thread_key(principal_id: &str) -> Result<ThreadKey, SessionRuntimeError> {
-    ThreadKey::parse(format!("mcp:{principal_id}"))
+pub fn tool_host_thread_key(principal_id: &str) -> Result<ThreadKey, SessionRuntimeError> {
+    ThreadKey::parse(format!("mcp:{}", principal_id.trim()))
         .map_err(|error| SessionRuntimeError::BadRequest(error.to_string()))
+}
+
+fn tool_host_execution_metadata(
+    request_id: &str,
+    tool_name: &str,
+    method: &str,
+    timeout: Duration,
+    traceparent: Option<String>,
+) -> Value {
+    let mut metadata = serde_json::Map::from_iter([
+        ("mcp_tool_host_call".to_owned(), Value::Bool(true)),
+        (
+            "request_id".to_owned(),
+            Value::String(request_id.to_owned()),
+        ),
+        ("tool".to_owned(), Value::String(tool_name.to_owned())),
+        ("method".to_owned(), Value::String(method.to_owned())),
+        (
+            "timeout_ms".to_owned(),
+            Value::Number(duration_millis_u64(timeout).into()),
+        ),
+    ]);
+    insert_non_empty_metadata_string(
+        &mut metadata,
+        EXECUTION_TRACEPARENT_METADATA_KEY,
+        traceparent.as_deref(),
+    );
+    Value::Object(metadata)
 }
 
 /// Session/principal metadata recorded for observability; runtime behavior
@@ -7299,6 +7453,33 @@ mod tests {
         assert_eq!(spec.command, Some(vec!["/entrypoint.sh".to_owned()]));
         assert_eq!(spec.args, vec!["centaur-tool-host"]);
         assert_eq!(env_value(&spec, "TOOL_DIRS"), Some("/app/tools"));
+    }
+
+    #[test]
+    fn tool_host_execution_metadata_propagates_tool_traceparent() {
+        let traceparent = "00-0123456789abcdef0123456789abcdef-1111111111111111-01";
+
+        let metadata = tool_host_execution_metadata(
+            "mcp-call-123",
+            "search",
+            "query",
+            Duration::from_secs(120),
+            Some(traceparent.to_owned()),
+        );
+
+        assert_eq!(metadata[EXECUTION_TRACEPARENT_METADATA_KEY], traceparent);
+        assert_eq!(metadata["request_id"], "mcp-call-123");
+        assert_eq!(metadata["tool"], "search");
+        assert_eq!(metadata["method"], "query");
+        assert_eq!(metadata["timeout_ms"], 120_000);
+    }
+
+    #[test]
+    fn tool_host_thread_key_trims_principal_id() {
+        assert_eq!(
+            tool_host_thread_key(" prn_test ").unwrap().as_str(),
+            "mcp:prn_test"
+        );
     }
 
     #[test]
