@@ -125,8 +125,6 @@ describe("turnOutputChars", () => {
   });
 
   test("reports the error text for a failed turn", () => {
-    // Zero would read as "produced nothing", which is a different fault from
-    // "produced an error" — the distinction the unverifiable state lost.
     expect(
       turnOutputChars(result({ errorText: "boom", failed: true })),
     ).toBe(4);
