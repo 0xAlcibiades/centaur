@@ -908,8 +908,8 @@ class CompanyContextClient:
                         occurred_before=occurred_before,
                     )
                 except Exception:
-                    # Embedding generation and the experimental vector schema are
-                    # both optional. Any incompatibility falls back to lexical.
+                    # Embedding generation and vector search are optional. Any
+                    # incompatibility falls back to lexical search.
                     vector_results = []
 
             if vector_results:
@@ -1170,7 +1170,7 @@ class CompanyContextClient:
                     result["result_type"] = GOOGLE_DOCS_SOURCE_TYPE
                     results.append(result)
             except Exception:
-                # Optional projections may lag the embedding experiment schema.
+                # Optional projections may lag the embedding schema.
                 pass
 
         if _include_granola_source(source, source_type):
@@ -1226,7 +1226,7 @@ class CompanyContextClient:
                     result["result_type"] = GRANOLA_SOURCE_TYPE
                     results.append(result)
             except Exception:
-                # Optional projections may lag the embedding experiment schema.
+                # Optional projections may lag the embedding schema.
                 pass
 
         results.sort(
