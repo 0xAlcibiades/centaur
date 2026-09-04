@@ -110,13 +110,16 @@ export function createOpenAiMessageOverridesStrategy(
   const fetchFn = options.fetch ?? fetch
 
   return async ({ text }) => {
-    // Explicit flags are a deterministic user command, even when the deployment
-    // enables the LLM strategy for natural-language model requests. Handle them
-    // first so a strict strategy schema or model failure cannot discard the
-    // selection, and so flags never leak into the harness prompt.
+    // Explicit model flags are deterministic user commands and bypass the
+    // strategy entirely. The wrapper has already removed any persona flag.
     const { cleanedText, ...explicitOverrides } = extractMessageOverrides(text)
     if (Object.values(explicitOverrides).some(value => value !== undefined)) {
       return { cleanedText, overrides: explicitOverrides }
+    }
+
+    const strategyText = cleanedText
+    if (!strategyText) {
+      return { cleanedText, overrides: {} }
     }
 
     const controller = new AbortController()
@@ -124,7 +127,7 @@ export function createOpenAiMessageOverridesStrategy(
     try {
       const response = await fetchFn(responsesUrl, {
         body: JSON.stringify({
-          input: text,
+          input: strategyText,
           instructions: SYSTEM_PROMPT,
           max_output_tokens: maxOutputTokens,
           model: options.model,
@@ -161,11 +164,10 @@ export function createOpenAiMessageOverridesStrategy(
         throw new Error('message overrides strategy response did not include output text')
       }
       const parsed = JSON.parse(outputText)
-      return {
-        overrides: validateStrategyOverrides(
-          isJsonObject(parsed) ? (parsed as OpenAiMessageOverridesStrategyOutput) : null
-        )
-      }
+      const strategyOverrides = validateStrategyOverrides(
+        isJsonObject(parsed) ? (parsed as OpenAiMessageOverridesStrategyOutput) : null
+      )
+      return { overrides: strategyOverrides }
     } catch (error) {
       options.logger?.warn('slackbotv2_message_overrides_strategy_request_failed', {
         error: errorMessage(error),
