@@ -790,12 +790,17 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
 /// the ones worth naming: they are capacity problems, not harness problems, and
 /// they are actionable in a way a generic io failure is not.
 ///
-/// The current `state` is preferred over `last_state`: a container that has
-/// just terminated carries the reason there, and `last_state` holds the
-/// previous run once the kubelet restarts it. The pod-level `reason` covers
-/// eviction, where the container may never report one.
+/// A pod-level `Evicted` reason takes precedence because the container may
+/// later report only the generic `Error` reason. Otherwise, the current
+/// `state` is preferred over `last_state`: a container that has just
+/// terminated carries the reason there, and `last_state` holds the previous
+/// run once the kubelet restarts it. Other pod-level reasons are used only when
+/// no container termination reason is available.
 fn pod_termination_reason(pod: &Pod) -> Option<String> {
     let status = pod.status.as_ref()?;
+    if status.reason.as_deref() == Some("Evicted") {
+        return status.reason.clone();
+    }
     let from_container = status
         .container_statuses
         .iter()
@@ -1952,6 +1957,14 @@ mod tests {
     #[test]
     fn termination_reason_falls_back_to_the_pod_reason() {
         let pod = terminated_pod(None, None, Some("Evicted"));
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
+    }
+
+    /// The kubelet records eviction on the pod while the terminated container
+    /// may carry only a generic `Error`, so the pod-level cause must win.
+    #[test]
+    fn termination_reason_prefers_eviction_over_generic_container_error() {
+        let pod = terminated_pod(Some("Error"), None, Some("Evicted"));
         assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
     }
 
