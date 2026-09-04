@@ -32,7 +32,8 @@ use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
-    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
+    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
+    SessionSandboxCleanupConfig,
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
@@ -62,6 +63,8 @@ pub(crate) struct Args {
     pub(crate) server: ServerArgs,
     #[command(flatten)]
     sandbox: SandboxArgs,
+    #[command(flatten)]
+    session_event_retention: SessionEventRetentionArgs,
     #[command(flatten)]
     activity_summary: ActivitySummaryArgs,
 }
@@ -97,6 +100,10 @@ impl Args {
 
     pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
         self.sandbox.sandbox_cleanup_config()
+    }
+
+    pub(crate) fn session_event_retention_config(&self) -> Option<SessionEventRetentionConfig> {
+        self.session_event_retention.config()
     }
 
     pub(crate) async fn workflow_host_sandbox_runtime(
@@ -181,6 +188,35 @@ struct ActivitySummaryArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     max_output_tokens: u64,
+}
+
+#[derive(Debug, ClapArgs)]
+struct SessionEventRetentionArgs {
+    /// Delete session_events older than this many days. 0 disables retention,
+    /// which is the default because session_events is durable history.
+    /// Events of a queued or running execution are never deleted.
+    #[arg(
+        long = "session-events-retention-days",
+        env = "SESSION_EVENTS_RETENTION_DAYS",
+        default_value_t = 0
+    )]
+    retention_days: u32,
+    #[arg(
+        long = "session-events-retention-sweep-interval-secs",
+        env = "SESSION_EVENTS_RETENTION_SWEEP_INTERVAL_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    sweep_interval_secs: u64,
+}
+
+impl SessionEventRetentionArgs {
+    fn config(&self) -> Option<SessionEventRetentionConfig> {
+        (self.retention_days > 0).then(|| SessionEventRetentionConfig {
+            interval: Duration::from_secs(self.sweep_interval_secs),
+            retention: Duration::from_secs(u64::from(self.retention_days) * 24 * 60 * 60),
+        })
+    }
 }
 
 impl ActivitySummaryArgs {
@@ -610,17 +646,6 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     sandbox_reap_interval_secs: u64,
-    /// Delete session_events older than this many days. 0 disables retention,
-    /// which is the default: session_events is durable history, and dropping it
-    /// is not something to start doing to an existing deployment unasked.
-    /// Events of a queued or running execution are never deleted, whatever
-    /// their age.
-    #[arg(
-        long = "session-events-retention-days",
-        env = "SESSION_EVENTS_RETENTION_DAYS",
-        default_value_t = 0
-    )]
-    session_events_retention_days: u64,
     #[arg(
         long = "session-sandbox-cleanup-interval-secs",
         env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
@@ -1390,8 +1415,6 @@ impl SandboxArgs {
         SessionSandboxCleanupConfig {
             interval: duration(self.sandbox_cleanup_interval_secs),
             idle_backstop: duration(self.sandbox_idle_cleanup_backstop_secs),
-            event_retention: (self.session_events_retention_days > 0)
-                .then(|| Duration::from_secs(self.session_events_retention_days * 24 * 60 * 60)),
         }
     }
 }
@@ -2217,6 +2240,39 @@ mod tests {
                 what: "unsupported transform".to_owned(),
             })
         ));
+    }
+
+    #[test]
+    fn session_event_retention_is_disabled_by_default() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert!(args.session_event_retention_config().is_none());
+    }
+
+    #[test]
+    fn session_event_retention_has_an_independent_sweep_interval() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-events-retention-days",
+            "7",
+            "--session-events-retention-sweep-interval-secs",
+            "45",
+            "--session-sandbox-cleanup-interval-secs",
+            "0",
+        ])
+        .unwrap();
+
+        let config = args.session_event_retention_config().unwrap();
+        assert_eq!(config.retention, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(config.interval, Duration::from_secs(45));
+        assert!(!args.sandbox_cleanup_config().is_enabled());
     }
 
     #[test]
