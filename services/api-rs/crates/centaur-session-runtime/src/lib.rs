@@ -336,6 +336,9 @@ pub struct CreateOrGetSessionOutcome {
     /// True when the session was restarted onto a different harness because
     /// the request asked for [`HarnessConflictPolicy::Restart`].
     pub harness_switched: bool,
+    /// Set only when a new-session request named an unavailable persona and
+    /// the returned session uses this request's resolved fallback.
+    pub unavailable_requested_persona_id: Option<String>,
 }
 
 /// Outcome of [`SessionRuntime::drain`]: the sandboxes that were stopped and
@@ -916,6 +919,7 @@ impl SandboxBootMode {
 struct PersonaResolution {
     persona_id: Option<String>,
     context: Option<PersonaContext>,
+    unavailable_requested_persona_id: Option<String>,
 }
 
 impl SessionRuntime {
@@ -980,63 +984,23 @@ impl SessionRuntime {
         Ok(self.store.get_session(thread_key).await?)
     }
 
-    fn resolve_persona_for_create(
-        &self,
-        requested_persona_id: Option<&str>,
-        capabilities: &SessionSandboxCapabilities,
-    ) -> Result<PersonaResolution, SessionRuntimeError> {
-        let requested = requested_persona_id.and_then(clean_persona_id);
-        let selected = requested.or_else(|| self.default_persona_id_for_access(capabilities));
-        let defaulted = requested.is_none() && selected.is_some();
-        let context = self.resolve_persona_context(selected, defaulted, capabilities)?;
-        Ok(PersonaResolution {
-            persona_id: selected.map(str::to_owned),
-            context,
-        })
-    }
-
     fn resolve_stored_persona(
         &self,
         persona_id: Option<&str>,
-        _harness_type: &HarnessType,
         capabilities: &SessionSandboxCapabilities,
     ) -> Result<Option<PersonaContext>, SessionRuntimeError> {
-        self.resolve_persona_context(persona_id.and_then(clean_persona_id), false, capabilities)
-    }
-
-    fn resolve_persona_context(
-        &self,
-        persona_id: Option<&str>,
-        defaulted: bool,
-        capabilities: &SessionSandboxCapabilities,
-    ) -> Result<Option<PersonaContext>, SessionRuntimeError> {
-        let Some(persona_id) = persona_id else {
-            return Ok(None);
-        };
-        let Some(registry) = self.personas.as_ref() else {
-            return Err(SessionRuntimeError::BadRequest(format!(
-                "persona {persona_id:?} was requested but no persona registry is configured"
-            )));
-        };
-        registry
-            .context_for_access(persona_id, defaulted, &capabilities.repo_cache)
-            .map(Some)
-            .map_err(SessionRuntimeError::BadRequest)
+        resolve_persona_context(
+            self.personas.as_deref(),
+            persona_id.and_then(clean_persona_id),
+            false,
+            capabilities,
+        )
     }
 
     fn default_persona_id(&self) -> Option<&str> {
         self.personas
             .as_ref()
             .and_then(|personas| personas.default_persona_id())
-    }
-
-    fn default_persona_id_for_access(
-        &self,
-        capabilities: &SessionSandboxCapabilities,
-    ) -> Option<&str> {
-        self.personas
-            .as_ref()
-            .and_then(|personas| personas.default_persona_id_for_access(&capabilities.repo_cache))
     }
 
     fn context(&self) -> RuntimeContext {
@@ -1621,8 +1585,13 @@ impl SessionRuntime {
                 Some(persona_id) => PersonaResolution {
                     context: None,
                     persona_id,
+                    unavailable_requested_persona_id: None,
                 },
-                None => self.resolve_persona_for_create(persona_id, &desired_capabilities)?,
+                None => resolve_persona_selection(
+                    self.personas.as_deref(),
+                    persona_id,
+                    &desired_capabilities,
+                )?,
             };
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
@@ -1658,11 +1627,15 @@ impl SessionRuntime {
                 .store
                 .bind_iron_control_principal(thread_key, &registered_principal.id)
                 .await?;
-            if let Some(context) = self.resolve_stored_persona(
-                session.persona_id.as_deref(),
-                harness_type,
-                &desired_capabilities,
-            )? {
+            let unavailable_requested_persona_id = persona_resolution
+                .unavailable_requested_persona_id
+                .filter(|_| {
+                    // Another first-create request may have won with a different resolution.
+                    persona_resolution.persona_id == session.persona_id
+                });
+            if let Some(context) =
+                self.resolve_stored_persona(session.persona_id.as_deref(), &desired_capabilities)?
+            {
                 self.store
                     .append_event(
                         thread_key,
@@ -1689,6 +1662,7 @@ impl SessionRuntime {
             Ok(CreateOrGetSessionOutcome {
                 session,
                 harness_switched,
+                unavailable_requested_persona_id,
             })
         }
         .instrument(span)
@@ -2835,8 +2809,7 @@ impl SessionRuntime {
         );
         let ensure_started = Instant::now();
         let result = async {
-            let persona_context =
-                self.resolve_stored_persona(persona_id, harness_type, desired_capabilities)?;
+            let persona_context = self.resolve_stored_persona(persona_id, desired_capabilities)?;
             if let Some(sandbox_id) = existing_sandbox_id {
                 let id = SandboxId::new(sandbox_id);
                 if !sandbox_capabilities_match(existing_sandbox_capabilities, desired_capabilities)
@@ -5693,6 +5666,59 @@ fn clean_persona_id(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+fn resolve_persona_context(
+    personas: Option<&PersonaRegistry>,
+    persona_id: Option<&str>,
+    defaulted: bool,
+    capabilities: &SessionSandboxCapabilities,
+) -> Result<Option<PersonaContext>, SessionRuntimeError> {
+    let Some(persona_id) = persona_id else {
+        return Ok(None);
+    };
+    let Some(registry) = personas else {
+        return Err(SessionRuntimeError::BadRequest(format!(
+            "persona {persona_id:?} was requested but no persona registry is configured"
+        )));
+    };
+    registry
+        .context_for_access(persona_id, defaulted, &capabilities.repo_cache)
+        .map(Some)
+        .map_err(SessionRuntimeError::BadRequest)
+}
+
+fn resolve_persona_selection(
+    personas: Option<&PersonaRegistry>,
+    requested_persona_id: Option<&str>,
+    capabilities: &SessionSandboxCapabilities,
+) -> Result<PersonaResolution, SessionRuntimeError> {
+    let requested = requested_persona_id.and_then(clean_persona_id);
+    let Some(registry) = personas else {
+        return Ok(PersonaResolution {
+            persona_id: None,
+            context: None,
+            unavailable_requested_persona_id: requested.map(str::to_owned),
+        });
+    };
+    let (selected, unavailable_requested_persona_id) = match requested {
+        Some(persona_id) if registry.get(persona_id).is_some() => (Some(persona_id), None),
+        Some(persona_id) => (
+            registry.default_persona_id_for_access(&capabilities.repo_cache),
+            Some(persona_id.to_owned()),
+        ),
+        None => (
+            registry.default_persona_id_for_access(&capabilities.repo_cache),
+            None,
+        ),
+    };
+    let defaulted = selected.is_some() && selected != requested;
+    let context = resolve_persona_context(Some(registry), selected, defaulted, capabilities)?;
+    Ok(PersonaResolution {
+        persona_id: selected.map(str::to_owned),
+        context,
+        unavailable_requested_persona_id,
+    })
+}
+
 fn upsert_spec_env(spec: &mut SandboxSpec, name: &str, value: String) {
     if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
         existing.value = value;
@@ -7437,6 +7463,50 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_requested_persona_uses_deployment_fallback() {
+        let default_registry = PersonaRegistry::new(
+            [PersonaDefinition {
+                id: "eng".to_owned(),
+                source_root: "/repo/tools".to_owned(),
+                source_path: "/repo/tools/personas/eng".to_owned(),
+                source_ref: None,
+                prompt_hash: "sha256:eng".to_owned(),
+                prompt: "engineering persona".to_owned(),
+            }],
+            Some("eng".to_owned()),
+            vec!["/repo/tools".to_owned()],
+        )
+        .unwrap();
+        let empty_registry = PersonaRegistry::new(Vec::new(), None, Vec::new()).unwrap();
+
+        for (registry, expected_persona_id) in [
+            (Some(&default_registry), Some("eng")),
+            (Some(&empty_registry), None),
+            (None, None),
+        ] {
+            let resolution = resolve_persona_selection(
+                registry,
+                Some("honk"),
+                &SessionSandboxCapabilities::default_enabled(),
+            )
+            .unwrap();
+
+            assert_eq!(resolution.persona_id.as_deref(), expected_persona_id);
+            assert_eq!(
+                resolution
+                    .context
+                    .as_ref()
+                    .map(|context| context.persona_id.as_str()),
+                expected_persona_id
+            );
+            assert_eq!(
+                resolution.unavailable_requested_persona_id.as_deref(),
+                Some("honk")
+            );
+        }
+    }
+
+    #[test]
     fn tool_host_command_preserves_sandbox_entrypoint_for_tool_setup() {
         let thread_key = ThreadKey::parse("mcp:test").unwrap();
         let workload = SandboxWorkloadMode::codex_app_server(
@@ -9153,7 +9223,7 @@ mod adoption_tests {
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let runtime = runtime_with_personas(&store, backend);
 
-        runtime
+        let created = runtime
             .create_or_get_session(
                 &thread_key,
                 &HarnessType::Codex,
@@ -9163,6 +9233,7 @@ mod adoption_tests {
             )
             .await
             .expect("create original session");
+        assert_eq!(created.unavailable_requested_persona_id, None);
 
         let outcome = runtime
             .create_or_get_session(
@@ -9176,6 +9247,7 @@ mod adoption_tests {
             .expect("restart session on requested harness");
 
         assert!(outcome.harness_switched);
+        assert_eq!(outcome.unavailable_requested_persona_id, None);
         assert_eq!(outcome.session.harness_type, HarnessType::ClaudeCode);
         assert_eq!(outcome.session.persona_id.as_deref(), Some("old"));
         assert_eq!(
@@ -9224,6 +9296,7 @@ mod adoption_tests {
             .expect("load session with pinned persona");
 
         assert!(!outcome.harness_switched);
+        assert_eq!(outcome.unavailable_requested_persona_id, None);
         assert_eq!(outcome.session.harness_type, HarnessType::Codex);
         assert_eq!(outcome.session.persona_id.as_deref(), Some("old"));
         assert_eq!(
