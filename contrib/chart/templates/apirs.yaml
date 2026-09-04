@@ -326,6 +326,8 @@ spec:
               value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
             - name: SESSION_SANDBOX_REAP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxReapIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_ORPHAN_SWEEP_GRACE_SECS
+              value: {{ .Values.apiRs.sandboxOrphanSweepGraceSecs | quote }}
             - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
             - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS

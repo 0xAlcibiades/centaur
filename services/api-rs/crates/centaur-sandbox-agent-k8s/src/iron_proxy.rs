@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{
@@ -30,13 +30,6 @@ use crate::{
 
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
-/// How long a labeled iron-proxy resource must survive with no live
-/// Sandbox before the orphan sweep may delete it. Creates and resumes build
-/// the resources before their Sandbox CR exists, so the grace keeps the
-/// sweep from racing an in-flight one.
-fn orphan_sweep_grace() -> jiff::Span {
-    jiff::Span::new().seconds(600)
-}
 const FIREWALL_CA_MOUNT_PATH: &str = "/firewall-certs";
 pub(crate) const FIREWALL_CA_CERT_PATH: &str = "/firewall-certs/ca-cert.pem";
 const PROXY_MANAGEMENT_PORT: u16 = 9092;
@@ -591,6 +584,7 @@ impl AgentSandboxBackend {
     /// class were deleted.
     pub(crate) async fn sweep_orphan_iron_proxy_resources(
         &self,
+        grace: Duration,
     ) -> SandboxResult<BTreeMap<String, u32>> {
         let live_sandboxes = self
             .sandboxes()
@@ -601,7 +595,7 @@ impl AgentSandboxBackend {
             .iter()
             .filter_map(|sandbox| sandbox.metadata.name.clone())
             .collect::<BTreeSet<String>>();
-        let now = jiff::Timestamp::now();
+        let now = SystemTime::now();
         let mut reaped = BTreeMap::new();
         let proxy_selector = format!("{IRON_PROXY_LABEL}=true");
         let pods = self
@@ -612,7 +606,7 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for pod in pods.items {
             let metadata = &pod.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now) {
+            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
                 continue;
             }
             let name = metadata.name.clone().unwrap_or_default();
@@ -640,7 +634,7 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for service in services.items {
             let metadata = &service.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now) {
+            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
                 continue;
             }
             let name = metadata.name.clone().unwrap_or_default();
@@ -674,7 +668,7 @@ impl AgentSandboxBackend {
         let mut count = 0u32;
         for policy in policies.items {
             let metadata = &policy.metadata;
-            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now) {
+            if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
                 continue;
             }
             let name = metadata.name.clone().unwrap_or_default();
@@ -2125,7 +2119,8 @@ fn pod_stopped(pod: &Pod) -> bool {
 fn is_orphan_proxy_resource(
     metadata: &ObjectMeta,
     live_sandboxes: &BTreeSet<String>,
-    now: jiff::Timestamp,
+    now: SystemTime,
+    grace: Duration,
 ) -> bool {
     let Some(sandbox_id) = metadata
         .labels
@@ -2140,7 +2135,8 @@ fn is_orphan_proxy_resource(
     let Some(created) = &metadata.creation_timestamp else {
         return false;
     };
-    created.0 + orphan_sweep_grace() <= now
+    now.duration_since(SystemTime::from(created.0))
+        .is_ok_and(|age| age >= grace)
 }
 
 fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
@@ -3440,7 +3436,9 @@ mod tests {
         assert_eq!(value, Some("http://console:3000/"));
     }
 
-    fn meta_labeled(sandbox_id: Option<&str>, age: Option<jiff::Span>) -> ObjectMeta {
+    const ORPHAN_SWEEP_GRACE: Duration = Duration::from_secs(600);
+
+    fn meta_labeled(sandbox_id: Option<&str>, age: Option<Duration>) -> ObjectMeta {
         let mut labels = BTreeMap::new();
         labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
         if let Some(sandbox_id) = sandbox_id {
@@ -3450,7 +3448,10 @@ mod tests {
             name: Some("asbx-1-proxy".to_owned()),
             labels: Some(labels),
             creation_timestamp: age.map(|age| {
-                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::now() - age)
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    jiff::Timestamp::try_from(SystemTime::now() - age)
+                        .expect("test timestamp should be representable"),
+                )
             }),
             ..Default::default()
         }
@@ -3462,56 +3463,74 @@ mod tests {
 
     #[test]
     fn orphan_sweep_deletes_only_resources_without_a_live_sandbox() {
-        let now = jiff::Timestamp::now();
-        let metadata = meta_labeled(Some("asbx-1"), Some(jiff::Span::new().seconds(700)));
+        let now = SystemTime::now();
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
         assert!(is_orphan_proxy_resource(
             &metadata,
             &live_sandboxes(&["asbx-2"]),
-            now
+            now,
+            ORPHAN_SWEEP_GRACE,
         ));
     }
 
     #[test]
     fn orphan_sweep_skips_resources_of_live_sandboxes() {
-        let now = jiff::Timestamp::now();
-        let metadata = meta_labeled(Some("asbx-1"), Some(jiff::Span::new().seconds(700)));
+        let now = SystemTime::now();
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
         assert!(!is_orphan_proxy_resource(
             &metadata,
             &live_sandboxes(&["asbx-1"]),
-            now
+            now,
+            ORPHAN_SWEEP_GRACE,
         ));
     }
 
     #[test]
     fn orphan_sweep_skips_resources_inside_the_grace_window() {
-        let now = jiff::Timestamp::now();
-        let metadata = meta_labeled(Some("asbx-1"), Some(jiff::Span::new().seconds(60)));
+        let now = SystemTime::now();
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(60)));
         assert!(!is_orphan_proxy_resource(
             &metadata,
             &live_sandboxes(&[]),
-            now
+            now,
+            ORPHAN_SWEEP_GRACE,
         ));
     }
 
     #[test]
     fn orphan_sweep_skips_resources_without_a_sandbox_label() {
-        let now = jiff::Timestamp::now();
-        let metadata = meta_labeled(None, Some(jiff::Span::new().seconds(700)));
+        let now = SystemTime::now();
+        let metadata = meta_labeled(None, Some(Duration::from_secs(700)));
         assert!(!is_orphan_proxy_resource(
             &metadata,
             &live_sandboxes(&[]),
-            now
+            now,
+            ORPHAN_SWEEP_GRACE,
         ));
     }
 
     #[test]
     fn orphan_sweep_skips_resources_without_a_creation_timestamp() {
-        let now = jiff::Timestamp::now();
+        let now = SystemTime::now();
         let metadata = meta_labeled(Some("asbx-1"), None);
         assert!(!is_orphan_proxy_resource(
             &metadata,
             &live_sandboxes(&[]),
-            now
+            now,
+            ORPHAN_SWEEP_GRACE,
+        ));
+    }
+
+    #[test]
+    fn orphan_sweep_honors_configured_grace() {
+        let now = SystemTime::now();
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+
+        assert!(!is_orphan_proxy_resource(
+            &metadata,
+            &live_sandboxes(&[]),
+            now,
+            Duration::from_secs(800),
         ));
     }
 }

@@ -24,6 +24,9 @@ use crate::SandboxManager;
 pub struct SandboxReaperConfig {
     /// How often to sweep.
     pub interval: Duration,
+    /// Minimum age of an iron-proxy resource whose Sandbox no longer exists
+    /// before the orphan sweep may delete it.
+    pub orphan_sweep_grace: Duration,
     /// Stop any sandbox older than this regardless of status. `None` disables
     /// the max-lifetime sweep.
     pub max_lifetime: Option<Duration>,
@@ -93,7 +96,10 @@ impl SandboxReaper {
                 }
             }
         }
-        let orphaned = self.manager.reap_orphan_iron_proxy_resources().await?;
+        let orphaned = self
+            .manager
+            .reap_orphan_iron_proxy_resources(self.config.orphan_sweep_grace)
+            .await?;
         if !orphaned.is_empty() {
             info!(?orphaned, "reaped orphaned iron-proxy resources");
         }
@@ -126,6 +132,7 @@ mod tests {
     fn config(max_lifetime: Option<Duration>) -> SandboxReaperConfig {
         SandboxReaperConfig {
             interval: Duration::from_secs(60),
+            orphan_sweep_grace: Duration::from_secs(600),
             max_lifetime,
         }
     }

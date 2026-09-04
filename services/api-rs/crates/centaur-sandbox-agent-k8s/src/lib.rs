@@ -622,8 +622,11 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
-    async fn reap_orphan_iron_proxy_resources(&self) -> SandboxResult<BTreeMap<String, u32>> {
-        self.sweep_orphan_iron_proxy_resources().await
+    async fn reap_orphan_iron_proxy_resources(
+        &self,
+        grace: Duration,
+    ) -> SandboxResult<BTreeMap<String, u32>> {
+        self.sweep_orphan_iron_proxy_resources(grace).await
     }
 
     async fn ensure_iron_control_proxy_resources(
