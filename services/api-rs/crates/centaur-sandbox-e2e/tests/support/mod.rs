@@ -213,11 +213,16 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
         .await
         .expect("create sandbox with initial resources");
 
-    creator.pause(&handle.id).await.expect("pause sandbox");
-    eventually_status(&creator, &handle.id, SandboxStatus::Suspended).await;
+    // Leave replicas at one but remove the running Pod, reproducing a Created
+    // sandbox whose controller may already be rebuilding from the old template.
+    let pods: Api<Pod> = Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
+    pods.delete(handle.id.as_str(), &DeleteParams::default())
+        .await
+        .expect("delete old sandbox pod");
 
     let desired_resources = ResourceRequirements::new()
         .request("cpu", "20m")
+        .request("memory", "16Mi")
         .limit("memory", "32Mi");
     let mut config = agent_k8s_config(&kubernetes.namespace);
     config.default_resources = Some(desired_resources);
@@ -233,7 +238,11 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
         &handle.id,
         serde_json::json!({
             "limits": { "memory": "32Mi" },
-            "requests": { "cpu": "20m" },
+            "requests": { "cpu": "20m", "memory": "16Mi" },
+        }),
+        serde_json::json!({
+            "limits": { "memory": "32Mi" },
+            "requests": { "cpu": "20m", "memory": "16Mi" },
         }),
     )
     .await;
@@ -251,7 +260,13 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
         .await
         .expect("resume sandbox without resource constraints");
     eventually_status(&unbounded, &handle.id, SandboxStatus::Running).await;
-    assert_agent_resources(kubernetes, &handle.id, serde_json::Value::Null).await;
+    assert_agent_resources(
+        kubernetes,
+        &handle.id,
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
+    .await;
 
     unbounded.stop(&handle.id).await.expect("stop sandbox");
 }
@@ -259,7 +274,8 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
 async fn assert_agent_resources(
     kubernetes: &KubernetesImplementation,
     id: &SandboxId,
-    expected: serde_json::Value,
+    expected_stored: serde_json::Value,
+    expected_running: serde_json::Value,
 ) {
     let sandboxes: Api<crd::Sandbox> =
         Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
@@ -278,7 +294,7 @@ async fn assert_agent_resources(
     let stored_resources =
         serde_json::to_value(&stored_container.resources).expect("serialize stored resources");
     assert_eq!(
-        stored_resources, expected,
+        stored_resources, expected_stored,
         "stored resources should exactly match current configuration"
     );
 
@@ -294,11 +310,14 @@ async fn assert_agent_resources(
         .into_iter()
         .find(|container| container.name == "agent")
         .expect("resumed agent container");
-    let running_resources =
+    let mut running_resources =
         serde_json::to_value(&agent.resources).expect("serialize running resources");
+    if running_resources.is_null() {
+        running_resources = serde_json::json!({});
+    }
     assert_eq!(
-        running_resources, expected,
-        "resumed pod resources should exactly match current configuration"
+        running_resources, expected_running,
+        "resumed pod resources should match current configuration after Kubernetes defaulting"
     );
 }
 

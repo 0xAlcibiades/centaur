@@ -19,6 +19,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{
     AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
+    Preconditions,
 };
 use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
@@ -360,8 +361,48 @@ impl AgentSandboxBackend {
                 &Patch::Json::<crd::Sandbox>(patch),
             )
             .await
-            .map(|_| ())
-            .map_err(|err| map_kube_error("patch sandbox resources", err))
+            .map_err(|err| map_kube_error("patch sandbox resources", err))?;
+
+        // `resume` also repairs Created sandboxes, whose old Pod can already
+        // exist. Recreate that Pod after updating the durable template so the
+        // running container cannot retain the previous resources.
+        self.recreate_existing_pod(id, sandbox.spec.replicas.unwrap_or(1) == 0)
+            .await
+    }
+
+    async fn recreate_existing_pod(&self, id: &SandboxId, suspended: bool) -> SandboxResult<()> {
+        let Some(pod) = self.get_pod(id).await? else {
+            return Ok(());
+        };
+        // Keep resume idempotent for an already-running sandbox. Suspended
+        // sandboxes and Created (terminating, Pending, or unready) Pods must
+        // finish replacement from the updated template.
+        if !suspended && pod.metadata.deletion_timestamp.is_none() && pod_ready(&pod) {
+            return Ok(());
+        }
+        let uid = pod
+            .metadata
+            .uid
+            .ok_or_else(|| SandboxError::backend("sandbox pod has no uid"))?;
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.clone()),
+                ..Preconditions::default()
+            }),
+            ..DeleteParams::default()
+        };
+        if let Err(error) = self.pods().delete(id.as_str(), &params).await {
+            // A replacement may have won the race after the read. Never delete
+            // it using a stale observation; it was created from the new CR.
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(current) if current.metadata.uid.as_deref() != Some(uid.as_str()) => {
+                    return Ok(());
+                }
+                Some(_) => return Err(map_kube_error("recreate sandbox pod", error)),
+            }
+        }
+        self.wait_until_pod_instance_changes(id, &uid).await
     }
 
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -462,6 +503,27 @@ impl AgentSandboxBackend {
                 Some(_) if Instant::now() >= deadline => {
                     return Err(SandboxError::NotReady(format!(
                         "sandbox {} pod did not terminate before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn wait_until_pod_instance_changes(
+        &self,
+        id: &SandboxId,
+        previous_uid: &str,
+    ) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(pod) if pod.metadata.uid.as_deref() != Some(previous_uid) => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod instance did not change before timeout",
                         id.as_str()
                     )));
                 }
@@ -771,8 +833,8 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
-        // Do not scale up with stale fleet policy. The resourceVersion and
-        // container-name tests make the replacement atomic against a changed CR.
+        // Do not scale up with stale fleet policy. The container-name test
+        // makes the replacement atomic against a reordered pod template.
         if let Some(sandbox) = &sandbox {
             self.apply_configured_resources(id, sandbox).await?;
         }
@@ -1396,11 +1458,6 @@ fn sandbox_resources_patch(
     container_name: &str,
     resources: &ResourceRequirements,
 ) -> SandboxResult<Value> {
-    let resource_version = sandbox
-        .metadata
-        .resource_version
-        .as_deref()
-        .ok_or_else(|| SandboxError::backend("sandbox has no resourceVersion"))?;
     let index = sandbox
         .spec
         .pod_template
@@ -1418,11 +1475,6 @@ fn sandbox_resources_patch(
     };
 
     Ok(json!([
-        {
-            "op": "test",
-            "path": "/metadata/resourceVersion",
-            "value": resource_version,
-        },
         {
             "op": "test",
             "path": format!("/spec/podTemplate/spec/containers/{index}/name"),
@@ -1754,7 +1806,6 @@ mod tests {
             &config,
         )
         .unwrap();
-        sandbox.metadata.resource_version = Some("42".to_owned());
         let mut sidecar = sandbox.spec.pod_template.spec.containers[0].clone();
         sidecar.name = "sidecar".to_owned();
         sandbox.spec.pod_template.spec.containers.insert(0, sidecar);
@@ -1767,11 +1818,6 @@ mod tests {
         assert_eq!(
             patch,
             json!([
-                {
-                    "op": "test",
-                    "path": "/metadata/resourceVersion",
-                    "value": "42",
-                },
                 {
                     "op": "test",
                     "path": "/spec/podTemplate/spec/containers/1/name",
@@ -1792,18 +1838,16 @@ mod tests {
     #[test]
     fn resource_patch_can_atomically_clear_stale_resources() {
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
-        let mut sandbox = build_agent_sandbox(
+        let sandbox = build_agent_sandbox(
             &SandboxId::new("asbx-test"),
             &SandboxSpec::new("centaur-agent:latest"),
             &config,
         )
         .unwrap();
-        sandbox.metadata.resource_version = Some("42".to_owned());
-
         let patch =
             sandbox_resources_patch(&sandbox, "agent", &ResourceRequirements::default()).unwrap();
 
-        assert!(patch[2]["value"].is_null());
+        assert!(patch[1]["value"].is_null());
     }
 
     #[test]
