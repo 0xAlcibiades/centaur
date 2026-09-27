@@ -4,8 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use centaur_iron_control::IronControlClient;
-use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig, IronControlSettings};
-use centaur_sandbox_core::{SandboxBackend, SandboxId, SandboxSpec, SandboxStatus, SandboxWrite};
+use centaur_sandbox_agent_k8s::{
+    AgentSandboxBackend, AgentSandboxConfig, IronControlSettings, crd,
+};
+use centaur_sandbox_core::{
+    ResourceRequirements, SandboxBackend, SandboxId, SandboxSpec, SandboxStatus, SandboxWrite,
+};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{DriftReason, ReconcileOutcome, SandboxManager};
 use clap::Parser;
@@ -190,6 +194,89 @@ pub(crate) async fn pause_resume_restores_running(implementation: &SandboxImplem
         .stop(&handle.id)
         .await
         .unwrap_or_else(|err| panic!("{} stop failed: {err}", implementation.name));
+}
+
+pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxImplementation) {
+    let kubernetes = implementation
+        .kubernetes
+        .as_ref()
+        .expect("resource reconciliation test requires the agent-k8s implementation");
+    let creator = SandboxManager::new(implementation.backend.clone());
+    let initial_resources = ResourceRequirements::new()
+        .request("cpu", "10m")
+        .request("memory", "8Mi")
+        .limit("memory", "24Mi");
+    let handle = creator
+        .create_running(
+            k8s_shell_spec(&kubernetes.image, "sleep 3600").resources(initial_resources),
+        )
+        .await
+        .expect("create sandbox with initial resources");
+
+    creator.pause(&handle.id).await.expect("pause sandbox");
+    eventually_status(&creator, &handle.id, SandboxStatus::Suspended).await;
+
+    let desired_resources = ResourceRequirements::new()
+        .request("cpu", "20m")
+        .limit("memory", "32Mi");
+    let mut config = agent_k8s_config(&kubernetes.namespace);
+    config.default_resources = Some(desired_resources);
+    let resumed = SandboxManager::new(Arc::new(AgentSandboxBackend::new(
+        kubernetes.client.clone(),
+        config,
+    )));
+    resumed.resume(&handle.id).await.expect("resume sandbox");
+    eventually_status(&resumed, &handle.id, SandboxStatus::Running).await;
+
+    let sandboxes: Api<crd::Sandbox> =
+        Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
+    let sandbox = sandboxes
+        .get(handle.id.as_str())
+        .await
+        .expect("read resumed Sandbox CR");
+    let stored_container = sandbox
+        .spec
+        .pod_template
+        .spec
+        .containers
+        .iter()
+        .find(|container| container.name == "agent")
+        .expect("stored agent container");
+    let stored_resources =
+        serde_json::to_value(&stored_container.resources).expect("serialize stored resources");
+    assert_eq!(
+        stored_resources,
+        serde_json::json!({
+            "limits": { "memory": "32Mi" },
+            "requests": { "cpu": "20m" },
+        }),
+        "stored resources should exactly match current configuration"
+    );
+
+    let pods: Api<Pod> = Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
+    let pod = pods
+        .get(handle.id.as_str())
+        .await
+        .expect("read resumed sandbox pod");
+    let agent = pod
+        .spec
+        .expect("resumed pod spec")
+        .containers
+        .into_iter()
+        .find(|container| container.name == "agent")
+        .expect("resumed agent container");
+    let running_resources =
+        serde_json::to_value(&agent.resources).expect("serialize running resources");
+    assert_eq!(
+        running_resources,
+        serde_json::json!({
+            "limits": { "memory": "32Mi" },
+            "requests": { "cpu": "20m" },
+        }),
+        "resumed pod resources should exactly match current configuration"
+    );
+
+    resumed.stop(&handle.id).await.expect("stop sandbox");
 }
 
 pub(crate) async fn unexpected_shutdown_reports_drift(implementation: &SandboxImplementation) {
@@ -516,15 +603,7 @@ async fn agent_k8s_implementation() -> SandboxImplementation {
     .await
     .expect("load e2e kube config");
     let client = Client::try_from(kube_config).expect("create e2e kube client");
-    let mut config = AgentSandboxConfig::new(
-        namespace.clone(),
-        IronControlSettings {
-            client: IronControlClient::new("http://127.0.0.1:1", "test-key"),
-            console_url: "http://iron-control".to_owned(),
-            control_url: "http://iron-control".to_owned(),
-        },
-    );
-    config.ready_timeout = Duration::from_secs(90);
+    let config = agent_k8s_config(&namespace);
     let backend = Arc::new(AgentSandboxBackend::new(client.clone(), config.clone()));
     let reconnect_client = client.clone();
     let reconnect_config = config.clone();
@@ -549,6 +628,19 @@ async fn agent_k8s_implementation() -> SandboxImplementation {
             image,
         }),
     }
+}
+
+fn agent_k8s_config(namespace: &str) -> AgentSandboxConfig {
+    let mut config = AgentSandboxConfig::new(
+        namespace,
+        IronControlSettings {
+            client: IronControlClient::new("http://127.0.0.1:1", "test-key"),
+            console_url: "http://iron-control".to_owned(),
+            control_url: "http://iron-control".to_owned(),
+        },
+    );
+    config.ready_timeout = Duration::from_secs(90);
+    config
 }
 
 fn validate_requested_implementations(args: &E2eArgs) {

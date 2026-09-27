@@ -1618,10 +1618,16 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.node_selector = args.node_selector()?;
-        config.default_resources = resource_requirements(
-            args.sandbox_resources_json.as_deref(),
-            "SESSION_SANDBOX_RESOURCES",
-        )?;
+        // `Some(empty)` means resume should remove resources retained from an
+        // older configuration; `None` is reserved for backend users that do
+        // not want resource reconciliation.
+        config.default_resources = Some(
+            resource_requirements(
+                args.sandbox_resources_json.as_deref(),
+                "SESSION_SANDBOX_RESOURCES",
+            )?
+            .unwrap_or_default(),
+        );
         config.pod_annotations = args.pod_annotations()?;
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
@@ -3603,7 +3609,7 @@ mod tests {
             AgentSandboxConfig::try_from(&args.sandbox)
                 .unwrap()
                 .default_resources,
-            None
+            Some(ResourceRequirements::default())
         );
     }
 

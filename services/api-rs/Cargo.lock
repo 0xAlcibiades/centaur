@@ -1008,6 +1008,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "rustls 0.23.45",
+ "serde_json",
  "test-case",
  "tokio",
 ]

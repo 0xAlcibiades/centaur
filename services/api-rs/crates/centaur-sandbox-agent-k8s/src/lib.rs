@@ -342,21 +342,31 @@ impl AgentSandboxBackend {
     }
 
     async fn apply_configured_resources(&self, id: &SandboxId) -> SandboxResult<()> {
-        let Some(resources) = self
-            .config
-            .default_resources
-            .as_ref()
-            .filter(|resources| !resources.is_empty())
-        else {
+        let Some(resources) = self.config.default_resources.as_ref() else {
             return Ok(());
         };
 
-        let patch = sandbox_resources_apply_patch(id, &self.config.container_name, resources);
+        // Clear the complete resources field first. Resource names inside
+        // requests and limits are granular SSA map fields, so applying only
+        // the desired keys would retain stale keys owned by the CR creator.
+        // The sandbox is still paused, so no pod can observe the intermediate
+        // state. A failed second apply leaves it paused and can be retried.
+        let params = PatchParams::apply(&self.config.field_manager).force();
+        let clear = sandbox_resources_apply_patch(id, &self.config.container_name, None);
+        self.sandboxes()
+            .patch(id.as_str(), &params, &Patch::Apply(&clear))
+            .await
+            .map_err(|err| map_kube_error("clear sandbox resources", err))?;
+
+        if resources.is_empty() {
+            return Ok(());
+        }
+
         // The CRD declares containers as a map keyed by name, so server-side
         // apply updates only the agent container without positional JSON Patch
         // logic or replacing sidecars. This fleet policy deliberately takes
         // ownership from the manager that created the older CR.
-        let params = PatchParams::apply(&self.config.field_manager).force();
+        let patch = sandbox_resources_apply_patch(id, &self.config.container_name, Some(resources));
         self.sandboxes()
             .patch(id.as_str(), &params, &Patch::Apply(&patch))
             .await
@@ -771,15 +781,9 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
-        if let Err(error) = self.apply_configured_resources(id).await {
-            // Keep resume available if resource reconciliation is temporarily
-            // unavailable; the replacement pod will retain its previous limits.
-            tracing::warn!(
-                sandbox_id = id.as_str(),
-                %error,
-                "failed to apply current resources to resumed sandbox"
-            );
-        }
+        // Do not scale up with stale or partially applied fleet policy. The
+        // caller can retry resume after a transient Kubernetes API failure.
+        self.apply_configured_resources(id).await?;
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
@@ -1398,7 +1402,7 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
 fn sandbox_resources_apply_patch(
     id: &SandboxId,
     container_name: &str,
-    resources: &ResourceRequirements,
+    resources: Option<&ResourceRequirements>,
 ) -> Value {
     json!({
         "apiVersion": crd::Sandbox::api_version(&()),
@@ -1733,7 +1737,7 @@ mod tests {
             .limit("memory", "8Gi");
 
         let patch =
-            sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", &resources);
+            sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", Some(&resources));
 
         assert_eq!(patch["apiVersion"], "agents.x-k8s.io/v1alpha1");
         assert_eq!(patch["kind"], "Sandbox");
@@ -1748,6 +1752,13 @@ mod tests {
                 },
             }])
         );
+    }
+
+    #[test]
+    fn resource_apply_can_clear_stale_resources() {
+        let patch = sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", None);
+
+        assert!(patch["spec"]["podTemplate"]["spec"]["containers"][0]["resources"].is_null());
     }
 
     #[test]

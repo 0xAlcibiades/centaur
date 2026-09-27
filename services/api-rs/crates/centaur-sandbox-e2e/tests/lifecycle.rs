@@ -30,6 +30,14 @@ async fn pause_resume_restores_running(implementation_name: &'static str) {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires the agent-k8s e2e infrastructure; run `just e2e-kind`"]
+async fn resume_reconciles_agent_resources() {
+    if let Some(implementation) = support::implementation_if_requested("agent-k8s").await {
+        support::resume_reconciles_agent_resources(&implementation).await;
+    }
+}
+
 #[test_case("local"; "local")]
 #[test_case("agent-k8s"; "agent_k8s")]
 #[tokio::test]
