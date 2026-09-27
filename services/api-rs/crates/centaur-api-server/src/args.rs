@@ -1618,6 +1618,10 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.node_selector = args.node_selector()?;
+        config.default_resources = resource_requirements(
+            args.sandbox_resources_json.as_deref(),
+            "SESSION_SANDBOX_RESOURCES",
+        )?;
         config.pod_annotations = args.pod_annotations()?;
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
@@ -3514,6 +3518,10 @@ mod tests {
             r#"{"requests":{"memory":"1Gi"},"limits":{"memory":"1Gi"}}"#,
             "--kubernetes-iron-proxy-resources",
             r#"{"requests":{"cpu":"50m"}}"#,
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
         ])
         .unwrap();
 
@@ -3547,6 +3555,18 @@ mod tests {
             proxy.resources,
             Some(ResourceRequirements::new().request("cpu", "50m"))
         );
+
+        let backend = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        assert_eq!(
+            backend.default_resources,
+            Some(
+                ResourceRequirements::new()
+                    .request("cpu", "0.5")
+                    .request("ephemeral-storage", "2Gi")
+                    .limit("memory", "4Gi")
+                    .limit("example.com/gpu", "1")
+            )
+        );
     }
 
     #[test]
@@ -3559,6 +3579,10 @@ mod tests {
             "codex-app-server",
             "--session-sandbox-resources",
             "",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
         ])
         .unwrap();
 
@@ -3573,6 +3597,12 @@ mod tests {
                 .workflow_host_spec("prn_test")
                 .unwrap()
                 .resources,
+            None
+        );
+        assert_eq!(
+            AgentSandboxConfig::try_from(&args.sandbox)
+                .unwrap()
+                .default_resources,
             None
         );
     }

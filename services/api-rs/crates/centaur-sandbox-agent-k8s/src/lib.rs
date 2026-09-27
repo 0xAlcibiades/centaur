@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -63,6 +63,8 @@ pub struct AgentSandboxConfig {
     pub namespace: String,
     pub field_manager: String,
     pub container_name: String,
+    /// Resources applied to the agent container when a retained sandbox resumes.
+    pub default_resources: Option<ResourceRequirements>,
     pub labels: BTreeMap<String, String>,
     /// Metadata applied to the Sandbox custom resource and its pod template.
     pub annotations: BTreeMap<String, String>,
@@ -142,6 +144,7 @@ impl AgentSandboxConfig {
             namespace: namespace.into(),
             field_manager: "centaur-api-rs".to_owned(),
             container_name: DEFAULT_CONTAINER_NAME.to_owned(),
+            default_resources: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             pod_annotations: BTreeMap::new(),
@@ -336,6 +339,29 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox", err))
+    }
+
+    async fn apply_configured_resources(&self, id: &SandboxId) -> SandboxResult<()> {
+        let Some(resources) = self
+            .config
+            .default_resources
+            .as_ref()
+            .filter(|resources| !resources.is_empty())
+        else {
+            return Ok(());
+        };
+
+        let patch = sandbox_resources_apply_patch(id, &self.config.container_name, resources);
+        // The CRD declares containers as a map keyed by name, so server-side
+        // apply updates only the agent container without positional JSON Patch
+        // logic or replacing sidecars. This fleet policy deliberately takes
+        // ownership from the manager that created the older CR.
+        let params = PatchParams::apply(&self.config.field_manager).force();
+        self.sandboxes()
+            .patch(id.as_str(), &params, &Patch::Apply(&patch))
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("apply sandbox resources", err))
     }
 
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -745,6 +771,15 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
+        if let Err(error) = self.apply_configured_resources(id).await {
+            // Keep resume available if resource reconciliation is temporarily
+            // unavailable; the replacement pod will retain its previous limits.
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to apply current resources to resumed sandbox"
+            );
+        }
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
@@ -1360,6 +1395,28 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!resources.is_empty()).then(|| json!(resources))
 }
 
+fn sandbox_resources_apply_patch(
+    id: &SandboxId,
+    container_name: &str,
+    resources: &ResourceRequirements,
+) -> Value {
+    json!({
+        "apiVersion": crd::Sandbox::api_version(&()),
+        "kind": crd::Sandbox::kind(&()),
+        "metadata": { "name": id.as_str() },
+        "spec": {
+            "podTemplate": {
+                "spec": {
+                    "containers": [{
+                        "name": container_name,
+                        "resources": resources,
+                    }],
+                },
+            },
+        },
+    })
+}
+
 fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
     let mut pvc_spec = json!({
         "accessModes": ["ReadWriteOnce"],
@@ -1666,6 +1723,30 @@ mod tests {
             sandbox.spec.pod_template.spec.containers[0]
                 .resources
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn resource_apply_targets_the_agent_container_by_name() {
+        let resources = ResourceRequirements::new()
+            .request("cpu", "2")
+            .limit("memory", "8Gi");
+
+        let patch =
+            sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", &resources);
+
+        assert_eq!(patch["apiVersion"], "agents.x-k8s.io/v1alpha1");
+        assert_eq!(patch["kind"], "Sandbox");
+        assert_eq!(patch["metadata"]["name"], "asbx-test");
+        assert_eq!(
+            patch["spec"]["podTemplate"]["spec"]["containers"],
+            json!([{
+                "name": "agent",
+                "resources": {
+                    "limits": { "memory": "8Gi" },
+                    "requests": { "cpu": "2" },
+                },
+            }])
         );
     }
 
