@@ -428,6 +428,33 @@ impl AgentSandboxBackend {
         }
     }
 
+    async fn wait_until_pod_gone(&self, id: &SandboxId) -> SandboxResult<()> {
+        let deadline = Instant::now() + self.config.ready_timeout;
+        loop {
+            match self.get_pod(id).await? {
+                None => return Ok(()),
+                Some(_) if Instant::now() >= deadline => {
+                    return Err(SandboxError::NotReady(format!(
+                        "sandbox {} pod did not terminate before timeout",
+                        id.as_str()
+                    )));
+                }
+                Some(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    async fn quiesce_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
+        match self
+            .patch_sandbox_merge(id, json!({ "spec": { "replicas": 0 } }))
+            .await
+        {
+            Ok(()) => self.wait_until_pod_gone(id).await,
+            Err(SandboxError::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn attach_io(&self, id: &SandboxId) -> SandboxResult<SandboxIo> {
         let observed = self.observe(id).await?;
         if observed.status != SandboxStatus::Running {
@@ -611,25 +638,26 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
-        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        // TERM/preStop cleanup may still need the per-sandbox egress path.
+        let quiesce_result = self.quiesce_sandbox(id).await;
         let files_result = self.delete_sandbox_files_config_map(id).await;
-        match self
+        let sandbox_result = match self
             .sandboxes()
             .delete(id.as_str(), &DeleteParams::default())
             .await
         {
-            Ok(_) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
-            Err(err) if is_not_found(&err) => {
-                proxy_result?;
-                files_result?;
-                self.delete_state_pvc(id).await
-            }
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Ok(()),
             Err(err) => Err(map_kube_error("delete sandbox", err)),
-        }
+        };
+        let proxy_result = self.delete_iron_proxy_resources(id).await;
+        let state_result = self.delete_state_pvc(id).await;
+
+        quiesce_result?;
+        files_result?;
+        sandbox_result?;
+        proxy_result?;
+        state_result
     }
 
     async fn assign_iron_control_proxy_principal(

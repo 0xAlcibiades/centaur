@@ -1005,6 +1005,7 @@ dependencies = [
  "centaur-sandbox-local",
  "centaur-sandbox-manager",
  "clap",
+ "k8s-openapi",
  "kube",
  "rustls 0.23.45",
  "test-case",
