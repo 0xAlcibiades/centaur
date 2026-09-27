@@ -341,37 +341,27 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("patch sandbox", err))
     }
 
-    async fn apply_configured_resources(&self, id: &SandboxId) -> SandboxResult<()> {
+    async fn apply_configured_resources(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
         let Some(resources) = self.config.default_resources.as_ref() else {
             return Ok(());
         };
-
-        // Clear the complete resources field first. Resource names inside
-        // requests and limits are granular SSA map fields, so applying only
-        // the desired keys would retain stale keys owned by the CR creator.
-        // The sandbox is still paused, so no pod can observe the intermediate
-        // state. A failed second apply leaves it paused and can be retried.
-        let params = PatchParams::apply(&self.config.field_manager).force();
-        let clear = sandbox_resources_apply_patch(id, &self.config.container_name, None);
+        let patch = sandbox_resources_patch(sandbox, &self.config.container_name, resources)?;
+        let patch = serde_json::from_value(patch).map_err(|error| {
+            SandboxError::backend(format!("build sandbox resources patch: {error}"))
+        })?;
         self.sandboxes()
-            .patch(id.as_str(), &params, &Patch::Apply(&clear))
-            .await
-            .map_err(|err| map_kube_error("clear sandbox resources", err))?;
-
-        if resources.is_empty() {
-            return Ok(());
-        }
-
-        // The CRD declares containers as a map keyed by name, so server-side
-        // apply updates only the agent container without positional JSON Patch
-        // logic or replacing sidecars. This fleet policy deliberately takes
-        // ownership from the manager that created the older CR.
-        let patch = sandbox_resources_apply_patch(id, &self.config.container_name, Some(resources));
-        self.sandboxes()
-            .patch(id.as_str(), &params, &Patch::Apply(&patch))
+            .patch(
+                id.as_str(),
+                &PatchParams::default(),
+                &Patch::Json::<crd::Sandbox>(patch),
+            )
             .await
             .map(|_| ())
-            .map_err(|err| map_kube_error("apply sandbox resources", err))
+            .map_err(|err| map_kube_error("patch sandbox resources", err))
     }
 
     async fn delete_state_pvc(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -781,9 +771,11 @@ impl SandboxBackend for AgentSandboxBackend {
                 sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
             })
             .unwrap_or_default();
-        // Do not scale up with stale or partially applied fleet policy. The
-        // caller can retry resume after a transient Kubernetes API failure.
-        self.apply_configured_resources(id).await?;
+        // Do not scale up with stale fleet policy. The resourceVersion and
+        // container-name tests make the replacement atomic against a changed CR.
+        if let Some(sandbox) = &sandbox {
+            self.apply_configured_resources(id, sandbox).await?;
+        }
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
@@ -1399,26 +1391,49 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!resources.is_empty()).then(|| json!(resources))
 }
 
-fn sandbox_resources_apply_patch(
-    id: &SandboxId,
+fn sandbox_resources_patch(
+    sandbox: &crd::Sandbox,
     container_name: &str,
-    resources: Option<&ResourceRequirements>,
-) -> Value {
-    json!({
-        "apiVersion": crd::Sandbox::api_version(&()),
-        "kind": crd::Sandbox::kind(&()),
-        "metadata": { "name": id.as_str() },
-        "spec": {
-            "podTemplate": {
-                "spec": {
-                    "containers": [{
-                        "name": container_name,
-                        "resources": resources,
-                    }],
-                },
-            },
+    resources: &ResourceRequirements,
+) -> SandboxResult<Value> {
+    let resource_version = sandbox
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| SandboxError::backend("sandbox has no resourceVersion"))?;
+    let index = sandbox
+        .spec
+        .pod_template
+        .spec
+        .containers
+        .iter()
+        .position(|container| container.name == container_name)
+        .ok_or_else(|| {
+            SandboxError::backend(format!("sandbox has no container named {container_name:?}"))
+        })?;
+    let resources = if resources.is_empty() {
+        Value::Null
+    } else {
+        json!(resources)
+    };
+
+    Ok(json!([
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": resource_version,
         },
-    })
+        {
+            "op": "test",
+            "path": format!("/spec/podTemplate/spec/containers/{index}/name"),
+            "value": container_name,
+        },
+        {
+            "op": "add",
+            "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
+            "value": resources,
+        },
+    ]))
 }
 
 fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
@@ -1731,34 +1746,64 @@ mod tests {
     }
 
     #[test]
-    fn resource_apply_targets_the_agent_container_by_name() {
+    fn resource_patch_atomically_targets_the_agent_container() {
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &config,
+        )
+        .unwrap();
+        sandbox.metadata.resource_version = Some("42".to_owned());
+        let mut sidecar = sandbox.spec.pod_template.spec.containers[0].clone();
+        sidecar.name = "sidecar".to_owned();
+        sandbox.spec.pod_template.spec.containers.insert(0, sidecar);
         let resources = ResourceRequirements::new()
             .request("cpu", "2")
             .limit("memory", "8Gi");
 
-        let patch =
-            sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", Some(&resources));
+        let patch = sandbox_resources_patch(&sandbox, "agent", &resources).unwrap();
 
-        assert_eq!(patch["apiVersion"], "agents.x-k8s.io/v1alpha1");
-        assert_eq!(patch["kind"], "Sandbox");
-        assert_eq!(patch["metadata"]["name"], "asbx-test");
         assert_eq!(
-            patch["spec"]["podTemplate"]["spec"]["containers"],
-            json!([{
-                "name": "agent",
-                "resources": {
-                    "limits": { "memory": "8Gi" },
-                    "requests": { "cpu": "2" },
+            patch,
+            json!([
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": "42",
                 },
-            }])
+                {
+                    "op": "test",
+                    "path": "/spec/podTemplate/spec/containers/1/name",
+                    "value": "agent",
+                },
+                {
+                    "op": "add",
+                    "path": "/spec/podTemplate/spec/containers/1/resources",
+                    "value": {
+                        "limits": { "memory": "8Gi" },
+                        "requests": { "cpu": "2" },
+                    },
+                },
+            ])
         );
     }
 
     #[test]
-    fn resource_apply_can_clear_stale_resources() {
-        let patch = sandbox_resources_apply_patch(&SandboxId::new("asbx-test"), "agent", None);
+    fn resource_patch_can_atomically_clear_stale_resources() {
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &config,
+        )
+        .unwrap();
+        sandbox.metadata.resource_version = Some("42".to_owned());
 
-        assert!(patch["spec"]["podTemplate"]["spec"]["containers"][0]["resources"].is_null());
+        let patch =
+            sandbox_resources_patch(&sandbox, "agent", &ResourceRequirements::default()).unwrap();
+
+        assert!(patch[2]["value"].is_null());
     }
 
     #[test]

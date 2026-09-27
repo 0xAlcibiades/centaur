@@ -228,10 +228,43 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
     resumed.resume(&handle.id).await.expect("resume sandbox");
     eventually_status(&resumed, &handle.id, SandboxStatus::Running).await;
 
+    assert_agent_resources(
+        kubernetes,
+        &handle.id,
+        serde_json::json!({
+            "limits": { "memory": "32Mi" },
+            "requests": { "cpu": "20m" },
+        }),
+    )
+    .await;
+
+    resumed.pause(&handle.id).await.expect("pause sandbox");
+    eventually_status(&resumed, &handle.id, SandboxStatus::Suspended).await;
+    let mut unbounded_config = agent_k8s_config(&kubernetes.namespace);
+    unbounded_config.default_resources = Some(ResourceRequirements::default());
+    let unbounded = SandboxManager::new(Arc::new(AgentSandboxBackend::new(
+        kubernetes.client.clone(),
+        unbounded_config,
+    )));
+    unbounded
+        .resume(&handle.id)
+        .await
+        .expect("resume sandbox without resource constraints");
+    eventually_status(&unbounded, &handle.id, SandboxStatus::Running).await;
+    assert_agent_resources(kubernetes, &handle.id, serde_json::Value::Null).await;
+
+    unbounded.stop(&handle.id).await.expect("stop sandbox");
+}
+
+async fn assert_agent_resources(
+    kubernetes: &KubernetesImplementation,
+    id: &SandboxId,
+    expected: serde_json::Value,
+) {
     let sandboxes: Api<crd::Sandbox> =
         Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
     let sandbox = sandboxes
-        .get(handle.id.as_str())
+        .get(id.as_str())
         .await
         .expect("read resumed Sandbox CR");
     let stored_container = sandbox
@@ -245,17 +278,13 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
     let stored_resources =
         serde_json::to_value(&stored_container.resources).expect("serialize stored resources");
     assert_eq!(
-        stored_resources,
-        serde_json::json!({
-            "limits": { "memory": "32Mi" },
-            "requests": { "cpu": "20m" },
-        }),
+        stored_resources, expected,
         "stored resources should exactly match current configuration"
     );
 
     let pods: Api<Pod> = Api::namespaced(kubernetes.client.clone(), &kubernetes.namespace);
     let pod = pods
-        .get(handle.id.as_str())
+        .get(id.as_str())
         .await
         .expect("read resumed sandbox pod");
     let agent = pod
@@ -268,15 +297,9 @@ pub(crate) async fn resume_reconciles_agent_resources(implementation: &SandboxIm
     let running_resources =
         serde_json::to_value(&agent.resources).expect("serialize running resources");
     assert_eq!(
-        running_resources,
-        serde_json::json!({
-            "limits": { "memory": "32Mi" },
-            "requests": { "cpu": "20m" },
-        }),
+        running_resources, expected,
         "resumed pod resources should exactly match current configuration"
     );
-
-    resumed.stop(&handle.id).await.expect("stop sandbox");
 }
 
 pub(crate) async fn unexpected_shutdown_reports_drift(implementation: &SandboxImplementation) {
