@@ -14,10 +14,7 @@ centaur-sandbox-core.workspace = true
 clap.workspace = true
 jiff.workspace = true
 k8s-openapi.workspace = true
-# jsonpatch: reconciling one container's resources needs a positional
-# add (insert when absent, replace when present). A merge patch would rewrite
-# the whole containers array.
-kube = { workspace = true, features = ["derive", "jsonpatch", "ws"] }
+kube = { workspace = true, features = ["derive", "ws"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
